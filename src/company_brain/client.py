@@ -1,0 +1,237 @@
+"""Small synchronous SDK for the Company Brain REST API."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+
+
+class _Resource:
+    def __init__(self, client: "CompanyBrain") -> None:
+        self._client = client
+
+
+class DocumentsClient(_Resource):
+    def add(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/documents", payload)
+
+    def update(self, external_id: str, **payload: Any) -> dict[str, Any]:
+        payload["external_id"] = external_id
+        return self._client._request("PUT", f"/v1/documents/{external_id}", payload)
+
+    def status(self, source_id: str) -> dict[str, Any]:
+        return self._client._request("GET", f"/v1/documents/{source_id}/status")
+
+
+class SearchClient(_Resource):
+    def query(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/search", payload)
+
+
+class ContextClient(_Resource):
+    def prepare(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/context:prepare", payload)
+
+    def relationship(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/relationships:query", payload)
+
+    def project(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/projects:context", payload)
+
+    def resolve_owner(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/owners:resolve", payload)
+
+
+class EventsClient(_Resource):
+    def publish(self, **event: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/events", event)
+
+    def publish_batch(self, events: list[dict[str, Any]]) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/events:batch", events)
+
+
+class SkillsClient(_Resource):
+    def search(self, organization_id: str, query: str, limit: int = 20) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/skills:search", {"organization_id": organization_id, "query": query, "limit": limit})
+
+    def prepare(self, skill_id: str, context_warnings: list[str] | None = None) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/skills:prepare", {"skill_id": skill_id, "context_warnings": context_warnings or []})
+
+
+class ProactiveClient(_Resource):
+    def evaluate(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/proactive:evaluate", payload)
+
+
+class SignalsClient(_Resource):
+    def list(self, organization_id: str, state: str | None = None) -> dict[str, Any]:
+        params = {"organization_id": organization_id}
+        if state:
+            params["state"] = state
+        return self._client._request("GET", "/v1/signals", params=params)
+
+    def acknowledge(self, signal_id: str, acting_principal_id: str) -> dict[str, Any]:
+        return self._client._request("POST", f"/v1/signals/{signal_id}:acknowledge", {"acting_principal_id": acting_principal_id})
+
+
+class RunsClient(_Resource):
+    def start(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/runs", payload)
+
+    def record_action(self, run_id: str, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", f"/v1/runs/{run_id}/events", payload)
+
+    def complete(self, run_id: str, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", f"/v1/runs/{run_id}:complete", payload)
+
+    def evaluate(self, run_id: str) -> dict[str, Any]:
+        return self._client._request("POST", f"/v1/runs/{run_id}:evaluate")
+
+
+class AgentClient(_Resource):
+    """Managed company-agent runs, including full durable traces."""
+
+    def invoke(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/agent/invoke", payload)
+
+    def get(self, run_id: str) -> dict[str, Any]:
+        return self._client._request("GET", f"/v1/agent/runs/{run_id}")
+
+    def list(
+        self,
+        organization_id: str,
+        *,
+        state: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "organization_id": organization_id,
+            "limit": limit,
+        }
+        if state:
+            params["state"] = state
+        return self._client._request("GET", "/v1/agent/runs", params=params)
+
+    def cancel(self, run_id: str, cancelled_by: str) -> dict[str, Any]:
+        return self._client._request(
+            "POST",
+            f"/v1/agent/runs/{run_id}:cancel",
+            params={"cancelled_by": cancelled_by},
+        )
+
+
+class ApprovalsClient(_Resource):
+    def list(
+        self, organization_id: str, *, status: str | None = None
+    ) -> dict[str, Any]:
+        params = {"organization_id": organization_id}
+        if status:
+            params["status"] = status
+        return self._client._request("GET", "/v1/approvals", params=params)
+
+    def decide(
+        self,
+        approval_id: str,
+        *,
+        approved: bool,
+        decided_by: str,
+        edited_arguments: dict[str, Any] | None = None,
+        run_now: bool = False,
+    ) -> dict[str, Any]:
+        return self._client._request(
+            "POST",
+            f"/v1/approvals/{approval_id}:decide",
+            {
+                "approved": approved,
+                "decided_by": decided_by,
+                "edited_arguments": edited_arguments,
+                "run_now": run_now,
+            },
+        )
+
+
+class AutomationsClient(_Resource):
+    def create(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/automations", payload)
+
+    def list(self, organization_id: str) -> dict[str, Any]:
+        return self._client._request(
+            "GET",
+            "/v1/automations",
+            params={"organization_id": organization_id},
+        )
+
+    def enable(self, automation_id: str) -> dict[str, Any]:
+        return self._client._request(
+            "POST", f"/v1/automations/{automation_id}:enable"
+        )
+
+    def disable(self, automation_id: str) -> dict[str, Any]:
+        return self._client._request(
+            "POST", f"/v1/automations/{automation_id}:disable"
+        )
+
+
+class HarnessClient(_Resource):
+    def status(self) -> dict[str, Any]:
+        return self._client._request("GET", "/v1/harness/status")
+
+    def jobs(
+        self, organization_id: str, *, status: str | None = None
+    ) -> dict[str, Any]:
+        params = {"organization_id": organization_id}
+        if status:
+            params["status"] = status
+        return self._client._request("GET", "/v1/harness/jobs", params=params)
+
+    def drain(self, max_cycles: int = 100) -> dict[str, Any]:
+        return self._client._request(
+            "POST",
+            "/v1/harness/worker:drain",
+            params={"max_cycles": max_cycles},
+        )
+
+    def feedback(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/harness/feedback", payload)
+
+    def evaluation(self, organization_id: str) -> dict[str, Any]:
+        return self._client._request(
+            "GET",
+            "/v1/harness/evaluation",
+            params={"organization_id": organization_id},
+        )
+
+
+class CompanyBrain:
+    """Typed-by-convention SDK surface for harnesses and internal applications."""
+
+    def __init__(self, api_key: str | None = None, base_url: str = "http://127.0.0.1:8080", *, transport: httpx.BaseTransport | None = None) -> None:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self._http = httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=30.0, transport=transport)
+        self.documents = DocumentsClient(self)
+        self.search = SearchClient(self)
+        self.context = ContextClient(self)
+        self.events = EventsClient(self)
+        self.skills = SkillsClient(self)
+        self.runs = RunsClient(self)
+        self.agent = AgentClient(self)
+        self.approvals = ApprovalsClient(self)
+        self.automations = AutomationsClient(self)
+        self.harness = HarnessClient(self)
+        self.proactive = ProactiveClient(self)
+        self.signals = SignalsClient(self)
+
+    def close(self) -> None:
+        self._http.close()
+
+    def __enter__(self) -> "CompanyBrain":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def _request(self, method: str, path: str, payload: Any | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        response = self._http.request(method, path, json=payload, params=params)
+        response.raise_for_status()
+        return response.json()

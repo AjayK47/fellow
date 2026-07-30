@@ -1,0 +1,1706 @@
+"""SQLite-backed control plane and property graph store."""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+
+def _ser(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, datetime):
+        return json.dumps(value.isoformat())
+    return json.dumps(value, default=str)
+
+
+def _de(value: str | None) -> Any:
+    if value is None:
+        return None
+    return json.loads(value)
+
+
+class BrainStore:
+    """Tenant-aware store for evidence, graph, memories, skills, runs, audit."""
+
+    def __init__(self, db_path: Path | str) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._migrate()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    @contextmanager
+    def cursor(self) -> Iterator[sqlite3.Cursor]:
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                yield cur
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            finally:
+                cur.close()
+
+    def _migrate(self) -> None:
+        with self.cursor() as cur:
+            cur.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS organizations (
+                    id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS sources (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    external_key TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    revoked INTEGER NOT NULL DEFAULT 0,
+                    deleted_at TEXT,
+                    payload TEXT NOT NULL,
+                    UNIQUE (organization_id, external_key, version)
+                );
+
+                CREATE TABLE IF NOT EXISTS entities (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS edges (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    edge_type TEXT NOT NULL,
+                    from_id TEXT NOT NULL,
+                    to_id TEXT NOT NULL,
+                    valid_until TEXT,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS memories (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    memory_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    is_latest INTEGER NOT NULL DEFAULT 1,
+                    scope_id TEXT NOT NULL,
+                    is_private INTEGER NOT NULL DEFAULT 0,
+                    content TEXT NOT NULL,
+                    valid_from TEXT,
+                    valid_until TEXT,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS scopes (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS skills (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    UNIQUE (organization_id, id, version)
+                );
+
+                CREATE TABLE IF NOT EXISTS runs (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS signals (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS authz_decisions (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS processing_jobs (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    source_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS received_events (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    received_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS idempotency_keys (
+                    organization_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    response TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (organization_id, operation, key)
+                );
+
+                CREATE TABLE IF NOT EXISTS profiles (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    profile_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, profile_type, entity_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_versions (
+                    skill_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (skill_id, version)
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_sessions (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    conversation_key TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, conversation_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_runs (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    trigger_kind TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    trace_id TEXT NOT NULL,
+                    parent_run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_messages (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tool_call_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_turns (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    turn_number INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (run_id, turn_number)
+                );
+
+                CREATE TABLE IF NOT EXISTS harness_tool_calls (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, idempotency_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS approvals (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS thread_states (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    conversation_key TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, conversation_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS attention_evaluations (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_interventions (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    conversation_key TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_feedback (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    run_id TEXT,
+                    attention_evaluation_id TEXT,
+                    feedback_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS deliveries (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    run_id TEXT,
+                    status TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, idempotency_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS harness_jobs (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    available_at TEXT NOT NULL,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 5,
+                    idempotency_key TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, idempotency_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS slack_installations (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (workspace_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS channel_policies (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, source, channel_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS identity_mappings (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_user_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    UNIQUE (organization_id, source, source_user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS connector_accounts (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    toolkit TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS tool_policies (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, tool_name)
+                );
+
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (run_id, sequence)
+                );
+
+                CREATE TABLE IF NOT EXISTS episodes (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    conversation_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS automations (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    next_run_at TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    embedding TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_embeddings (
+                    memory_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    embedding TEXT NOT NULL,
+                    content_hash TEXT NOT NULL
+                );
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                    chunk_id UNINDEXED, organization_id UNINDEXED, scope_id UNINDEXED, content
+                );
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    memory_id UNINDEXED, organization_id UNINDEXED, scope_id UNINDEXED, content
+                );
+
+                CREATE TABLE IF NOT EXISTS principal_memberships (
+                    organization_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    PRIMARY KEY (organization_id, principal_id, scope_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_memories_org_latest
+                    ON memories(organization_id, is_latest, status);
+                CREATE INDEX IF NOT EXISTS idx_edges_org_type
+                    ON edges(organization_id, edge_type);
+                CREATE INDEX IF NOT EXISTS idx_sources_org
+                    ON sources(organization_id);
+                CREATE INDEX IF NOT EXISTS idx_entities_org
+                    ON entities(organization_id, entity_type);
+                CREATE INDEX IF NOT EXISTS idx_chunks_org_scope ON chunks(organization_id, scope_id);
+                CREATE INDEX IF NOT EXISTS idx_memory_embeddings_org_scope
+                    ON memory_embeddings(organization_id, scope_id);
+                CREATE INDEX IF NOT EXISTS idx_processing_jobs_org ON processing_jobs(organization_id, status);
+                CREATE INDEX IF NOT EXISTS idx_profiles_org_entity ON profiles(organization_id, entity_id);
+                CREATE INDEX IF NOT EXISTS idx_skill_versions_org ON skill_versions(organization_id, skill_id);
+                CREATE INDEX IF NOT EXISTS idx_agent_runs_org_state
+                    ON agent_runs(organization_id, state, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_agent_messages_session
+                    ON agent_messages(session_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_tool_calls_run
+                    ON harness_tool_calls(run_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_approvals_run_status
+                    ON approvals(run_id, status);
+                CREATE INDEX IF NOT EXISTS idx_attention_event
+                    ON attention_evaluations(organization_id, event_id);
+                CREATE INDEX IF NOT EXISTS idx_interventions_conversation
+                    ON agent_interventions(organization_id, conversation_key, created_at);
+                CREATE INDEX IF NOT EXISTS idx_agent_feedback_org
+                    ON agent_feedback(organization_id, feedback_type, created_at);
+                CREATE INDEX IF NOT EXISTS idx_harness_jobs_ready
+                    ON harness_jobs(status, available_at, lease_expires_at);
+                """
+            )
+
+    # ---- generic helpers ----
+
+    def put_json(self, table: str, id_: str, organization_id: str, payload: dict[str, Any], **cols: Any) -> None:
+        with self.cursor() as cur:
+            if table == "organizations":
+                cur.execute(
+                    "INSERT OR REPLACE INTO organizations(id, payload) VALUES (?, ?)",
+                    (id_, _ser(payload)),
+                )
+                return
+            columns = ["id", "organization_id", "payload"] + list(cols.keys())
+            placeholders = ", ".join("?" for _ in columns)
+            col_names = ", ".join(columns)
+            values = [id_, organization_id, _ser(payload)] + list(cols.values())
+            # Use upsert-ish REPLACE for simplicity
+            cur.execute(f"INSERT OR REPLACE INTO {table} ({col_names}) VALUES ({placeholders})", values)
+
+    def get_json(self, table: str, id_: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(f"SELECT payload FROM {table} WHERE id = ?", (id_,))
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def list_by_org(self, table: str, organization_id: str) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(f"SELECT payload FROM {table} WHERE organization_id = ?", (organization_id,))
+            return [_de(r["payload"]) for r in cur.fetchall()]
+
+    # ---- sources ----
+
+    def upsert_source(self, source: dict[str, Any]) -> None:
+        """Insert or update a source by primary id. Versions of the same external_key coexist."""
+        external_key = f"{source['source_system']}:{source['external_id']}"
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO sources
+                (id, organization_id, external_key, version, revoked, deleted_at, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    organization_id=excluded.organization_id,
+                    external_key=excluded.external_key,
+                    version=excluded.version,
+                    revoked=excluded.revoked,
+                    deleted_at=excluded.deleted_at,
+                    payload=excluded.payload
+                """,
+                (
+                    source["id"],
+                    source["organization_id"],
+                    external_key,
+                    source.get("version", 1),
+                    1 if source.get("revoked") else 0,
+                    source.get("deleted_at"),
+                    _ser(source),
+                ),
+            )
+
+    def next_source_version(
+        self, organization_id: str, source_system: str, external_id: str
+    ) -> int:
+        external_key = f"{source_system}:{external_id}"
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) AS max_v
+                FROM sources
+                WHERE organization_id = ? AND external_key = ?
+                """,
+                (organization_id, external_key),
+            )
+            row = cur.fetchone()
+            return int(row["max_v"] or 0) + 1
+
+    def get_source(self, source_id: str) -> dict[str, Any] | None:
+        return self.get_json("sources", source_id)
+
+    def list_source_versions(
+        self, organization_id: str, source_system: str, external_id: str
+    ) -> list[dict[str, Any]]:
+        external_key = f"{source_system}:{external_id}"
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload FROM sources
+                WHERE organization_id = ? AND external_key = ?
+                ORDER BY version ASC
+                """,
+                (organization_id, external_key),
+            )
+            return [_de(r["payload"]) for r in cur.fetchall()]
+
+    def list_sources(self, organization_id: str, include_revoked: bool = False) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            if include_revoked:
+                cur.execute("SELECT payload FROM sources WHERE organization_id = ?", (organization_id,))
+            else:
+                cur.execute(
+                    "SELECT payload FROM sources WHERE organization_id = ? AND revoked = 0 AND deleted_at IS NULL",
+                    (organization_id,),
+                )
+            return [_de(r["payload"]) for r in cur.fetchall()]
+
+    def revoke_source(self, source_id: str) -> dict[str, Any] | None:
+        src = self.get_source(source_id)
+        if not src:
+            return None
+        src["revoked"] = True
+        src["deleted_at"] = datetime.now(timezone.utc).isoformat()
+        self.upsert_source(src)
+        return src
+
+    # ---- entities / edges ----
+
+    def upsert_entity(self, entity: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO entities(id, organization_id, entity_type, name, payload)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    entity["id"],
+                    entity["organization_id"],
+                    entity["entity_type"] if isinstance(entity["entity_type"], str) else entity["entity_type"].value,
+                    entity["name"],
+                    _ser(entity),
+                ),
+            )
+
+    def get_entity(self, entity_id: str) -> dict[str, Any] | None:
+        return self.get_json("entities", entity_id)
+
+    def list_entities(self, organization_id: str, entity_type: str | None = None) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            if entity_type:
+                cur.execute(
+                    "SELECT payload FROM entities WHERE organization_id = ? AND entity_type = ?",
+                    (organization_id, entity_type),
+                )
+            else:
+                cur.execute("SELECT payload FROM entities WHERE organization_id = ?", (organization_id,))
+            return [_de(r["payload"]) for r in cur.fetchall()]
+
+    def upsert_edge(self, edge: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO edges
+                (id, organization_id, edge_type, from_id, to_id, valid_until, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    edge["id"],
+                    edge["organization_id"],
+                    edge["edge_type"],
+                    edge["from_id"],
+                    edge["to_id"],
+                    edge.get("valid_until"),
+                    _ser(edge),
+                ),
+            )
+
+    def list_edges(
+        self,
+        organization_id: str,
+        edge_type: str | None = None,
+        from_id: str | None = None,
+        to_id: str | None = None,
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        clauses = ["organization_id = ?"]
+        params: list[Any] = [organization_id]
+        if edge_type:
+            clauses.append("edge_type = ?")
+            params.append(edge_type)
+        if from_id:
+            clauses.append("from_id = ?")
+            params.append(from_id)
+        if to_id:
+            clauses.append("to_id = ?")
+            params.append(to_id)
+        sql = f"SELECT payload, valid_until FROM edges WHERE {' AND '.join(clauses)}"
+        with self.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        results = []
+        for r in rows:
+            edge = _de(r["payload"])
+            if active_only and edge.get("valid_until"):
+                continue
+            results.append(edge)
+        return results
+
+    def neighbors(self, organization_id: str, node_id: str, edge_types: list[str] | None = None) -> list[dict[str, Any]]:
+        edges = self.list_edges(organization_id)
+        out = []
+        for e in edges:
+            if edge_types and e["edge_type"] not in edge_types:
+                continue
+            if e["from_id"] == node_id or e["to_id"] == node_id:
+                out.append(e)
+        return out
+
+    # ---- memories ----
+
+    def upsert_memory(self, memory: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO memories
+                (id, organization_id, memory_type, status, is_latest, scope_id, is_private,
+                 content, valid_from, valid_until, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    memory["id"],
+                    memory["organization_id"],
+                    memory["memory_type"] if isinstance(memory["memory_type"], str) else memory["memory_type"].value,
+                    memory["status"] if isinstance(memory["status"], str) else memory["status"].value,
+                    1 if memory.get("is_latest", True) else 0,
+                    memory["scope_id"],
+                    1 if memory.get("is_private") else 0,
+                    memory["content"],
+                    memory.get("valid_from"),
+                    memory.get("valid_until"),
+                    _ser(memory),
+                ),
+            )
+
+    def get_memory(self, memory_id: str) -> dict[str, Any] | None:
+        return self.get_json("memories", memory_id)
+
+    def list_memories(
+        self,
+        organization_id: str,
+        latest_only: bool = False,
+        status: str | None = None,
+        scope_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["organization_id = ?"]
+        params: list[Any] = [organization_id]
+        if latest_only:
+            clauses.append("is_latest = 1")
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        sql = f"SELECT payload FROM memories WHERE {' AND '.join(clauses)}"
+        with self.cursor() as cur:
+            cur.execute(sql, params)
+            rows = [_de(r["payload"]) for r in cur.fetchall()]
+        if scope_ids is not None:
+            allowed = set(scope_ids)
+            rows = [m for m in rows if m.get("scope_id") in allowed]
+        return rows
+
+    def mark_superseded(self, memory_id: str, superseded_at: str) -> None:
+        mem = self.get_memory(memory_id)
+        if not mem:
+            return
+        mem["status"] = "superseded"
+        mem["is_latest"] = False
+        mem["superseded_at"] = superseded_at
+        mem["valid_until"] = superseded_at
+        self.upsert_memory(mem)
+
+    # ---- search indexes ----
+
+    def upsert_chunk(self, chunk: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO chunks
+                (id, organization_id, source_id, scope_id, position, content, model, embedding, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (chunk["id"], chunk["organization_id"], chunk["source_id"], chunk["scope_id"],
+                 chunk["position"], chunk["content"], chunk["model"], _ser(chunk["embedding"]), _ser(chunk)),
+            )
+            cur.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk["id"],))
+            cur.execute("INSERT INTO chunks_fts(chunk_id, organization_id, scope_id, content) VALUES (?, ?, ?, ?)",
+                        (chunk["id"], chunk["organization_id"], chunk["scope_id"], chunk["content"]))
+
+    def upsert_memory_embedding(
+        self, *, memory_id: str, organization_id: str, scope_id: str, model: str,
+        embedding: list[float], content_hash: str,
+    ) -> None:
+        memory = self.get_memory(memory_id)
+        if not memory:
+            return
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO memory_embeddings
+                (memory_id, organization_id, scope_id, model, embedding, content_hash)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (memory_id, organization_id, scope_id, model, _ser(embedding), content_hash),
+            )
+            cur.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,))
+            cur.execute("INSERT INTO memories_fts(memory_id, organization_id, scope_id, content) VALUES (?, ?, ?, ?)",
+                        (memory_id, organization_id, scope_id, memory.get("content") or ""))
+
+    def memory_embeddings(self, memory_ids: list[str]) -> dict[str, list[float]]:
+        if not memory_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in memory_ids)
+        with self.cursor() as cur:
+            cur.execute(f"SELECT memory_id, embedding FROM memory_embeddings WHERE memory_id IN ({placeholders})", memory_ids)
+            return {row["memory_id"]: _de(row["embedding"]) for row in cur.fetchall()}
+
+    def list_chunks(
+        self,
+        organization_id: str,
+        *,
+        scope_ids: list[str] | None = None,
+        source_ids: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["organization_id = ?"]
+        params: list[Any] = [organization_id]
+        if scope_ids is not None:
+            if not scope_ids:
+                return []
+            placeholders = ", ".join("?" for _ in scope_ids)
+            clauses.append(f"scope_id IN ({placeholders})")
+            params.extend(scope_ids)
+        if source_ids is not None:
+            if not source_ids:
+                return []
+            placeholders = ", ".join("?" for _ in source_ids)
+            clauses.append(f"source_id IN ({placeholders})")
+            params.extend(source_ids)
+        sql = (
+            f"SELECT payload FROM chunks WHERE {' AND '.join(clauses)} "
+            "ORDER BY rowid DESC"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self.cursor() as cur:
+            cur.execute(sql, params)
+            return [_de(row["payload"]) for row in cur.fetchall()]
+
+    def chunk_fts_ranks(
+        self, query: str, organization_id: str, scope_ids: list[str]
+    ) -> dict[str, float]:
+        tokens = [
+            token
+            for token in re.findall(r"[a-z0-9_]+", query.lower())
+            if len(token) > 2
+        ]
+        if not tokens or not scope_ids:
+            return {}
+        match = " OR ".join(tokens)
+        placeholders = ", ".join("?" for _ in scope_ids)
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT chunk_id, bm25(chunks_fts) AS rank FROM chunks_fts
+                WHERE chunks_fts MATCH ? AND organization_id = ?
+                AND scope_id IN ({placeholders})""",
+                [match, organization_id, *scope_ids],
+            )
+            return {
+                row["chunk_id"]: -float(row["rank"]) for row in cur.fetchall()
+            }
+
+    def has_chunks_for_source(self, source_id: str) -> bool:
+        with self.cursor() as cur:
+            cur.execute("SELECT 1 FROM chunks WHERE source_id = ? LIMIT 1", (source_id,))
+            return cur.fetchone() is not None
+
+    def has_memory_embedding(self, memory_id: str, content: str) -> bool:
+        import hashlib
+
+        with self.cursor() as cur:
+            cur.execute("SELECT content_hash FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+            row = cur.fetchone()
+        return bool(row and row["content_hash"] == hashlib.sha256(content.encode()).hexdigest())
+
+    def memory_fts_ranks(self, query: str, memory_ids: list[str]) -> dict[str, float]:
+        """Return native FTS5 BM25 ranks only for already-authorized memory ids."""
+        tokens = [token for token in re.findall(r"[a-z0-9_]+", query.lower()) if len(token) > 2]
+        if not tokens or not memory_ids:
+            return {}
+        match = " OR ".join(tokens)
+        placeholders = ", ".join("?" for _ in memory_ids)
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT memory_id, bm25(memories_fts) AS rank FROM memories_fts "
+                f"WHERE memories_fts MATCH ? AND memory_id IN ({placeholders})",
+                [match, *memory_ids],
+            )
+            # FTS5 BM25 returns smaller (normally negative) values for better matches.
+            return {row["memory_id"]: -float(row["rank"]) for row in cur.fetchall()}
+
+    # ---- scopes / memberships ----
+
+    def upsert_scope(self, scope: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO scopes(id, organization_id, payload) VALUES (?, ?, ?)",
+                (scope["id"], scope["organization_id"], _ser(scope)),
+            )
+
+    def get_scope(self, scope_id: str) -> dict[str, Any] | None:
+        return self.get_json("scopes", scope_id)
+
+    def list_scopes(self, organization_id: str) -> list[dict[str, Any]]:
+        return self.list_by_org("scopes", organization_id)
+
+    def add_membership(self, organization_id: str, principal_id: str, scope_id: str) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO principal_memberships(organization_id, principal_id, scope_id)
+                VALUES (?, ?, ?)
+                """,
+                (organization_id, principal_id, scope_id),
+            )
+
+    def memberships_for(self, organization_id: str, principal_id: str) -> list[str]:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT scope_id FROM principal_memberships
+                WHERE organization_id = ? AND principal_id = ?
+                """,
+                (organization_id, principal_id),
+            )
+            return [r["scope_id"] for r in cur.fetchall()]
+
+    # ---- skills / runs / signals / audit ----
+
+    def upsert_skill(self, skill: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO skills(id, organization_id, name, version, status, payload)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    skill["id"],
+                    skill["organization_id"],
+                    skill["name"],
+                    skill.get("version", 1),
+                    skill["status"] if isinstance(skill["status"], str) else skill["status"].value,
+                    _ser(skill),
+                ),
+            )
+
+    def get_skill(self, skill_id: str) -> dict[str, Any] | None:
+        return self.get_json("skills", skill_id)
+
+    def list_skills(self, organization_id: str) -> list[dict[str, Any]]:
+        return self.list_by_org("skills", organization_id)
+
+    def upsert_skill_version(self, skill: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO skill_versions
+                (skill_id, version, organization_id, status, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (skill["id"], int(skill.get("version") or 1), skill["organization_id"], skill["status"],
+                 _ser(skill), skill.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            )
+
+    def get_skill_version(self, skill_id: str, version: int) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute("SELECT payload FROM skill_versions WHERE skill_id = ? AND version = ?", (skill_id, version))
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def list_skill_versions(self, skill_id: str) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute("SELECT payload FROM skill_versions WHERE skill_id = ? ORDER BY version", (skill_id,))
+            return [_de(row["payload"]) for row in cur.fetchall()]
+
+    def upsert_run(self, run: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO runs(id, organization_id, status, payload) VALUES (?, ?, ?, ?)",
+                (
+                    run["id"],
+                    run["organization_id"],
+                    run["status"] if isinstance(run["status"], str) else run["status"].value,
+                    _ser(run),
+                ),
+            )
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        return self.get_json("runs", run_id)
+
+    def list_runs(self, organization_id: str) -> list[dict[str, Any]]:
+        return self.list_by_org("runs", organization_id)
+
+    def upsert_signal(self, signal: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO signals(id, organization_id, signal_type, payload) VALUES (?, ?, ?, ?)",
+                (
+                    signal["id"],
+                    signal["organization_id"],
+                    signal["signal_type"] if isinstance(signal["signal_type"], str) else signal["signal_type"].value,
+                    _ser(signal),
+                ),
+            )
+
+    def get_signal(self, signal_id: str) -> dict[str, Any] | None:
+        return self.get_json("signals", signal_id)
+
+    def list_signals(self, organization_id: str) -> list[dict[str, Any]]:
+        return self.list_by_org("signals", organization_id)
+
+    def append_audit(self, event: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO audit_events(id, organization_id, event_type, created_at, payload)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event["id"],
+                    event["organization_id"],
+                    event["event_type"],
+                    event.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                    _ser(event),
+                ),
+            )
+
+    def list_audit(self, organization_id: str, event_type: str | None = None) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            if event_type:
+                cur.execute(
+                    "SELECT payload FROM audit_events WHERE organization_id = ? AND event_type = ? ORDER BY created_at",
+                    (organization_id, event_type),
+                )
+            else:
+                cur.execute(
+                    "SELECT payload FROM audit_events WHERE organization_id = ? ORDER BY created_at",
+                    (organization_id,),
+                )
+            return [_de(r["payload"]) for r in cur.fetchall()]
+
+    def save_authz(self, decision: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO authz_decisions(id, organization_id, payload) VALUES (?, ?, ?)",
+                (decision["id"], decision["organization_id"], _ser(decision)),
+            )
+
+    def get_authz(self, decision_id: str) -> dict[str, Any] | None:
+        return self.get_json("authz_decisions", decision_id)
+
+    def put_organization(self, org: dict[str, Any]) -> None:
+        self.put_json("organizations", org["id"], org["id"], org)
+
+    def get_organization(self, org_id: str) -> dict[str, Any] | None:
+        return self.get_json("organizations", org_id)
+
+    def list_organizations(self) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute("SELECT payload FROM organizations")
+            return [_de(row["payload"]) for row in cur.fetchall()]
+
+    # ---- ingestion jobs, events, idempotency ----
+
+    def upsert_job(self, job: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO processing_jobs
+                (id, organization_id, kind, status, source_id, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job["id"], job["organization_id"], job["kind"], job["status"], job.get("source_id"),
+                 _ser(job), job["created_at"], job["updated_at"]),
+            )
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        return self.get_json("processing_jobs", job_id)
+
+    def list_jobs(self, organization_id: str) -> list[dict[str, Any]]:
+        return self.list_by_org("processing_jobs", organization_id)
+
+    def upsert_received_event(self, event: dict[str, Any]) -> bool:
+        with self.cursor() as cur:
+            try:
+                cur.execute(
+                    """INSERT INTO received_events(id, organization_id, event_type, source, payload, received_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (event["id"], event["organization_id"], event["type"], event["source"],
+                     _ser(event), event["received_at"]),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def idempotency_response(self, organization_id: str, operation: str, key: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT response FROM idempotency_keys WHERE organization_id = ? AND operation = ? AND key = ?",
+                (organization_id, operation, key),
+            )
+            row = cur.fetchone()
+            return _de(row["response"]) if row else None
+
+    def save_idempotency_response(
+        self, organization_id: str, operation: str, key: str, response: dict[str, Any]
+    ) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR IGNORE INTO idempotency_keys(organization_id, operation, key, response, created_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (organization_id, operation, key, _ser(response), datetime.now(timezone.utc).isoformat()),
+            )
+
+    # ---- profile projections ----
+
+    def upsert_profile(self, profile: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO profiles(id, organization_id, profile_type, entity_id, payload, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (profile["id"], profile["organization_id"], profile["profile_type"], profile["entity_id"],
+                 _ser(profile), profile["updated_at"]),
+            )
+
+    def get_profile(self, organization_id: str, profile_type: str, entity_id: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM profiles WHERE organization_id = ? AND profile_type = ? AND entity_id = ?",
+                (organization_id, profile_type, entity_id),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    # ---- durable agent harness ----
+
+    _HARNESS_TABLES = {
+        "agent_sessions",
+        "agent_runs",
+        "agent_messages",
+        "agent_turns",
+        "harness_tool_calls",
+        "approvals",
+        "thread_states",
+        "attention_evaluations",
+        "agent_interventions",
+        "agent_feedback",
+        "deliveries",
+        "slack_installations",
+        "channel_policies",
+        "identity_mappings",
+        "connector_accounts",
+        "tool_policies",
+        "checkpoints",
+        "episodes",
+        "automations",
+    }
+
+    def _checked_harness_table(self, table: str) -> str:
+        if table not in self._HARNESS_TABLES:
+            raise ValueError(f"unsupported harness table: {table}")
+        return table
+
+    def get_harness_record(self, table: str, id_: str) -> dict[str, Any] | None:
+        table = self._checked_harness_table(table)
+        with self.cursor() as cur:
+            cur.execute(f"SELECT payload FROM {table} WHERE id = ?", (id_,))
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def list_harness_records(
+        self,
+        table: str,
+        organization_id: str,
+        *,
+        where: dict[str, Any] | None = None,
+        order_by: str = "created_at",
+        descending: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        table = self._checked_harness_table(table)
+        allowed_columns = {
+            "id",
+            "organization_id",
+            "state",
+            "status",
+            "session_id",
+            "run_id",
+            "event_id",
+            "conversation_key",
+            "workspace_id",
+            "channel_id",
+            "source",
+            "tool_name",
+            "trigger_kind",
+            "kind",
+        }
+        clauses = ["organization_id = ?"]
+        params: list[Any] = [organization_id]
+        for column, value in (where or {}).items():
+            if column not in allowed_columns:
+                raise ValueError(f"unsupported harness filter: {column}")
+            clauses.append(f"{column} = ?")
+            params.append(value)
+        safe_order = (
+            order_by
+            if order_by in {"created_at", "updated_at", "sequence", "turn_number"}
+            else "created_at"
+        )
+        sql = (
+            f"SELECT payload FROM {table} WHERE {' AND '.join(clauses)} "
+            f"ORDER BY {safe_order} {'DESC' if descending else 'ASC'}"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self.cursor() as cur:
+            cur.execute(sql, params)
+            return [_de(row["payload"]) for row in cur.fetchall()]
+
+    def upsert_agent_session(self, session: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO agent_sessions
+                (id, organization_id, conversation_key, state, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session["id"],
+                    session["organization_id"],
+                    session["conversation_key"],
+                    session["state"],
+                    _ser(session),
+                    session["created_at"],
+                    session["updated_at"],
+                ),
+            )
+
+    def session_by_conversation(
+        self, organization_id: str, conversation_key: str
+    ) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM agent_sessions
+                WHERE organization_id = ? AND conversation_key = ?""",
+                (organization_id, conversation_key),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def upsert_agent_run(self, run: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO agent_runs
+                (id, organization_id, session_id, trigger_kind, state, trace_id,
+                 parent_run_id, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run["id"],
+                    run["organization_id"],
+                    run["session_id"],
+                    run["trigger_kind"],
+                    run["state"],
+                    run["trace_id"],
+                    run.get("parent_run_id"),
+                    _ser(run),
+                    run["created_at"],
+                    run["updated_at"],
+                ),
+            )
+
+    def active_run_for_session(self, session_id: str) -> dict[str, Any] | None:
+        terminal = ("completed", "failed", "cancelled")
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM agent_runs
+                WHERE session_id = ? AND state NOT IN (?, ?, ?)
+                ORDER BY updated_at DESC LIMIT 1""",
+                (session_id, *terminal),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def append_agent_message(self, message: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO agent_messages
+                (id, organization_id, session_id, run_id, role, content,
+                 tool_call_id, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    message["id"],
+                    message["organization_id"],
+                    message["session_id"],
+                    message.get("run_id"),
+                    message["role"],
+                    message.get("content") or "",
+                    message.get("tool_call_id"),
+                    _ser(message),
+                    message["created_at"],
+                ),
+            )
+
+    def session_messages(
+        self, session_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM agent_messages WHERE session_id = ?
+                ORDER BY created_at DESC LIMIT ?""",
+                (session_id, limit),
+            )
+            rows = [_de(row["payload"]) for row in cur.fetchall()]
+        return list(reversed(rows))
+
+    def append_agent_turn(self, turn: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO agent_turns
+                (id, organization_id, run_id, turn_number, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    turn["id"],
+                    turn["organization_id"],
+                    turn["run_id"],
+                    turn["turn_number"],
+                    _ser(turn),
+                    turn["created_at"],
+                ),
+            )
+
+    def upsert_harness_tool_call(self, call: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO harness_tool_calls
+                (id, organization_id, run_id, tool_name, status, idempotency_key,
+                 payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    call["id"],
+                    call["organization_id"],
+                    call["run_id"],
+                    call["tool_name"],
+                    call["status"],
+                    call["idempotency_key"],
+                    _ser(call),
+                    call["created_at"],
+                    call["updated_at"],
+                ),
+            )
+
+    def tool_call_by_idempotency(
+        self, organization_id: str, idempotency_key: str
+    ) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM harness_tool_calls
+                WHERE organization_id = ? AND idempotency_key = ?""",
+                (organization_id, idempotency_key),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def upsert_approval(self, approval: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO approvals
+                (id, organization_id, run_id, tool_call_id, status, payload,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    approval["id"],
+                    approval["organization_id"],
+                    approval["run_id"],
+                    approval["tool_call_id"],
+                    approval["status"],
+                    _ser(approval),
+                    approval["created_at"],
+                    approval["updated_at"],
+                ),
+            )
+
+    def upsert_thread_state(self, state: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO thread_states
+                (id, organization_id, conversation_key, payload, updated_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (
+                    state["id"],
+                    state["organization_id"],
+                    state["conversation_key"],
+                    _ser(state),
+                    state["updated_at"],
+                ),
+            )
+
+    def thread_state(
+        self, organization_id: str, conversation_key: str
+    ) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM thread_states
+                WHERE organization_id = ? AND conversation_key = ?""",
+                (organization_id, conversation_key),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def insert_attention_evaluation(self, evaluation: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO attention_evaluations
+                (id, organization_id, event_id, decision, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    evaluation["id"],
+                    evaluation["organization_id"],
+                    evaluation["event_id"],
+                    evaluation["decision"],
+                    _ser(evaluation),
+                    evaluation["created_at"],
+                ),
+            )
+
+    def insert_intervention(self, intervention: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO agent_interventions
+                (id, organization_id, conversation_key, run_id, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    intervention["id"],
+                    intervention["organization_id"],
+                    intervention["conversation_key"],
+                    intervention["run_id"],
+                    _ser(intervention),
+                    intervention["created_at"],
+                ),
+            )
+
+    def recent_intervention(
+        self,
+        organization_id: str,
+        conversation_key: str,
+        *,
+        since: str,
+    ) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM agent_interventions
+                WHERE organization_id = ? AND conversation_key = ? AND created_at >= ?
+                ORDER BY created_at DESC LIMIT 1""",
+                (organization_id, conversation_key, since),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def upsert_delivery(self, delivery: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO deliveries
+                (id, organization_id, run_id, status, idempotency_key, payload,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    delivery["id"],
+                    delivery["organization_id"],
+                    delivery.get("run_id"),
+                    delivery["status"],
+                    delivery["idempotency_key"],
+                    _ser(delivery),
+                    delivery["created_at"],
+                    delivery["updated_at"],
+                ),
+            )
+
+    def upsert_simple_harness_record(
+        self, table: str, record: dict[str, Any]
+    ) -> None:
+        """Upsert low-volume configuration/projection records."""
+        table = self._checked_harness_table(table)
+        now = datetime.now(timezone.utc).isoformat()
+        if table == "channel_policies":
+            sql = """INSERT OR REPLACE INTO channel_policies
+                (id, organization_id, source, channel_id, payload, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)"""
+            values = (
+                record["id"],
+                record["organization_id"],
+                record["source"],
+                record["channel_id"],
+                _ser(record),
+                record.get("updated_at") or now,
+            )
+        elif table == "identity_mappings":
+            sql = """INSERT OR REPLACE INTO identity_mappings
+                (id, organization_id, source, source_user_id, principal_id, payload)
+                VALUES (?, ?, ?, ?, ?, ?)"""
+            values = (
+                record["id"],
+                record["organization_id"],
+                record["source"],
+                record["source_user_id"],
+                record["principal_id"],
+                _ser(record),
+            )
+        elif table == "tool_policies":
+            sql = """INSERT OR REPLACE INTO tool_policies
+                (id, organization_id, tool_name, payload, updated_at)
+                VALUES (?, ?, ?, ?, ?)"""
+            values = (
+                record["id"],
+                record["organization_id"],
+                record["tool_name"],
+                _ser(record),
+                record.get("updated_at") or now,
+            )
+        else:
+            raise ValueError(f"no simple upsert mapping for {table}")
+        with self.cursor() as cur:
+            cur.execute(sql, values)
+
+    def identity_mapping(
+        self, organization_id: str, source: str, source_user_id: str
+    ) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM identity_mappings
+                WHERE organization_id = ? AND source = ? AND source_user_id = ?""",
+                (organization_id, source, source_user_id),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def channel_policy(
+        self, organization_id: str, source: str, channel_id: str
+    ) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM channel_policies
+                WHERE organization_id = ? AND source = ? AND channel_id = ?""",
+                (organization_id, source, channel_id),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def connector_account(
+        self, organization_id: str, toolkit: str
+    ) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM connector_accounts
+                WHERE organization_id = ? AND toolkit = ? AND status = 'active'
+                ORDER BY updated_at DESC LIMIT 1""",
+                (organization_id, toolkit),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def slack_installation_by_workspace(
+        self, workspace_id: str
+    ) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM slack_installations WHERE workspace_id = ?",
+                (workspace_id,),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def upsert_slack_installation(self, installation: dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO slack_installations
+                (id, organization_id, workspace_id, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    installation["id"],
+                    installation["organization_id"],
+                    installation["workspace_id"],
+                    _ser(installation),
+                    installation.get("created_at") or now,
+                    installation.get("updated_at") or now,
+                ),
+            )
+
+    # ---- durable leased work queue ----
+
+    def enqueue_harness_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        with self.cursor() as cur:
+            try:
+                cur.execute(
+                    """INSERT INTO harness_jobs
+                    (id, organization_id, kind, status, available_at, lease_owner,
+                     lease_expires_at, attempts, max_attempts, idempotency_key,
+                     payload, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        job["id"],
+                        job["organization_id"],
+                        job["kind"],
+                        job.get("status", "queued"),
+                        job["available_at"],
+                        job.get("lease_owner"),
+                        job.get("lease_expires_at"),
+                        int(job.get("attempts", 0)),
+                        int(job.get("max_attempts", 5)),
+                        job["idempotency_key"],
+                        _ser(job),
+                        job["created_at"],
+                        job["updated_at"],
+                    ),
+                )
+                return job
+            except sqlite3.IntegrityError:
+                cur.execute(
+                    """SELECT payload FROM harness_jobs
+                    WHERE organization_id = ? AND idempotency_key = ?""",
+                    (job["organization_id"], job["idempotency_key"]),
+                )
+                row = cur.fetchone()
+                return _de(row["payload"]) if row else job
+
+    def get_harness_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute("SELECT payload FROM harness_jobs WHERE id = ?", (job_id,))
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def lease_harness_jobs(
+        self,
+        *,
+        worker_id: str,
+        limit: int,
+        lease_seconds: int,
+        kinds: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        now_s = now.isoformat()
+        expiry = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self.cursor() as cur:
+            clauses = [
+                "available_at <= ?",
+                "(status = 'queued' OR (status = 'leased' AND lease_expires_at < ?))",
+                "attempts < max_attempts",
+            ]
+            params: list[Any] = [now_s, now_s]
+            if kinds:
+                placeholders = ", ".join("?" for _ in kinds)
+                clauses.append(f"kind IN ({placeholders})")
+                params.extend(kinds)
+            cur.execute(
+                f"""SELECT id, payload FROM harness_jobs
+                WHERE {' AND '.join(clauses)}
+                ORDER BY available_at, created_at LIMIT ?""",
+                [*params, int(limit)],
+            )
+            rows = cur.fetchall()
+            leased: list[dict[str, Any]] = []
+            for row in rows:
+                job = _de(row["payload"])
+                job["status"] = "leased"
+                job["lease_owner"] = worker_id
+                job["lease_expires_at"] = expiry
+                job["attempts"] = int(job.get("attempts", 0)) + 1
+                job["updated_at"] = now_s
+                cur.execute(
+                    """UPDATE harness_jobs SET status = 'leased', lease_owner = ?,
+                    lease_expires_at = ?, attempts = ?, payload = ?, updated_at = ?
+                    WHERE id = ?""",
+                    (
+                        worker_id,
+                        expiry,
+                        job["attempts"],
+                        _ser(job),
+                        now_s,
+                        job["id"],
+                    ),
+                )
+                leased.append(job)
+            return leased
+
+    def finish_harness_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+        retry_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        job = self.get_harness_job(job_id)
+        if not job:
+            return None
+        now = datetime.now(timezone.utc).isoformat()
+        job["status"] = status
+        job["updated_at"] = now
+        job["lease_owner"] = None
+        job["lease_expires_at"] = None
+        if result is not None:
+            job["result"] = result
+        if error:
+            job["error"] = error
+        if retry_at:
+            job["available_at"] = retry_at
+        with self.cursor() as cur:
+            cur.execute(
+                """UPDATE harness_jobs SET status = ?, available_at = ?,
+                lease_owner = NULL, lease_expires_at = NULL, payload = ?, updated_at = ?
+                WHERE id = ?""",
+                (status, job["available_at"], _ser(job), now, job_id),
+            )
+        return job
+
+    def harness_job_counts(self, organization_id: str) -> dict[str, int]:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT status, COUNT(*) AS count FROM harness_jobs
+                WHERE organization_id = ? GROUP BY status""",
+                (organization_id,),
+            )
+            return {row["status"]: int(row["count"]) for row in cur.fetchall()}
