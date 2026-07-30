@@ -1,4 +1,4 @@
-"""Deterministic event router connecting Slack to runs and attention."""
+"""Deterministic router connecting company events to memory and attention."""
 
 from __future__ import annotations
 
@@ -150,9 +150,10 @@ class EventRouter:
         return {"route": "reactive", "run_id": run["id"], "job_id": job["id"]}
 
     def _store_raw_evidence(self, event: NormalizedEvent) -> dict[str, Any]:
+        learn = bool(event.payload.get("learn", event.source != "slack"))
         result = self.ingestion.ingest(
             organization_id=event.organization_id,
-            source_system="slack",
+            source_system=event.source,
             source_type=event.type,
             external_id=event.id,
             content=event.payload.get("text") or "",
@@ -168,9 +169,17 @@ class EventRouter:
                 "conversation_key": event.payload.get("conversation_key"),
                 "message_ts": event.payload.get("message_ts"),
                 "event_id": event.id,
+                "source": event.source,
+                "trigger_slug": event.payload.get("trigger_slug"),
+                "trigger_id": event.payload.get("trigger_id"),
+                "connected_account_id": event.payload.get(
+                    "connected_account_id"
+                ),
+                "raw_data": event.payload.get("raw_data"),
             },
-            learn=False,
-            processing_mode="reference",
+            learn=learn,
+            processing_mode="memory" if learn else "reference",
+            occurred_at=event.occurred_at,
         )
         self._update_event_graph(event, result["source"])
         self.audit.record(
@@ -197,7 +206,8 @@ class EventRouter:
                 "organization_id": event.organization_id,
                 "entity_type": "conversation",
                 "name": (
-                    f"Slack {event.scope.channel_id}/{event.scope.thread_id}"
+                    f"{event.source} "
+                    f"{event.scope.channel_id}/{event.scope.thread_id}"
                 ),
                 "aliases": [key],
                 "attributes": {
@@ -213,7 +223,7 @@ class EventRouter:
                 "id": source["id"],
                 "organization_id": event.organization_id,
                 "entity_type": "source",
-                "name": f"Slack message {event.id}",
+                "name": f"{event.source} event {event.id}",
                 "aliases": [],
                 "attributes": {
                     "external_id": event.id,

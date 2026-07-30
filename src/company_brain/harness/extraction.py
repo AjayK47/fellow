@@ -188,7 +188,8 @@ class ModelMemoryExtractor:
                     }
                 ],
                 is_private=bool(source.get("is_private_channel")),
-                observed_at=utcnow(),
+                valid_from=source.get("occurred_at") or utcnow(),
+                observed_at=source.get("ingested_at") or utcnow(),
             )
             data = self.memory._consolidate(memory)
             committed.append(data)

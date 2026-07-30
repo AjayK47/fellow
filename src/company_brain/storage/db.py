@@ -451,6 +451,167 @@ class BrainStore:
                     PRIMARY KEY (organization_id, principal_id, scope_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS connector_objects (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    connector_account_id TEXT,
+                    provider TEXT NOT NULL,
+                    object_type TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    occurred_at TEXT,
+                    observed_at TEXT NOT NULL,
+                    deleted_at TEXT,
+                    payload TEXT NOT NULL,
+                    UNIQUE (
+                        organization_id, provider, object_type, external_id, version
+                    )
+                );
+
+                CREATE TABLE IF NOT EXISTS connector_sync_runs (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    connector_account_id TEXT NOT NULL,
+                    object_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    cursor_before TEXT,
+                    cursor_after TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS connector_sync_cursors (
+                    organization_id TEXT NOT NULL,
+                    connector_account_id TEXT NOT NULL,
+                    object_type TEXT NOT NULL,
+                    cursor TEXT,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (
+                        organization_id, connector_account_id, object_type
+                    )
+                );
+
+                CREATE TABLE IF NOT EXISTS external_identifiers (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    normalized_value TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    verified INTEGER NOT NULL DEFAULT 0,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (organization_id, namespace, normalized_value)
+                );
+
+                CREATE TABLE IF NOT EXISTS entity_resolution_candidates (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    left_entity_id TEXT NOT NULL,
+                    right_entity_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS reality_facts (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    object_value TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    valid_from TEXT,
+                    valid_to TEXT,
+                    system_from TEXT NOT NULL,
+                    system_to TEXT,
+                    scope_id TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS fact_conflicts (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cases (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    case_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS case_events (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    case_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    occurred_at TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (case_id, source_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS judgment_events (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    principal_id TEXT,
+                    judgment_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS policy_versions (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    policy_key TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    effect TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (organization_id, policy_key, version)
+                );
+
+                CREATE TABLE IF NOT EXISTS action_preconditions (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    approval_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    checked_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    run_id TEXT,
+                    artifact_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_memories_org_latest
                     ON memories(organization_id, is_latest, status);
                 CREATE INDEX IF NOT EXISTS idx_edges_org_type
@@ -462,6 +623,30 @@ class BrainStore:
                 CREATE INDEX IF NOT EXISTS idx_chunks_org_scope ON chunks(organization_id, scope_id);
                 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_org_scope
                     ON memory_embeddings(organization_id, scope_id);
+                CREATE INDEX IF NOT EXISTS idx_connector_objects_lookup
+                    ON connector_objects(
+                        organization_id, provider, object_type, external_id
+                    );
+                CREATE INDEX IF NOT EXISTS idx_sync_runs_org_status
+                    ON connector_sync_runs(organization_id, status);
+                CREATE INDEX IF NOT EXISTS idx_external_identifiers_entity
+                    ON external_identifiers(organization_id, entity_id);
+                CREATE INDEX IF NOT EXISTS idx_resolution_candidates_status
+                    ON entity_resolution_candidates(organization_id, status);
+                CREATE INDEX IF NOT EXISTS idx_reality_facts_current
+                    ON reality_facts(
+                        organization_id, subject_id, predicate, system_to
+                    );
+                CREATE INDEX IF NOT EXISTS idx_cases_org_status
+                    ON cases(organization_id, status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_case_events_case
+                    ON case_events(case_id, occurred_at);
+                CREATE INDEX IF NOT EXISTS idx_judgments_org
+                    ON judgment_events(organization_id, judgment_type);
+                CREATE INDEX IF NOT EXISTS idx_policy_versions_current
+                    ON policy_versions(organization_id, policy_key, status);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_org
+                    ON artifacts(organization_id, artifact_type, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_processing_jobs_org ON processing_jobs(organization_id, status);
                 CREATE INDEX IF NOT EXISTS idx_profiles_org_entity ON profiles(organization_id, entity_id);
                 CREATE INDEX IF NOT EXISTS idx_skill_versions_org ON skill_versions(organization_id, skill_id);
@@ -1539,6 +1724,60 @@ class BrainStore:
             )
             row = cur.fetchone()
             return _de(row["payload"]) if row else None
+
+    def connector_account_by_external_id(
+        self, connected_account_id: str, *, active_only: bool = True
+    ) -> dict[str, Any] | None:
+        """Resolve webhook tenancy from trusted server-side account state."""
+        with self.cursor() as cur:
+            sql = (
+                "SELECT payload FROM connector_accounts "
+                "WHERE json_extract(payload, '$.connected_account_id') = ?"
+            )
+            params: list[Any] = [connected_account_id]
+            if active_only:
+                sql += " AND status = 'active'"
+            sql += " ORDER BY updated_at DESC LIMIT 1"
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
+
+    def list_connector_accounts(
+        self, organization_id: str, *, active_only: bool = False
+    ) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            sql = (
+                "SELECT payload FROM connector_accounts "
+                "WHERE organization_id = ?"
+            )
+            params: list[Any] = [organization_id]
+            if active_only:
+                sql += " AND status = 'active'"
+            sql += " ORDER BY updated_at DESC"
+            cur.execute(sql, params)
+            return [_de(row["payload"]) for row in cur.fetchall()]
+
+    def upsert_connector_account(self, account: dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        record = dict(account)
+        record.setdefault("created_at", now)
+        record["updated_at"] = now
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO connector_accounts
+                (id, organization_id, toolkit, status, payload, created_at,
+                 updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record["id"],
+                    record["organization_id"],
+                    record["toolkit"],
+                    record.get("status", "active"),
+                    _ser(record),
+                    record["created_at"],
+                    record["updated_at"],
+                ),
+            )
 
     def slack_installation_by_workspace(
         self, workspace_id: str

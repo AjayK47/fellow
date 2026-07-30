@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 from typing import Any
 
 from company_brain.domain.models import SourceEvidence, new_id, utcnow
@@ -19,11 +20,13 @@ class IngestionService:
         memory: MemoryService,
         audit: AuditService,
         indexing: IndexingService,
+        reality: Any | None = None,
     ) -> None:
         self.store = store
         self.memory = memory
         self.audit = audit
         self.indexing = indexing
+        self.reality = reality
 
     def ingest(
         self,
@@ -41,6 +44,7 @@ class IngestionService:
         metadata: dict[str, Any] | None = None,
         learn: bool = True,
         processing_mode: str = "memory",
+        occurred_at: datetime | str | None = None,
     ) -> dict[str, Any]:
         content_hash = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
         # Bump version for same (source_system, external_id) so prior evidence rows remain
@@ -52,7 +56,7 @@ class IngestionService:
             source_type=source_type,
             external_id=external_id,
             author_entity_id=author_entity_id,
-            occurred_at=utcnow(),
+            occurred_at=occurred_at or utcnow(),
             ingested_at=utcnow(),
             content=content,
             content_uri=f"local://{organization_id}/sources/{external_id}/v{version}",
@@ -73,6 +77,11 @@ class IngestionService:
         if learn and processing_mode == "memory":
             memories = self.memory.learn_from_source(data)
         # reference-only path stores evidence without memory extraction
+        reality_result = (
+            self.reality.ingest_source(data, memories)
+            if self.reality
+            else None
+        )
 
         self.audit.record(
             organization_id=organization_id,
@@ -86,7 +95,11 @@ class IngestionService:
                 "content_hash": content_hash,
             },
         )
-        return {"source": data, "memories": memories}
+        return {
+            "source": data,
+            "memories": memories,
+            "reality": reality_result,
+        }
 
     def revoke_source(self, source_id: str) -> dict[str, Any] | None:
         src = self.store.revoke_source(source_id)

@@ -119,6 +119,8 @@ def build_tool_registry(
     context: Any,
     skills: Any,
     composio: ComposioClient,
+    reality: Any | None = None,
+    artifacts: Any | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
 
@@ -178,6 +180,245 @@ def build_tool_registry(
         ),
     )
 
+    if reality:
+        def _query_facts(
+            args: dict[str, Any], runtime: dict[str, Any]
+        ) -> dict[str, Any]:
+            decision = retrieval.authorize(
+                runtime["organization_id"],
+                runtime["principal_id"],
+                runtime["destination"],
+                runtime["purpose"],
+            )
+            facts = reality.current_facts(
+                runtime["organization_id"],
+                subject_id=args.get("subject_id"),
+                predicate=args.get("predicate"),
+                valid_at=args.get("valid_at"),
+                known_at=args.get("known_at"),
+                scope_ids=decision.allowed_scope_ids,
+            )
+            return {
+                "facts": facts[: min(int(args.get("limit", 20)), 50)],
+                "permission_decision_id": decision.id,
+            }
+
+        registry.register(
+            ToolDefinition(
+                name="brain_query_facts",
+                description=(
+                    "Query permission-safe bi-temporal company facts. Use "
+                    "valid_at for what was true in the company then and known_at "
+                    "for what Company Brain knew at that time."
+                ),
+                input_schema=_object_schema(
+                    {
+                        "subject_id": {"type": "string"},
+                        "predicate": {"type": "string"},
+                        "valid_at": {"type": "string"},
+                        "known_at": {"type": "string"},
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 50,
+                        },
+                    },
+                    [],
+                ),
+                risk="read",
+            ),
+            _query_facts,
+        )
+
+        def _list_cases(
+            args: dict[str, Any], runtime: dict[str, Any]
+        ) -> dict[str, Any]:
+            decision = retrieval.authorize(
+                runtime["organization_id"],
+                runtime["principal_id"],
+                runtime["destination"],
+                runtime["purpose"],
+            )
+            statuses = {args["status"]} if args.get("status") else None
+            cases = reality.list_cases(
+                runtime["organization_id"],
+                statuses=statuses,
+                scope_ids=decision.allowed_scope_ids,
+            )
+            return {
+                "cases": cases[: min(int(args.get("limit", 20)), 50)],
+                "permission_decision_id": decision.id,
+            }
+
+        registry.register(
+            ToolDefinition(
+                name="brain_list_cases",
+                description=(
+                    "List permission-safe cross-tool company cases that correlate "
+                    "events from Slack, tickets, code, CRM, and other sources."
+                ),
+                input_schema=_object_schema(
+                    {
+                        "status": {"type": "string"},
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 50,
+                        },
+                    },
+                    [],
+                ),
+                risk="read",
+            ),
+            _list_cases,
+        )
+
+        registry.register(
+            ToolDefinition(
+                name="brain_update_case",
+                description=(
+                    "Update the lifecycle state or summary of an existing "
+                    "company case. This is a governed write and requires approval."
+                ),
+                input_schema=_object_schema(
+                    {
+                        "case_id": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": [
+                                "open",
+                                "investigating",
+                                "blocked",
+                                "mitigated",
+                                "resolved",
+                                "dismissed",
+                            ],
+                        },
+                        "summary": {"type": "string"},
+                        "title": {"type": "string"},
+                    },
+                    ["case_id", "status"],
+                ),
+                risk="write",
+                approval_required=True,
+            ),
+            lambda args, runtime: reality.update_case(
+                args["case_id"],
+                status=args["status"],
+                updated_by=runtime["principal_id"],
+                summary=args.get("summary"),
+                title=args.get("title"),
+            ),
+        )
+
+        registry.register(
+            ToolDefinition(
+                name="brain_judgment_guidance",
+                description=(
+                    "Read durable human corrections, approvals, rejections, and "
+                    "preferences applicable to the acting principal."
+                ),
+                input_schema=_object_schema(
+                    {
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20,
+                        }
+                    },
+                    [],
+                ),
+                risk="read",
+            ),
+            lambda args, runtime: {
+                "judgments": reality.judgment_guidance(
+                    runtime["organization_id"],
+                    runtime["principal_id"],
+                    limit=min(int(args.get("limit", 10)), 20),
+                )
+            },
+        )
+
+    if artifacts:
+        def _list_artifacts(
+            args: dict[str, Any], runtime: dict[str, Any]
+        ) -> dict[str, Any]:
+            decision = retrieval.authorize(
+                runtime["organization_id"],
+                runtime["principal_id"],
+                runtime["destination"],
+                runtime["purpose"],
+            )
+            values = artifacts.list(
+                runtime["organization_id"],
+                scope_ids=decision.allowed_scope_ids,
+                artifact_type=args.get("artifact_type"),
+                run_id=args.get("run_id"),
+            )
+            return {
+                "artifacts": values[: min(int(args.get("limit", 20)), 50)],
+                "permission_decision_id": decision.id,
+            }
+
+        registry.register(
+            ToolDefinition(
+                name="brain_list_artifacts",
+                description=(
+                    "List durable reports, plans, briefs, tables, and specialist "
+                    "results visible to the acting principal."
+                ),
+                input_schema=_object_schema(
+                    {
+                        "artifact_type": {"type": "string"},
+                        "run_id": {"type": "string"},
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 50,
+                        },
+                    },
+                    [],
+                ),
+                risk="read",
+            ),
+            _list_artifacts,
+        )
+
+        registry.register(
+            ToolDefinition(
+                name="brain_create_artifact",
+                description=(
+                    "Create a durable permission-scoped report, plan, brief, "
+                    "table, or other structured artifact from completed work."
+                ),
+                input_schema=_object_schema(
+                    {
+                        "artifact_type": {"type": "string"},
+                        "title": {"type": "string"},
+                        "content": {},
+                        "scope_id": {"type": "string"},
+                        "metadata": {
+                            "type": "object",
+                            "additionalProperties": True,
+                        },
+                    },
+                    ["artifact_type", "title", "content", "scope_id"],
+                ),
+                risk="write",
+                approval_required=True,
+            ),
+            lambda args, runtime: artifacts.create(
+                organization_id=runtime["organization_id"],
+                artifact_type=args["artifact_type"],
+                title=args["title"],
+                content=args["content"],
+                scope_id=args["scope_id"],
+                run_id=runtime["run_id"],
+                created_by=runtime["principal_id"],
+                metadata=args.get("metadata") or {},
+            ),
+        )
+
     registry.register(
         ToolDefinition(
             name="brain_resolve_owner",
@@ -226,6 +467,194 @@ def build_tool_registry(
                 limit=min(int(args.get("limit", 5)), 10),
             )
         },
+    )
+
+    def _connected_accounts(runtime: dict[str, Any]) -> list[dict[str, Any]]:
+        return store.list_connector_accounts(
+            runtime["organization_id"], active_only=True
+        )
+
+    registry.register(
+        ToolDefinition(
+            name="composio_list_integrations",
+            description=(
+                "List the external applications connected to this organization. "
+                "Use this before searching for external actions."
+            ),
+            input_schema=_object_schema({}, []),
+            risk="read",
+        ),
+        lambda _args, runtime: {
+            "configured": composio.configured,
+            "integrations": [
+                {
+                    "toolkit": account["toolkit"],
+                    "connected_account_id": account["connected_account_id"],
+                    "status": account.get("status"),
+                }
+                for account in _connected_accounts(runtime)
+            ],
+        },
+    )
+
+    def _search_composio(
+        args: dict[str, Any], runtime: dict[str, Any]
+    ) -> dict[str, Any]:
+        accounts = _connected_accounts(runtime)
+        connected_toolkits = sorted(
+            {str(account["toolkit"]).lower() for account in accounts}
+        )
+        requested = (
+            str(args.get("toolkit") or "").lower().strip() or None
+        )
+        if requested and requested not in connected_toolkits:
+            return {
+                "tools": [],
+                "connected_toolkits": connected_toolkits,
+                "error": f"{requested} is not connected for this organization",
+            }
+        toolkits = [requested] if requested else connected_toolkits
+        limit = min(max(int(args.get("limit", 10)), 1), 25)
+        found: dict[str, dict[str, Any]] = {}
+        for toolkit in toolkits:
+            response = composio.search_tools(
+                query=args["query"], toolkit=toolkit, limit=limit
+            )
+            for item in response.get("items") or []:
+                slug = item.get("slug")
+                item_toolkit = (item.get("toolkit") or {}).get("slug")
+                if (
+                    slug
+                    and str(item_toolkit or toolkit).lower()
+                    in connected_toolkits
+                ):
+                    found[str(slug)] = {
+                        "slug": slug,
+                        "name": item.get("name"),
+                        "description": item.get("description"),
+                        "toolkit": item_toolkit or toolkit,
+                    }
+        return {
+            "tools": list(found.values())[:limit],
+            "connected_toolkits": connected_toolkits,
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="composio_search",
+            description=(
+                "Search actions available only in this organization's connected "
+                "external applications. Never guess an action slug."
+            ),
+            input_schema=_object_schema(
+                {
+                    "query": {"type": "string"},
+                    "toolkit": {"type": "string"},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 25,
+                    },
+                },
+                ["query"],
+            ),
+            risk="read",
+        ),
+        _search_composio,
+    )
+
+    def _describe_composio(
+        args: dict[str, Any], runtime: dict[str, Any]
+    ) -> dict[str, Any]:
+        accounts = _connected_accounts(runtime)
+        connected_toolkits = {
+            str(account["toolkit"]).lower() for account in accounts
+        }
+        result = composio.describe(args["tool_slug"])
+        toolkit = str((result.get("toolkit") or {}).get("slug") or "").lower()
+        if toolkit not in connected_toolkits:
+            raise PermissionError(
+                "Tool does not belong to an organization-connected toolkit"
+            )
+        return result
+
+    registry.register(
+        ToolDefinition(
+            name="composio_describe",
+            description=(
+                "Fetch the exact input schema for a Composio action returned by "
+                "composio_search."
+            ),
+            input_schema=_object_schema(
+                {"tool_slug": {"type": "string"}}, ["tool_slug"]
+            ),
+            risk="read",
+        ),
+        _describe_composio,
+    )
+
+    def _execute_composio(
+        args: dict[str, Any], runtime: dict[str, Any]
+    ) -> dict[str, Any]:
+        accounts = _connected_accounts(runtime)
+        described = composio.describe(args["tool_slug"])
+        toolkit = str(
+            (described.get("toolkit") or {}).get("slug") or ""
+        ).lower()
+        matching = [
+            account
+            for account in accounts
+            if str(account["toolkit"]).lower() == toolkit
+        ]
+        selected_id = args.get("connected_account_id")
+        if selected_id:
+            matching = [
+                account
+                for account in matching
+                if account["connected_account_id"] == selected_id
+            ]
+        if not matching:
+            raise PermissionError(
+                "No matching organization-connected account for this action"
+            )
+        if len(matching) > 1:
+            raise ValueError(
+                "Multiple connected accounts match; connected_account_id is required"
+            )
+        result = composio.execute(
+            args["tool_slug"],
+            args.get("arguments") or {},
+            connected_account_id=matching[0]["connected_account_id"],
+        )
+        if result.get("successful") is False:
+            raise RuntimeError(
+                str(result.get("error") or "Composio action failed")
+            )
+        return result
+
+    registry.register(
+        ToolDefinition(
+            name="composio_execute",
+            description=(
+                "Execute an exact action slug previously returned by "
+                "composio_search and inspected with composio_describe. Dynamic "
+                "external actions require human approval."
+            ),
+            input_schema=_object_schema(
+                {
+                    "tool_slug": {"type": "string"},
+                    "arguments": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "connected_account_id": {"type": "string"},
+                },
+                ["tool_slug", "arguments"],
+            ),
+            risk="write",
+            approval_required=True,
+        ),
+        _execute_composio,
     )
 
     external_schema = _object_schema(
@@ -315,15 +744,35 @@ def refresh_composio_tool_schemas(
 class ToolExecutor:
     """The model proposes; trusted code authorizes, validates, and executes."""
 
-    def __init__(self, store: BrainStore, registry: ToolRegistry, audit: Any) -> None:
+    def __init__(
+        self,
+        store: BrainStore,
+        registry: ToolRegistry,
+        audit: Any,
+        *,
+        policy_engine: Any | None = None,
+        reality: Any | None = None,
+    ) -> None:
         self.store = store
         self.registry = registry
         self.audit = audit
+        self.policy_engine = policy_engine
+        self.reality = reality
 
     def allowed_definitions(self, run: dict[str, Any]) -> list[ToolDefinition]:
         org = run["organization_id"]
+        metadata = run.get("metadata") or {}
+        worker_allowed = (
+            set(metadata.get("allowed_tools") or [])
+            if metadata.get("specialist_worker")
+            else None
+        )
         definitions: list[ToolDefinition] = []
         for definition in self.registry.definitions():
+            if worker_allowed is not None and definition.name not in worker_allowed:
+                continue
+            if metadata.get("specialist_worker") and definition.risk != "read":
+                continue
             policy = self._policy(org, definition.name)
             if policy.get("enabled", True) and definition.risk != "destructive":
                 definitions.append(definition)
@@ -345,6 +794,16 @@ class ToolExecutor:
                 error="Unknown or unavailable tool.",
             )
         definition = registered.definition
+        metadata = run.get("metadata") or {}
+        if metadata.get("specialist_worker"):
+            worker_allowed = set(metadata.get("allowed_tools") or [])
+            if definition.name not in worker_allowed or definition.risk != "read":
+                return ToolResult(
+                    call_id=call.id,
+                    tool_name=call.name,
+                    status="disabled",
+                    error="Tool is outside this specialist worker's read-only capability envelope.",
+                )
         policy = self._policy(run["organization_id"], definition.name)
         if not policy.get("enabled", True) or definition.risk == "destructive":
             return ToolResult(
@@ -352,6 +811,14 @@ class ToolExecutor:
                 tool_name=call.name,
                 status="disabled",
                 error="Tool is disabled by organization policy.",
+            )
+        conditional = self._conditional_policy(run, definition, call.arguments)
+        if conditional["decision"] == "deny":
+            return ToolResult(
+                call_id=call.id,
+                tool_name=call.name,
+                status="denied",
+                error="Tool is denied by conditional organization policy.",
             )
 
         validation_error = self._validate_arguments(
@@ -396,9 +863,21 @@ class ToolExecutor:
             definition.approval_required
             or definition.risk == "write"
             or policy.get("approval_required", False)
+            or conditional.get("approval_required", False)
         )
         if requires_approval and not approved:
             approval = self._create_approval(run, record, definition)
+            if self.policy_engine and conditional.get("preconditions"):
+                runtime = self._runtime(run, call.arguments)
+                captured = self.policy_engine.capture_preconditions(
+                    organization_id=run["organization_id"],
+                    approval_id=approval["id"],
+                    specifications=conditional["preconditions"],
+                    runtime=runtime,
+                    arguments=call.arguments,
+                )
+                approval["precondition_ids"] = [item["id"] for item in captured]
+                self.store.upsert_approval(approval)
             record["status"] = "waiting_for_approval"
             record["approval_id"] = approval["id"]
             record["updated_at"] = utcnow().isoformat()
@@ -412,13 +891,7 @@ class ToolExecutor:
             )
 
         envelope = run["envelope"]
-        runtime = {
-            "organization_id": run["organization_id"],
-            "principal_id": envelope["principal_id"],
-            "destination": envelope["destination"],
-            "purpose": envelope["purpose"],
-            "run_id": run["id"],
-        }
+        runtime = self._runtime(run, call.arguments)
         record["status"] = "running"
         record["updated_at"] = utcnow().isoformat()
         self.store.upsert_harness_tool_call(record)
@@ -503,6 +976,25 @@ class ToolExecutor:
         if edited_arguments is not None:
             approval["edited_arguments"] = edited_arguments
         self.store.upsert_approval(approval)
+        if self.reality:
+            self.reality.record_judgment(
+                organization_id=approval["organization_id"],
+                judgment_type="tool_approval",
+                principal_id=decided_by,
+                subject={
+                    "tool_name": approval["tool_name"],
+                    "arguments": edited_arguments
+                    if edited_arguments is not None
+                    else approval["arguments"],
+                    "approval_id": approval_id,
+                },
+                decision="approved" if approved else approval["status"],
+                reason=(
+                    "arguments_edited"
+                    if edited_arguments is not None
+                    else None
+                ),
+            )
 
         if not approved:
             return approval, ToolResult(
@@ -523,7 +1015,86 @@ class ToolExecutor:
             if edited_arguments is not None
             else approval["arguments"],
         )
+        if self.policy_engine and approval.get("precondition_ids"):
+            check = self.policy_engine.revalidate(
+                approval_id=approval_id,
+                runtime=self._runtime(run, call.arguments),
+                arguments=call.arguments,
+            )
+            if not check["valid"]:
+                approval["status"] = "stale"
+                approval["precondition_check"] = check
+                approval["updated_at"] = utcnow().isoformat()
+                self.store.upsert_approval(approval)
+                return approval, ToolResult(
+                    call_id=approval["tool_call_id"],
+                    tool_name=approval["tool_name"],
+                    status="failed",
+                    error=(
+                        "External state changed after approval; the action was "
+                        "not executed and must be replanned."
+                    ),
+                    approval_id=approval_id,
+                )
         return approval, self.execute(run=run, call=call, approved=True)
+
+    def _conditional_policy(
+        self,
+        run: dict[str, Any],
+        definition: ToolDefinition,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self.policy_engine:
+            return {
+                "decision": "legacy",
+                "approval_required": False,
+                "preconditions": [],
+            }
+        envelope = run["envelope"]
+        return self.policy_engine.evaluate(
+            organization_id=run["organization_id"],
+            action=definition.name,
+            context={
+                "principal": {
+                    "id": envelope["principal_id"],
+                },
+                "action": {
+                    "name": definition.name,
+                    "risk": definition.risk,
+                    "arguments": arguments,
+                },
+                "destination": envelope["destination"],
+                "purpose": envelope["purpose"],
+                "run": {
+                    "id": run["id"],
+                    "trigger_kind": run["trigger_kind"],
+                    "is_worker": bool(
+                        (run.get("metadata") or {}).get("specialist_worker")
+                    ),
+                },
+            },
+        )
+
+    def _runtime(
+        self, run: dict[str, Any], arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        envelope = run["envelope"]
+        account_id = arguments.get("connected_account_id")
+        account = (
+            self.store.connector_account_by_external_id(str(account_id))
+            if account_id
+            else None
+        )
+        return {
+            "organization_id": run["organization_id"],
+            "principal_id": envelope["principal_id"],
+            "destination": envelope["destination"],
+            "purpose": envelope["purpose"],
+            "run_id": run["id"],
+            "connected_account_id": account_id,
+            "composio_user_id": (account or {}).get("composio_user_id"),
+            "run_metadata": run.get("metadata") or {},
+        }
 
     def _policy(self, organization_id: str, tool_name: str) -> dict[str, Any]:
         records = self.store.list_harness_records(
@@ -581,17 +1152,75 @@ class ToolExecutor:
     def _validate_arguments(
         arguments: dict[str, Any], schema: dict[str, Any]
     ) -> str | None:
+        def validate(value: Any, node: dict[str, Any], path: str) -> str | None:
+            expected = node.get("type")
+            expected_types = (
+                set(expected) if isinstance(expected, list) else {expected}
+            )
+            expected_types.discard(None)
+            type_ok = {
+                "object": lambda item: isinstance(item, dict),
+                "array": lambda item: isinstance(item, list),
+                "string": lambda item: isinstance(item, str),
+                "integer": lambda item: isinstance(item, int)
+                and not isinstance(item, bool),
+                "number": lambda item: isinstance(item, (int, float))
+                and not isinstance(item, bool),
+                "boolean": lambda item: isinstance(item, bool),
+                "null": lambda item: item is None,
+            }
+            if expected_types and not any(
+                type_ok[kind](value)
+                for kind in expected_types
+                if kind in type_ok
+            ):
+                return (
+                    f"{path} must be one of: "
+                    f"{', '.join(sorted(expected_types))}"
+                )
+            if "enum" in node and value not in node["enum"]:
+                return f"{path} must be one of: {', '.join(map(str, node['enum']))}"
+            if isinstance(value, dict):
+                properties = node.get("properties") or {}
+                for required in node.get("required") or []:
+                    if required not in value:
+                        return f"Missing required tool argument: {path}.{required}"
+                if node.get("additionalProperties") is False:
+                    extras = set(value) - set(properties)
+                    if extras:
+                        return (
+                            f"Unknown tool arguments at {path}: "
+                            f"{', '.join(sorted(extras))}"
+                        )
+                for key, child in value.items():
+                    child_schema = properties.get(key)
+                    if isinstance(child_schema, dict):
+                        error = validate(child, child_schema, f"{path}.{key}")
+                        if error:
+                            return error
+            if isinstance(value, list):
+                if len(value) < int(node.get("minItems", 0)):
+                    return f"{path} contains too few items"
+                if "maxItems" in node and len(value) > int(node["maxItems"]):
+                    return f"{path} contains too many items"
+                item_schema = node.get("items")
+                if isinstance(item_schema, dict):
+                    for index, child in enumerate(value):
+                        error = validate(
+                            child, item_schema, f"{path}[{index}]"
+                        )
+                        if error:
+                            return error
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if "minimum" in node and value < node["minimum"]:
+                    return f"{path} is below minimum {node['minimum']}"
+                if "maximum" in node and value > node["maximum"]:
+                    return f"{path} is above maximum {node['maximum']}"
+            return None
+
         if not isinstance(arguments, dict):
             return "Tool arguments must be an object."
-        for required in schema.get("required") or []:
-            if required not in arguments:
-                return f"Missing required tool argument: {required}"
-        if schema.get("additionalProperties") is False:
-            allowed = set((schema.get("properties") or {}).keys())
-            extras = set(arguments) - allowed
-            if extras:
-                return f"Unknown tool arguments: {', '.join(sorted(extras))}"
-        return None
+        return validate(arguments, schema, "arguments")
 
     @staticmethod
     def _bounded_output(output: Any) -> dict[str, Any]:

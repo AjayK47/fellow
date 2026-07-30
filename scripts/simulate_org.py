@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Exercise the complete Slack-native company agent harness locally.
+"""Exercise Slack and connector events through the company harness locally.
 
 The simulation sends real Slack Events API-shaped envelopes through the gateway,
-drains the durable SQLite worker, runs reactive and proactive agent invocations,
-captures outcomes into memory, and checks permission isolation.
+adds a signed Composio V3 trigger, drains the durable SQLite worker, runs
+reactive and proactive agent invocations, captures outcomes into memory, and
+checks permission and connector isolation.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +146,27 @@ def seed(brain: Any) -> None:
                 "principal_id": principal_id,
             },
         )
+    brain.store.upsert_connector_account(
+        {
+            "id": "connector_sim_github",
+            "organization_id": ORG,
+            "toolkit": "github",
+            "connected_account_id": "ca_sim_github",
+            "status": "active",
+            "composio_user_id": f"company-brain:{ORG}",
+            "principal_id": "person_bob",
+            "scope_id": "scope_sim_eng",
+            "visibility": "team",
+            "observe_enabled": True,
+            "proactivity_enabled": True,
+            "learn": True,
+            "destination": {
+                "type": "internal_agent_session",
+                "id": "github-engineering",
+                "is_private": True,
+            },
+        }
+    )
     channel_policies = [
         ("C_GENERAL", "scope_sim_public", False, False),
         ("C_SUPPORT", "scope_sim_public", True, False),
@@ -271,7 +297,123 @@ def run_simulation(
             headers={},
             allow_unsigned=True,
         )
+        from company_brain.adapters import normalize_composio_harness_event
+        from company_brain.domain.models import utcnow
+
+        connector_payload = {
+            "id": "Composio_export_failure",
+            "type": "composio.trigger.message",
+            "metadata": {
+                "log_id": "log_sim_export_failure",
+                "trigger_slug": "GITHUB_ISSUE_EVENT",
+                "trigger_id": "ti_sim_github_issues",
+                "connected_account_id": "ca_sim_github",
+                "user_id": f"company-brain:{ORG}",
+            },
+            "data": {
+                "title": "Export worker failure after deployment 982",
+                "message": (
+                    "Northstar customer exports are failing and the queue is stuck"
+                ),
+                "repository": "northstar/export-worker",
+                "action": "opened",
+            },
+            "timestamp": utcnow().isoformat(),
+        }
+        connector_secret = "simulation-composio-webhook-secret"
+        brain.composio.webhook_secret = connector_secret
+        raw_connector = json.dumps(
+            connector_payload, separators=(",", ":")
+        ).encode()
+        webhook_id = "webhook_sim_1"
+        webhook_timestamp = str(int(time.time()))
+        signing = (
+            webhook_id.encode()
+            + b"."
+            + webhook_timestamp.encode()
+            + b"."
+            + raw_connector
+        )
+        signature = "v1," + base64.b64encode(
+            hmac.new(
+                connector_secret.encode(), signing, hashlib.sha256
+            ).digest()
+        ).decode()
+        verified = brain.composio.verify_webhook(
+            raw_body=raw_connector,
+            webhook_id=webhook_id,
+            webhook_timestamp=webhook_timestamp,
+            webhook_signature=signature,
+        )
+        connector_account = brain.store.connector_account_by_external_id(
+            "ca_sim_github"
+        )
+        connector_event = normalize_composio_harness_event(
+            verified,
+            account=connector_account,
+            principal_id="person_bob",
+        )
+        connector_received = {
+            "id": connector_event["id"],
+            "organization_id": ORG,
+            "type": connector_event["type"],
+            "source": connector_event["source"],
+            "received_at": utcnow().isoformat(),
+            "data": connector_event,
+            "raw_payload": verified,
+        }
+        connector_accepted = brain.store.upsert_received_event(
+            connector_received
+        )
+        brain.harness_jobs.enqueue(
+            organization_id=ORG,
+            kind="event.route",
+            payload={"event": connector_event},
+            idempotency_key=(
+                f"event.route:{connector_event['dedupe_key']}"
+            ),
+        )
+        connector_duplicate = not brain.store.upsert_received_event(
+            connector_received
+        )
         worker = brain.harness_worker.drain_until_idle(max_cycles=100)
+
+        # Simulate a connector's initial history import in addition to live
+        # webhook traffic.
+        sync_run = brain.reality.begin_sync(
+            organization_id=ORG,
+            connector_account_id="connector_sim_github",
+            object_type="issue",
+            mode="historical_backfill",
+        )
+        backfill = brain._process_connector_backfill(
+            {
+                "sync_run_id": sync_run["id"],
+                "provider": "github",
+                "records": [
+                    {
+                        "id": "GH-77",
+                        "title": "Export worker retry storm",
+                        "content": (
+                            "Issue: Northstar exports are blocked by an "
+                            "export-worker retry storm."
+                        ),
+                        "repository_id": "northstar/export-worker",
+                        "repository_name": "Export Worker",
+                        "status": "open",
+                    }
+                ],
+                "next_cursor": "github-cursor-77",
+            }
+        )
+        brain.reality.record_judgment(
+            organization_id=ORG,
+            judgment_type="operating_preference",
+            principal_id="person_bob",
+            subject={"case_type": "incident"},
+            decision="include_customer_impact",
+            reason="Incident summaries must state customer impact.",
+        )
 
         runs = brain.store.list_harness_records("agent_runs", ORG)
         evaluations = brain.store.list_harness_records(
@@ -310,11 +452,43 @@ def run_simulation(
         proactive_run = next(
             item for item in runs if item.get("trigger_event_id") == "Ev_incident"
         )
+        connector_run = next(
+            item
+            for item in runs
+            if item.get("trigger_event_id") == "Composio_export_failure"
+        )
+        connector_search = brain.retrieval.search_evidence(
+            organization_id=ORG,
+            query="deployment 982 queue stuck",
+            acting_principal_id="person_bob",
+            destination={
+                "type": "internal_agent_session",
+                "id": "github-engineering",
+                "is_private": True,
+            },
+            purpose="simulation_connector_retrieval",
+            limit=10,
+        )
         captured_run_ids = {
             source.get("external_id")
             for source in brain.store.list_sources(ORG)
             if source.get("source_type") == "agent_run"
         }
+        connector_objects = brain.reality.list_connector_objects(
+            ORG,
+            provider="github",
+            scope_ids=["scope_sim_eng"],
+        )
+        cases = brain.reality.list_cases(
+            ORG, scope_ids=["scope_sim_public", "scope_sim_eng"]
+        )
+        facts = brain.reality.current_facts(
+            ORG,
+            scope_ids=["scope_sim_public", "scope_sim_eng"],
+        )
+        judgments = brain.reality.judgment_guidance(
+            ORG, "person_bob"
+        )
         checks = [
             (
                 "Slack events accepted",
@@ -325,6 +499,61 @@ def run_simulation(
                 "Slack event deduplication",
                 duplicate.get("duplicate") is True,
                 str(duplicate),
+            ),
+            (
+                "Signed connector trigger accepted and deduplicated",
+                connector_accepted and connector_duplicate,
+                connector_event["id"],
+            ),
+            (
+                "Connector evidence embedded and retrievable",
+                any(
+                    item["source_system"] == "composio:github"
+                    for item in connector_search["results"]
+                ),
+                f"{connector_search['count']} connector retrieval result(s)",
+            ),
+            (
+                "Historical connector backfill completes with cursor",
+                backfill["sync_run"]["status"] == "completed"
+                and brain.reality.get_sync_cursor(
+                    ORG, "connector_sim_github", "issue"
+                )["cursor"]
+                == "github-cursor-77",
+                f"{backfill['sync_run']['processed']} object(s)",
+            ),
+            (
+                "Canonical connector objects are versioned",
+                any(
+                    item["external_id"] == "GH-77"
+                    for item in connector_objects
+                ),
+                f"{len(connector_objects)} GitHub object(s)",
+            ),
+            (
+                "Temporal facts materialized from extracted memory",
+                bool(facts)
+                and all("system_from" in item for item in facts),
+                f"{len(facts)} current fact(s)",
+            ),
+            (
+                "Cross-tool events correlate into cases",
+                any(len(item.get("source_ids") or []) >= 2 for item in cases),
+                f"{len(cases)} case(s)",
+            ),
+            (
+                "Human judgment is durable guidance",
+                any(
+                    item["decision"] == "include_customer_impact"
+                    for item in judgments
+                ),
+                f"{len(judgments)} judgment(s)",
+            ),
+            (
+                "Connector trigger wakes proactive agent",
+                connector_run["trigger_kind"] == "proactive"
+                and connector_run["state"] == "completed",
+                connector_run["id"],
             ),
             (
                 "Mention bypasses attention and completes",
@@ -381,7 +610,7 @@ def run_simulation(
             "database": str(db_path),
             "embedding_provider": type(brain.embeddings).__name__,
             "model_provider": getattr(brain.main_model, "model", "unknown"),
-            "events": len(events),
+            "events": len(events) + 1,
             "runs": len(runs),
             "attention_evaluations": len(evaluations),
             "interventions": len(interventions),
@@ -390,6 +619,10 @@ def run_simulation(
             "memories": len(
                 brain.store.list_memories(ORG, latest_only=False)
             ),
+            "connector_objects": len(connector_objects),
+            "cases": len(cases),
+            "facts": len(facts),
+            "judgments": len(judgments),
             "checks": [
                 {"name": name, "passed": passed, "detail": detail}
                 for name, passed, detail in checks
@@ -413,6 +646,9 @@ def markdown(report: dict[str, Any]) -> str:
         f"- Proactive interventions: {report['interventions']}",
         f"- Deliveries: {report['deliveries']}",
         f"- Sources / memories: {report['sources']} / {report['memories']}",
+        f"- Connector objects: {report['connector_objects']}",
+        f"- Temporal facts / cases: {report['facts']} / {report['cases']}",
+        f"- Judgment memories: {report['judgments']}",
         "",
         "| Check | Result | Detail |",
         "| --- | --- | --- |",

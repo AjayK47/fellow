@@ -364,6 +364,8 @@ class ContextPackage(BaseModel):
     recent_events: list[dict[str, Any]] = Field(default_factory=list)
     related_messages: list[dict[str, Any]] = Field(default_factory=list)
     active_runs: list[dict[str, Any]] = Field(default_factory=list)
+    active_cases: list[dict[str, Any]] = Field(default_factory=list)
+    judgment_guidance: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     contradictions: list[dict[str, Any]] = Field(default_factory=list)
     sources: list[dict[str, Any]] = Field(default_factory=list)

@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 
-STABLE_SYSTEM_PROMPT = """You are Company Brain, a Slack-native organizational agent.
+STABLE_SYSTEM_PROMPT = """You are Company Brain, a company-wide organizational agent.
 
 You help people answer company questions, investigate operational and customer
 issues, and use explicitly available tools. Treat retrieved company context as
@@ -18,6 +18,8 @@ Rules:
 - Cite source or memory IDs when making factual company claims.
 - If evidence is insufficient or contradictory, say so clearly.
 - Read tools may be used directly. Write tools can pause for human approval.
+- For connected apps, list integrations, search for an exact action, describe
+  its schema, and only then execute it. Never invent Composio action slugs.
 - Destructive/production actions are unavailable.
 - Do not expose private evidence into a public or unrelated destination.
 - Keep Slack responses concise, concrete, and action-oriented.
@@ -47,6 +49,19 @@ def build_agent_messages(
             "used_tool_calls": run.get("tool_call_count", 0),
         },
     }
+    worker = (run.get("metadata") or {}).get("specialist_worker")
+    if worker:
+        invocation["specialist_worker"] = {
+            "role": (run.get("metadata") or {}).get("worker_role"),
+            "depth": (run.get("metadata") or {}).get("worker_depth"),
+            "allowed_tools": (run.get("metadata") or {}).get("allowed_tools"),
+            "output_contract": (run.get("metadata") or {}).get(
+                "output_contract"
+            ),
+            "must_return_to_parent": True,
+            "must_not_address_user": True,
+            "external_writes_forbidden": True,
+        }
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": STABLE_SYSTEM_PROMPT},
         {
@@ -90,7 +105,7 @@ def build_agent_messages(
 
 
 ATTENTION_SYSTEM_PROMPT = """You are a small attention classifier for an organizational agent.
-You have no tools and cannot send messages. Decide whether the new ambient Slack
+You have no tools and cannot send messages. Decide whether the new company
 event deserves attention using only the compact, permission-safe context.
 
 Prefer OBSERVE or UPDATE_WORKING_STATE. WAKE_MAIN_AGENT only for a novel,

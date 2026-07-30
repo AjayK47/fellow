@@ -65,6 +65,10 @@ class HarnessMemoryCapture:
                 memories = self.model_extractor.extract_source(result["source"])
             except Exception:
                 memories = self.ingestion.memory.learn_from_source(result["source"])
+            if self.ingestion.reality:
+                self.ingestion.reality.ingest_source(
+                    result["source"], memories
+                )
         self.audit.record(
             run["organization_id"],
             "memory.run_captured",
@@ -182,6 +186,10 @@ class HarnessMemoryCapture:
                 memories = self.model_extractor.extract_source(result["source"])
             except Exception:
                 memories = self.ingestion.memory.learn_from_source(result["source"])
+            if self.ingestion.reality:
+                self.ingestion.reality.ingest_source(
+                    result["source"], memories
+                )
         return {
             "conversation_key": conversation_key,
             "consolidated": True,

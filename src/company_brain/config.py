@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     agent_max_tool_calls: int = 24
     agent_context_token_budget: int = 12_000
     agent_max_total_tokens: int = 100_000
+    specialist_max_parallel: int = 3
+    specialist_max_depth: int = 1
 
     # Slack Events API / Web API.
     slack_signing_secret: str | None = None
@@ -65,11 +67,13 @@ class Settings(BaseSettings):
     slack_proactive_channels: str = ""
     slack_signature_tolerance_seconds: int = 300
 
-    # Composio v3.1 direct tool execution.
+    # Composio connections, triggers, webhook ingestion, and tool execution.
     composio_api_key: str | None = None
     composio_base_url: str = "https://backend.composio.dev/api/v3.1"
     composio_connected_account_id: str | None = None
     composio_toolkit_versions: str = "latest"
+    composio_webhook_secret: str | None = None
+    composio_webhook_tolerance_seconds: int = 300
 
     # Durable local worker. PostgreSQL/Redis can replace these interfaces at
     # deployment time; SQLite remains the fully runnable local backend.

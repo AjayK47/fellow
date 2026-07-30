@@ -160,6 +160,27 @@ class AttentionPipeline:
             if thread.get("active_run_id")
             else None
         )
+        related_cases: list[dict[str, Any]] = []
+        if self.retrieval.reality:
+            event_tokens = set(
+                (event.payload.get("text") or "").lower().replace("_", " ").split()
+            )
+            for case in self.retrieval.reality.list_cases(
+                event.organization_id,
+                statuses={"open", "investigating"},
+                scope_ids=memories.get("allowed_scope_ids") or [],
+            ):
+                case_tokens = set(case.get("correlation_tokens") or [])
+                if event_tokens & case_tokens:
+                    related_cases.append(
+                        {
+                            "id": case["id"],
+                            "title": case["title"],
+                            "status": case["status"],
+                            "entity_ids": case.get("entity_ids") or [],
+                            "source_ids": case.get("source_ids") or [],
+                        }
+                    )
         return {
             "new_event": {
                 "id": event.id,
@@ -193,6 +214,15 @@ class AttentionPipeline:
                 ),
             },
             "related_memories": memories["results"],
+            "related_facts": memories.get("reality_facts") or [],
+            "related_cases": related_cases[:5],
+            "judgment_guidance": (
+                self.retrieval.reality.judgment_guidance(
+                    event.organization_id, event.actor.id, limit=5
+                )
+                if self.retrieval.reality
+                else []
+            ),
             "related_messages": raw["results"],
             "permission_decision_ids": [
                 memories["permission_decision_id"],
@@ -271,7 +301,7 @@ class AttentionPipeline:
         envelope = InvocationEnvelope(
             organization_id=event.organization_id,
             principal_id=event.actor.id,
-            application_id="slack_company_brain",
+            application_id=f"{event.source}_company_brain",
             conversation_id=event.payload["conversation_key"],
             destination=destination,
             purpose="proactive_investigation",
@@ -288,7 +318,7 @@ class AttentionPipeline:
             trigger_kind=TriggerKind.PROACTIVE,
             trigger_event_id=event.id,
             initial_message=(
-                "Proactive trigger from an ambient Slack message:\n"
+                f"Proactive trigger from {event.source}:\n"
                 + (event.payload.get("text") or "")
                 + "\nAttention reason: "
                 + evaluation.reason
@@ -337,7 +367,23 @@ class AttentionPipeline:
 
     @staticmethod
     def _destination(event: NormalizedEvent) -> dict[str, Any]:
+        configured = event.payload.get("destination")
+        if isinstance(configured, dict) and configured.get("type"):
+            return {
+                "type": configured["type"],
+                "id": str(configured.get("id") or ""),
+                "is_private": bool(configured.get("is_private", True)),
+                "audience_principal_ids": list(
+                    configured.get("audience_principal_ids") or []
+                ),
+            }
         private = event.scope.visibility != "organization_public"
+        if event.source != "slack":
+            return {
+                "type": "internal_agent_session",
+                "id": event.scope.channel_id or event.source,
+                "is_private": private,
+            }
         return {
             "type": "dm"
             if event.type == "slack.dm"

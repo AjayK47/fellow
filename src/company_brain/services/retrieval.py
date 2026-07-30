@@ -20,11 +20,13 @@ class RetrievalService:
         authz: AuthorizationService,
         graph: GraphService,
         embeddings: EmbeddingProvider,
+        reality: Any | None = None,
     ) -> None:
         self.store = store
         self.authz = authz
         self.graph = graph
         self.embeddings = embeddings
+        self.reality = reality
 
     def authorize(
         self,
@@ -123,9 +125,47 @@ class RetrievalService:
 
         scored.sort(key=lambda r: r.score, reverse=True)
         results = scored[:limit]
+        reality_facts: list[dict[str, Any]] = []
+        if self.reality:
+            fact_candidates = self.reality.current_facts(
+                organization_id,
+                valid_at=as_of,
+                known_at=None,
+                scope_ids=decision.allowed_scope_ids,
+            )
+            query_tokens = self._tokens(query)
+            for fact in fact_candidates:
+                text = " ".join(
+                    [
+                        fact.get("subject_id") or "",
+                        fact.get("predicate") or "",
+                        fact.get("object_value") or "",
+                    ]
+                )
+                overlap = len(query_tokens & self._tokens(text))
+                if query_tokens and not overlap and not (
+                    entity_ids
+                    and fact.get("subject_id") in set(entity_ids)
+                ):
+                    continue
+                reality_facts.append(
+                    {
+                        **fact,
+                        "score": (
+                            overlap / max(len(query_tokens), 1)
+                            + float(fact.get("authority") or 0) * 0.15
+                            + float(fact.get("confidence") or 0) * 0.1
+                        ),
+                    }
+                )
+            reality_facts.sort(
+                key=lambda item: item["score"], reverse=True
+            )
         return {
             "results": [r.model_dump(mode="json") for r in results],
+            "reality_facts": reality_facts[:limit],
             "permission_decision_id": decision.id,
+            "allowed_scope_ids": decision.allowed_scope_ids,
             "count": len(results),
         }
 

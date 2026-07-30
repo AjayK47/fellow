@@ -123,6 +123,13 @@ class CompanyAgent:
                 run["id"],
                 envelope.principal_id,
             )
+            if parent_run_id:
+                self.graph.add_edge(
+                    envelope.organization_id,
+                    "DELEGATED_TO",
+                    parent_run_id,
+                    run["id"],
+                )
         return self.runs.transition(run["id"], AgentRunState.QUEUED)
 
     def run(self, run_id: str) -> AgentOutcome:
@@ -181,9 +188,11 @@ class CompanyAgent:
             if int(run.get("tool_call_count", 0)) >= int(run["max_tool_calls"]):
                 raise RuntimeError("tool_call_limit")
             if int((run.get("usage") or {}).get("total_tokens", 0)) >= int(
-                self.max_total_tokens
+                run.get("max_total_tokens") or self.max_total_tokens
             ):
                 raise RuntimeError("model_token_budget")
+            if run.get("deadline_at") and utcnow().isoformat() >= run["deadline_at"]:
+                raise RuntimeError("worker_deadline_exceeded")
             context = self.context_service.prepare_context(
                 organization_id=run["organization_id"],
                 task=run["goal"],
@@ -455,7 +464,10 @@ class CompanyAgent:
         )
 
     def _enqueue_post_run_jobs(self, run: dict[str, Any]) -> None:
-        for kind in ("memory.capture_run", "delivery.send"):
+        kinds = ["memory.capture_run"]
+        if not (run.get("metadata") or {}).get("suppress_delivery"):
+            kinds.append("delivery.send")
+        for kind in kinds:
             self.enqueue_job(
                 organization_id=run["organization_id"],
                 kind=kind,

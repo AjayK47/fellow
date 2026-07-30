@@ -40,6 +40,7 @@ class EventService:
             metadata=body.get("metadata") or {},
             learn=body.get("learn", True),
             processing_mode=body.get("processing_mode", "memory"),
+            occurred_at=body.get("occurred_at"),
         )
         now = _now()
         job = {
@@ -82,6 +83,7 @@ class EventService:
             metadata={"cloudevent": event, "subject": event.get("subject"), "trace_id": event.get("trace_id")},
             learn=event.get("processing_mode", "memory") == "memory",
             processing_mode=event.get("processing_mode", "memory"),
+            occurred_at=event.get("time") or event.get("occurred_at"),
         )
         self.audit.record(org, "event.accepted", {"event_id": event["id"], "source_id": source["source"]["id"], "type": event["type"]}, principal_id=event.get("principal_id"), trace_id=event.get("trace_id"))
         return {"event_id": event["id"], "status": "accepted", "accepted": True, "source": source["source"], "memory_count": len(source["memories"])}

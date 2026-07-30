@@ -203,6 +203,99 @@ class HarnessClient(_Resource):
         )
 
 
+class RealityClient(_Resource):
+    """Canonical objects, temporal facts, cases, policies, and artifacts."""
+
+    def backfill(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/connectors/backfill", payload)
+
+    def sync_runs(self, organization_id: str) -> dict[str, Any]:
+        return self._client._request(
+            "GET",
+            "/v1/connectors/sync-runs",
+            params={"organization_id": organization_id},
+        )
+
+    def link_identifier(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request(
+            "POST", "/v1/entities/identifiers", payload
+        )
+
+    def resolution_candidates(
+        self, organization_id: str, status: str | None = None
+    ) -> dict[str, Any]:
+        params = {"organization_id": organization_id}
+        if status:
+            params["status"] = status
+        return self._client._request(
+            "GET", "/v1/entity-resolution/candidates", params=params
+        )
+
+    def assert_fact(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/facts", payload)
+
+    def facts(self, **params: Any) -> dict[str, Any]:
+        return self._client._request("GET", "/v1/facts", params=params)
+
+    def conflicts(
+        self,
+        organization_id: str,
+        acting_principal_id: str,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        params = {
+            "organization_id": organization_id,
+            "acting_principal_id": acting_principal_id,
+        }
+        if status:
+            params["status"] = status
+        return self._client._request(
+            "GET", "/v1/fact-conflicts", params=params
+        )
+
+    def cases(
+        self,
+        organization_id: str,
+        acting_principal_id: str,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        params = {
+            "organization_id": organization_id,
+            "acting_principal_id": acting_principal_id,
+        }
+        if status:
+            params["status"] = status
+        return self._client._request("GET", "/v1/cases", params=params)
+
+    def judgments(
+        self, organization_id: str, acting_principal_id: str
+    ) -> dict[str, Any]:
+        return self._client._request(
+            "GET",
+            "/v1/judgments",
+            params={
+                "organization_id": organization_id,
+                "acting_principal_id": acting_principal_id,
+            },
+        )
+
+    def create_policy(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/policies", payload)
+
+    def policies(self, organization_id: str) -> dict[str, Any]:
+        return self._client._request(
+            "GET",
+            "/v1/policies",
+            params={"organization_id": organization_id},
+        )
+
+    def create_artifact(self, **payload: Any) -> dict[str, Any]:
+        return self._client._request("POST", "/v1/artifacts", payload)
+
+    def artifacts(self, **params: Any) -> dict[str, Any]:
+        return self._client._request("GET", "/v1/artifacts", params=params)
+
+
 class CompanyBrain:
     """Typed-by-convention SDK surface for harnesses and internal applications."""
 
@@ -221,6 +314,7 @@ class CompanyBrain:
         self.harness = HarnessClient(self)
         self.proactive = ProactiveClient(self)
         self.signals = SignalsClient(self)
+        self.reality = RealityClient(self)
 
     def close(self) -> None:
         self._http.close()

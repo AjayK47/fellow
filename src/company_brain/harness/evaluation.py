@@ -9,9 +9,12 @@ from company_brain.domain.models import new_id, utcnow
 
 
 class HarnessEvaluationService:
-    def __init__(self, *, store: Any, audit: Any) -> None:
+    def __init__(
+        self, *, store: Any, audit: Any, reality: Any | None = None
+    ) -> None:
         self.store = store
         self.audit = audit
+        self.reality = reality
 
     def record_feedback(
         self,
@@ -67,6 +70,18 @@ class HarnessEvaluationService:
             item,
             principal_id=principal_id,
         )
+        if self.reality:
+            self.reality.record_judgment(
+                organization_id=organization_id,
+                judgment_type="agent_feedback",
+                principal_id=principal_id,
+                subject={
+                    "run_id": run_id,
+                    "attention_evaluation_id": attention_evaluation_id,
+                },
+                decision=feedback_type,
+                reason=comment,
+            )
         return item
 
     def metrics(self, organization_id: str) -> dict[str, Any]:

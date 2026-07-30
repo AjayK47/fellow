@@ -49,6 +49,8 @@ class MemoryService:
             participant_ids=[source["author_entity_id"]] if source.get("author_entity_id") else [],
             is_private=bool(source.get("is_private_channel")),
             entity_name_map=name_map,
+            occurred_at=source.get("occurred_at"),
+            observed_at=source.get("ingested_at"),
         )
 
         committed: list[dict[str, Any]] = []
@@ -78,7 +80,6 @@ class MemoryService:
         match = self._find_supersede_target(memory, existing)
         if match:
             # new memory updates old
-            memory.valid_from = utcnow()
             return self.graph.supersede_memory(match["id"], memory, MemoryEdgeType.UPDATES)
 
         # check extends (same subject, different predicate detail)

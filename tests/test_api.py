@@ -42,6 +42,25 @@ def test_health(client):
     assert r.json()["status"] == "ok"
 
 
+def test_organization_bootstrap_api(client):
+    created = client.post(
+        "/v1/organizations",
+        json={"id": "org_newco", "name": "NewCo", "region": "ap-south-1"},
+    )
+    assert created.status_code == 200
+    assert created.json()["id"] == "org_newco"
+    duplicate = client.post(
+        "/v1/organizations",
+        json={"id": "org_newco", "name": "NewCo"},
+    )
+    assert duplicate.status_code == 409
+    listed = client.get("/v1/organizations")
+    assert listed.status_code == 200
+    assert "org_newco" in {
+        item["id"] for item in listed.json()["organizations"]
+    }
+
+
 def test_five_reactive_operations(client):
     org = "org_acme"
     dest = {"type": "internal_agent_session", "id": "sess", "is_private": True}

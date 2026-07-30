@@ -13,8 +13,13 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from company_brain.adapters import (
+    composio_connected_account_id,
+    normalize_composio_harness_event,
+)
 from company_brain.services.container import BrainApp
 from company_brain.config import Settings
+from company_brain.domain.models import utcnow
 from company_brain.harness.models import InvocationEnvelope, TriggerKind
 from company_brain.harness.slack import verify_slack_signature
 from company_brain.harness.tools import refresh_composio_tool_schemas
@@ -43,6 +48,7 @@ class IngestRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     learn: bool = True
     processing_mode: str = "memory"
+    occurred_at: datetime | None = None
 
 
 class DocumentRequest(IngestRequest):
@@ -202,6 +208,13 @@ class ScopeRequest(BaseModel):
     is_public: bool = False
 
 
+class OrganizationRequest(BaseModel):
+    id: str
+    name: str
+    region: str | None = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
 class MembershipRequest(BaseModel):
     organization_id: str
     principal_id: str
@@ -272,6 +285,44 @@ class ConnectorAccountRequest(BaseModel):
     toolkit: str
     connected_account_id: str
     status: str = "active"
+    composio_user_id: str | None = None
+    principal_id: str | None = None
+    scope_id: str = "scope_org_public"
+    visibility: str = "organization_public"
+    observe_enabled: bool = True
+    proactivity_enabled: bool = True
+    learn: bool = True
+    destination_id: str | None = None
+    destination: dict[str, Any] | None = None
+
+
+class ComposioSyncRequest(BaseModel):
+    organization_id: str
+    composio_user_id: str | None = None
+    principal_id: str | None = None
+    scope_id: str = "scope_org_public"
+    visibility: str = "organization_public"
+    proactivity_enabled: bool = True
+
+
+class ComposioConnectRequest(BaseModel):
+    organization_id: str
+    auth_config_id: str
+    callback_url: str | None = None
+    alias: str | None = None
+    composio_user_id: str | None = None
+
+
+class ComposioTriggerRequest(BaseModel):
+    organization_id: str
+    connected_account_id: str
+    trigger_slug: str
+    trigger_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ComposioTriggerStateRequest(BaseModel):
+    organization_id: str
+    enabled: bool
 
 
 class HarnessFeedbackRequest(BaseModel):
@@ -308,12 +359,129 @@ class DeferredMaintenanceRequest(BaseModel):
     entity_id: str | None = None
 
 
+class ConnectorBackfillRequest(BaseModel):
+    organization_id: str
+    connector_account_id: str
+    provider: str
+    object_type: str
+    records: list[dict[str, Any]] = Field(default_factory=list)
+    action_slug: str | None = None
+    action_arguments: dict[str, Any] = Field(default_factory=dict)
+    items_path: str = "data.items"
+    next_cursor_path: str = "data.next_cursor"
+    cursor_argument: str = "cursor"
+    max_pages: int = Field(default=100, ge=1, le=1000)
+    next_cursor: str | None = None
+    mode: str = "incremental"
+    run_now: bool = False
+
+
+class ExternalIdentifierRequest(BaseModel):
+    organization_id: str
+    entity_id: str
+    namespace: str
+    value: str
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    verified: bool = True
+    source_id: str | None = None
+
+
+class ResolutionDecisionRequest(BaseModel):
+    approved: bool
+    decided_by: str
+
+
+class FactAssertionRequest(BaseModel):
+    organization_id: str
+    subject_id: str
+    predicate: str
+    object_value: str
+    scope_id: str = "scope_org_public"
+    valid_from: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    valid_to: str | None = None
+    source_ids: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.8, ge=0, le=1)
+    authority: float = Field(default=0.8, ge=0, le=1)
+
+
+class ConflictResolutionRequest(BaseModel):
+    winner_fact_id: str
+    decided_by: str
+
+
+class JudgmentRequest(BaseModel):
+    organization_id: str
+    judgment_type: str
+    principal_id: str | None = None
+    subject: dict[str, Any]
+    decision: str
+    reason: str | None = None
+
+
+class CaseUpdateRequest(BaseModel):
+    status: str
+    updated_by: str
+    summary: str | None = None
+    title: str | None = None
+
+
+class ConditionalPolicyRequest(BaseModel):
+    organization_id: str
+    policy_key: str
+    effect: str
+    actions: list[str]
+    conditions: dict[str, Any] = Field(default_factory=dict)
+    approval_required: bool = False
+    precondition: dict[str, Any] | None = None
+    created_by: str
+
+
+class PolicyActivationRequest(BaseModel):
+    approved_by: str
+
+
+class ArtifactRequest(BaseModel):
+    organization_id: str
+    artifact_type: str
+    title: str
+    content: Any
+    scope_id: str = "scope_org_public"
+    run_id: str | None = None
+    created_by: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 # ---- health ----
 
 
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "company-brain"}
+
+
+@router.post("/v1/organizations")
+def create_organization(
+    body: OrganizationRequest, request: Request
+) -> dict[str, Any]:
+    brain = _app(request)
+    if brain.store.get_organization(body.id):
+        raise HTTPException(409, "organization already exists")
+    organization = body.model_dump(exclude_none=True)
+    brain.store.put_organization(organization)
+    brain.audit.record(
+        body.id,
+        "organization.created",
+        {"organization_id": body.id, "name": body.name},
+    )
+    return organization
+
+
+@router.get("/v1/organizations")
+def list_organizations(request: Request) -> dict[str, Any]:
+    organizations = _app(request).store.list_organizations()
+    return {"organizations": organizations, "count": len(organizations)}
 
 
 @router.get("/v1/metrics")
@@ -334,6 +502,15 @@ def metrics(request: Request, organization_id: str | None = None) -> dict[str, A
             brain.store.list_harness_records("agent_runs", org)
         ),
         "harness_jobs": brain.store.harness_job_counts(org),
+        "connector_objects": len(
+            brain.reality.list_connector_objects(org, latest_only=True)
+        ),
+        "temporal_facts": len(brain.reality.current_facts(org)),
+        "open_cases": len(
+            brain.reality.list_cases(
+                org, statuses={"open", "investigating"}
+            )
+        ),
     }
 
 
@@ -613,6 +790,24 @@ def harness_status(request: Request) -> dict[str, Any]:
             "concurrency": config.worker_concurrency,
             "batch_size": config.worker_batch_size,
         },
+        "specialists": {
+            "enabled": True,
+            "max_parallel": config.specialist_max_parallel,
+            "max_depth": config.specialist_max_depth,
+            "write_tools_allowed": False,
+        },
+        "reality_engine": {
+            "canonical_connector_objects": True,
+            "historical_backfill": True,
+            "entity_resolution": True,
+            "bitemporal_facts": True,
+            "contradiction_resolution": True,
+            "cross_source_cases": True,
+            "judgment_memory": True,
+            "conditional_policies": True,
+            "execution_preconditions": True,
+            "durable_artifacts": True,
+        },
     }
 
 
@@ -775,23 +970,339 @@ def upsert_connector_account(
 ) -> dict[str, Any]:
     data = body.model_dump()
     now = datetime.now(timezone.utc).isoformat()
-    data.update({"created_at": now, "updated_at": now})
-    with _app(request).store.cursor() as cur:
-        cur.execute(
-            """INSERT OR REPLACE INTO connector_accounts
-            (id, organization_id, toolkit, status, payload, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                data["id"],
-                data["organization_id"],
-                data["toolkit"],
-                data["status"],
-                json.dumps(data),
-                now,
-                now,
-            ),
+    brain = _app(request)
+    existing = brain.store.get_harness_record("connector_accounts", data["id"])
+    data["created_at"] = (existing or {}).get("created_at") or now
+    data["updated_at"] = now
+    data["composio_user_id"] = (
+        data.get("composio_user_id") or f"company-brain:{data['organization_id']}"
+    )
+    data["principal_id"] = (
+        data.get("principal_id")
+        or f"connector:{data['connected_account_id']}"
+    )
+    scope = brain.store.get_scope(data["scope_id"])
+    if not scope or scope["organization_id"] != data["organization_id"]:
+        raise HTTPException(400, "Connector scope does not belong to organization")
+    if not brain.store.get_entity(data["principal_id"]):
+        brain.graph.upsert_entity(
+            {
+                "id": data["principal_id"],
+                "organization_id": data["organization_id"],
+                "entity_type": "service_account",
+                "name": f"{data['toolkit']} connector",
+                "aliases": [data["connected_account_id"]],
+                "attributes": {
+                    "toolkit": data["toolkit"],
+                    "connected_account_id": data["connected_account_id"],
+                },
+            }
         )
+    brain.store.add_membership(
+        data["organization_id"], data["principal_id"], data["scope_id"]
+    )
+    brain.store.upsert_connector_account(data)
     return data
+
+
+@router.get("/v1/connector-accounts")
+def list_connector_accounts(
+    request: Request, organization_id: str
+) -> dict[str, Any]:
+    accounts = _app(request).store.list_connector_accounts(organization_id)
+    return {"accounts": accounts, "count": len(accounts)}
+
+
+@router.post("/v1/composio/connections:sync")
+def sync_composio_connections(
+    body: ComposioSyncRequest, request: Request
+) -> dict[str, Any]:
+    brain = _app(request)
+    if not brain.composio.configured:
+        raise HTTPException(503, "Composio API key is not configured")
+    user_id = body.composio_user_id or f"company-brain:{body.organization_id}"
+    scope = brain.store.get_scope(body.scope_id)
+    if not scope or scope["organization_id"] != body.organization_id:
+        raise HTTPException(400, "Connector scope does not belong to organization")
+    try:
+        response = brain.composio.list_connected_accounts(user_id=user_id)
+    except Exception as exc:
+        raise HTTPException(502, f"Composio connection sync failed: {exc}") from exc
+    saved: list[dict[str, Any]] = []
+    for remote in response.get("items") or []:
+        toolkit_data = remote.get("toolkit") or {}
+        toolkit = toolkit_data.get("slug") or remote.get("toolkit_slug")
+        account_id = remote.get("id") or remote.get("nanoid")
+        if not toolkit or not account_id:
+            continue
+        account = ConnectorAccountRequest(
+            id=f"connector:{body.organization_id}:{account_id}",
+            organization_id=body.organization_id,
+            toolkit=str(toolkit).lower(),
+            connected_account_id=str(account_id),
+            status=(
+                "active"
+                if str(remote.get("status") or "ACTIVE").upper() == "ACTIVE"
+                else str(remote.get("status") or "inactive").lower()
+            ),
+            composio_user_id=user_id,
+            principal_id=body.principal_id,
+            scope_id=body.scope_id,
+            visibility=body.visibility,
+            proactivity_enabled=body.proactivity_enabled,
+        )
+        saved.append(upsert_connector_account(account, request))
+    return {
+        "organization_id": body.organization_id,
+        "composio_user_id": user_id,
+        "accounts": saved,
+        "count": len(saved),
+    }
+
+
+@router.get("/v1/composio/auth-configs")
+def list_composio_auth_configs(
+    request: Request, toolkit: str | None = None
+) -> dict[str, Any]:
+    try:
+        return _app(request).composio.list_auth_configs(toolkit=toolkit)
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Composio auth-config listing failed: {exc}") from exc
+
+
+@router.post("/v1/composio/connections:link")
+def create_composio_connection_link(
+    body: ComposioConnectRequest, request: Request
+) -> dict[str, Any]:
+    brain = _app(request)
+    if not brain.store.get_organization(body.organization_id):
+        raise HTTPException(404, "Organization not found")
+    user_id = (
+        body.composio_user_id or f"company-brain:{body.organization_id}"
+    )
+    try:
+        result = brain.composio.create_connect_link(
+            user_id=user_id,
+            auth_config_id=body.auth_config_id,
+            callback_url=body.callback_url,
+            alias=body.alias,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Composio connect-link creation failed: {exc}") from exc
+    return {
+        "organization_id": body.organization_id,
+        "composio_user_id": user_id,
+        **result,
+    }
+
+
+@router.delete("/v1/composio/connections/{connected_account_id}")
+def disconnect_composio_account(
+    connected_account_id: str,
+    request: Request,
+    organization_id: str,
+) -> dict[str, Any]:
+    brain = _app(request)
+    account = brain.store.connector_account_by_external_id(
+        connected_account_id
+    )
+    if not account or account["organization_id"] != organization_id:
+        raise HTTPException(404, "Active connector account not found")
+    try:
+        remote = brain.composio.delete_connected_account(
+            connected_account_id
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Composio disconnect failed: {exc}") from exc
+    account["status"] = "disconnected"
+    brain.store.upsert_connector_account(account)
+    return {"account": account, "composio": remote}
+
+
+@router.get("/v1/composio/trigger-types")
+def list_composio_trigger_types(
+    request: Request, toolkit: str | None = None
+) -> dict[str, Any]:
+    try:
+        return _app(request).composio.list_trigger_types(toolkit=toolkit)
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Composio trigger discovery failed: {exc}") from exc
+
+
+@router.post("/v1/composio/triggers")
+def create_composio_trigger(
+    body: ComposioTriggerRequest, request: Request
+) -> dict[str, Any]:
+    brain = _app(request)
+    account = brain.store.connector_account_by_external_id(
+        body.connected_account_id
+    )
+    if not account or account["organization_id"] != body.organization_id:
+        raise HTTPException(404, "Active connector account not found")
+    try:
+        result = brain.composio.create_trigger(
+            slug=body.trigger_slug,
+            connected_account_id=body.connected_account_id,
+            user_id=account.get("composio_user_id"),
+            trigger_config=body.trigger_config,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Composio trigger creation failed: {exc}") from exc
+    return {
+        "organization_id": body.organization_id,
+        "connected_account_id": body.connected_account_id,
+        "trigger": result,
+    }
+
+
+@router.get("/v1/composio/triggers")
+def list_composio_triggers(
+    request: Request, organization_id: str
+) -> dict[str, Any]:
+    brain = _app(request)
+    accounts = brain.store.list_connector_accounts(
+        organization_id, active_only=True
+    )
+    account_ids = [account["connected_account_id"] for account in accounts]
+    if not account_ids:
+        return {"items": [], "count": 0}
+    try:
+        return brain.composio.list_active_triggers(
+            connected_account_ids=account_ids
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Composio trigger listing failed: {exc}") from exc
+
+
+@router.patch("/v1/composio/triggers/{trigger_id}")
+def set_composio_trigger_state(
+    trigger_id: str,
+    body: ComposioTriggerStateRequest,
+    request: Request,
+) -> dict[str, Any]:
+    brain = _app(request)
+    accounts = brain.store.list_connector_accounts(
+        body.organization_id, active_only=True
+    )
+    try:
+        active = brain.composio.list_active_triggers(
+            connected_account_ids=[
+                account["connected_account_id"] for account in accounts
+            ]
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"Composio trigger lookup failed: {exc}") from exc
+    items = active.get("items") or active.get("triggers") or []
+    if not any(
+        str(item.get("id") or item.get("trigger_id")) == trigger_id
+        for item in items
+    ):
+        raise HTTPException(404, "Trigger does not belong to organization")
+    try:
+        return brain.composio.set_trigger_enabled(
+            trigger_id, enabled=body.enabled
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"Composio trigger update failed: {exc}") from exc
+
+
+@router.post("/v1/composio/webhooks")
+async def receive_composio_webhook(request: Request) -> dict[str, Any]:
+    """Accept every signed event belonging to a registered connector account."""
+    brain = _app(request)
+    raw_body = await request.body()
+    try:
+        payload = brain.composio.verify_webhook(
+            raw_body=raw_body,
+            webhook_id=request.headers.get("webhook-id", ""),
+            webhook_timestamp=request.headers.get("webhook-timestamp", ""),
+            webhook_signature=request.headers.get("webhook-signature", ""),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    connected_account_id = composio_connected_account_id(payload)
+    if not connected_account_id:
+        raise HTTPException(422, "Composio event has no connected account")
+    account = brain.store.connector_account_by_external_id(
+        connected_account_id
+    )
+    if not account:
+        raise HTTPException(403, "Composio account is not registered or active")
+    external_user_id = str(
+        (payload.get("metadata") or {}).get("user_id")
+        or (payload.get("data") or {}).get("user_id")
+        or ""
+    )
+    identity = (
+        brain.store.identity_mapping(
+            account["organization_id"], "composio", external_user_id
+        )
+        if external_user_id
+        else None
+    )
+    principal_id = (
+        (identity or {}).get("principal_id")
+        or account.get("principal_id")
+        or f"connector:{connected_account_id}"
+    )
+    try:
+        event = normalize_composio_harness_event(
+            payload, account=account, principal_id=principal_id
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    received = {
+        "id": event["id"],
+        "organization_id": event["organization_id"],
+        "type": event["type"],
+        "source": event["source"],
+        "received_at": utcnow().isoformat(),
+        "data": event,
+        "raw_payload": payload,
+    }
+    if not brain.store.upsert_received_event(received):
+        return {
+            "accepted": False,
+            "duplicate": True,
+            "event_id": event["id"],
+        }
+    job = brain.harness_jobs.enqueue(
+        organization_id=event["organization_id"],
+        kind="event.route",
+        payload={"event": event},
+        idempotency_key=f"event.route:{event['dedupe_key']}",
+    )
+    brain.audit.record(
+        event["organization_id"],
+        "composio.event.accepted",
+        {
+            "event_id": event["id"],
+            "job_id": job["id"],
+            "trigger_slug": event["payload"].get("trigger_slug"),
+            "connected_account_id": connected_account_id,
+        },
+        principal_id=principal_id,
+    )
+    return {
+        "accepted": True,
+        "event_id": event["id"],
+        "organization_id": event["organization_id"],
+        "job_id": job["id"],
+    }
 
 
 @router.post("/v1/automations")
@@ -907,6 +1418,412 @@ async def slack_interactions(request: Request) -> dict[str, Any]:
         idempotency_key=f"approval.slack:{approval_id}:{action['action_id']}",
     )
     return {"accepted": True, "job_id": job["id"]}
+
+
+# ---- company reality engine ----
+
+
+@router.post("/v1/connectors/backfill")
+def enqueue_connector_backfill(
+    body: ConnectorBackfillRequest, request: Request
+) -> dict[str, Any]:
+    brain = _app(request)
+    account = brain.store.get_harness_record(
+        "connector_accounts", body.connector_account_id
+    )
+    if not account or account["organization_id"] != body.organization_id:
+        raise HTTPException(404, "connector account not found")
+    if not body.records and not body.action_slug:
+        raise HTTPException(400, "records or action_slug is required")
+    run = brain.reality.begin_sync(
+        organization_id=body.organization_id,
+        connector_account_id=body.connector_account_id,
+        object_type=body.object_type,
+        mode=body.mode,
+    )
+    job = brain.harness_jobs.enqueue(
+        organization_id=body.organization_id,
+        kind="connector.backfill",
+        payload={
+            "sync_run_id": run["id"],
+            "provider": body.provider,
+            "records": body.records,
+            "next_cursor": body.next_cursor,
+            "action_slug": body.action_slug,
+            "action_arguments": body.action_arguments,
+            "items_path": body.items_path,
+            "next_cursor_path": body.next_cursor_path,
+            "cursor_argument": body.cursor_argument,
+            "max_pages": body.max_pages,
+        },
+        idempotency_key=f"connector.backfill:{run['id']}",
+    )
+    response: dict[str, Any] = {"sync_run": run, "job": job}
+    if body.run_now:
+        response["worker"] = brain.harness_worker.drain_until_idle()
+        response["sync_run"] = brain.reality.get_sync_run(run["id"])
+    return response
+
+
+@router.get("/v1/connectors/sync-runs")
+def list_connector_sync_runs(
+    request: Request, organization_id: str
+) -> dict[str, Any]:
+    runs = _app(request).reality.list_sync_runs(organization_id)
+    return {"sync_runs": runs, "count": len(runs)}
+
+
+@router.get("/v1/connectors/objects")
+def list_connector_objects(
+    request: Request,
+    organization_id: str,
+    acting_principal_id: str,
+    provider: str | None = None,
+    object_type: str | None = None,
+    external_id: str | None = None,
+    latest_only: bool = True,
+) -> dict[str, Any]:
+    brain = _app(request)
+    decision = brain.authz.resolve(
+        organization_id=organization_id,
+        acting_principal_id=acting_principal_id,
+        purpose="connector_object_query",
+    )
+    values = brain.reality.list_connector_objects(
+        organization_id,
+        provider=provider,
+        object_type=object_type,
+        external_id=external_id,
+        latest_only=latest_only,
+        scope_ids=decision.allowed_scope_ids,
+    )
+    return {
+        "objects": values,
+        "count": len(values),
+        "permission_decision_id": decision.id,
+    }
+
+
+@router.post("/v1/entities/identifiers")
+def link_external_identifier(
+    body: ExternalIdentifierRequest, request: Request
+) -> dict[str, Any]:
+    brain = _app(request)
+    entity = brain.store.get_entity(body.entity_id)
+    if not entity or entity["organization_id"] != body.organization_id:
+        raise HTTPException(404, "entity not found")
+    try:
+        return brain.reality.link_identifier(**body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.get("/v1/entities/identifiers")
+def list_external_identifiers(
+    request: Request, organization_id: str, entity_id: str | None = None
+) -> dict[str, Any]:
+    values = _app(request).reality.list_identifiers(
+        organization_id, entity_id=entity_id
+    )
+    return {"identifiers": values, "count": len(values)}
+
+
+@router.get("/v1/entity-resolution/candidates")
+def list_entity_resolution_candidates(
+    request: Request, organization_id: str, status: str | None = None
+) -> dict[str, Any]:
+    candidates = _app(request).reality.list_resolution_candidates(
+        organization_id, status=status
+    )
+    return {"candidates": candidates, "count": len(candidates)}
+
+
+@router.post("/v1/entity-resolution/candidates/{candidate_id}:decide")
+def decide_entity_resolution_candidate(
+    candidate_id: str,
+    body: ResolutionDecisionRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return _app(request).reality.decide_resolution_candidate(
+            candidate_id,
+            approved=body.approved,
+            decided_by=body.decided_by,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "resolution candidate not found") from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/v1/facts")
+def assert_reality_fact(
+    body: FactAssertionRequest, request: Request
+) -> dict[str, Any]:
+    brain = _app(request)
+    scope = brain.store.get_scope(body.scope_id)
+    if not scope or scope["organization_id"] != body.organization_id:
+        raise HTTPException(400, "scope does not belong to organization")
+    return brain.reality.assert_fact(**body.model_dump())
+
+
+@router.get("/v1/facts")
+def list_reality_facts(
+    request: Request,
+    organization_id: str,
+    acting_principal_id: str,
+    subject_id: str | None = None,
+    predicate: str | None = None,
+    valid_at: str | None = None,
+    known_at: str | None = None,
+) -> dict[str, Any]:
+    brain = _app(request)
+    decision = brain.authz.resolve(
+        organization_id=organization_id,
+        acting_principal_id=acting_principal_id,
+        purpose="fact_query",
+    )
+    facts = brain.reality.current_facts(
+        organization_id,
+        subject_id=subject_id,
+        predicate=predicate,
+        valid_at=valid_at,
+        known_at=known_at,
+        scope_ids=decision.allowed_scope_ids,
+    )
+    return {
+        "facts": facts,
+        "count": len(facts),
+        "permission_decision_id": decision.id,
+    }
+
+
+@router.get("/v1/fact-conflicts")
+def list_fact_conflicts(
+    request: Request,
+    organization_id: str,
+    acting_principal_id: str,
+    status: str | None = None,
+) -> dict[str, Any]:
+    brain = _app(request)
+    decision = brain.authz.resolve(
+        organization_id=organization_id,
+        acting_principal_id=acting_principal_id,
+        purpose="fact_conflict_query",
+    )
+    conflicts = brain.reality.list_conflicts(
+        organization_id,
+        status=status,
+        scope_ids=decision.allowed_scope_ids,
+    )
+    return {
+        "conflicts": conflicts,
+        "count": len(conflicts),
+        "permission_decision_id": decision.id,
+    }
+
+
+@router.post("/v1/fact-conflicts/{conflict_id}:resolve")
+def resolve_fact_conflict(
+    conflict_id: str,
+    body: ConflictResolutionRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return _app(request).reality.resolve_conflict(
+            conflict_id,
+            winner_fact_id=body.winner_fact_id,
+            decided_by=body.decided_by,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "fact conflict not found") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/v1/cases")
+def list_reality_cases(
+    request: Request,
+    organization_id: str,
+    acting_principal_id: str,
+    status: str | None = None,
+) -> dict[str, Any]:
+    brain = _app(request)
+    decision = brain.authz.resolve(
+        organization_id=organization_id,
+        acting_principal_id=acting_principal_id,
+        purpose="case_query",
+    )
+    cases = brain.reality.list_cases(
+        organization_id,
+        statuses={status} if status else None,
+        scope_ids=decision.allowed_scope_ids,
+    )
+    return {
+        "cases": cases,
+        "count": len(cases),
+        "permission_decision_id": decision.id,
+    }
+
+
+@router.get("/v1/cases/{case_id}/timeline")
+def get_case_timeline(
+    case_id: str,
+    request: Request,
+    organization_id: str,
+    acting_principal_id: str,
+) -> dict[str, Any]:
+    brain = _app(request)
+    decision = brain.authz.resolve(
+        organization_id=organization_id,
+        acting_principal_id=acting_principal_id,
+        purpose="case_query",
+    )
+    visible = {
+        case["id"]
+        for case in brain.reality.list_cases(
+            organization_id, scope_ids=decision.allowed_scope_ids
+        )
+    }
+    if case_id not in visible:
+        raise HTTPException(404, "case not found")
+    events = brain.reality.case_timeline(case_id)
+    return {"case_id": case_id, "events": events, "count": len(events)}
+
+
+@router.post("/v1/cases/{case_id}:update")
+def update_reality_case(
+    case_id: str, body: CaseUpdateRequest, request: Request
+) -> dict[str, Any]:
+    try:
+        return _app(request).reality.update_case(
+            case_id, **body.model_dump()
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "case not found") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/v1/judgments")
+def record_judgment(
+    body: JudgmentRequest, request: Request
+) -> dict[str, Any]:
+    return _app(request).reality.record_judgment(**body.model_dump())
+
+
+@router.get("/v1/judgments")
+def list_judgments(
+    request: Request,
+    organization_id: str,
+    acting_principal_id: str,
+    principal_id: str | None = None,
+    judgment_type: str | None = None,
+) -> dict[str, Any]:
+    values = _app(request).reality.list_judgments(
+        organization_id,
+        principal_id=principal_id,
+        judgment_type=judgment_type,
+    )
+    values = [
+        item
+        for item in values
+        if item.get("principal_id") in {None, acting_principal_id}
+    ]
+    return {"judgments": values, "count": len(values)}
+
+
+@router.post("/v1/policies")
+def create_conditional_policy(
+    body: ConditionalPolicyRequest, request: Request
+) -> dict[str, Any]:
+    data = body.model_dump()
+    data["status"] = "pending"
+    return _app(request).policy.create_version(**data)
+
+
+@router.post("/v1/policies/{policy_id}:activate")
+def activate_conditional_policy(
+    policy_id: str, body: PolicyActivationRequest, request: Request
+) -> dict[str, Any]:
+    try:
+        return _app(request).policy.activate(
+            policy_id, approved_by=body.approved_by
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "policy not found") from exc
+
+
+@router.get("/v1/policies")
+def list_conditional_policies(
+    request: Request,
+    organization_id: str,
+    policy_key: str | None = None,
+) -> dict[str, Any]:
+    values = _app(request).policy.list_versions(
+        organization_id, policy_key=policy_key
+    )
+    return {"policies": values, "count": len(values)}
+
+
+@router.post("/v1/artifacts")
+def create_artifact(
+    body: ArtifactRequest, request: Request
+) -> dict[str, Any]:
+    try:
+        return _app(request).artifacts.create(**body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/v1/artifacts")
+def list_artifacts(
+    request: Request,
+    organization_id: str,
+    acting_principal_id: str,
+    artifact_type: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    brain = _app(request)
+    decision = brain.authz.resolve(
+        organization_id=organization_id,
+        acting_principal_id=acting_principal_id,
+        purpose="artifact_query",
+    )
+    values = brain.artifacts.list(
+        organization_id,
+        scope_ids=decision.allowed_scope_ids,
+        artifact_type=artifact_type,
+        run_id=run_id,
+    )
+    return {
+        "artifacts": values,
+        "count": len(values),
+        "permission_decision_id": decision.id,
+    }
+
+
+@router.get("/v1/artifacts/{artifact_id}")
+def get_artifact(
+    artifact_id: str,
+    request: Request,
+    acting_principal_id: str,
+) -> dict[str, Any]:
+    brain = _app(request)
+    artifact = brain.artifacts.get(artifact_id)
+    if not artifact:
+        raise HTTPException(404, "artifact not found")
+    decision = brain.authz.resolve(
+        organization_id=artifact["organization_id"],
+        acting_principal_id=acting_principal_id,
+        purpose="artifact_query",
+    )
+    if artifact["scope_id"] not in set(decision.allowed_scope_ids):
+        raise HTTPException(404, "artifact not found")
+    return {
+        "artifact": artifact,
+        "permission_decision_id": decision.id,
+    }
 
 
 # ---- ingestion ----

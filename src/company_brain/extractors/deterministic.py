@@ -59,6 +59,8 @@ class DeterministicExtractor:
         participant_ids: list[str] | None = None,
         is_private: bool = False,
         entity_name_map: dict[str, str] | None = None,
+        occurred_at: Any | None = None,
+        observed_at: Any | None = None,
     ) -> ExtractionResult:
         entity_ids = list(entity_ids or [])
         participant_ids = list(participant_ids or [])
@@ -96,7 +98,8 @@ class DeterministicExtractor:
                 is_private=is_private,
                 extraction_method=self.name,
                 model_version=self.model_version,
-                observed_at=utcnow(),
+                valid_from=occurred_at or utcnow(),
+                observed_at=observed_at or utcnow(),
                 created_at=utcnow(),
                 **kwargs,
             )

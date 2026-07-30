@@ -65,6 +65,44 @@ class ContextService:
         people: list[dict[str, Any]] = []
         relationships: list[dict[str, Any]] = []
 
+        for fact in search.get("reality_facts") or []:
+            current_facts.append(
+                {
+                    "id": fact["id"],
+                    "content": (
+                        f"{fact['subject_id']} {fact['predicate']} "
+                        f"{fact['object_value']}"
+                    ),
+                    "subject_id": fact["subject_id"],
+                    "predicate": fact["predicate"],
+                    "object_value": fact["object_value"],
+                    "confidence": fact.get("confidence"),
+                    "authority": fact.get("authority"),
+                    "source_ids": fact.get("source_ids"),
+                    "valid_from": fact.get("valid_from"),
+                    "valid_to": fact.get("valid_to"),
+                    "system_from": fact.get("system_from"),
+                    "status": fact.get("status"),
+                    "score": fact.get("score"),
+                }
+            )
+        if self.retrieval.reality:
+            for conflict in self.retrieval.reality.list_conflicts(
+                organization_id,
+                scope_ids=search.get("allowed_scope_ids") or [],
+            )[:20]:
+                contradictions.append(
+                    {
+                        "id": conflict["id"],
+                        "subject_id": conflict["subject_id"],
+                        "predicate": conflict["predicate"],
+                        "objects": conflict.get("objects") or [],
+                        "status": conflict["status"],
+                        "kind": conflict["kind"],
+                        "resolution": conflict.get("resolution"),
+                    }
+                )
+
         seen_source: set[str] = set()
         for r in results:
             mem = r["memory"]
@@ -183,6 +221,32 @@ class ContextService:
                     }
                 )
 
+        active_cases: list[dict[str, Any]] = []
+        judgment_guidance: list[dict[str, Any]] = []
+        if self.retrieval.reality:
+            relevant_entity_ids = set(eids)
+            for case in self.retrieval.reality.list_cases(
+                organization_id,
+                statuses={"open", "investigating"},
+                scope_ids=search.get("allowed_scope_ids") or [],
+            ):
+                if not relevant_entity_ids or relevant_entity_ids.intersection(
+                    case.get("entity_ids") or []
+                ):
+                    active_cases.append(
+                        {
+                            "id": case["id"],
+                            "title": case["title"],
+                            "status": case["status"],
+                            "case_type": case["case_type"],
+                            "entity_ids": case.get("entity_ids") or [],
+                            "source_ids": case.get("source_ids") or [],
+                        }
+                    )
+            judgment_guidance = self.retrieval.reality.judgment_guidance(
+                organization_id, acting_principal_id
+            )
+
         # Budget by priority (spec §8.11)
         ordered_sections: list[tuple[str, list[dict[str, Any]]]] = [
             ("current_facts", current_facts),
@@ -240,6 +304,8 @@ class ContextService:
             recent_events=budgeted["related_messages"][:8],
             related_messages=budgeted["related_messages"][:12],
             active_runs=active_runs,
+            active_cases=active_cases[:10],
+            judgment_guidance=judgment_guidance[:10],
             warnings=[],
             contradictions=budgeted["contradictions"][:10],
             sources=budgeted["sources"],
