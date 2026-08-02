@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Callable
 
 from docket.domain.models import new_id, utcnow
@@ -47,6 +48,38 @@ class ToolRegistry:
         self._tools[definition.name] = RegisteredTool(
             definition=definition, handler=registered.handler
         )
+
+    def capabilities(self) -> set[str]:
+        """Expose stable capability names for skill readiness matching."""
+        capabilities: set[str] = set()
+        for name in self._tools:
+            if name in {"brain_create_artifact", "slack_send_artifact"}:
+                capabilities.add("documents.write")
+            elif name == "brain_list_artifacts":
+                capabilities.add("documents.read")
+            elif name == "web_search":
+                capabilities.add("web.search")
+            elif name == "web_fetch":
+                capabilities.add("web.fetch")
+            elif name.startswith("brain_"):
+                capabilities.add("memory.read")
+            elif name.startswith("slack_"):
+                capabilities.add("slack.actions")
+            elif name in {"composio_search", "composio_describe", "composio_execute"}:
+                capabilities.add("connectors.composio")
+            elif name == "workspace_read":
+                capabilities.add("workspace.read")
+            elif name == "workspace_write":
+                capabilities.add("workspace.write")
+            elif name == "workspace_patch":
+                capabilities.add("workspace.write")
+            elif name == "workspace_list":
+                capabilities.add("workspace.list")
+        # The document package can use the artifact surface for extraction and
+        # creation; this marker is intentionally coarse and policy-filtered.
+        if "documents.write" in capabilities or "documents.read" in capabilities:
+            capabilities.add("documents.read")
+        return capabilities
 
 
 def _object_schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -126,8 +159,168 @@ def build_tool_registry(
     run_code_enabled: bool = False,
     run_code_timeout_seconds: int = 60,
     run_code_max_tool_calls: int = 20,
+    workspace_root: Path | str | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
+
+    workspace = Path(workspace_root or Path.cwd()).expanduser().resolve()
+
+    def _workspace_root(runtime: dict[str, Any] | None = None) -> Path:
+        run_id = str((runtime or {}).get("run_id") or "shared")
+        root = (workspace / ".docket-workspaces" / run_id).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _workspace_path(relative_path: str, runtime: dict[str, Any] | None = None) -> Path:
+        root = _workspace_root(runtime)
+        candidate = (root / relative_path).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ValueError("workspace path escapes the configured workspace root")
+        return candidate
+
+    registry.register(
+        ToolDefinition(
+            name="workspace_list",
+            description="List files under the configured workspace root.",
+            input_schema=_object_schema(
+                {
+                    "path": {"type": "string"},
+                    "recursive": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                },
+                [],
+            ),
+            risk="read",
+        ),
+        lambda args, _runtime: {
+            "root": str(_workspace_root(_runtime)),
+            "files": [
+                str(path.relative_to(_workspace_root(_runtime)))
+                for path in sorted(
+                    (_workspace_path(args.get("path", ""), _runtime)).rglob("*")
+                    if args.get("recursive")
+                    else (_workspace_path(args.get("path", ""), _runtime)).glob("*")
+                )
+                if path.is_file()
+            ][: min(int(args.get("limit", 100)), 500)],
+        },
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="workspace_read",
+            description="Read a UTF-8 text file under the configured workspace root.",
+            input_schema=_object_schema(
+                {"path": {"type": "string"}, "max_chars": {"type": "integer", "minimum": 1, "maximum": 200000}},
+                ["path"],
+            ),
+            risk="read",
+        ),
+        lambda args, _runtime: {
+            "path": args["path"],
+            "content": _workspace_path(args["path"], _runtime).read_text(encoding="utf-8")[: int(args.get("max_chars", 50000))],
+        },
+    )
+
+    def _workspace_write(args: dict[str, Any], _runtime: dict[str, Any]) -> dict[str, Any]:
+        path = _workspace_path(args["path"], _runtime)
+        content = str(args["content"])
+        if len(content.encode("utf-8")) > 1_000_000:
+            raise ValueError("workspace writes are limited to 1 MB")
+        run_root = _workspace_root(_runtime)
+        current_bytes = sum(item.stat().st_size for item in run_root.rglob("*") if item.is_file()) if run_root.exists() else 0
+        if current_bytes - (path.stat().st_size if path.exists() else 0) + len(content.encode("utf-8")) > 10_000_000:
+            raise ValueError("per-run workspace quota exceeded (10 MB)")
+        if any(marker in content for marker in ("OPENAI_API_KEY=", "SLACK_BOT_TOKEN=", "xoxb-", "-----BEGIN PRIVATE KEY-----")):
+            raise ValueError("workspace writes cannot contain obvious secrets")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return {"path": args["path"], "bytes": len(content.encode("utf-8"))}
+
+    registry.register(
+        ToolDefinition(
+            name="workspace_write",
+            description="Write a UTF-8 text file under the configured workspace root after approval.",
+            input_schema=_object_schema({"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
+            risk="write",
+            approval_required=True,
+        ),
+        _workspace_write,
+    )
+
+    def _workspace_search(args: dict[str, Any], _runtime: dict[str, Any]) -> dict[str, Any]:
+        query = str(args["query"])
+        if not query:
+            raise ValueError("query is required")
+        base = _workspace_path(args.get("path", ""), _runtime)
+        suffix = args.get("extension")
+        matches: list[dict[str, Any]] = []
+        for path in sorted(base.rglob("*") if base.is_dir() else [base]):
+            if not path.is_file() or (suffix and path.suffix != suffix):
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (UnicodeDecodeError, OSError):
+                continue
+            for line_no, line in enumerate(lines, 1):
+                if query.lower() in line.lower():
+                    matches.append({"path": str(path.relative_to(_workspace_root(_runtime))), "line": line_no, "text": line[:500]})
+                    if len(matches) >= min(int(args.get("limit", 50)), 200):
+                        return {"matches": matches}
+        return {"matches": matches}
+
+    registry.register(
+        ToolDefinition(
+            name="workspace_search",
+            description="Search UTF-8 text files under the configured workspace root.",
+            input_schema=_object_schema(
+                {"query": {"type": "string"}, "path": {"type": "string"}, "extension": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}},
+                ["query"],
+            ),
+            risk="read",
+        ),
+        _workspace_search,
+    )
+
+    def _workspace_patch(args: dict[str, Any], _runtime: dict[str, Any]) -> dict[str, Any]:
+        path = _workspace_path(args["path"], _runtime)
+        original = path.read_text(encoding="utf-8")
+        old = str(args["old_text"])
+        new = str(args["new_text"])
+        if original.count(old) != 1:
+            raise ValueError("old_text must match exactly once")
+        updated = original.replace(old, new, 1)
+        if any(marker in updated for marker in ("OPENAI_API_KEY=", "SLACK_BOT_TOKEN=", "xoxb-", "-----BEGIN PRIVATE KEY-----")):
+            raise ValueError("workspace patches cannot contain obvious secrets")
+        path.write_text(updated, encoding="utf-8")
+        return {"path": args["path"], "changed": True}
+
+    registry.register(
+        ToolDefinition(
+            name="workspace_patch",
+            description="Apply one exact text replacement inside a workspace file after approval.",
+            input_schema=_object_schema({"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, ["path", "old_text", "new_text"]),
+            risk="write",
+            approval_required=True,
+        ),
+        _workspace_patch,
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="workspace_diff",
+            description="Compare two workspace text files and return a bounded unified diff.",
+            input_schema=_object_schema({"before": {"type": "string"}, "after": {"type": "string"}}, ["before", "after"]),
+            risk="read",
+        ),
+        lambda args, _runtime: {
+            "diff": "\n".join(__import__("difflib").unified_diff(
+                _workspace_path(args["before"], _runtime).read_text(encoding="utf-8").splitlines(),
+                _workspace_path(args["after"], _runtime).read_text(encoding="utf-8").splitlines(),
+                fromfile=args["before"], tofile=args["after"], lineterm=""
+            ))[:100_000]
+        },
+    )
 
     registry.register(
         ToolDefinition(
@@ -217,6 +410,41 @@ def build_tool_registry(
         ),
         _set_slack_channel_proactivity,
     )
+
+    if slack_sender:
+        def _slack_send_message(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+            destination = runtime["destination"]
+            if destination.get("type") not in {"slack_channel", "private_channel", "dm"}:
+                raise ValueError("outbound Slack action requires the current Slack destination")
+            return slack_sender.send(channel_id=str(destination["id"]), text=args["text"], blocks=args.get("blocks"))
+
+        registry.register(
+            ToolDefinition(
+                name="slack_send_message",
+                description="Send an explicit outbound message to the current Slack conversation after approval.",
+                input_schema=_object_schema({"text": {"type": "string"}, "blocks": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, ["text"]),
+                risk="write",
+                approval_required=True,
+            ),
+            _slack_send_message,
+        )
+
+        def _slack_react(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+            destination = runtime["destination"]
+            if destination.get("type") not in {"slack_channel", "private_channel", "dm"}:
+                raise ValueError("Slack reactions require the current Slack destination")
+            return slack_sender.react(channel_id=str(destination["id"]), timestamp=args["timestamp"], name=args["name"])
+
+        registry.register(
+            ToolDefinition(
+                name="slack_react",
+                description="Add a reaction to a message in the current Slack conversation after approval.",
+                input_schema=_object_schema({"timestamp": {"type": "string"}, "name": {"type": "string"}}, ["timestamp", "name"]),
+                risk="write",
+                approval_required=True,
+            ),
+            _slack_react,
+        )
 
     # Internet content is deliberately isolated from company retrieval. It is
     # read-only, opt-in for search, and explicitly marked untrusted in prompts.
@@ -617,6 +845,166 @@ def build_tool_registry(
         },
     )
 
+    registry.register(
+        ToolDefinition(
+            name="skills_list",
+            description=(
+                "List approved Docket skills available to this organization, "
+                "including immutable built-in and connector packages."
+            ),
+            input_schema=_object_schema(
+                {
+                    "query": {"type": "string"},
+                    "include_company": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                },
+                [],
+            ),
+            risk="read",
+        ),
+        lambda args, runtime: {
+            "skills": [
+                {
+                    key: skill.get(key)
+                    for key in (
+                        "id", "name", "description", "version", "status", "kind",
+                        "immutable", "activation_mode", "activation", "required_capabilities",
+                        "license", "origin", "content_hash", "platform_key",
+                    )
+                }
+                for skill in skills.search(
+                    runtime["organization_id"],
+                    args.get("query", ""),
+                    limit=min(int(args.get("limit", 20)), 50),
+                )
+                if bool(args.get("include_company", True)) or skill.get("kind") != "company"
+            ]
+        },
+    )
+
+    def _view_skill(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        package = skills.package_catalog.get(args["name"])
+        if package:
+            skills.audit.record(
+                runtime["organization_id"],
+                "skill.package.viewed",
+                {"name": package.manifest.name, "content_hash": package.content_hash, "run_id": runtime["run_id"]},
+                principal_id=runtime["principal_id"],
+            )
+            result = {
+                "metadata": next(
+                    item for item in skills.package_catalog.metadata()
+                    if item["name"] == package.manifest.name
+                ),
+                "instructions": package.body,
+            }
+            if args.get("resource_path"):
+                result["resource"] = skills.package_catalog.resource(
+                    package.manifest.name, str(args["resource_path"])
+                )
+            return result
+        matches = skills.search(runtime["organization_id"], args["name"], limit=10)
+        exact = next((item for item in matches if item.get("name") == args["name"]), None)
+        if not exact:
+            raise KeyError("skill not found")
+        skills.audit.record(
+            runtime["organization_id"],
+            "skill.company.viewed",
+            {"skill_id": exact["id"], "run_id": runtime["run_id"]},
+            principal_id=runtime["principal_id"],
+        )
+        return {"skill": exact, "instructions": exact.get("instructions", "")}
+
+    registry.register(
+        ToolDefinition(
+            name="skill_view",
+            description="View the trusted instructions and metadata for one skill.",
+            input_schema=_object_schema({"name": {"type": "string"}, "resource_path": {"type": "string"}}, ["name"]),
+            risk="read",
+        ),
+        _view_skill,
+    )
+    registry.register(
+        ToolDefinition(
+            name="skill_validate",
+            description="Preview a company skill definition for completeness and prompt-injection markers.",
+            input_schema=_object_schema({"definition": {"type": "object", "additionalProperties": True}}, ["definition"]),
+            risk="read",
+        ),
+        lambda args, _runtime: skills.validate_definition(args["definition"]),
+    )
+
+    def _session_search(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        run = store.get_harness_record("agent_runs", runtime["run_id"])
+        session_id = (run or {}).get("session_id")
+        if not session_id:
+            return {"messages": []}
+        session = store.get_harness_record("agent_sessions", session_id)
+        messages = store.session_messages(session_id, limit=min(int(args.get("limit", 20)), 100))
+        query = str(args.get("query") or "").lower()
+        if query:
+            messages = [item for item in messages if query in str(item.get("content", "")).lower()]
+        return {
+            "conversation_id": (session or {}).get("conversation_key"),
+            "messages": [
+                {"id": item.get("id"), "role": item.get("role"), "content": item.get("content"), "created_at": item.get("created_at"), "metadata": item.get("metadata") or {}}
+                for item in messages[-min(int(args.get("limit", 20)), 100):]
+            ],
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="session_search",
+            description="Search the current authorized conversation's exact agent/user history.",
+            input_schema=_object_schema({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, []),
+            risk="read",
+        ),
+        _session_search,
+    )
+
+    def _plan_record(runtime: dict[str, Any]) -> dict[str, Any]:
+        record = store.get_harness_record("agent_runs", runtime["run_id"])
+        if not record:
+            raise KeyError("run not found")
+        return record
+
+    def _plan_create(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        run = _plan_record(runtime)
+        plan = {"title": args["title"], "items": args.get("items") or [], "updated_at": utcnow().isoformat()}
+        run["plan"] = plan
+        run["updated_at"] = plan["updated_at"]
+        store.upsert_agent_run(run)
+        return {"plan": plan}
+
+    def _plan_get(_args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        return {"plan": _plan_record(runtime).get("plan")}
+
+    def _plan_update(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        run = _plan_record(runtime)
+        plan = dict(run.get("plan") or {"title": "", "items": []})
+        if args.get("title") is not None:
+            plan["title"] = args["title"]
+        if args.get("items") is not None:
+            plan["items"] = args["items"]
+        plan["updated_at"] = utcnow().isoformat()
+        run["plan"] = plan
+        run["updated_at"] = plan["updated_at"]
+        store.upsert_agent_run(run)
+        return {"plan": plan}
+
+    registry.register(
+        ToolDefinition(name="plan_create", description="Create a structured plan attached to the current run.", input_schema=_object_schema({"title": {"type": "string"}, "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, ["title"]), risk="read"),
+        _plan_create,
+    )
+    registry.register(
+        ToolDefinition(name="plan_get", description="Read the current run's structured plan.", input_schema=_object_schema({}, []), risk="read"),
+        _plan_get,
+    )
+    registry.register(
+        ToolDefinition(name="plan_update", description="Update the current run's structured plan.", input_schema=_object_schema({"title": {"type": "string"}, "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, []), risk="read"),
+        _plan_update,
+    )
+
     _skill_step_schema = _object_schema(
         {
             "order": {"type": "integer", "minimum": 1},
@@ -626,6 +1014,32 @@ def build_tool_registry(
         },
         ["name", "description"],
     )
+
+    def _propose_skill_create(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        definition = {
+            key: args.get(key)
+            for key in ("name", "description", "goal", "steps", "inputs", "preconditions", "warnings")
+            if args.get(key) is not None
+        }
+        validation = skills.validate_definition(definition)
+        if not validation["valid"]:
+            raise ValueError("invalid skill proposal: " + "; ".join(validation["errors"]))
+        return {
+            "skill": skills.create(
+                organization_id=runtime["organization_id"],
+                name=args["name"],
+                description=args["description"],
+                goal=args["goal"],
+                steps=args.get("steps") or [],
+                inputs=args.get("inputs") or [],
+                preconditions=args.get("preconditions") or [],
+                warnings=args.get("warnings") or [],
+                owner_id=runtime["principal_id"],
+                status="draft",
+            ),
+            "validation": validation,
+            "note": "Created as a draft. A human must approve it before it takes effect.",
+        }
 
     registry.register(
         ToolDefinition(
@@ -652,21 +1066,7 @@ def build_tool_registry(
             risk="write",
             approval_required=True,
         ),
-        lambda args, runtime: {
-            "skill": skills.create(
-                organization_id=runtime["organization_id"],
-                name=args["name"],
-                description=args["description"],
-                goal=args["goal"],
-                steps=args.get("steps") or [],
-                inputs=args.get("inputs") or [],
-                preconditions=args.get("preconditions") or [],
-                warnings=args.get("warnings") or [],
-                owner_id=runtime["principal_id"],
-                status="draft",
-            ),
-            "note": "Created as a draft. A human must approve it before it takes effect.",
-        },
+        _propose_skill_create,
     )
 
     registry.register(
@@ -1068,6 +1468,36 @@ class ToolExecutor:
             if policy.get("enabled", True) and definition.risk != "destructive":
                 definitions.append(definition)
         return definitions
+
+    def available_capabilities(self, run: dict[str, Any]) -> set[str]:
+        """Return capabilities that are actually enabled for this run."""
+        org = run["organization_id"]
+        names = {definition.name for definition in self.allowed_definitions(run)}
+        capabilities = self.registry.capabilities()
+        # A disabled policy or specialist allow-list must remove the associated
+        # capability rather than merely hiding individual tool schemas.
+        if "web_search" not in names:
+            capabilities.discard("web.search")
+        if "web_fetch" not in names:
+            capabilities.discard("web.fetch")
+        if not any(name.startswith("brain_") for name in names):
+            capabilities.discard("memory.read")
+        if not any(name in {"brain_create_artifact", "brain_list_artifacts", "slack_send_artifact"} for name in names):
+            capabilities.discard("documents.read")
+            capabilities.discard("documents.write")
+        if not any(name.startswith("slack_") for name in names):
+            capabilities.discard("slack.actions")
+        if not any(name in {"composio_search", "composio_describe", "composio_execute"} for name in names):
+            capabilities.discard("connectors.composio")
+        elif not self.store.list_connector_accounts(org, active_only=True):
+            capabilities.discard("connectors.composio")
+        if "workspace_read" not in names:
+            capabilities.discard("workspace.read")
+        if not any(name in {"workspace_write", "workspace_patch"} for name in names):
+            capabilities.discard("workspace.write")
+        if "workspace_list" not in names:
+            capabilities.discard("workspace.list")
+        return capabilities
 
     def execute(
         self,

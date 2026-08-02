@@ -91,12 +91,21 @@ flowchart LR
 | Authorization | Principal, destination, membership, and scope resolution | `services/authorization.py` |
 | Agent runtime | Bounded model → tool → observation loop and resumable states | `harness/runtime.py`, `harness/run_store.py`, `harness/prompts.py` |
 | Tools and actions | Schema validation, policy checks, previews, approvals, idempotency | `harness/tools.py`, `services/policy.py` |
+| Skill packages | Immutable file-backed `SKILL.md` procedures, provenance, readiness, and run-level pinning | `services/skill_packages.py`, `builtin_skills/`, `services/skills.py` |
 | Specialists | Parallel read-only child runs with inherited permissions and budgets | `harness/specialists.py` |
 | Retrieval | Permission-filtered lexical, FTS5, vector, graph, fact, case, and run context | `services/retrieval.py`, `services/context.py` |
 | Reality | Connector objects, identity resolution, temporal facts, conflicts, and cases | `services/reality.py` |
 | Memory | Atomic memories, temporal revisions, relations, profiles, and extraction | `services/memory.py`, `harness/extraction.py`, `harness/memory_capture.py` |
 | Proactivity | Retrieval-first attention followed by deterministic delivery policy | `harness/attention.py`, `services/proactive.py` |
 | Durability | SQLite state, leased jobs, retries, artifacts, traces, and audit | `storage/db.py`, `harness/jobs.py`, `harness/worker.py`, `services/artifacts.py` |
+
+Built-in and connector procedures are not database-only rows. The authoritative
+content lives in validated `src/docket/builtin_skills/**/SKILL.md` packages.
+SQLite materializes a tenant-aware index so company skills can be reset or
+versioned independently. Each run resolves mandatory destination skills and
+relevant optional skills, checks declared capabilities, and pins the package
+hash and instructions into its trace. Use `GET /v1/skills/catalog` to inspect
+the package inventory and readiness; the Skills console shows the same view.
 
 ### How an event becomes action and memory
 
@@ -155,6 +164,12 @@ always performed for an acting principal and destination.
   deterministic zero-cost providers for tests and local development
 - Optional Brave Search and a safe public-page fetch tool; both are read-only,
   and fetched web content is explicitly treated as untrusted evidence
+- 44 immutable Hermes-adapted skill packages with YAML frontmatter, provenance,
+  readiness checks, progressive body loading, Slack response validation, and
+  company-skill draft/approval workflows
+- Root-confined per-run workspace list/search/read/write/patch/diff tools,
+  session search, durable run plans, explicit Slack actions, and approval-gated
+  automation management
 - Permission-filtered hybrid retrieval across evidence, memories, FTS5,
   embeddings, graph relationships, temporal facts, cases, profiles, and runs
 - Canonical versioned connector objects, per-stream sync cursors, cross-tool
@@ -202,8 +217,10 @@ The same local UI optionally accepts Brave Search and Firecrawl keys. Brave
 finds public sources; Firecrawl converts public pages and URL-addressable PDFs
 to clean markdown. Without Firecrawl, `web_fetch` uses a safe, read-only direct
 fetch fallback; without Brave, the agent does not get web search. Browser
-automation, shell execution, and general computer control are not part of the
-company gateway's trusted tool surface.
+automation and unrestricted shell/computer control are not part of the company
+gateway's trusted tool surface. `run_code` remains a bounded, approval-gated
+read-only sandbox; workspace tools operate only inside a per-run directory under
+the configured workspace root.
 
 The gateway creates the SQLite database when needed but does not seed demo data.
 For a synthetic Acme organization, seed it explicitly:

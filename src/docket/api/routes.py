@@ -161,6 +161,10 @@ class SkillCreateRequest(BaseModel):
     response_validation: dict[str, Any] = Field(default_factory=dict)
     scope_id: str = "scope_org_public"
     status: str = "approved"
+    instructions: str = ""
+    kind: str = "company"
+    immutable: bool = False
+    required_capabilities: dict[str, Any] = Field(default_factory=dict)
 
 
 class SkillSearchRequest(BaseModel):
@@ -2383,7 +2387,35 @@ def correct_memory(memory_id: str, body: dict[str, Any], request: Request) -> di
 
 @router.post("/v1/skills")
 def create_skill(body: SkillCreateRequest, request: Request) -> dict[str, Any]:
-    return _app(request).skills.create(**body.model_dump())
+    try:
+        return _app(request).skills.create(**body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/v1/skills/catalog")
+def skill_catalog(request: Request, organization_id: str = "org_acme") -> dict[str, Any]:
+    brain = _app(request)
+    capabilities = brain.tool_registry.capabilities()
+    if not brain.store.list_connector_accounts(organization_id, active_only=True):
+        capabilities.discard("connectors.composio")
+    return {
+        "packages": brain.skill_packages.metadata(),
+        "readiness": brain.skill_packages.readiness(capabilities),
+        "capabilities": sorted(capabilities),
+    }
+
+
+@router.get("/v1/skills/catalog/{name}/resources/{relative_path:path}")
+def skill_resource(name: str, relative_path: str, request: Request) -> dict[str, Any]:
+    try:
+        return _app(request).skill_packages.resource(name, relative_path)
+    except KeyError as exc:
+        raise HTTPException(404, "skill package not found") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "skill resource not found") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.get("/v1/skills/{skill_id}")
@@ -2420,6 +2452,11 @@ def prepare_skill(body: dict[str, Any], request: Request) -> dict[str, Any]:
     return result
 
 
+@router.post("/v1/skills:validate")
+def validate_skill(body: dict[str, Any], request: Request) -> dict[str, Any]:
+    return _app(request).skills.validate_definition(body)
+
+
 @router.post("/v1/skills/{skill_id}:propose-update")
 def propose_skill_update(skill_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
     try:
@@ -2441,7 +2478,10 @@ def skill_versions(skill_id: str, request: Request) -> dict[str, Any]:
 
 @router.post("/v1/skills/{skill_id}/versions/{version}:approve")
 def approve_skill_version(skill_id: str, version: int, request: Request) -> dict[str, Any]:
-    skill = _app(request).skills.approve(skill_id, version)
+    try:
+        skill = _app(request).skills.approve(skill_id, version)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not skill:
         raise HTTPException(404, "skill version not found")
     return skill

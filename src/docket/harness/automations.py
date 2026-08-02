@@ -320,6 +320,20 @@ class AutomationService:
         self._upsert(automation)
         return automation
 
+    def delete(self, automation_id: str) -> dict[str, Any]:
+        automation = self.store.get_harness_record("automations", automation_id)
+        if not automation:
+            raise KeyError(automation_id)
+        with self.store.cursor() as cur:
+            cur.execute("DELETE FROM automations WHERE id = ?", (automation_id,))
+        self.audit.record(
+            automation["organization_id"],
+            "automation.deleted",
+            {"automation_id": automation_id},
+            principal_id=automation.get("principal_id"),
+        )
+        return {"id": automation_id, "deleted": True}
+
     def _upsert(self, automation: dict[str, Any]) -> None:
         with self.store.cursor() as cur:
             cur.execute(

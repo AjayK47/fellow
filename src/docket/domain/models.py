@@ -279,6 +279,13 @@ class SkillResponseValidation(BaseModel):
     instructions: str = ""
 
 
+class SkillKind(str, Enum):
+    BUILTIN = "builtin"
+    CONNECTOR = "connector"
+    COMPANY = "company"
+    MARKETPLACE = "marketplace"
+
+
 class Skill(BaseModel):
     id: str = Field(default_factory=lambda: new_id("skill"))
     organization_id: str
@@ -298,6 +305,14 @@ class Skill(BaseModel):
     response_validation: SkillResponseValidation = Field(
         default_factory=SkillResponseValidation
     )
+    instructions: str = ""
+    kind: SkillKind = SkillKind.COMPANY
+    immutable: bool = False
+    content_hash: str = ""
+    package_path: str = ""
+    license: str = "unspecified"
+    origin: dict[str, Any] = Field(default_factory=dict)
+    required_capabilities: dict[str, Any] = Field(default_factory=dict)
     platform_key: str | None = None
     owner_id: str | None = None
     scope_id: str = "scope_org_public"

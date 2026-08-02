@@ -57,6 +57,8 @@ _WRITE_TOOL_DUMMY_ARGS: dict[str, dict] = {
     },
     "composio_execute": {"tool_slug": "FAKE_SLUG", "arguments": {}},
     "run_code": {"code": "print(1)"},
+    "workspace_write": {"path": "redteam.txt", "content": "x"},
+    "workspace_patch": {"path": "redteam.txt", "old_text": "x", "new_text": "y"},
     "skill_propose_create": {
         "name": "redteam skill",
         "description": "d",
@@ -68,6 +70,17 @@ _WRITE_TOOL_DUMMY_ARGS: dict[str, dict] = {
         "enabled": False,
         "reason": "explicit red-team policy change",
     },
+    "automation_create": {
+        "name": "redteam",
+        "goal": "redteam",
+        "conversation_id": "redteam",
+        "destination": {"type": "internal_agent_session", "id": "redteam", "is_private": True},
+    },
+    "automation_set_enabled": {"automation_id": "automation_redteam", "enabled": False},
+    "automation_run_now": {"automation_id": "automation_redteam"},
+    "automation_delete": {"automation_id": "automation_redteam"},
+    "slack_send_message": {"text": "redteam"},
+    "slack_react": {"timestamp": "0.0", "name": "white_check_mark"},
 }
 
 

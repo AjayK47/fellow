@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8080
     data_dir: Path = _default_data_dir()
+    workspace_root: Path = Field(default_factory=lambda: Path.cwd())
     db_name: str = "brain.db"
     default_org_id: str = "org_acme"
     log_level: str = "info"

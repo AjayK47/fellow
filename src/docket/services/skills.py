@@ -8,6 +8,7 @@ from docket.domain.models import (
     Skill,
     SkillActivation,
     SkillActivationMode,
+    SkillKind,
     SkillResponseValidation,
     SkillStatus,
     SkillStep,
@@ -16,12 +17,19 @@ from docket.domain.models import (
 )
 from docket.services.audit import AuditService
 from docket.storage.db import BrainStore
+from docket.services.skill_packages import SkillPackageCatalog
 
 
 class SkillsService:
-    def __init__(self, store: BrainStore, audit: AuditService) -> None:
+    def __init__(
+        self,
+        store: BrainStore,
+        audit: AuditService,
+        package_catalog: SkillPackageCatalog | None = None,
+    ) -> None:
         self.store = store
         self.audit = audit
+        self.package_catalog = package_catalog or SkillPackageCatalog()
 
     def create(
         self,
@@ -41,7 +49,29 @@ class SkillsService:
         platform_key: str | None = None,
         scope_id: str = "scope_org_public",
         status: str = "approved",
+        instructions: str = "",
+        kind: str = "company",
+        immutable: bool = False,
+        content_hash: str = "",
+        package_path: str = "",
+        license: str = "unspecified",
+        origin: dict[str, Any] | None = None,
+        required_capabilities: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if kind != SkillKind.COMPANY.value or immutable:
+            raise ValueError("only mutable company skills may be created through this API")
+        validation = self.validate_definition(
+            {
+                "name": name,
+                "description": description,
+                "goal": goal,
+                "steps": steps or [],
+                "warnings": warnings or [],
+                "instructions": instructions,
+            }
+        )
+        if not validation["valid"]:
+            raise ValueError("invalid skill definition: " + "; ".join(validation["errors"]))
         step_models = [
             SkillStep(
                 order=s.get("order", i + 1),
@@ -69,6 +99,14 @@ class SkillsService:
             response_validation=SkillResponseValidation(
                 **(response_validation or {})
             ),
+            instructions=instructions,
+            kind=SkillKind(kind) if kind in SkillKind._value2member_map_ else SkillKind.COMPANY,
+            immutable=immutable,
+            content_hash=content_hash,
+            package_path=package_path,
+            license=license,
+            origin=origin or {},
+            required_capabilities=required_capabilities or {},
             platform_key=platform_key,
             owner_id=owner_id,
             scope_id=scope_id,
@@ -84,143 +122,52 @@ class SkillsService:
         return data
 
     def ensure_platform_skills(self, organization_id: str) -> list[dict[str, Any]]:
-        """Install immutable platform skills required by the harness.
+        """Materialize immutable package skills into the tenant index.
 
-        Platform skills are capabilities of Docket itself, not company-authored
-        procedures.  They must remain available even when a tenant has no
-        organization-public memory scope yet.
+        The package files are authoritative.  SQLite only holds a searchable,
+        tenant-aware projection so reset/deletion of company data cannot remove
+        the harness procedures.
         """
         existing = {
             skill.get("platform_key"): skill
             for skill in self.list(organization_id)
             if skill.get("platform_key")
         }
-        slack_key = "destination.slack.communication"
-        slack_name = "Write for Slack"
-        if slack_key not in existing:
-            existing[slack_key] = self.create(
-                organization_id=organization_id,
-                name=slack_name,
-                description=(
-                    "Compose user-facing responses for Slack public channels, "
-                    "private channels, and DMs using native Slack conventions."
-                ),
-                goal=(
-                    "Produce concise, readable Slack messages with valid mrkdwn, "
-                    "links, citations, and channel-appropriate structure."
-                ),
-                steps=[
+        materialized: list[dict[str, Any]] = []
+        for package in self.package_catalog.list():
+            manifest = package.manifest
+            platform_key = manifest.platform_key or f"{manifest.kind}.{manifest.name}"
+            old = existing.get(platform_key)
+            skill_id = old.get("id") if old else new_id("skill_builtin")
+            data = package.as_record(organization_id=organization_id, skill_id=skill_id)
+            if old and old.get("created_at"):
+                data["created_at"] = old["created_at"]
+            else:
+                data["created_at"] = utcnow().isoformat()
+            data["updated_at"] = utcnow().isoformat()
+            if not old or old.get("content_hash") != data.get("content_hash"):
+                self.audit.record(
+                    organization_id,
+                    "skill.package.materialized",
                     {
-                        "order": 1,
-                        "name": "Use Slack mrkdwn",
-                        "description": (
-                            "Use *bold*, _italic_, ~strike~, `inline code`, and "
-                            "triple-backtick code blocks. Never emit Markdown "
-                            "double-asterisk bold or Markdown headings."
-                        ),
+                        "name": manifest.name,
+                        "skill_id": skill_id,
+                        "content_hash": data.get("content_hash"),
+                        "kind": manifest.kind,
                     },
-                    {
-                        "order": 2,
-                        "name": "Format links for Slack",
-                        "description": (
-                            "Write labeled links as <https://example.com|label>. "
-                            "Never write Markdown links in [label](URL) form."
-                        ),
-                    },
-                    {
-                        "order": 3,
-                        "name": "Optimize for chat",
-                        "description": (
-                            "Lead with the answer, keep paragraphs short, use "
-                            "bullets for scanability, and avoid Markdown tables."
-                        ),
-                    },
-                    {
-                        "order": 4,
-                        "name": "Present evidence clearly",
-                        "description": (
-                            "Place source links next to the claims they support. "
-                            "Do not imply that a link supports a claim unless the "
-                            "retrieved evidence actually does."
-                        ),
-                    },
-                ],
-                warnings=[
-                    "Do not expose private evidence into a public channel.",
-                    "Do not use standard Markdown link or bold syntax in Slack.",
-                ],
-                activation_mode="mandatory",
-                activation={
-                    "destination_types": [
-                        "slack_channel",
-                        "private_channel",
-                        "dm",
-                    ]
-                },
-                response_validation={
-                    "enabled": True,
-                    "instructions": (
-                        "Confirm the response follows the Slack skill, especially "
-                        "native mrkdwn and <URL|label> links; contains no Markdown "
-                        "headings, tables, **bold**, or [label](URL) links; remains "
-                        "concise and preserves every factual claim and citation."
-                    ),
-                },
-                platform_key=slack_key,
-                status="approved",
-            )
-        skill = existing[slack_key]
-        if skill.get("status") != SkillStatus.APPROVED.value:
-            raise RuntimeError(
-                "The mandatory Slack communication skill is not approved."
-            )
-        # These are the small, tool-surface-safe procedures adapted from the
-        # Hermes/Enclaw skill set.  They are intentionally concise because the
-        # full procedure is injected only when relevant.
-        builtin_specs = [
-            (
-                "builtin.hermes.systematic_debugging",
-                "Investigate Before Fixing",
-                "Investigate an issue from evidence before recommending a fix.",
-                "Establish the symptom, gather evidence, identify the root cause, and propose the smallest verified next step.",
-                ["Separate observed facts from assumptions.", "Check related history and evidence before concluding.", "State confidence and remaining unknowns."],
-            ),
-            (
-                "builtin.hermes.deep_research",
-                "Deep Research",
-                "Research a question using multiple authoritative sources.",
-                "Produce a concise, source-grounded research answer with uncertainty and citations.",
-                ["Search broadly, then fetch primary sources.", "Cross-check important claims.", "Put source links next to the claims they support."],
-            ),
-            (
-                "builtin.hermes.pdf_documents",
-                "PDF and Document Handling",
-                "Read, extract, summarize, and create document artifacts safely.",
-                "Use the available document tools for PDFs and office files and preserve source fidelity.",
-                ["Inspect the source before transforming it.", "Keep layout and citations intact where possible.", "Report the generated artifact and any limitations."],
-            ),
-            (
-                "builtin.hermes.decision_communication",
-                "Decision Communication",
-                "Communicate decisions with clear options and tradeoffs.",
-                "Recommend one option, explain the tradeoff, and give concrete next steps.",
-                ["Use alternatives only when they are materially different.", "Make a direct recommendation.", "Mark actions that require human approval."],
-            ),
-        ]
-        for key, name, description, goal, steps in builtin_specs:
-            if key in existing:
-                continue
-            existing[key] = self.create(
-                organization_id=organization_id,
-                name=name,
-                description=description,
-                goal=goal,
-                steps=[{"order": i + 1, "name": f"Step {i + 1}", "description": step} for i, step in enumerate(steps)],
-                activation_mode="optional",
-                platform_key=key,
-                status="approved",
-            )
-        return [skill] + [existing[key] for key, *_ in builtin_specs]
+                )
+            self.store.upsert_skill(data)
+            self.store.upsert_skill_version(data)
+            materialized.append(data)
+        slack = next(
+            (skill for skill in materialized if skill.get("platform_key") == "destination.slack.communication"),
+            None,
+        )
+        if slack is None:
+            raise RuntimeError("The mandatory Slack communication package is missing")
+        if slack.get("status") != SkillStatus.APPROVED.value:
+            raise RuntimeError("The mandatory Slack communication skill is not approved")
+        return materialized
 
     def resolve_for_run(
         self,
@@ -232,6 +179,7 @@ class SkillsService:
         purpose: str,
         allowed_scope_ids: list[str],
         optional_limit: int = 3,
+        available_capabilities: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Resolve and pin approved mandatory and relevant optional skills."""
         self.ensure_platform_skills(organization_id)
@@ -241,7 +189,7 @@ class SkillsService:
             # Platform/default skills are harness capabilities, not tenant
             # memory.  Never hide them because a reset or a new tenant has not
             # materialized its organization-public scope yet.
-            if skill.get("platform_key"):
+            if skill.get("platform_key") or skill.get("immutable") or skill.get("kind") in {"builtin", "connector"}:
                 return True
             scope_id = skill.get("scope_id")
             if not scope_id or scope_id in allowed:
@@ -255,6 +203,25 @@ class SkillsService:
             if skill.get("status") == SkillStatus.APPROVED.value
             and skill_is_visible(skill)
         ]
+
+        capabilities = available_capabilities
+
+        def ready(skill: dict[str, Any]) -> bool:
+            if capabilities is None:
+                return True
+            required = skill.get("required_capabilities") or {}
+            all_of = {str(item) for item in required.get("all_of", [])}
+            any_of = {str(item) for item in required.get("any_of", [])}
+            missing = all_of - capabilities
+            has_any = not any_of or bool(any_of & capabilities)
+            if missing or not has_any:
+                if skill.get("activation_mode") == SkillActivationMode.MANDATORY.value:
+                    raise RuntimeError(
+                        f"Mandatory skill {skill.get('name')} is not ready: "
+                        f"missing {sorted(missing or any_of)}"
+                    )
+                return False
+            return True
 
         def applies(skill: dict[str, Any]) -> bool:
             activation = skill.get("activation") or {}
@@ -272,6 +239,7 @@ class SkillsService:
             for skill in approved
             if skill.get("activation_mode") == SkillActivationMode.MANDATORY.value
             and applies(skill)
+            and ready(skill)
         ]
         mandatory_ids = {skill["id"] for skill in mandatory}
         relevant = self.search(
@@ -287,6 +255,7 @@ class SkillsService:
             and skill["id"] not in mandatory_ids
             and skill.get("activation_mode", "optional") == "optional"
             and applies(approved_by_id[skill["id"]])
+            and ready(approved_by_id[skill["id"]])
         ][:optional_limit]
         return [
             self._active_skill(skill, reason="destination_mandatory")
@@ -310,6 +279,12 @@ class SkillsService:
             "activation_reason": reason,
             "response_validation": skill.get("response_validation") or {},
             "platform_key": skill.get("platform_key"),
+            "instructions": skill.get("instructions") or "",
+            "kind": skill.get("kind", "company"),
+            "immutable": bool(skill.get("immutable")),
+            "content_hash": skill.get("content_hash", ""),
+            "required_capabilities": skill.get("required_capabilities") or {},
+            "origin": skill.get("origin") or {},
         }
 
     def get(self, skill_id: str) -> dict[str, Any] | None:
@@ -334,6 +309,7 @@ class SkillsService:
         admin console) to see other statuses.
         """
         allowed_status = include_status or {SkillStatus.APPROVED.value}
+        stop_words = {"a", "an", "and", "before", "for", "in", "is", "it", "of", "on", "or", "the", "to"}
         q = query.lower()
         skills = [
             s for s in self.store.list_skills(organization_id)
@@ -342,10 +318,17 @@ class SkillsService:
         scored = []
         for s in skills:
             text = f"{s.get('name','')} {s.get('description','')} {s.get('goal','')}".lower()
-            score = sum(1 for tok in q.split() if tok in text)
+            score = sum(1 for tok in q.split() if tok not in stop_words and len(tok) > 1 and tok in text)
             if score or not q.strip():
                 scored.append((score, s))
-        scored.sort(key=lambda x: x[0], reverse=True)
+        scored.sort(
+            key=lambda x: (
+                x[0],
+                1 if x[1].get("kind") == "company" else 0,
+                1 if x[1].get("immutable") else 0,
+            ),
+            reverse=True,
+        )
         return [s for _, s in scored[:limit]]
 
     def prepare(self, skill_id: str, context_warnings: list[str] | None = None) -> dict[str, Any] | None:
@@ -360,13 +343,35 @@ class SkillsService:
             "version": skill.get("version"),
         }
 
+    @staticmethod
+    def validate_definition(definition: dict[str, Any]) -> dict[str, Any]:
+        """Deterministically preview a company skill before creating a draft."""
+        errors: list[str] = []
+        warnings: list[str] = []
+        for field in ("name", "description", "goal"):
+            if not str(definition.get(field) or "").strip():
+                errors.append(f"{field} is required")
+        if definition.get("activation_mode") not in {None, "mandatory", "optional"}:
+            errors.append("activation_mode must be mandatory or optional")
+        for index, step in enumerate(definition.get("steps") or [], 1):
+            if not step.get("name") or not step.get("description"):
+                errors.append(f"steps[{index}] requires name and description")
+        text = " ".join(str(definition.get(key) or "") for key in ("description", "goal", "instructions"))
+        if any(marker in text.lower() for marker in ("ignore previous instructions", "system override", "reveal the system prompt")):
+            errors.append("skill text contains a prompt-injection marker")
+        if not definition.get("warnings"):
+            warnings.append("add explicit warnings for privacy, approvals, and failure handling")
+        if not definition.get("response_validation"):
+            warnings.append("consider a response validation contract for user-facing output")
+        return {"valid": not errors, "errors": errors, "warnings": warnings}
+
     def propose_update(
         self, skill_id: str, changes: dict[str, Any]
     ) -> dict[str, Any] | None:
         skill = self.get(skill_id)
         if not skill:
             return None
-        if skill.get("platform_key"):
+        if skill.get("platform_key") or skill.get("immutable") or skill.get("kind") in {"builtin", "connector"}:
             raise ValueError("platform skills are immutable")
         new_version = dict(skill)
         new_version["version"] = int(skill.get("version") or 1) + 1
@@ -386,6 +391,9 @@ class SkillsService:
                 "response_validation",
             }:
                 new_version[k] = v
+        validation = self.validate_definition(new_version)
+        if not validation["valid"]:
+            raise ValueError("invalid skill update: " + "; ".join(validation["errors"]))
         # A proposed version is immutable history; it does not replace the approved current skill.
         self.store.upsert_skill_version(new_version)
         self.audit.record(
@@ -399,6 +407,9 @@ class SkillsService:
         return self.store.list_skill_versions(skill_id)
 
     def approve(self, skill_id: str, version: int) -> dict[str, Any] | None:
+        current = self.get(skill_id)
+        if current and (current.get("immutable") or current.get("kind") in {"builtin", "connector"}):
+            raise ValueError("platform skills are immutable")
         proposed = self.store.get_skill_version(skill_id, version)
         if not proposed:
             return None
@@ -414,7 +425,7 @@ class SkillsService:
         skill = self.get(skill_id)
         if not skill:
             return None
-        if skill.get("platform_key"):
+        if skill.get("platform_key") or skill.get("immutable") or skill.get("kind") in {"builtin", "connector"}:
             raise ValueError("platform skills cannot be deprecated")
         skill["status"] = SkillStatus.DEPRECATED.value
         skill["updated_at"] = utcnow().isoformat()

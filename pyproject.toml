@@ -15,6 +15,7 @@ dependencies = [
   "pydantic-settings>=2.6.0",
   "httpx>=0.27.0",
   "websockets>=15.0",
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +33,9 @@ docket-worker = "docket.worker_main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+docket = ["builtin_skills/**/SKILL.md", "builtin_skills/**/resources/**"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

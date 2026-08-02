@@ -598,6 +598,24 @@ class SlackSender:
             raise RuntimeError(f"Slack delivery failed: {payload.get('error')}")
         return payload
 
+    def react(self, *, channel_id: str, timestamp: str, name: str) -> dict[str, Any]:
+        if not self.bot_token:
+            return {"ok": False, "dry_run": True, "channel": channel_id, "timestamp": timestamp, "name": name}
+        response = httpx.post(
+            "https://slack.com/api/reactions.add",
+            headers={
+                "Authorization": f"Bearer {self.bot_token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json={"channel": channel_id, "timestamp": timestamp, "name": name},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError(f"Slack reaction failed: {payload.get('error')}")
+        return payload
+
     def upload_file(
         self,
         *,

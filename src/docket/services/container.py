@@ -22,6 +22,7 @@ from docket.services.retention import RetentionService
 from docket.services.web_tools import WebTools
 from docket.services.runs import RunsService
 from docket.services.skills import SkillsService
+from docket.services.skill_packages import SkillPackageCatalog
 from docket.services.signals import SignalsService
 from docket.services.reality import RealityEngine
 from docket.services.policy import PolicyEngine
@@ -43,7 +44,7 @@ from docket.harness.runtime import CompanyAgent
 from docket.harness.slack import SlackGateway, SlackSender
 from docket.harness.skill_validation import SkillResponseValidator
 from docket.harness.tool_output_summary import ToolOutputSummarizer
-from docket.harness.tools import ToolExecutor, build_tool_registry
+from docket.harness.tools import ToolExecutor, ToolDefinition, build_tool_registry
 from docket.harness.worker import HarnessWorker
 from docket.harness.specialists import SpecialistWorkerService
 
@@ -78,7 +79,12 @@ class DocketApp:
         )
         self.context = ContextService(self.store, self.retrieval, self.graph, self.audit)
         self.profiles = ProfilesService(self.store, self.retrieval, self.graph, self.audit)
-        self.skills = SkillsService(self.store, self.audit)
+        self.skill_packages = SkillPackageCatalog()
+        self.skills = SkillsService(
+            self.store,
+            self.audit,
+            package_catalog=self.skill_packages,
+        )
         self.runs = RunsService(self.store, self.graph, self.audit)
         self.signals = SignalsService(self.store, self.graph, self.audit)
         self.proactive = ProactiveService(
@@ -138,6 +144,7 @@ class DocketApp:
             run_code_enabled=runtime_settings.run_code_enabled,
             run_code_timeout_seconds=runtime_settings.run_code_timeout_seconds,
             run_code_max_tool_calls=runtime_settings.run_code_max_tool_calls,
+            workspace_root=runtime_settings.workspace_root,
         )
         self.tool_output_summarizer = ToolOutputSummarizer(
             model=self.tool_output_summary_model
@@ -245,6 +252,77 @@ class DocketApp:
             queue=self.harness_jobs,
             audit=self.audit,
         )
+        def _automation_owned(automation_id: str, organization_id: str) -> dict[str, object]:
+            automation = self.store.get_harness_record("automations", automation_id)
+            if not automation or automation.get("organization_id") != organization_id:
+                raise KeyError("automation not found")
+            return automation
+
+        self.tool_registry.register(
+            ToolDefinition(
+                name="automation_list",
+                description="List scheduled automations for the organization.",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                risk="read",
+            ),
+            lambda _args, runtime: {"automations": self.automations.list(runtime["organization_id"])},
+        )
+        self.tool_registry.register(
+            ToolDefinition(
+                name="automation_create",
+                description="Create a durable scheduled agent run after approval.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"}, "goal": {"type": "string"},
+                        "conversation_id": {"type": "string"}, "destination": {"type": "object", "additionalProperties": True},
+                        "interval_seconds": {"type": "integer", "minimum": 60}, "cron_expression": {"type": "string"}, "timezone": {"type": "string"},
+                    },
+                    "required": ["name", "goal", "conversation_id", "destination"],
+                    "additionalProperties": False,
+                },
+                risk="write",
+                approval_required=True,
+            ),
+            lambda args, runtime: {"automation": self.automations.create(
+                organization_id=runtime["organization_id"], name=args["name"], goal=args["goal"],
+                principal_id=runtime["principal_id"], conversation_id=args["conversation_id"], destination=args["destination"],
+                interval_seconds=args.get("interval_seconds", 3600), cron_expression=args.get("cron_expression"), timezone=args.get("timezone", "UTC"),
+            )},
+        )
+        self.tool_registry.register(
+            ToolDefinition(
+                name="automation_set_enabled",
+                description="Enable or pause one organization automation after approval.",
+                input_schema={"type": "object", "properties": {"automation_id": {"type": "string"}, "enabled": {"type": "boolean"}}, "required": ["automation_id", "enabled"], "additionalProperties": False},
+                risk="write", approval_required=True,
+            ),
+            lambda args, runtime: self.automations.set_enabled(
+                _automation_owned(args["automation_id"], runtime["organization_id"])["id"], bool(args["enabled"])
+            ),
+        )
+        self.tool_registry.register(
+            ToolDefinition(
+                name="automation_run_now",
+                description="Fire one enabled automation immediately after approval.",
+                input_schema={"type": "object", "properties": {"automation_id": {"type": "string"}}, "required": ["automation_id"], "additionalProperties": False},
+                risk="write", approval_required=True,
+            ),
+            lambda args, runtime: self._run_automation_now(
+                _automation_owned(args["automation_id"], runtime["organization_id"])
+            ),
+        )
+        self.tool_registry.register(
+            ToolDefinition(
+                name="automation_delete",
+                description="Delete one organization automation after approval.",
+                input_schema={"type": "object", "properties": {"automation_id": {"type": "string"}}, "required": ["automation_id"], "additionalProperties": False},
+                risk="write", approval_required=True,
+            ),
+            lambda args, runtime: self.automations.delete(
+                _automation_owned(args["automation_id"], runtime["organization_id"])["id"]
+            ),
+        )
         self.harness_worker.register(
             "automations.tick",
             lambda payload: self.automations.tick(payload.get("organization_id")),
@@ -256,6 +334,17 @@ class DocketApp:
             store=self.store, audit=self.audit, reality=self.reality
         )
         self.retention = RetentionService(store=self.store, audit=self.audit)
+
+    def _run_automation_now(self, automation: dict[str, object]) -> dict[str, object]:
+        """Queue one automation immediately while retaining normal tick semantics."""
+        from docket.domain.models import utcnow
+
+        automation = dict(automation)
+        automation["next_run_at"] = utcnow().isoformat()
+        automation["status"] = "enabled"
+        automation["updated_at"] = utcnow().isoformat()
+        self.automations._upsert(automation)
+        return self.automations.tick(str(automation["organization_id"]))
 
     def _process_connector_backfill(
         self, payload: dict[str, object]

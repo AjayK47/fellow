@@ -5,6 +5,7 @@ import { Fragment, useState } from "react";
 
 type Skills = { skills: Json[]; count: number };
 type Versions = { versions: Json[] };
+type Catalog = { packages: Json[]; readiness: Json[]; capabilities: string[] };
 
 function VersionsRow({ skillId, currentVersion, onChanged }: { skillId: string; currentVersion: number; onChanged: () => void }) {
   const { data, error, loading } = useAsync<Versions>(
@@ -58,6 +59,7 @@ export default function Skills() {
     () => api.get("/v1/skills", { organization_id: ORG }),
     [tick]
   );
+  const { data: catalog } = useAsync<Catalog>(() => api.get("/v1/skills/catalog", { organization_id: ORG }), []);
   async function approveDraft(id: string, version: number) {
     await api.post(`/v1/skills/${id}/versions/${version}:approve`, {});
     setTick((t) => t + 1);
@@ -68,6 +70,31 @@ export default function Skills() {
         title="Skills"
         subtitle="Reusable, versioned skill programs Docket can prepare and apply. Includes agent-proposed drafts pending your approval."
       />
+      <Section>
+        <Card title="Platform skill packages" meta={`${catalog?.packages.length ?? 0} immutable`}>
+          <p className="text-sm text-muted">
+            Built-in and connector procedures live in versioned <code>SKILL.md</code> packages.
+            Resetting SQLite cannot remove them.
+          </p>
+          {catalog && (
+            <table className="table mt-4">
+              <thead><tr><th>package</th><th>kind</th><th>readiness</th><th>hash</th></tr></thead>
+              <tbody>
+                {catalog.packages.map((pkg) => {
+                  const po = pkg as Record<string, unknown>;
+                  const readiness = catalog.readiness.find((item) => String((item as Record<string, unknown>).name) === String(po.name)) as Record<string, unknown> | undefined;
+                  return <tr key={String(po.name)}>
+                    <td>{String(po.display_name ?? po.name)}</td>
+                    <td><Pill tone="good">{String(po.kind)}</Pill></td>
+                    <td><Pill tone={readiness?.ready ? "good" : "orange"}>{readiness?.ready ? "ready" : "missing capability"}</Pill></td>
+                    <td className="font-mono text-xs">{String(po.content_hash ?? "").slice(0, 12)}</td>
+                  </tr>;
+                })}
+              </tbody>
+            </table>
+          )}
+        </Card>
+      </Section>
       <Section>
         <Card title="Skills" meta={String(data?.count ?? 0)}>
           {loading && <Empty>loading…</Empty>}
@@ -87,13 +114,13 @@ export default function Skills() {
                         <td>{id}</td>
                         <td>{fmt(so.name, 50)}</td>
                         <td>
-                          <Pill tone={so.status === "approved" ? "good" : so.status === "deprecated" ? "bad" : "orange"}>
-                            {String(so.status)}
+                          <Pill tone={so.immutable ? "good" : so.status === "approved" ? "good" : so.status === "deprecated" ? "bad" : "orange"}>
+                            {so.immutable ? "immutable" : String(so.status)}
                           </Pill>
                         </td>
                         <td>{fmt(so.description, 140)}</td>
                         <td className="flex gap-2">
-                          {so.status === "draft" && (
+                          {so.status === "draft" && !so.immutable && (
                             <button className="btn" onClick={() => approveDraft(id, version)}>Approve</button>
                           )}
                           <button className="btn btn-ghost" onClick={() => setExpanded(expanded === id ? null : id)}>

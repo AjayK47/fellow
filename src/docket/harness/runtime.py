@@ -730,6 +730,7 @@ class CompanyAgent:
             trigger_kind=run["trigger_kind"],
             purpose=run["envelope"]["purpose"],
             allowed_scope_ids=run["envelope"]["allowed_scope_ids"],
+            available_capabilities=self.tools.available_capabilities(run),
         )
         metadata["skills_resolved"] = True
         metadata["active_skills"] = active
