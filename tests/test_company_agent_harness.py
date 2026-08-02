@@ -1070,6 +1070,11 @@ def test_wake_preserves_slack_conversation_address_for_main_context(brain):
         "workspace_id": "TACME",
         "channel_id": "CSUPPORT2",
         "context_key": context_key,
+        "actor_profile": {
+            "principal_id": "person_ravi",
+            "source_user_id": "URAVI2",
+            "display_name": "person_ravi",
+        },
     }
 
 

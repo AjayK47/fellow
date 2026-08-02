@@ -60,6 +60,7 @@ class SlackGateway:
         self.graph = graph
         self.config = config
         self.audit = audit
+        self._user_profile_cache: dict[str, dict[str, Any]] = {}
 
     def accept(
         self,
@@ -265,8 +266,9 @@ class SlackGateway:
         )
         ts = str(inner.get("ts") or inner.get("event_ts") or "")
         source_user_id = str(inner.get("user") or "")
+        user_profile = self._fetch_user_profile(workspace_id, source_user_id)
         principal_id = self._principal_for_user(
-            organization_id, workspace_id, source_user_id
+            organization_id, workspace_id, source_user_id, user_profile=user_profile
         )
         text = str(inner.get("text") or "")
         bot_user_id = self._bot_user_id(workspace_id)
@@ -342,6 +344,17 @@ class SlackGateway:
             payload={
                 "text": self._strip_bot_mention(text, bot_user_id),
                 "raw_text": text,
+                "actor_profile": {
+                    "principal_id": principal_id,
+                    "source_user_id": source_user_id,
+                    "display_name": user_profile.get("display_name")
+                    or user_profile.get("real_name")
+                    or user_profile.get("name")
+                    or source_user_id,
+                    "real_name": user_profile.get("real_name"),
+                    "timezone": user_profile.get("tz"),
+                    "timezone_label": user_profile.get("tz_label"),
+                },
                 "message_ts": ts,
                 "channel_type": channel_type,
                 "conversation_key": conversation_key,
@@ -366,12 +379,18 @@ class SlackGateway:
         return self.config.default_org_id
 
     def _principal_for_user(
-        self, organization_id: str, workspace_id: str, source_user_id: str
+        self,
+        organization_id: str,
+        workspace_id: str,
+        source_user_id: str,
+        *,
+        user_profile: dict[str, Any] | None = None,
     ) -> str:
         mapping = self.store.identity_mapping(
             organization_id, "slack", source_user_id
         )
         if mapping:
+            self._update_user_entity(mapping["principal_id"], user_profile or {})
             return mapping["principal_id"]
         principal_id = f"person_slack_{workspace_id}_{source_user_id}".lower()
         if source_user_id and not self.store.get_entity(principal_id):
@@ -380,14 +399,20 @@ class SlackGateway:
                     "id": principal_id,
                     "organization_id": organization_id,
                     "entity_type": "person",
-                    "name": source_user_id,
-                    "aliases": [],
+                    "name": user_profile.get("display_name")
+                    or user_profile.get("real_name")
+                    or user_profile.get("name")
+                    or source_user_id,
+                    "aliases": [source_user_id],
                     "attributes": {
                         "slack_user_id": source_user_id,
                         "workspace_id": workspace_id,
+                        **self._profile_attributes(user_profile or {}),
                     },
                 }
             )
+        else:
+            self._update_user_entity(principal_id, user_profile or {})
         mapping = {
             "id": new_id("identity"),
             "organization_id": organization_id,
@@ -397,6 +422,58 @@ class SlackGateway:
         }
         self.store.upsert_simple_harness_record("identity_mappings", mapping)
         return principal_id
+
+    def _fetch_user_profile(self, workspace_id: str, source_user_id: str) -> dict[str, Any]:
+        """Resolve a Slack display profile once per event when configured.
+
+        Slack events carry only the user ID. Failure to enrich must never block
+        ingestion, so the ID remains the safe fallback.
+        """
+        if not source_user_id or not self.config.slack_bot_token:
+            return {}
+        cache_key = f"{workspace_id}:{source_user_id}"
+        if cache_key in self._user_profile_cache:
+            return self._user_profile_cache[cache_key]
+        try:
+            response = httpx.get(
+                "https://slack.com/api/users.info",
+                headers={"Authorization": f"Bearer {self.config.slack_bot_token}"},
+                params={"user": source_user_id},
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            profile = dict(payload.get("user") or {}) if payload.get("ok") else {}
+            self._user_profile_cache[cache_key] = profile
+            return profile
+        except Exception:
+            self._user_profile_cache[cache_key] = {}
+            return {}
+
+    @staticmethod
+    def _profile_attributes(profile: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: profile[key]
+            for key in ("tz", "tz_label", "title")
+            if profile.get(key)
+        }
+
+    def _update_user_entity(self, principal_id: str, profile: dict[str, Any]) -> None:
+        if not profile:
+            return
+        entity = self.graph.get_entity(principal_id)
+        if not entity:
+            return
+        name = profile.get("display_name") or profile.get("real_name") or profile.get("name")
+        if name:
+            entity["name"] = name
+        entity["aliases"] = list(dict.fromkeys([*(entity.get("aliases") or []), profile.get("name") or ""]))
+        entity["aliases"] = [alias for alias in entity["aliases"] if alias]
+        entity["attributes"] = {
+            **(entity.get("attributes") or {}),
+            **self._profile_attributes(profile),
+        }
+        self.graph.upsert_entity(entity)
 
     def _channel_policy(
         self, organization_id: str, channel_id: str, is_dm: bool

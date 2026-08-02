@@ -2422,7 +2422,10 @@ def prepare_skill(body: dict[str, Any], request: Request) -> dict[str, Any]:
 
 @router.post("/v1/skills/{skill_id}:propose-update")
 def propose_skill_update(skill_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
-    proposal = _app(request).skills.propose_update(skill_id, body.get("changes") or {})
+    try:
+        proposal = _app(request).skills.propose_update(skill_id, body.get("changes") or {})
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not proposal:
         raise HTTPException(404, "skill not found")
     return proposal
@@ -2446,7 +2449,10 @@ def approve_skill_version(skill_id: str, version: int, request: Request) -> dict
 
 @router.post("/v1/skills/{skill_id}:deprecate")
 def deprecate_skill(skill_id: str, request: Request) -> dict[str, Any]:
-    skill = _app(request).skills.deprecate(skill_id)
+    try:
+        skill = _app(request).skills.deprecate(skill_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not skill:
         raise HTTPException(404, "skill not found")
     return skill

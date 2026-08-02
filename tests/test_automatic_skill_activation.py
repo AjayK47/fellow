@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from docket.harness.model_client import ScriptedModelClient
 from docket.harness.models import InvocationEnvelope, ModelResponse
 from docket.harness.skill_validation import SkillResponseValidator
@@ -56,24 +58,26 @@ def test_resolver_separates_destination_mandatory_and_task_optional_skills(brain
 def test_active_skill_versions_are_pinned_to_the_run(brain):
     run = brain.company_agent.create_invocation(
         envelope=_slack_envelope(brain, conversation="slack:T:channel_eng:event:pin"),
-        goal="Answer in Slack",
+        goal="Investigate the export failure before fixing it",
         trigger_kind="reactive",
-        initial_message="Answer in Slack",
+        initial_message="Investigate the export failure before fixing it",
     )
     first = brain.company_agent._active_skills(run)
-    slack = next(skill for skill in first if skill["name"] == "Write for Slack")
+    pinned_procedure = next(
+        skill for skill in first if skill["name"] == "Handle Export Failure"
+    )
     proposal = brain.skills.propose_update(
-        slack["id"], {"description": "A newly proposed Slack style."}
+        pinned_procedure["id"], {"description": "A newly proposed procedure."}
     )
     assert proposal
-    brain.skills.approve(slack["id"], proposal["version"])
+    brain.skills.approve(pinned_procedure["id"], proposal["version"])
 
     persisted = brain.agent_runs.get(run["id"])
     pinned = brain.company_agent._active_skills(persisted)
-    pinned_slack = next(
-        skill for skill in pinned if skill["name"] == "Write for Slack"
+    pinned_again = next(
+        skill for skill in pinned if skill["name"] == "Handle Export Failure"
     )
-    assert pinned_slack["version"] == slack["version"]
+    assert pinned_again["version"] == pinned_procedure["version"]
 
 
 def test_slack_skill_is_injected_and_validates_the_final_response(brain):
@@ -147,3 +151,31 @@ def test_slack_skill_is_injected_and_validates_the_final_response(brain):
         "org_acme", event_type="agent.response.skill_validated"
     )
     assert audit[-1]["payload"]["corrected"] is True
+
+
+def test_platform_skills_are_visible_without_memory_public_scope(brain):
+    # A fresh/reset tenant may not have materialized its organization-public
+    # memory scope yet. Destination skills must still be active.
+    active = brain.skills.resolve_for_run(
+        organization_id="org_acme",
+        task="read and summarize a PDF",
+        destination={"type": "dm", "id": "D1", "is_private": True},
+        trigger_kind="reactive",
+        purpose="answer_question",
+        allowed_scope_ids=[],
+    )
+    names = {skill["name"] for skill in active}
+    assert "Write for Slack" in names
+    assert "PDF and Document Handling" in names
+
+
+def test_platform_skills_cannot_be_changed_or_deprecated(brain):
+    slack = next(
+        skill
+        for skill in brain.skills.ensure_platform_skills("org_acme")
+        if skill["name"] == "Write for Slack"
+    )
+    with pytest.raises(ValueError, match="immutable"):
+        brain.skills.propose_update(slack["id"], {"goal": "changed"})
+    with pytest.raises(ValueError, match="cannot be deprecated"):
+        brain.skills.deprecate(slack["id"])

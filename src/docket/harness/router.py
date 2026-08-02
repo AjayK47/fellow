@@ -189,6 +189,11 @@ class EventRouter:
                     "workspace_id": event.scope.workspace_id,
                     "channel_id": event.scope.channel_id,
                     "context_key": event.payload.get("context_key"),
+                    "actor_profile": event.payload.get("actor_profile") or {
+                        "principal_id": event.actor.id,
+                        "source_user_id": event.actor.source_id,
+                        "display_name": event.actor.id,
+                    },
                 }
             },
         )

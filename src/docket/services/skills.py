@@ -84,7 +84,12 @@ class SkillsService:
         return data
 
     def ensure_platform_skills(self, organization_id: str) -> list[dict[str, Any]]:
-        """Install versioned platform skills required by destination adapters."""
+        """Install immutable platform skills required by the harness.
+
+        Platform skills are capabilities of Docket itself, not company-authored
+        procedures.  They must remain available even when a tenant has no
+        organization-public memory scope yet.
+        """
         existing = {
             skill.get("platform_key"): skill
             for skill in self.list(organization_id)
@@ -169,7 +174,53 @@ class SkillsService:
             raise RuntimeError(
                 "The mandatory Slack communication skill is not approved."
             )
-        return [skill]
+        # These are the small, tool-surface-safe procedures adapted from the
+        # Hermes/Enclaw skill set.  They are intentionally concise because the
+        # full procedure is injected only when relevant.
+        builtin_specs = [
+            (
+                "builtin.hermes.systematic_debugging",
+                "Investigate Before Fixing",
+                "Investigate an issue from evidence before recommending a fix.",
+                "Establish the symptom, gather evidence, identify the root cause, and propose the smallest verified next step.",
+                ["Separate observed facts from assumptions.", "Check related history and evidence before concluding.", "State confidence and remaining unknowns."],
+            ),
+            (
+                "builtin.hermes.deep_research",
+                "Deep Research",
+                "Research a question using multiple authoritative sources.",
+                "Produce a concise, source-grounded research answer with uncertainty and citations.",
+                ["Search broadly, then fetch primary sources.", "Cross-check important claims.", "Put source links next to the claims they support."],
+            ),
+            (
+                "builtin.hermes.pdf_documents",
+                "PDF and Document Handling",
+                "Read, extract, summarize, and create document artifacts safely.",
+                "Use the available document tools for PDFs and office files and preserve source fidelity.",
+                ["Inspect the source before transforming it.", "Keep layout and citations intact where possible.", "Report the generated artifact and any limitations."],
+            ),
+            (
+                "builtin.hermes.decision_communication",
+                "Decision Communication",
+                "Communicate decisions with clear options and tradeoffs.",
+                "Recommend one option, explain the tradeoff, and give concrete next steps.",
+                ["Use alternatives only when they are materially different.", "Make a direct recommendation.", "Mark actions that require human approval."],
+            ),
+        ]
+        for key, name, description, goal, steps in builtin_specs:
+            if key in existing:
+                continue
+            existing[key] = self.create(
+                organization_id=organization_id,
+                name=name,
+                description=description,
+                goal=goal,
+                steps=[{"order": i + 1, "name": f"Step {i + 1}", "description": step} for i, step in enumerate(steps)],
+                activation_mode="optional",
+                platform_key=key,
+                status="approved",
+            )
+        return [skill] + [existing[key] for key, *_ in builtin_specs]
 
     def resolve_for_run(
         self,
@@ -187,6 +238,11 @@ class SkillsService:
         destination_type = str(destination.get("type") or "")
         allowed = set(allowed_scope_ids)
         def skill_is_visible(skill: dict[str, Any]) -> bool:
+            # Platform/default skills are harness capabilities, not tenant
+            # memory.  Never hide them because a reset or a new tenant has not
+            # materialized its organization-public scope yet.
+            if skill.get("platform_key"):
+                return True
             scope_id = skill.get("scope_id")
             if not scope_id or scope_id in allowed:
                 return True
@@ -310,6 +366,8 @@ class SkillsService:
         skill = self.get(skill_id)
         if not skill:
             return None
+        if skill.get("platform_key"):
+            raise ValueError("platform skills are immutable")
         new_version = dict(skill)
         new_version["version"] = int(skill.get("version") or 1) + 1
         new_version["status"] = SkillStatus.DRAFT.value
@@ -356,6 +414,8 @@ class SkillsService:
         skill = self.get(skill_id)
         if not skill:
             return None
+        if skill.get("platform_key"):
+            raise ValueError("platform skills cannot be deprecated")
         skill["status"] = SkillStatus.DEPRECATED.value
         skill["updated_at"] = utcnow().isoformat()
         self.store.upsert_skill(skill)
