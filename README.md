@@ -205,13 +205,21 @@ fetch fallback; without Brave, the agent does not get web search. Browser
 automation, shell execution, and general computer control are not part of the
 company gateway's trusted tool surface.
 
-The API automatically creates the SQLite database and seeds the synthetic Acme
-organization when the configured default organization does not exist. You can
-also seed it explicitly:
+The gateway creates the SQLite database when needed but does not seed demo data.
+For a synthetic Acme organization, seed it explicitly:
 
 ```bash
 uv run docket-seed
 ```
+
+To remove all local Docket data and start over, stop the gateway and run:
+
+```bash
+uv run docket reset --yes
+```
+
+This deletes the configured SQLite database and its sidecar files, but does not
+touch `.env` or source code.
 
 Open:
 

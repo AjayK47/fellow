@@ -13,7 +13,7 @@ export default function Channels() {
     <>
       <PageHeader
         title="Channels"
-        subtitle="Slack installations and per-channel policies: observe, free-response, and opt-in proactive delivery. Docket only proactively speaks in channels with proactivity enabled."
+        subtitle="Docket is proactive by default in every observed Slack channel. Use a channel policy to opt out or enable free response."
       />
       <Section>
         <Card title="Installations" meta={String(inst?.installations?.length ?? 0)}>
@@ -55,7 +55,7 @@ export default function Channels() {
                       <td>{po.enabled ? <Pill tone="good">on</Pill> : <Pill tone="bad">off</Pill>}</td>
                       <td>{po.observe ? <Pill tone="good">on</Pill> : <Pill tone="muted">off</Pill>}</td>
                       <td>{po.free_response ? <Pill tone="good">on</Pill> : <Pill tone="muted">off</Pill>}</td>
-                      <td>{po.proactivity_enabled ? <Pill tone="orange">on</Pill> : <Pill tone="muted">off</Pill>}</td>
+                      <td>{po.proactive ? <Pill tone="orange">on</Pill> : <Pill tone="muted">off</Pill>}</td>
                       <td>{fmt(po.scope_id, 40)}</td>
                     </tr>
                   );

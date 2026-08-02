@@ -135,6 +135,49 @@ def test_summary_prefix_appears_only_when_a_summary_is_present():
     assert "latest message wins" in matches[0]["content"]
 
 
+def test_slack_session_context_and_company_memory_are_separate_prompt_blocks():
+    run = {
+        "id": "arun_slack_context",
+        "goal": "answer the follow-up",
+        "trigger_kind": "reactive",
+        "max_iterations": 12,
+        "max_tool_calls": 24,
+        "envelope": {
+            "principal_id": "person_ajay",
+            "destination": {
+                "type": "slack_channel",
+                "id": "CPUBLIC",
+                "is_private": False,
+            },
+            "purpose": "reactive_agent",
+            "allowed_scope_ids": ["scope_org_public"],
+        },
+    }
+    messages = build_agent_messages(
+        run=run,
+        context={"current_facts": [{"content": "company memory"}]},
+        history=[{"role": "user", "content": "current request"}],
+        slack_conversation=[
+            {"role": "user", "author": "Ajay", "text": "earlier message"},
+            {"role": "assistant", "author": "docket", "text": "earlier reply"},
+        ],
+    )
+    slack_block = next(
+        message["content"]
+        for message in messages
+        if message["content"].startswith("<slack_conversation>")
+    )
+    memory_block = next(
+        message["content"]
+        for message in messages
+        if message["content"].startswith("<company_context>")
+    )
+    assert "earlier reply" in slack_block
+    assert "company memory" not in slack_block
+    assert "company memory" in memory_block
+    assert "earlier reply" not in memory_block
+
+
 def _envelope(brain, *, conversation: str) -> InvocationEnvelope:
     destination = {"type": "internal_agent_session", "id": "compaction-test", "is_private": True}
     decision = brain.authz.resolve("org_acme", "person_ajay", destination, "reactive_agent")

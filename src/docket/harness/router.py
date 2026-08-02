@@ -87,11 +87,12 @@ class EventRouter:
             kind="memory.consolidate_episode",
             payload={
                 "organization_id": event.organization_id,
-                "conversation_key": event.payload["conversation_key"],
+                "conversation_key": event.payload.get("context_key")
+                or event.payload["conversation_key"],
                 "quiet_seconds": self.config.episode_quiet_seconds,
             },
             idempotency_key=(
-                f"episode:{event.payload['conversation_key']}:{event.id}"
+                f"episode:{event.payload.get('context_key') or event.payload['conversation_key']}:{event.id}"
             ),
             available_at=(
                 event.occurred_at
@@ -187,7 +188,7 @@ class EventRouter:
                 "slack": {
                     "workspace_id": event.scope.workspace_id,
                     "channel_id": event.scope.channel_id,
-                    "thread_id": event.scope.thread_id,
+                    "context_key": event.payload.get("context_key"),
                 }
             },
         )
@@ -222,8 +223,8 @@ class EventRouter:
             metadata={
                 "workspace_id": event.scope.workspace_id,
                 "channel_id": event.scope.channel_id,
-                "thread_id": event.scope.thread_id,
                 "conversation_key": event.payload.get("conversation_key"),
+                "context_key": event.payload.get("context_key"),
                 "message_ts": event.payload.get("message_ts"),
                 "event_id": event.id,
                 "source": event.source,
@@ -254,7 +255,7 @@ class EventRouter:
     def _update_event_graph(
         self, event: NormalizedEvent, source: dict[str, Any]
     ) -> None:
-        key = event.payload["conversation_key"]
+        key = event.payload.get("context_key") or event.payload["conversation_key"]
         digest = hashlib.sha256(key.encode()).hexdigest()[:20]
         conversation_id = f"conversation_{digest}"
         self.graph.upsert_entity(
@@ -263,14 +264,12 @@ class EventRouter:
                 "organization_id": event.organization_id,
                 "entity_type": "conversation",
                 "name": (
-                    f"{event.source} "
-                    f"{event.scope.channel_id}/{event.scope.thread_id}"
+                    f"{event.source} {event.scope.channel_id}"
                 ),
                 "aliases": [key],
                 "attributes": {
                     "workspace_id": event.scope.workspace_id,
                     "channel_id": event.scope.channel_id,
-                    "thread_id": event.scope.thread_id,
                     "scope_id": event.scope.scope_id,
                 },
             }

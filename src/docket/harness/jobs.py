@@ -64,10 +64,17 @@ class JobQueue:
         )
 
     def complete(
-        self, job_id: str, result: dict[str, Any] | None = None
+        self,
+        job_id: str,
+        result: dict[str, Any] | None = None,
+        *,
+        worker_id: str | None = None,
     ) -> dict[str, Any] | None:
         return self.store.finish_harness_job(
-            job_id, status="completed", result=result or {}
+            job_id,
+            status="completed",
+            result=result or {},
+            lease_owner=worker_id,
         )
 
     def fail(self, job: dict[str, Any], error: str) -> dict[str, Any] | None:
@@ -75,7 +82,10 @@ class JobQueue:
         max_attempts = int(job.get("max_attempts", self.max_attempts))
         if attempts >= max_attempts:
             return self.store.finish_harness_job(
-                job["id"], status="dead_letter", error=error
+                job["id"],
+                status="dead_letter",
+                error=error,
+                lease_owner=job.get("lease_owner"),
             )
         retry_at = (
             utcnow() + timedelta(seconds=min(2**attempts, 300))
@@ -85,4 +95,5 @@ class JobQueue:
             status="queued",
             error=error,
             retry_at=retry_at,
+            lease_owner=job.get("lease_owner"),
         )

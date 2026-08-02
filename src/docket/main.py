@@ -32,11 +32,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         db = os.environ.get("DOCKET_DB")
         brain = reset_app(Path(db) if db else settings.db_path)
     app.state.brain = brain
-    # Auto-seed if empty
-    if not brain.store.get_organization(settings.default_org_id):
-        from docket.fixtures.seed import seed_synthetic_org
-
-        seed_synthetic_org(brain)
     brain.indexing.backfill()
     worker_task: asyncio.Task[None] | None = None
     if settings.worker_enabled:
@@ -160,10 +155,6 @@ def gateway() -> None:
     worker loop rather than two independent copies of each.
     """
     brain = reset_app(settings.db_path)
-    if not brain.store.get_organization(settings.default_org_id):
-        from docket.fixtures.seed import seed_synthetic_org
-
-        seed_synthetic_org(brain)
     brain.indexing.backfill()
     _register_composio_webhook(brain)
 
@@ -257,6 +248,33 @@ def retention_cli(args: argparse.Namespace) -> None:
         brain.close()
 
 
+def reset_cli(args: argparse.Namespace) -> None:
+    """Delete the configured local database and its SQLite sidecar files."""
+    db_path = settings.db_path.resolve()
+    if not args.yes:
+        print(
+            f"This permanently deletes all Docket data in {db_path}. "
+            "Pass --yes to continue."
+        )
+        raise SystemExit(2)
+
+    removed: list[Path] = []
+    for path in (
+        db_path,
+        Path(f"{db_path}-wal"),
+        Path(f"{db_path}-shm"),
+        Path(f"{db_path}-journal"),
+    ):
+        if path.exists():
+            path.unlink()
+            removed.append(path)
+    if removed:
+        print(f"Reset Docket database: {db_path}")
+        print(f"Removed {len(removed)} database file(s).")
+    else:
+        print(f"Docket database is already clean: {db_path}")
+
+
 def main() -> None:
     logging.basicConfig(
         level=settings.log_level.upper(),
@@ -270,6 +288,15 @@ def main() -> None:
     sub.add_parser("serve", help="serve the API")
     sub.add_parser(
         "gateway", help="run the API plus configured messaging gateway"
+    )
+    reset = sub.add_parser(
+        "reset",
+        help="permanently delete the configured local database and all stored data",
+    )
+    reset.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm deletion of the configured SQLite database",
     )
     retention = sub.add_parser(
         "retention",
@@ -298,6 +325,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "gateway":
         gateway()
+    elif args.command == "reset":
+        reset_cli(args)
     elif args.command == "retention":
         retention_cli(args)
     else:

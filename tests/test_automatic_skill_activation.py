@@ -1,0 +1,149 @@
+"""Automatic destination skills, prompt injection, and response validation."""
+
+from __future__ import annotations
+
+import json
+
+from docket.harness.model_client import ScriptedModelClient
+from docket.harness.models import InvocationEnvelope, ModelResponse
+from docket.harness.skill_validation import SkillResponseValidator
+
+
+def _slack_envelope(brain, *, conversation: str) -> InvocationEnvelope:
+    destination = {
+        "type": "slack_channel",
+        "id": "channel_eng",
+        "is_private": False,
+    }
+    decision = brain.authz.resolve(
+        "org_acme", "person_ajay", destination, "reactive_agent"
+    )
+    return InvocationEnvelope(
+        organization_id="org_acme",
+        principal_id="person_ajay",
+        conversation_id=conversation,
+        destination=destination,
+        purpose="reactive_agent",
+        permission_decision_id=decision.id,
+        allowed_scope_ids=decision.allowed_scope_ids,
+    )
+
+
+def test_resolver_separates_destination_mandatory_and_task_optional_skills(brain):
+    resolved = brain.skills.resolve_for_run(
+        organization_id="org_acme",
+        task="Investigate the export failure before fixing it",
+        destination={
+            "type": "private_channel",
+            "id": "channel_leadership",
+            "is_private": True,
+        },
+        trigger_kind="reactive",
+        purpose="reactive_agent",
+        allowed_scope_ids=["scope_channel_leadership_private"],
+    )
+
+    slack = next(skill for skill in resolved if skill["name"] == "Write for Slack")
+    investigation = next(
+        skill for skill in resolved if skill["name"] == "Investigate Before Fixing"
+    )
+    assert slack["activation_mode"] == "mandatory"
+    assert slack["activation_reason"] == "destination_mandatory"
+    assert investigation["activation_mode"] == "optional"
+    assert investigation["activation_reason"] == "task_relevant"
+
+
+def test_active_skill_versions_are_pinned_to_the_run(brain):
+    run = brain.company_agent.create_invocation(
+        envelope=_slack_envelope(brain, conversation="slack:T:channel_eng:event:pin"),
+        goal="Answer in Slack",
+        trigger_kind="reactive",
+        initial_message="Answer in Slack",
+    )
+    first = brain.company_agent._active_skills(run)
+    slack = next(skill for skill in first if skill["name"] == "Write for Slack")
+    proposal = brain.skills.propose_update(
+        slack["id"], {"description": "A newly proposed Slack style."}
+    )
+    assert proposal
+    brain.skills.approve(slack["id"], proposal["version"])
+
+    persisted = brain.agent_runs.get(run["id"])
+    pinned = brain.company_agent._active_skills(persisted)
+    pinned_slack = next(
+        skill for skill in pinned if skill["name"] == "Write for Slack"
+    )
+    assert pinned_slack["version"] == slack["version"]
+
+
+def test_slack_skill_is_injected_and_validates_the_final_response(brain):
+    main_model = ScriptedModelClient(
+        [
+            ModelResponse(
+                content=(
+                    "Spain won the **2026 FIFA World Cup**. "
+                    "Source: [FIFA](https://www.fifa.com/final)"
+                )
+            )
+        ]
+    )
+    validation_model = ScriptedModelClient(
+        [
+            ModelResponse(
+                content=json.dumps(
+                    {
+                        "valid": False,
+                        "violations": [
+                            "Used Markdown bold and Markdown link syntax."
+                        ],
+                        "corrected_response": (
+                            "Spain won the *2026 FIFA World Cup*. "
+                            "Source: <https://www.fifa.com/final|FIFA>"
+                        ),
+                    }
+                )
+            )
+        ]
+    )
+    brain.company_agent.model = main_model
+    brain.company_agent.skill_validator = SkillResponseValidator(
+        model=validation_model
+    )
+    run = brain.company_agent.create_invocation(
+        envelope=_slack_envelope(
+            brain, conversation="slack:T:channel_eng:event:validation"
+        ),
+        goal="Who won the World Cup?",
+        trigger_kind="reactive",
+        initial_message="Who won the World Cup?",
+        metadata={
+            "slack": {"workspace_id": "T", "channel_id": "channel_eng"}
+        },
+    )
+
+    outcome = brain.company_agent.run(run["id"])
+
+    assert outcome.answer == (
+        "Spain won the *2026 FIFA World Cup*. "
+        "Source: <https://www.fifa.com/final|FIFA>"
+    )
+    active_block = next(
+        message["content"]
+        for message in main_model.requests[0]["messages"]
+        if message["content"].startswith("<active_skills>")
+    )
+    assert "Write for Slack" in active_block
+    assert '"activation_mode": "mandatory"' in active_block
+    validation_input = json.loads(
+        validation_model.requests[0]["messages"][-1]["content"]
+    )
+    assert validation_input["destination"]["type"] == "slack_channel"
+    assert validation_input["active_skill_contracts"][0]["name"] == (
+        "Write for Slack"
+    )
+    completed = brain.agent_runs.get(run["id"])
+    assert completed["metadata"]["last_skill_validation"]["valid"] is False
+    audit = brain.store.list_audit(
+        "org_acme", event_type="agent.response.skill_validated"
+    )
+    assert audit[-1]["payload"]["corrected"] is True

@@ -15,7 +15,7 @@ SLACK_MANIFEST = """_metadata:
   major_version: 1
 display_information:
   name: Docket
-  description: Docket workspace assistant, built by trugen.ai
+  description: Docket workspace assistant, built by Ajay
   features:
     bot_user:
       display_name: Docket
@@ -57,10 +57,13 @@ def _slug(value: str) -> str:
 class GatewaySetupService:
     """Writes only the gateway-local env file; never returns stored secrets."""
 
-    def __init__(self, store: Any, graph: Any, audit: Any) -> None:
+    def __init__(
+        self, store: Any, graph: Any, audit: Any, skills: Any | None = None
+    ) -> None:
         self.store = store
         self.graph = graph
         self.audit = audit
+        self.skills = skills
 
     @staticmethod
     def env_path() -> Path:
@@ -160,7 +163,7 @@ class GatewaySetupService:
         admin_slack_user_id: str | None = None,
         admin_name: str | None = None,
         channel_id: str | None = None,
-        proactive: bool = False,
+        proactive: bool = True,
     ) -> dict[str, Any]:
         required = {
             "Slack bot token": bot_token,
@@ -203,6 +206,8 @@ class GatewaySetupService:
             "updated_at": now,
         }
         self.store.upsert_slack_installation(installation)
+        if self.skills:
+            self.skills.ensure_platform_skills(organization_id)
         admin = None
         if admin_slack_user_id:
             admin_id = f"person_{_slug(admin_slack_user_id)}"
@@ -250,7 +255,6 @@ class GatewaySetupService:
                 "observe": True,
                 "proactive": proactive,
                 "free_response": False,
-                "thread_require_mention": False,
                 "is_private": False,
                 "scope_id": scope_id,
             }

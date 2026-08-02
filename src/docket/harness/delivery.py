@@ -47,43 +47,41 @@ class DeliveryService:
         slack = (run.get("metadata") or {}).get("slack") or {}
         destination = envelope["destination"]
         channel_id = slack.get("channel_id") or destination["id"]
-        thread_id = slack.get("thread_id")
         log.info(
-            "Delivering final answer: run_id=%s channel=%s thread=%s",
+            "Delivering final answer: run_id=%s channel=%s",
             run_id,
             channel_id,
-            thread_id,
         )
         result = self.slack.send(
             channel_id=channel_id,
-            thread_id=thread_id,
             text=run["final_answer"],
         )
         delivery = self._record(
             run=run,
             kind="final_answer",
             status="completed" if result.get("ok") else "dry_run",
-            payload={"provider_result": result},
+            payload={"provider_result": result, "text": run["final_answer"]},
             idempotency_key=f"slack.final:{run_id}",
         )
         if run["trigger_kind"] == "proactive":
             intervention = {
                 "id": new_id("intervention"),
                 "organization_id": run["organization_id"],
-                "conversation_key": envelope["conversation_id"],
+                "conversation_key": slack.get("context_key")
+                or envelope["conversation_id"],
                 "run_id": run_id,
                 "delivery_id": delivery["id"],
                 "destination": destination,
                 "created_at": utcnow().isoformat(),
             }
             self.store.insert_intervention(intervention)
-            thread = self.store.thread_state(
-                run["organization_id"], envelope["conversation_id"]
+            conversation = self.store.conversation_state(
+                run["organization_id"], intervention["conversation_key"]
             )
-            if thread:
-                thread["last_agent_intervention_at"] = intervention["created_at"]
-                thread["updated_at"] = intervention["created_at"]
-                self.store.upsert_thread_state(thread)
+            if conversation:
+                conversation["last_agent_intervention_at"] = intervention["created_at"]
+                conversation["updated_at"] = intervention["created_at"]
+                self.store.upsert_conversation_state(conversation)
         return {"run_id": run_id, "delivered": True, "delivery": delivery}
 
     def deliver_approval(self, approval_id: str) -> dict[str, Any]:
@@ -134,7 +132,6 @@ class DeliveryService:
         ]
         result = self.slack.send(
             channel_id=slack.get("channel_id") or envelope["destination"]["id"],
-            thread_id=slack.get("thread_id"),
             text=text,
             blocks=blocks,
         )
@@ -142,34 +139,84 @@ class DeliveryService:
             run=run,
             kind="approval_request",
             status="completed" if result.get("ok") else "dry_run",
-            payload={"approval_id": approval_id, "provider_result": result},
+            payload={
+                "approval_id": approval_id,
+                "provider_result": result,
+                "text": text,
+            },
             idempotency_key=f"slack.approval:{approval_id}",
         )
         return {"approval_id": approval_id, "delivery": delivery}
 
-    def deliver_question(self, run_id: str, question: str) -> dict[str, Any]:
+    def deliver_question(
+        self, run_id: str, question: str, *, choices: list[str] | None = None
+    ) -> dict[str, Any]:
         run = self.store.get_harness_record("agent_runs", run_id)
         if not run:
             raise KeyError(run_id)
         self._recheck(run)
         envelope = run["envelope"]
         slack = (run.get("metadata") or {}).get("slack") or {}
+        blocks = self._choice_blocks(run_id, question, choices) if choices else None
         result = self.slack.send(
             channel_id=slack.get("channel_id") or envelope["destination"]["id"],
-            thread_id=slack.get("thread_id"),
             text=question,
+            blocks=blocks,
         )
         delivery = self._record(
             run=run,
             kind="human_question",
             status="completed" if result.get("ok") else "dry_run",
-            payload={"provider_result": result, "question": question},
+            payload={
+                "provider_result": result,
+                "question": question,
+                "text": question,
+            },
             idempotency_key=(
                 f"slack.question:{run_id}:"
                 f"{hashlib.sha256(question.encode()).hexdigest()[:16]}"
             ),
         )
         return {"run_id": run_id, "delivery": delivery}
+
+    def _choice_blocks(
+        self, run_id: str, question: str, choices: list[str]
+    ) -> list[dict[str, Any]]:
+        # Slack caps interactive element values at 75 chars, far shorter than
+        # a choice's text could be — encode a stable index into the value
+        # instead and resolve it back against the run's own stored
+        # pending_question_choices (see SlackGateway._resolve_interaction),
+        # rather than round-tripping the choice text through Slack itself.
+        section = {"type": "section", "text": {"type": "mrkdwn", "text": question}}
+        if len(choices) <= 5 and all(len(c) <= 75 for c in choices):
+            return [
+                section,
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": choice[:75]},
+                            "action_id": "docket_choice",
+                            "value": f"{run_id}::{index}",
+                        }
+                        for index, choice in enumerate(choices)
+                    ],
+                },
+            ]
+        section["accessory"] = {
+            "type": "static_select",
+            "action_id": "docket_choice_select",
+            "placeholder": {"type": "plain_text", "text": "Choose an option"},
+            "options": [
+                {
+                    "text": {"type": "plain_text", "text": choice[:75]},
+                    "value": f"{run_id}::{index}",
+                }
+                for index, choice in enumerate(choices)
+            ],
+        }
+        return [section]
 
     def _recheck(self, run: dict[str, Any]) -> None:
         envelope = run["envelope"]

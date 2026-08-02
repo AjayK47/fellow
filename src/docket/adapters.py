@@ -29,7 +29,7 @@ def normalize_slack_event(payload: dict[str, Any], *, organization_id: str, scop
     if not event_id:
         raise ValueError("Slack event_callback is missing event_id")
     team_id = payload.get("team_id", "unknown-team")
-    return {"id": str(event_id), "source": f"slack:{team_id}", "type": f"slack.{inner.get('type', 'event')}", "subject": str(inner.get("channel") or inner.get("user") or team_id), "organization_id": organization_id, "principal_id": inner.get("user") or inner.get("bot_id"), "scope_id": scope_id, "trace_id": payload.get("event_context"), "data": {"text": inner.get("text", ""), "channel": inner.get("channel"), "thread_ts": inner.get("thread_ts") or inner.get("ts"), "subtype": inner.get("subtype"), "team_id": team_id, "raw_event": inner}}
+    return {"id": str(event_id), "source": f"slack:{team_id}", "type": f"slack.{inner.get('type', 'event')}", "subject": str(inner.get("channel") or inner.get("user") or team_id), "organization_id": organization_id, "principal_id": inner.get("user") or inner.get("bot_id"), "scope_id": scope_id, "trace_id": payload.get("event_context"), "data": {"text": inner.get("text", ""), "channel": inner.get("channel"), "subtype": inner.get("subtype"), "team_id": team_id, "raw_event": inner}}
 
 
 def normalize_composio_trigger(payload: dict[str, Any], *, organization_id: str, scope_id: str) -> dict[str, Any]:

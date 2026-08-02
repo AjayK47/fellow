@@ -13,6 +13,7 @@ from docket.harness.models import (
     ToolDefinition,
     TriggerKind,
 )
+from docket.services.scope_resolution import resolve_scope
 
 
 class SpecialistWorkerService:
@@ -190,11 +191,12 @@ class SpecialistWorkerService:
         self.agent.runs.update(run)
         outcome = self.agent.run(run["id"])
         answer = outcome.answer or outcome.error or ""
-        scope_id = (
-            envelope.allowed_scope_ids[0]
-            if envelope.allowed_scope_ids
-            else "scope_org_public"
-        )
+        scope_id = resolve_scope(
+            store=self.agent.runs.store,
+            organization_id=parent["organization_id"],
+            principal_id=envelope.principal_id,
+            destination=envelope_data["destination"],
+        ).write_scope_id
         artifact = self.artifacts.create(
             organization_id=parent["organization_id"],
             artifact_type="specialist_result",

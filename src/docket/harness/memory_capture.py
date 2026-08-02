@@ -105,9 +105,11 @@ class HarnessMemoryCapture:
         *,
         quiet_seconds: int = 0,
     ) -> dict[str, Any]:
-        thread = self.store.thread_state(organization_id, conversation_key)
-        if quiet_seconds and thread and thread.get("updated_at"):
-            updated = datetime.fromisoformat(thread["updated_at"])
+        conversation = self.store.conversation_state(
+            organization_id, conversation_key
+        )
+        if quiet_seconds and conversation and conversation.get("updated_at"):
+            updated = datetime.fromisoformat(conversation["updated_at"])
             if updated.tzinfo is None:
                 updated = updated.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) - updated < timedelta(
@@ -116,13 +118,15 @@ class HarnessMemoryCapture:
                 return {
                     "conversation_key": conversation_key,
                     "consolidated": False,
-                    "reason": "thread_not_quiet",
+                    "reason": "conversation_not_quiet",
                 }
         sources = [
             source
             for source in self.store.list_sources(organization_id)
-            if (source.get("metadata") or {}).get("conversation_key")
-            == conversation_key
+            if (
+                (source.get("metadata") or {}).get("context_key")
+                or (source.get("metadata") or {}).get("conversation_key")
+            ) == conversation_key
             and source.get("source_system") == "slack"
         ]
         if not sources:

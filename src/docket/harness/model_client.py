@@ -158,6 +158,25 @@ class DeterministicHarnessModel:
         del temperature, max_tokens
         joined = "\n".join(str(m.get("content") or "") for m in messages)
         if response_schema:
+            if "corrected_response" in (response_schema.get("properties") or {}):
+                try:
+                    validation_input = json.loads(
+                        str(messages[-1].get("content") or "{}")
+                    )
+                except json.JSONDecodeError:
+                    validation_input = {}
+                draft = str(validation_input.get("draft_response") or "")
+                return ModelResponse(
+                    content=json.dumps(
+                        {
+                            "valid": True,
+                            "violations": [],
+                            "corrected_response": draft,
+                        }
+                    ),
+                    finish_reason="stop",
+                    model=self.model,
+                )
             # Classify the compact user payload only. The classifier's system
             # prompt necessarily contains words such as "acknowledged" and
             # must not become evidence about the actual Slack thread.

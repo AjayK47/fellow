@@ -44,8 +44,8 @@ class AttentionPipeline:
         self.config = config
 
     def process(self, event: NormalizedEvent) -> dict[str, Any]:
-        thread = self._update_thread_state(event)
-        compact = self._build_context(event, thread)
+        conversation = self._update_conversation_state(event)
+        compact = self._build_context(event, conversation)
         response = self.model.generate(
             messages=[
                 {"role": "system", "content": ATTENTION_SYSTEM_PROMPT},
@@ -66,7 +66,7 @@ class AttentionPipeline:
                 confidence=0.0,
                 reason=f"Attention model output was invalid: {exc}",
             )
-        evaluation = self._apply_policy(event, thread, evaluation)
+        evaluation = self._apply_policy(event, conversation, evaluation)
         record = {
             "id": new_id("attention"),
             "organization_id": event.organization_id,
@@ -82,9 +82,9 @@ class AttentionPipeline:
         if evaluation.decision in {
             AttentionDecision.ATTACH_TO_EXISTING_RUN,
             AttentionDecision.ESCALATE_EXISTING_RUN,
-        } and thread.get("active_run_id"):
+        } and conversation.get("active_run_id"):
             run = self.store.get_harness_record(
-                "agent_runs", thread["active_run_id"]
+                "agent_runs", conversation["active_run_id"]
             )
             if run:
                 self.agent.runs.add_message(
@@ -108,10 +108,10 @@ class AttentionPipeline:
             AttentionDecision.WAKE_MAIN_AGENT,
             AttentionDecision.DM_OWNER,
         }:
-            run = self._wake(event, evaluation, thread)
-            thread["active_run_id"] = run["id"]
-            thread["updated_at"] = utcnow().isoformat()
-            self.store.upsert_thread_state(thread)
+            run = self._wake(event, evaluation)
+            conversation["active_run_id"] = run["id"]
+            conversation["updated_at"] = utcnow().isoformat()
+            self.store.upsert_conversation_state(conversation)
             job = self.queue.enqueue(
                 organization_id=event.organization_id,
                 kind="agent.run",
@@ -146,7 +146,7 @@ class AttentionPipeline:
         return self.process(NormalizedEvent(**payload))
 
     def _build_context(
-        self, event: NormalizedEvent, thread: dict[str, Any]
+        self, event: NormalizedEvent, conversation: dict[str, Any]
     ) -> dict[str, Any]:
         destination = self._destination(event)
         memories = self.retrieval.search(
@@ -167,9 +167,9 @@ class AttentionPipeline:
         )
         active_run = (
             self.store.get_harness_record(
-                "agent_runs", thread.get("active_run_id", "")
+                "agent_runs", conversation.get("active_run_id", "")
             )
-            if thread.get("active_run_id")
+            if conversation.get("active_run_id")
             else None
         )
         related_cases: list[dict[str, Any]] = []
@@ -199,26 +199,30 @@ class AttentionPipeline:
                 "text": event.payload.get("text") or "",
                 "author": event.actor.id,
                 "channel": event.scope.channel_id,
-                "thread": event.scope.thread_id,
             },
-            "recent_thread": [
-                {
-                    "event_id": item.get("event_id"),
-                    "author": item.get("author"),
-                    "text": item.get("text"),
-                    "at": item.get("at"),
-                }
-                for item in (thread.get("recent_messages") or [])[-8:]
-            ],
+            "recent_conversation": [
+                item
+                for item in (
+                    self.store.recent_slack_messages(
+                        event.organization_id,
+                        workspace_id=event.scope.workspace_id or "",
+                        channel_id=event.scope.channel_id or "",
+                        limit=11,
+                    )
+                    if event.source == "slack" and event.scope.channel_id
+                    else []
+                )
+                if item.get("message_id") != event.id
+            ][-10:],
             "related_state": {
                 "active_run_id": active_run["id"] if active_run else None,
                 "active_run_state": active_run.get("state")
                 if active_run
                 else None,
-                "recent_agent_intervention": thread.get(
+                "recent_agent_intervention": conversation.get(
                     "last_agent_intervention_at"
                 ),
-                "last_human_acknowledgement_at": thread.get(
+                "last_human_acknowledgement_at": conversation.get(
                     "last_human_acknowledgement_at"
                 ),
                 "proactivity_enabled": bool(
@@ -245,20 +249,20 @@ class AttentionPipeline:
     def _apply_policy(
         self,
         event: NormalizedEvent,
-        thread: dict[str, Any],
+        conversation: dict[str, Any],
         evaluation: AttentionEvaluation,
     ) -> AttentionEvaluation:
         if event.is_direct_agent_request:
             evaluation.decision = AttentionDecision.IGNORE
             evaluation.reason = "Direct requests bypass the attention pipeline."
             return evaluation
-        if thread.get("active_run_id") and evaluation.decision in {
+        if conversation.get("active_run_id") and evaluation.decision in {
             AttentionDecision.WAKE_MAIN_AGENT,
             AttentionDecision.DM_OWNER,
         }:
             evaluation.decision = AttentionDecision.ATTACH_TO_EXISTING_RUN
-            evaluation.existing_run_id = thread["active_run_id"]
-            evaluation.reason = "An active run already owns this thread."
+            evaluation.existing_run_id = conversation["active_run_id"]
+            evaluation.reason = "An active run already owns this conversation."
             return evaluation
         since = (
             utcnow()
@@ -266,7 +270,7 @@ class AttentionPipeline:
         ).isoformat()
         recent = self.store.recent_intervention(
             event.organization_id,
-            event.payload["conversation_key"],
+            event.payload.get("context_key") or event.payload["conversation_key"],
             since=since,
         )
         if recent and evaluation.decision in {
@@ -304,7 +308,6 @@ class AttentionPipeline:
         self,
         event: NormalizedEvent,
         evaluation: AttentionEvaluation,
-        thread: dict[str, Any],
     ) -> dict[str, Any]:
         destination = self._destination(event)
         authz = self.retrieval.authorize(
@@ -327,22 +330,6 @@ class AttentionPipeline:
             "Investigate this company event and intervene only if useful: "
             + (event.payload.get("text") or "")
         )
-        # The classifier already had the recent channel history when it
-        # decided to wake the main agent (see _build_context). The woken run
-        # should start with that same situational awareness rather than only
-        # the single triggering message — the last entry is the trigger
-        # itself (just appended in _update_thread_state), so exclude it here
-        # to avoid duplicating it against the "Proactive trigger" line below.
-        recent = (thread.get("recent_messages") or [])[:-1][-8:]
-        context_block = (
-            "\n\nRecent channel context (oldest first):\n"
-            + "\n".join(
-                f"- {item.get('author', 'unknown')}: {item.get('text', '')}"
-                for item in recent
-            )
-            if recent
-            else ""
-        )
         return self.agent.create_invocation(
             envelope=envelope,
             goal=goal,
@@ -353,22 +340,28 @@ class AttentionPipeline:
                 + (event.payload.get("text") or "")
                 + "\nAttention reason: "
                 + evaluation.reason
-                + context_block
             ),
-            metadata={"attention_decision": evaluation.model_dump(mode="json")},
+            metadata={
+                "attention_decision": evaluation.model_dump(mode="json"),
+                "slack": {
+                    "workspace_id": event.scope.workspace_id,
+                    "channel_id": event.scope.channel_id,
+                    "context_key": event.payload.get("context_key"),
+                },
+            },
         )
 
-    def _update_thread_state(self, event: NormalizedEvent) -> dict[str, Any]:
+    def _update_conversation_state(self, event: NormalizedEvent) -> dict[str, Any]:
         key = event.payload["conversation_key"]
-        thread = self.store.thread_state(event.organization_id, key)
-        if not thread:
-            thread = {
-                "id": new_id("thread"),
+        key = event.payload.get("context_key") or key
+        conversation = self.store.conversation_state(event.organization_id, key)
+        if not conversation:
+            conversation = {
+                "id": new_id("conversation_state"),
                 "organization_id": event.organization_id,
                 "conversation_key": key,
                 "workspace_id": event.scope.workspace_id,
                 "channel_id": event.scope.channel_id,
-                "thread_id": event.scope.thread_id,
                 "participants": [],
                 "recent_messages": [],
                 "active_run_id": None,
@@ -377,10 +370,10 @@ class AttentionPipeline:
                 "possible_topics": [],
                 "status": "active",
             }
-        participants = set(thread.get("participants") or [])
+        participants = set(conversation.get("participants") or [])
         participants.add(event.actor.id)
-        thread["participants"] = sorted(participants)
-        messages = list(thread.get("recent_messages") or [])
+        conversation["participants"] = sorted(participants)
+        messages = list(conversation.get("recent_messages") or [])
         messages.append(
             {
                 "event_id": event.id,
@@ -389,13 +382,15 @@ class AttentionPipeline:
                 "at": event.occurred_at.isoformat(),
             }
         )
-        thread["recent_messages"] = messages[-30:]
+        conversation["recent_messages"] = messages[-30:]
         lower = (event.payload.get("text") or "").lower()
         if any(word in lower for word in ("thanks", "ack", "investigating")):
-            thread["last_human_acknowledgement_at"] = event.occurred_at.isoformat()
-        thread["updated_at"] = utcnow().isoformat()
-        self.store.upsert_thread_state(thread)
-        return thread
+            conversation["last_human_acknowledgement_at"] = (
+                event.occurred_at.isoformat()
+            )
+        conversation["updated_at"] = utcnow().isoformat()
+        self.store.upsert_conversation_state(conversation)
+        return conversation
 
     @staticmethod
     def _destination(event: NormalizedEvent) -> dict[str, Any]:

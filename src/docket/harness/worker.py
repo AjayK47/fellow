@@ -59,7 +59,7 @@ class HarnessWorker:
                 payload["approval_id"]
             ),
             "delivery.question": lambda payload: self.delivery.deliver_question(
-                payload["run_id"], payload["question"]
+                payload["run_id"], payload["question"], choices=payload.get("choices")
             ),
             "approval.resolve": self._resolve_approval,
         }
@@ -109,7 +109,7 @@ class HarnessWorker:
             return {"job_id": job["id"], "kind": job["kind"], "error": error}
         try:
             result = handler(job["payload"]) or {}
-            self.queue.complete(job["id"], result)
+            self.queue.complete(job["id"], result, worker_id=self.worker_id)
             return {
                 "job_id": job["id"],
                 "kind": job["kind"],

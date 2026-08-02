@@ -89,7 +89,6 @@ class Settings(BaseSettings):
     slack_app_token: str | None = None
     slack_bot_user_id: str | None = None
     slack_require_mention: bool = True
-    slack_thread_require_mention: bool = False
     slack_free_response_channels: str = ""
     slack_allowed_channels: str = ""
     slack_proactive_channels: str = ""

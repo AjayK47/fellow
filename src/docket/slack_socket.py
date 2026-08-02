@@ -11,7 +11,6 @@ import httpx
 from websockets.asyncio.client import connect
 
 from docket.config import settings
-from docket.fixtures.seed import seed_synthetic_org
 from docket.services.container import DocketApp
 
 log = logging.getLogger("docket.slack_socket")
@@ -53,8 +52,6 @@ async def run_socket_mode(
     owns_brain = brain is None
     if owns_brain:
         brain = DocketApp(settings.db_path)
-        if not brain.store.get_organization(settings.default_org_id):
-            seed_synthetic_org(brain)
         brain.indexing.backfill()
 
     worker: asyncio.Task[None] | None = None

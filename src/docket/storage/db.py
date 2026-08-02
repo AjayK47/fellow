@@ -32,29 +32,50 @@ class BrainStore:
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._closed = False
+        self._local = threading.local()
+        bootstrap = self._new_connection()
+        bootstrap.execute("PRAGMA journal_mode=WAL")
+        bootstrap.close()
         self._migrate()
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        conn = getattr(self._local, "connection", None)
+        if conn is not None:
+            conn.close()
+            del self._local.connection
+        self._closed = True
+
+    def _new_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
+    def _connection(self) -> sqlite3.Connection:
+        if self._closed:
+            raise RuntimeError("BrainStore is closed")
+        conn = getattr(self._local, "connection", None)
+        if conn is None:
+            conn = self._new_connection()
+            self._local.connection = conn
+        return conn
 
     @contextmanager
-    def cursor(self) -> Iterator[sqlite3.Cursor]:
-        with self._lock:
-            cur = self._conn.cursor()
-            try:
-                yield cur
-                self._conn.commit()
-            except Exception:
-                self._conn.rollback()
-                raise
-            finally:
-                cur.close()
+    def cursor(self, *, immediate: bool = False) -> Iterator[sqlite3.Cursor]:
+        conn = self._connection()
+        cur = conn.cursor()
+        try:
+            if immediate:
+                cur.execute("BEGIN IMMEDIATE")
+            yield cur
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
 
     def _migrate(self) -> None:
         with self.cursor() as cur:
@@ -271,7 +292,7 @@ class BrainStore:
                     updated_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS thread_states (
+                CREATE TABLE IF NOT EXISTS conversation_states (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
                     conversation_key TEXT NOT NULL,
@@ -1309,7 +1330,7 @@ class BrainStore:
         "agent_turns",
         "harness_tool_calls",
         "approvals",
-        "thread_states",
+        "conversation_states",
         "attention_evaluations",
         "agent_interventions",
         "agent_feedback",
@@ -1547,10 +1568,10 @@ class BrainStore:
                 ),
             )
 
-    def upsert_thread_state(self, state: dict[str, Any]) -> None:
+    def upsert_conversation_state(self, state: dict[str, Any]) -> None:
         with self.cursor() as cur:
             cur.execute(
-                """INSERT OR REPLACE INTO thread_states
+                """INSERT OR REPLACE INTO conversation_states
                 (id, organization_id, conversation_key, payload, updated_at)
                 VALUES (?, ?, ?, ?, ?)""",
                 (
@@ -1562,12 +1583,12 @@ class BrainStore:
                 ),
             )
 
-    def thread_state(
+    def conversation_state(
         self, organization_id: str, conversation_key: str
     ) -> dict[str, Any] | None:
         with self.cursor() as cur:
             cur.execute(
-                """SELECT payload FROM thread_states
+                """SELECT payload FROM conversation_states
                 WHERE organization_id = ? AND conversation_key = ?""",
                 (organization_id, conversation_key),
             )
@@ -1622,6 +1643,58 @@ class BrainStore:
             )
             row = cur.fetchone()
             return _de(row["payload"]) if row else None
+
+    def recent_slack_messages(
+        self,
+        organization_id: str,
+        *,
+        workspace_id: str,
+        channel_id: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Return one Slack conversation timeline, including Docket replies."""
+        fetch_limit = max(int(limit) * 2, 10)
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT received_at AS at,
+                          json_extract(payload, '$.data.id') AS message_id,
+                          json_extract(payload, '$.data.actor.id') AS author,
+                          json_extract(payload, '$.data.payload.text') AS text,
+                          'user' AS role
+                FROM received_events
+                WHERE organization_id = ? AND source = 'slack'
+                  AND json_extract(payload, '$.data.scope.workspace_id') = ?
+                  AND json_extract(payload, '$.data.scope.channel_id') = ?
+                ORDER BY received_at DESC LIMIT ?""",
+                (organization_id, workspace_id, channel_id, fetch_limit),
+            )
+            inbound = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                """SELECT d.created_at AS at, d.id AS message_id,
+                          'docket' AS author,
+                          COALESCE(
+                              json_extract(d.payload, '$.text'),
+                              json_extract(r.payload, '$.final_answer')
+                          ) AS text,
+                          'assistant' AS role
+                FROM deliveries d
+                JOIN agent_runs r ON r.id = d.run_id
+                WHERE d.organization_id = ?
+                  AND d.status IN ('completed', 'dry_run')
+                  AND d.idempotency_key LIKE 'slack.%'
+                  AND json_extract(r.payload, '$.metadata.slack.workspace_id') = ?
+                  AND json_extract(r.payload, '$.envelope.destination.id') = ?
+                ORDER BY d.created_at DESC LIMIT ?""",
+                (organization_id, workspace_id, channel_id, fetch_limit),
+            )
+            outbound = [dict(row) for row in cur.fetchall()]
+        timeline = [
+            item
+            for item in [*inbound, *outbound]
+            if (item.get("text") or "").strip()
+        ]
+        timeline.sort(key=lambda item: str(item.get("at") or ""))
+        return timeline[-max(1, int(limit)) :]
 
     def upsert_delivery(self, delivery: dict[str, Any]) -> None:
         with self.cursor() as cur:
@@ -1861,7 +1934,10 @@ class BrainStore:
         now = datetime.now(timezone.utc)
         now_s = now.isoformat()
         expiry = (now + timedelta(seconds=lease_seconds)).isoformat()
-        with self.cursor() as cur:
+        # Selection and claiming are one atomic writer transaction across
+        # threads and gateway processes. A competitor waits, then re-runs the
+        # query after these rows are no longer eligible.
+        with self.cursor(immediate=True) as cur:
             clauses = [
                 "available_at <= ?",
                 "(status = 'queued' OR (status = 'leased' AND lease_expires_at < ?))",
@@ -1911,22 +1987,27 @@ class BrainStore:
         result: dict[str, Any] | None = None,
         error: str | None = None,
         retry_at: str | None = None,
+        lease_owner: str | None = None,
     ) -> dict[str, Any] | None:
-        job = self.get_harness_job(job_id)
-        if not job:
-            return None
-        now = datetime.now(timezone.utc).isoformat()
-        job["status"] = status
-        job["updated_at"] = now
-        job["lease_owner"] = None
-        job["lease_expires_at"] = None
-        if result is not None:
-            job["result"] = result
-        if error:
-            job["error"] = error
-        if retry_at:
-            job["available_at"] = retry_at
-        with self.cursor() as cur:
+        with self.cursor(immediate=True) as cur:
+            cur.execute("SELECT payload FROM harness_jobs WHERE id = ?", (job_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            job = _de(row["payload"])
+            if lease_owner is not None and job.get("lease_owner") != lease_owner:
+                return None
+            now = datetime.now(timezone.utc).isoformat()
+            job["status"] = status
+            job["updated_at"] = now
+            job["lease_owner"] = None
+            job["lease_expires_at"] = None
+            if result is not None:
+                job["result"] = result
+            if error:
+                job["error"] = error
+            if retry_at:
+                job["available_at"] = retry_at
             cur.execute(
                 """UPDATE harness_jobs SET status = ?, available_at = ?,
                 lease_owner = NULL, lease_expires_at = NULL, payload = ?, updated_at = ?

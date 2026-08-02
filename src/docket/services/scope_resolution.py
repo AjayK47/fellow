@@ -84,5 +84,5 @@ def resolve_scope(
         )
     return ScopeResolution(
         write_scope_id=room_scope_id,
-        read_scope_ids={room_scope_id} | public_scope_ids,
+        read_scope_ids={room_scope_id},
     )

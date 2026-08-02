@@ -263,6 +263,22 @@ class SkillStep(BaseModel):
     approvals: list[str] = Field(default_factory=list)
 
 
+class SkillActivationMode(str, Enum):
+    MANDATORY = "mandatory"
+    OPTIONAL = "optional"
+
+
+class SkillActivation(BaseModel):
+    destination_types: list[str] = Field(default_factory=list)
+    trigger_kinds: list[str] = Field(default_factory=list)
+    purposes: list[str] = Field(default_factory=list)
+
+
+class SkillResponseValidation(BaseModel):
+    enabled: bool = False
+    instructions: str = ""
+
+
 class Skill(BaseModel):
     id: str = Field(default_factory=lambda: new_id("skill"))
     organization_id: str
@@ -277,6 +293,12 @@ class Skill(BaseModel):
     expected_evidence: list[str] = Field(default_factory=list)
     completion_conditions: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    activation_mode: SkillActivationMode = SkillActivationMode.OPTIONAL
+    activation: SkillActivation = Field(default_factory=SkillActivation)
+    response_validation: SkillResponseValidation = Field(
+        default_factory=SkillResponseValidation
+    )
+    platform_key: str | None = None
     owner_id: str | None = None
     scope_id: str = "scope_org_public"
     created_at: datetime = Field(default_factory=utcnow)

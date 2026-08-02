@@ -68,7 +68,7 @@ export default function App() {
           <i className="block h-6 w-6 rounded-[50%_50%_42%_58%] bg-acid" />
           <span>Docket</span>
           <span className="font-mono text-[10px] uppercase tracking-widest text-muted">
-            by trugen.ai
+            by Ajay
           </span>
         </div>
         <nav className="mt-10 grid gap-5">

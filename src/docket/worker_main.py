@@ -6,14 +6,11 @@ import asyncio
 import signal
 
 from docket.config import settings
-from docket.fixtures.seed import seed_synthetic_org
 from docket.services.container import DocketApp
 
 
 async def run_worker() -> None:
     brain = DocketApp(settings.db_path)
-    if not brain.store.get_organization(settings.default_org_id):
-        seed_synthetic_org(brain)
     brain.indexing.backfill()
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()

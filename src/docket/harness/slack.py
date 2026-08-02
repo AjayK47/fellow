@@ -95,11 +95,15 @@ class SlackGateway:
                 "event_id": event.id,
             }
         received = {
-            "id": event.id,
+            # Slack may emit both `message` and `app_mention` callbacks for
+            # one mentioned message. Their event_ids differ, so dedupe on the
+            # normalized underlying message identity instead.
+            "id": event.dedupe_key,
             "organization_id": event.organization_id,
             "type": event.type,
             "source": "slack",
             "received_at": utcnow().isoformat(),
+            "provider_event_id": event.id,
             "data": event.model_dump(mode="json"),
         }
         if not self.store.upsert_received_event(received):
@@ -167,11 +171,16 @@ class SlackGateway:
         if not actions:
             raise ValueError("Interaction has no action")
         action = actions[0]
-        if action.get("action_id") not in {
-            "docket_approve",
-            "docket_deny",
-        }:
-            raise ValueError("Unsupported interaction")
+        action_id = action.get("action_id")
+        if action_id in {"docket_approve", "docket_deny"}:
+            return self._resolve_approval_interaction(payload, action)
+        if action_id in {"docket_choice", "docket_choice_select"}:
+            return self._resolve_choice_interaction(payload, action)
+        raise ValueError("Unsupported interaction")
+
+    def _resolve_approval_interaction(
+        self, payload: dict[str, Any], action: dict[str, Any]
+    ) -> dict[str, Any]:
         approval_id = action.get("value")
         approval = self.store.get_harness_record("approvals", approval_id)
         if not approval:
@@ -197,16 +206,64 @@ class SlackGateway:
         )
         return {"accepted": True, "job_id": job["id"]}
 
+    def _resolve_choice_interaction(
+        self, payload: dict[str, Any], action: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve a request_human_input(choices=...) button/select click.
+
+        The interactive element's value only ever carries `run_id::index` —
+        Slack caps option/button values at 75 chars, far shorter than a
+        choice's actual text could be — so the real choice text is looked up
+        from the run's own pending_question_choices, set when the question
+        was asked (harness/runtime.py), rather than round-tripped through
+        Slack.
+        """
+        if action.get("type") == "static_select":
+            value = (action.get("selected_option") or {}).get("value")
+        else:
+            value = action.get("value")
+        if not value or "::" not in value:
+            raise ValueError("Malformed choice interaction")
+        run_id, _, index_str = value.partition("::")
+        run = self.store.get_harness_record("agent_runs", run_id)
+        if not run:
+            raise KeyError("run not found")
+        if run.get("state") != "waiting_for_human":
+            return {"accepted": False, "reason": "run is no longer waiting for a response"}
+        choices = run.get("pending_question_choices") or []
+        try:
+            choice_text = choices[int(index_str)]
+        except (ValueError, IndexError):
+            raise ValueError("Choice index out of range")
+        user_id = str((payload.get("user") or {}).get("id") or "unknown")
+        mapping = self.store.identity_mapping(run["organization_id"], "slack", user_id)
+        principal_id = mapping["principal_id"] if mapping else f"slack:{user_id}"
+        job = self.queue.enqueue(
+            organization_id=run["organization_id"],
+            kind="agent.human_resume",
+            payload={
+                "run_id": run_id,
+                "message": choice_text,
+                "principal_id": principal_id,
+            },
+            idempotency_key=(
+                f"human_resume.slack_choice:{run_id}:{run.get('iteration_count')}"
+            ),
+        )
+        return {"accepted": True, "job_id": job["id"]}
+
     def normalize(self, payload: dict[str, Any]) -> NormalizedEvent:
         inner = payload.get("event") or {}
         workspace_id = str(payload.get("team_id") or inner.get("team") or "")
         organization_id = self._organization_for_workspace(workspace_id)
         channel_id = str(inner.get("channel") or "")
         channel_type = str(inner.get("channel_type") or "")
-        is_dm = channel_type == "im" or channel_id.startswith("D")
-        is_group_dm = channel_type == "mpim" or channel_id.startswith("G")
+        is_dm = (
+            channel_type in {"im", "mpim"}
+            or channel_id.startswith("D")
+            or channel_id.startswith("G")
+        )
         ts = str(inner.get("ts") or inner.get("event_ts") or "")
-        thread_id = str(inner.get("thread_ts") or ts)
         source_user_id = str(inner.get("user") or "")
         principal_id = self._principal_for_user(
             organization_id, workspace_id, source_user_id
@@ -217,11 +274,14 @@ class SlackGateway:
             bot_user_id and f"<@{bot_user_id}>" in text
         )
         policy = self._channel_policy(organization_id, channel_id, is_dm)
-        conversation_key = f"slack:{workspace_id}:{channel_id}:{thread_id}"
+        # Conversation context is always keyed by the Slack channel/DM. Agent
+        # execution is separate: DMs retain one continuous agent session,
+        # while addressed channel messages can run independently.
+        context_key = f"slack:{workspace_id}:{channel_id}"
+        conversation_key = context_key
         existing_session = self.store.session_by_conversation(
             organization_id, conversation_key
         )
-        addressed_thread = bool(existing_session)
         free_response = channel_id in self._csv_set(
             self.config.slack_free_response_channels
         ) or bool(policy.get("free_response"))
@@ -229,14 +289,7 @@ class SlackGateway:
             is_dm
             or bot_mentioned
             or free_response
-            or (
-                addressed_thread
-                and not self.config.slack_thread_require_mention
-                and not policy.get("thread_require_mention", False)
-            )
         )
-        if is_group_dm and not bot_mentioned and not free_response:
-            direct = addressed_thread and not self.config.slack_thread_require_mention
         visibility = (
             "person_private"
             if is_dm
@@ -267,6 +320,10 @@ class SlackGateway:
             if bot_mentioned
             else "slack.channel_message"
         )
+        client_message_id = str(inner.get("client_msg_id") or "")
+        message_identity = client_message_id or f"{channel_id}:{ts}:{source_user_id}"
+        if not is_dm:
+            conversation_key = f"{context_key}:event:{message_identity}"
         return NormalizedEvent(
             id=event_id,
             organization_id=organization_id,
@@ -279,7 +336,6 @@ class SlackGateway:
             scope=EventScope(
                 workspace_id=workspace_id,
                 channel_id=channel_id,
-                thread_id=thread_id,
                 visibility=visibility,
                 scope_id=scope_id,
             ),
@@ -287,18 +343,18 @@ class SlackGateway:
                 "text": self._strip_bot_mention(text, bot_user_id),
                 "raw_text": text,
                 "message_ts": ts,
-                "thread_ts": inner.get("thread_ts"),
                 "channel_type": channel_type,
                 "conversation_key": conversation_key,
+                "context_key": context_key,
                 "channel_enabled": bool(policy.get("enabled", True)),
                 "observe_enabled": bool(policy.get("observe", True)),
                 "proactivity_enabled": self._proactivity_enabled(
                     channel_id, policy
                 ),
             },
-            dedupe_key=f"slack:{workspace_id}:{event_id}:{ts}",
+            dedupe_key=f"slack:{workspace_id}:message:{message_identity}",
             is_direct_agent_request=direct,
-            belongs_to_waiting_run=addressed_thread and direct,
+            belongs_to_waiting_run=bool(existing_session) and direct,
             bot_mentioned=bot_mentioned,
             raw_event=payload,
         )
@@ -352,8 +408,9 @@ class SlackGateway:
         return {
             "enabled": is_dm or not allowed or channel_id in allowed,
             "observe": True,
-            "proactive": channel_id
-            in self._csv_set(self.config.slack_proactive_channels),
+            # A company agent should be attentive wherever it is installed.
+            # Persisted channel policy is the explicit opt-out mechanism.
+            "proactive": True,
             "free_response": False,
             "is_private": is_dm,
         }
@@ -361,10 +418,7 @@ class SlackGateway:
     def _proactivity_enabled(
         self, channel_id: str, policy: dict[str, Any]
     ) -> bool:
-        return bool(
-            policy.get("proactive")
-            or channel_id in self._csv_set(self.config.slack_proactive_channels)
-        )
+        return bool(policy.get("proactive", True))
 
     def _ensure_scope(
         self,
@@ -439,7 +493,6 @@ class SlackSender:
         *,
         channel_id: str,
         text: str,
-        thread_id: str | None = None,
         blocks: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if not self.bot_token:
@@ -447,7 +500,6 @@ class SlackSender:
                 "ok": False,
                 "dry_run": True,
                 "channel": channel_id,
-                "thread_ts": thread_id,
                 "text": text,
                 "blocks": blocks or [],
             }
@@ -468,3 +520,60 @@ class SlackSender:
         if not payload.get("ok"):
             raise RuntimeError(f"Slack delivery failed: {payload.get('error')}")
         return payload
+
+    def upload_file(
+        self,
+        *,
+        channel_id: str,
+        filename: str,
+        content: bytes,
+        title: str | None = None,
+        initial_comment: str | None = None,
+    ) -> dict[str, Any]:
+        """Share a file using Slack's current 3-step external upload flow
+        (files.upload is deprecated): get an upload URL, PUT the bytes, then
+        complete the upload into the destination channel."""
+        if not self.bot_token:
+            return {
+                "ok": False,
+                "dry_run": True,
+                "channel": channel_id,
+                "filename": filename,
+                "size": len(content),
+            }
+        headers = {"Authorization": f"Bearer {self.bot_token}"}
+        get_url = httpx.post(
+            "https://slack.com/api/files.getUploadURLExternal",
+            headers=headers,
+            data={"filename": filename, "length": str(len(content))},
+            timeout=30.0,
+        )
+        get_url.raise_for_status()
+        url_payload = get_url.json()
+        if not url_payload.get("ok"):
+            raise RuntimeError(f"Slack upload URL request failed: {url_payload.get('error')}")
+
+        put_response = httpx.post(
+            url_payload["upload_url"], content=content, timeout=60.0
+        )
+        put_response.raise_for_status()
+
+        complete_body: dict[str, Any] = {
+            "files": [
+                {"id": url_payload["file_id"], "title": title or filename}
+            ],
+            "channel_id": channel_id,
+        }
+        if initial_comment:
+            complete_body["initial_comment"] = initial_comment
+        complete = httpx.post(
+            "https://slack.com/api/files.completeUploadExternal",
+            headers={**headers, "Content-Type": "application/json; charset=utf-8"},
+            json=complete_body,
+            timeout=30.0,
+        )
+        complete.raise_for_status()
+        complete_payload = complete.json()
+        if not complete_payload.get("ok"):
+            raise RuntimeError(f"Slack upload completion failed: {complete_payload.get('error')}")
+        return complete_payload

@@ -52,7 +52,7 @@ _TENANT_TABLES = [
     "agent_sessions",
     "attention_evaluations",
     "agent_interventions",
-    "thread_states",
+    "conversation_states",
     "harness_jobs",
     "episodes",
     "automations",

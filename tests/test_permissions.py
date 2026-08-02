@@ -3,6 +3,37 @@
 from __future__ import annotations
 
 
+def test_slack_memory_scope_matrix(brain):
+    public = brain.authz.resolve(
+        "org_acme",
+        "person_ajay",
+        {"type": "slack_channel", "id": "channel_eng", "is_private": False},
+        "reactive_agent",
+    )
+    private = brain.authz.resolve(
+        "org_acme",
+        "person_ajay",
+        {
+            "type": "private_channel",
+            "id": "channel_leadership",
+            "is_private": True,
+        },
+        "reactive_agent",
+    )
+    dm = brain.authz.resolve(
+        "org_acme",
+        "person_ajay",
+        {"type": "dm", "id": "DAJAY", "is_private": True},
+        "reactive_agent",
+    )
+
+    assert "scope_org_public" in public.allowed_scope_ids
+    assert "scope_channel_leadership_private" not in public.allowed_scope_ids
+    assert private.allowed_scope_ids == ["scope_channel_leadership_private"]
+    assert "scope_org_public" in dm.allowed_scope_ids
+    assert "scope_channel_leadership_private" in dm.allowed_scope_ids
+
+
 def test_private_channel_memory_not_returned_for_public_destination(brain):
     org = "org_acme"
     # Public destination (engineering channel treated as shared/public-style)

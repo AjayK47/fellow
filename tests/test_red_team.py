@@ -57,6 +57,17 @@ _WRITE_TOOL_DUMMY_ARGS: dict[str, dict] = {
     },
     "composio_execute": {"tool_slug": "FAKE_SLUG", "arguments": {}},
     "run_code": {"code": "print(1)"},
+    "skill_propose_create": {
+        "name": "redteam skill",
+        "description": "d",
+        "goal": "g",
+    },
+    "skill_propose_update": {"skill_id": "skill_redteam", "description": "d2"},
+    "slack_send_artifact": {"artifact_id": "artifact_redteam"},
+    "slack_set_channel_proactivity": {
+        "enabled": False,
+        "reason": "explicit red-team policy change",
+    },
 }
 
 

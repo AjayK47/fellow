@@ -51,6 +51,12 @@ class AuthorizationService:
             is_public = bool(scope.get("is_public")) or kind == ScopeKind.ORGANIZATION_PUBLIC.value
 
             if is_public:
+                # A private-channel response may use only knowledge from that
+                # exact private channel. Public organization memory is not
+                # silently mixed into a private room's context.
+                if dest and dest.type == "private_channel":
+                    denied.append(f"{scope_id}:outside_private_channel")
+                    continue
                 if scope_id in memberships or kind == ScopeKind.ORGANIZATION_PUBLIC.value:
                     allowed.append(scope_id)
                 else:

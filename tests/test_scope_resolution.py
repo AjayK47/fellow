@@ -51,7 +51,7 @@ def test_private_channel_never_sees_another_private_channel_even_for_a_shared_me
         destination={"type": "private_channel", "id": "Cpriva", "is_private": True},
     )
     assert resolution.write_scope_id == "scope_priv_a"
-    assert "scope_priv_a" in resolution.read_scope_ids
+    assert resolution.read_scope_ids == {"scope_priv_a"}
     assert "scope_priv_b" not in resolution.read_scope_ids
 
 
@@ -105,10 +105,8 @@ def test_capture_run_writes_to_the_conversations_own_scope(brain):
 
     destination = {"type": "private_channel", "id": "Cprivf", "is_private": True}
     decision = brain.authz.resolve("org_acme", "person_ajay", destination, "reactive_agent")
-    # allowed_scope_ids legitimately contains multiple scopes (public ones
-    # plus this private channel) — position must not decide the write scope.
-    assert "scope_priv_f" in decision.allowed_scope_ids
-    assert len(decision.allowed_scope_ids) > 1
+    # A private channel reads only its exact private scope.
+    assert decision.allowed_scope_ids == ["scope_priv_f"]
 
     envelope = InvocationEnvelope(
         organization_id="org_acme",

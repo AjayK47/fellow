@@ -428,7 +428,11 @@ def test_specialist_worker_is_child_read_only_and_returns_artifact(brain):
     decision = brain.authz.resolve(
         organization_id="org_acme",
         acting_principal_id="person_ajay",
-        destination={"type": "dm", "id": "person_ajay", "is_private": True},
+        destination={
+            "type": "slack_channel",
+            "id": "channel_eng",
+            "is_private": False,
+        },
         purpose="reactive_agent",
     )
     parent = brain.company_agent.create_invocation(
@@ -437,7 +441,7 @@ def test_specialist_worker_is_child_read_only_and_returns_artifact(brain):
             principal_id="person_ajay",
             conversation_id="specialist-parent",
             destination=DestinationEnvelope(
-                type="dm", id="person_ajay", is_private=True
+                type="slack_channel", id="channel_eng", is_private=False
             ),
             purpose="reactive_agent",
             permission_decision_id=decision.id,
@@ -489,6 +493,7 @@ def test_specialist_worker_is_child_read_only_and_returns_artifact(brain):
     artifact = brain.artifacts.get(worker["artifact_id"])
     assert artifact["run_id"] == child["id"]
     assert artifact["metadata"]["parent_run_id"] == parent["id"]
+    assert artifact["scope_id"] == "scope_channel_eng"
 
 
 def test_reality_api_exposes_permission_filtered_facts_and_artifacts(api_client):

@@ -156,6 +156,9 @@ class SkillCreateRequest(BaseModel):
     inputs: list[str] = Field(default_factory=list)
     preconditions: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    activation_mode: str = "optional"
+    activation: dict[str, Any] = Field(default_factory=dict)
+    response_validation: dict[str, Any] = Field(default_factory=dict)
     scope_id: str = "scope_org_public"
     status: str = "approved"
 
@@ -249,9 +252,8 @@ class ChannelPolicyRequest(BaseModel):
     channel_id: str
     enabled: bool = True
     observe: bool = True
-    proactive: bool = False
+    proactive: bool = True
     free_response: bool = False
-    thread_require_mention: bool = False
     is_private: bool = False
     scope_id: str | None = None
 
@@ -483,7 +485,7 @@ class GatewaySlackSetupRequest(BaseModel):
     admin_slack_user_id: str | None = None
     admin_name: str | None = None
     channel_id: str | None = None
-    proactive: bool = False
+    proactive: bool = True
 
 
 class GatewayToolsSetupRequest(BaseModel):
@@ -506,7 +508,9 @@ def _local_gateway_setup(request: Request) -> GatewaySetupService:
     if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
         raise HTTPException(403, "Gateway setup is only available from localhost")
     brain = _app(request)
-    return GatewaySetupService(brain.store, brain.graph, brain.audit)
+    return GatewaySetupService(
+        brain.store, brain.graph, brain.audit, skills=brain.skills
+    )
 
 
 @router.get("/v1/gateway/setup/status")

@@ -31,6 +31,8 @@ class CompanyAgent:
         context_service: Any,
         model: ModelClient,
         tools: ToolExecutor,
+        skills: Any,
+        skill_validator: Any,
         audit: Any,
         enqueue_job: Callable[..., dict[str, Any]],
         graph: Any | None = None,
@@ -44,6 +46,8 @@ class CompanyAgent:
         self.context_service = context_service
         self.model = model
         self.tools = tools
+        self.skills = skills
+        self.skill_validator = skill_validator
         self.audit = audit
         self.enqueue_job = enqueue_job
         self.graph = graph
@@ -244,6 +248,7 @@ class CompanyAgent:
                 agent_id="company_agent",
                 conversation={"session_id": run["session_id"]},
             ).model_dump(mode="json")
+            active_skills = self._active_skills(run)
             full_history = self.runs.messages(run["session_id"], limit=200)
             summary = ""
             history = full_history
@@ -289,6 +294,8 @@ class CompanyAgent:
                 context=context,
                 history=history,
                 conversation_summary=summary,
+                slack_conversation=self._slack_conversation(run),
+                active_skills=active_skills,
             )
             allowed = self.tools.allowed_definitions(run)
             schemas = [definition.openai_schema() for definition in allowed]
@@ -325,6 +332,20 @@ class CompanyAgent:
             usage["model_calls"] = int(usage.get("model_calls", 0)) + 1
             run["usage"] = usage
             self.runs.update(run)
+            answer: str | None = None
+            skill_validation: dict[str, Any] | None = None
+            assistant_content = response.content
+            if not response.tool_calls:
+                draft = response.content.strip()
+                if not draft:
+                    raise RuntimeError("model returned neither answer nor tool call")
+                skill_validation = self._validate_user_response(
+                    run=run,
+                    response=draft,
+                    active_skills=active_skills,
+                )
+                answer = str(skill_validation["response"]).strip()
+                assistant_content = answer
             self.runs.append_turn(
                 run,
                 request={
@@ -332,10 +353,28 @@ class CompanyAgent:
                     "context_request_id": context["request_id"],
                     "permission_decision_id": context["permission_decision_id"],
                     "tools": [definition.name for definition in allowed],
+                    "active_skills": [
+                        {
+                            "id": skill["id"],
+                            "version": skill["version"],
+                            "mode": skill["activation_mode"],
+                        }
+                        for skill in active_skills
+                    ],
                     "model": getattr(self.model, "model", ""),
                 },
                 response={
-                    "content": response.content,
+                    "content": assistant_content,
+                    "draft_content": response.content
+                    if assistant_content != response.content
+                    else None,
+                    "skill_validation": {
+                        key: value
+                        for key, value in (skill_validation or {}).items()
+                        if key not in {"response", "usage"}
+                    }
+                    if skill_validation
+                    else None,
                     "tool_calls": [
                         call.model_dump(mode="json") for call in response.tool_calls
                     ],
@@ -349,7 +388,7 @@ class CompanyAgent:
                 session_id=run["session_id"],
                 run_id=run["id"],
                 role="assistant",
-                content=response.content,
+                content=assistant_content,
                 tool_calls=[
                     {
                         "id": call.id,
@@ -363,9 +402,7 @@ class CompanyAgent:
                 ],
             )
             if not response.tool_calls:
-                answer = response.content.strip()
-                if not answer:
-                    raise RuntimeError("model returned neither answer nor tool call")
+                assert answer is not None
                 log.info(
                     "Agent run completed: run_id=%s iterations=%s tool_calls=%s answer_len=%s",
                     run["id"],
@@ -475,8 +512,17 @@ class CompanyAgent:
                     call.name == "request_human_input"
                     and result.status == "completed"
                 ):
+                    question = str(result.output.get("question") or "")
+                    question_validation = self._validate_user_response(
+                        run=run,
+                        response=question,
+                        active_skills=active_skills,
+                    )
+                    result.output["question"] = question_validation["response"]
+                    run = self.runs.get(run["id"]) or run
                     self._append_tool_result(run, result)
                     run["pending_question"] = result.output.get("question")
+                    run["pending_question_choices"] = result.output.get("choices")
                     self.runs.update(run)
                     self.runs.transition(
                         run["id"],
@@ -484,6 +530,7 @@ class CompanyAgent:
                         event_payload={
                             "question": result.output.get("question"),
                             "reason": result.output.get("reason"),
+                            "choices": result.output.get("choices"),
                         },
                     )
                     self.enqueue_job(
@@ -492,6 +539,7 @@ class CompanyAgent:
                         payload={
                             "run_id": run["id"],
                             "question": result.output.get("question"),
+                            "choices": result.output.get("choices"),
                         },
                         idempotency_key=f"delivery.question:{run['id']}:{call.id}",
                     )
@@ -636,6 +684,129 @@ class CompanyAgent:
                 payload={"run_id": run["id"]},
                 idempotency_key=f"{kind}:{run['id']}",
             )
+
+    def _slack_conversation(self, run: dict[str, Any]) -> list[dict[str, Any]]:
+        """Load previous messages from the exact Slack channel or DM."""
+        if (run.get("metadata") or {}).get("specialist_worker"):
+            return []
+        slack = (run.get("metadata") or {}).get("slack") or {}
+        workspace_id = str(slack.get("workspace_id") or "")
+        channel_id = str(
+            slack.get("channel_id")
+            or (run.get("envelope") or {}).get("destination", {}).get("id")
+            or ""
+        )
+        if not workspace_id or not channel_id:
+            return []
+        messages = self.runs.store.recent_slack_messages(
+            run["organization_id"],
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            limit=11,
+        )
+        trigger_event_id = run.get("trigger_event_id")
+        return [
+            item
+            for item in messages
+            if item.get("message_id") != trigger_event_id
+        ][-10:]
+
+    def _active_skills(self, run: dict[str, Any]) -> list[dict[str, Any]]:
+        """Resolve once and pin exact approved skill versions to the run."""
+        metadata = dict(run.get("metadata") or {})
+        if metadata.get("skills_resolved"):
+            return list(metadata.get("active_skills") or [])
+        destination = dict(run["envelope"]["destination"])
+        if metadata.get("specialist_worker"):
+            destination = {
+                "type": "internal_agent_session",
+                "id": run["id"],
+                "is_private": True,
+            }
+        active = self.skills.resolve_for_run(
+            organization_id=run["organization_id"],
+            task=run["goal"],
+            destination=destination,
+            trigger_kind=run["trigger_kind"],
+            purpose=run["envelope"]["purpose"],
+            allowed_scope_ids=run["envelope"]["allowed_scope_ids"],
+        )
+        metadata["skills_resolved"] = True
+        metadata["active_skills"] = active
+        metadata["skill_refs"] = [
+            {
+                "id": skill["id"],
+                "version": skill["version"],
+                "mode": skill["activation_mode"],
+                "reason": skill["activation_reason"],
+            }
+            for skill in active
+        ]
+        run["metadata"] = metadata
+        self.runs.update(run)
+        self.audit.record(
+            run["organization_id"],
+            "agent.skills.resolved",
+            {"run_id": run["id"], "skills": metadata["skill_refs"]},
+            principal_id=run["envelope"]["principal_id"],
+            trace_id=run["trace_id"],
+        )
+        return active
+
+    def _validate_user_response(
+        self,
+        *,
+        run: dict[str, Any],
+        response: str,
+        active_skills: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        validation = self.skill_validator.validate(
+            response=response,
+            active_skills=active_skills,
+            destination=run["envelope"]["destination"],
+        )
+        usage = dict(run.get("usage") or {})
+        validation_usage = validation.get("usage") or {}
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cost",
+        ):
+            try:
+                usage[key] = float(usage.get(key, 0)) + float(
+                    validation_usage.get(key, 0)
+                )
+            except (TypeError, ValueError):
+                continue
+        if validation.get("checked"):
+            usage["skill_validation_calls"] = int(
+                usage.get("skill_validation_calls", 0)
+            ) + 1
+        run["usage"] = usage
+        metadata = dict(run.get("metadata") or {})
+        metadata["last_skill_validation"] = {
+            key: value
+            for key, value in validation.items()
+            if key not in {"response", "usage"}
+        }
+        run["metadata"] = metadata
+        self.runs.update(run)
+        if validation.get("checked"):
+            self.audit.record(
+                run["organization_id"],
+                "agent.response.skill_validated",
+                {
+                    "run_id": run["id"],
+                    "valid": validation["valid"],
+                    "violations": validation["violations"],
+                    "skill_refs": validation["skill_refs"],
+                    "corrected": validation["response"] != response,
+                },
+                principal_id=run["envelope"]["principal_id"],
+                trace_id=run["trace_id"],
+            )
+        return validation
 
     @staticmethod
     def _compact_history(messages: list[dict[str, Any]]) -> str:

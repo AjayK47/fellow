@@ -258,7 +258,6 @@ def _reactive_event_payload(
         "scope": {
             "workspace_id": "TACME",
             "channel_id": channel_id,
-            "thread_id": "1",
             "visibility": "organization_public",
             "scope_id": "scope_org_public",
         },
@@ -483,6 +482,162 @@ def test_socket_mode_interaction_rejects_unauthorized_approver(brain):
     assert still_pending["status"] == "pending"
 
 
+def _pending_question_with_choices(brain, *, conversation: str) -> tuple[str, list[str]]:
+    choices = ["Rollback the deploy", "Wait and monitor", "Page on-call"]
+    brain.company_agent.model = ScriptedModelClient(
+        [
+            ModelResponse(
+                content="",
+                tool_calls=[
+                    ModelToolCall(
+                        id="call_ask",
+                        name="request_human_input",
+                        arguments={
+                            "question": "How should we handle the export failure?",
+                            "reason": "Multiple valid remediation paths.",
+                            "choices": choices,
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        ]
+    )
+    run = brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation=conversation),
+        goal="Handle the export failure",
+        trigger_kind="reactive",
+        initial_message="Handle the export failure",
+    )
+    outcome = brain.company_agent.run(run["id"])
+    assert outcome.state.value == "waiting_for_human"
+    return run["id"], choices
+
+
+def _choice_interaction_payload(
+    *, action_id: str, run_id: str, index: int, user_id: str, is_select: bool = False
+) -> bytes:
+    value = f"{run_id}::{index}"
+    action = (
+        {"type": "static_select", "action_id": action_id, "selected_option": {"value": value}}
+        if is_select
+        else {"type": "button", "action_id": action_id, "value": value}
+    )
+    return json.dumps(
+        {
+            "type": "block_actions",
+            "user": {"id": user_id},
+            "team": {"id": "T_ACME"},
+            "actions": [action],
+        }
+    ).encode()
+
+
+def test_choice_button_click_resumes_run_with_selected_text(brain):
+    run_id, choices = _pending_question_with_choices(brain, conversation="api:choice-button:thread")
+    brain.company_agent.model = ScriptedModelClient([ModelResponse(content="Rolling back now.")])
+    brain.store.upsert_simple_harness_record(
+        "identity_mappings",
+        {
+            "id": "identity_choice_1",
+            "organization_id": "org_acme",
+            "source": "slack",
+            "source_user_id": "U_CHOOSER",
+            "principal_id": "person_ajay",
+        },
+    )
+
+    result = brain.slack_gateway.accept_interaction(
+        body=_choice_interaction_payload(
+            action_id="docket_choice", run_id=run_id, index=0, user_id="U_CHOOSER"
+        ),
+        allow_unsigned=True,
+    )
+    assert result["accepted"] is True
+
+    drained = brain.harness_worker.drain_until_idle()
+    assert drained["failed"] == 0
+    stored = brain.agent_runs.get(run_id)
+    assert stored["state"] == "completed"
+    messages = brain.agent_runs.messages(stored["session_id"], limit=50)
+    assert any(m["content"] == choices[0] and m["role"] == "user" for m in messages)
+
+
+def test_choice_select_click_resumes_run_with_selected_text(brain):
+    """The same run_id::index encoding resolves identically whether Slack
+    rendered buttons or a static_select — the resolver doesn't care which
+    UI produced the click."""
+    run_id, choices = _pending_question_with_choices(brain, conversation="api:choice-select:thread")
+    brain.company_agent.model = ScriptedModelClient([ModelResponse(content="Monitoring now.")])
+    brain.store.upsert_simple_harness_record(
+        "identity_mappings",
+        {
+            "id": "identity_choice_2",
+            "organization_id": "org_acme",
+            "source": "slack",
+            "source_user_id": "U_CHOOSER2",
+            "principal_id": "person_ajay",
+        },
+    )
+
+    result = brain.slack_gateway.accept_interaction(
+        body=_choice_interaction_payload(
+            action_id="docket_choice_select",
+            run_id=run_id,
+            index=1,
+            user_id="U_CHOOSER2",
+            is_select=True,
+        ),
+        allow_unsigned=True,
+    )
+    assert result["accepted"] is True
+    drained = brain.harness_worker.drain_until_idle()
+    assert drained["failed"] == 0
+    messages = brain.agent_runs.messages(brain.agent_runs.get(run_id)["session_id"], limit=50)
+    assert any(m["content"] == choices[1] and m["role"] == "user" for m in messages)
+
+
+def test_choice_interaction_on_already_resumed_run_is_a_noop(brain):
+    run_id, choices = _pending_question_with_choices(brain, conversation="api:choice-stale:thread")
+    brain.company_agent.model = ScriptedModelClient([ModelResponse(content="Done.")])
+    first = brain.slack_gateway.accept_interaction(
+        body=_choice_interaction_payload(
+            action_id="docket_choice", run_id=run_id, index=0, user_id="U_FIRST"
+        ),
+        allow_unsigned=True,
+    )
+    assert first["accepted"] is True
+    brain.harness_worker.drain_until_idle()
+    assert brain.agent_runs.get(run_id)["state"] == "completed"
+
+    # A second, stale click (different choice, e.g. a slow double-tap) must
+    # not raise or attempt to resume a run that has already finished.
+    second = brain.slack_gateway.accept_interaction(
+        body=_choice_interaction_payload(
+            action_id="docket_choice", run_id=run_id, index=1, user_id="U_SECOND"
+        ),
+        allow_unsigned=True,
+    )
+    assert second["accepted"] is False
+
+
+def test_deliver_question_renders_buttons_or_select_by_choice_count(brain):
+    run_id, choices = _pending_question_with_choices(brain, conversation="api:choice-render:thread")
+
+    few = brain.delivery.deliver_question(run_id, "Pick one", choices=choices)
+    few_blocks = few["delivery"]["provider_result"]["blocks"]
+    assert any(b["type"] == "actions" for b in few_blocks)
+
+    many = [f"Option {i}" for i in range(8)]
+    result = brain.delivery.deliver_question(run_id, "Pick one of many", choices=many)
+    many_blocks = result["delivery"]["provider_result"]["blocks"]
+    assert many_blocks[0]["accessory"]["type"] == "static_select"
+    assert len(many_blocks[0]["accessory"]["options"]) == 8
+
+    plain = brain.delivery.deliver_question(run_id, "No choices here")
+    assert plain["delivery"]["provider_result"]["blocks"] == []
+
+
 def test_signed_slack_mention_routes_through_full_harness(brain):
     secret = "test-signing-secret"
     brain.slack_gateway.config.slack_signing_secret = secret
@@ -530,6 +685,190 @@ def test_signed_slack_mention_routes_through_full_harness(brain):
         source.get("external_id") == "Ev100"
         for source in brain.store.list_sources("org_acme")
     )
+
+
+def test_message_and_app_mention_callbacks_for_one_slack_message_are_deduped(brain):
+    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    common_event = {
+        "user": "UAJAY",
+        "channel": "CGENERAL",
+        "text": "Hey <@UBOT>",
+        "ts": "125.001",
+        "client_msg_id": "client-message-one",
+    }
+    message_payload = {
+        "type": "event_callback",
+        "team_id": "TACME",
+        "event_id": "EvMessageVariant",
+        "event": {
+            **common_event,
+            "type": "message",
+            "channel_type": "channel",
+        },
+    }
+    mention_payload = {
+        "type": "event_callback",
+        "team_id": "TACME",
+        "event_id": "EvMentionVariant",
+        "event": {**common_event, "type": "app_mention"},
+    }
+
+    first = brain.slack_gateway.accept(
+        body=json.dumps(message_payload).encode(), headers={}, allow_unsigned=True
+    )
+    second = brain.slack_gateway.accept(
+        body=json.dumps(mention_payload).encode(), headers={}, allow_unsigned=True
+    )
+
+    assert first["accepted"] is True
+    assert second == {
+        "accepted": False,
+        "duplicate": True,
+        "event_id": "EvMentionVariant",
+    }
+    drained = brain.harness_worker.drain_until_idle()
+    assert drained["failed"] == 0
+    matching_runs = [
+        run
+        for run in brain.store.list_harness_records("agent_runs", "org_acme")
+        if run.get("trigger_event_id")
+        in {"EvMessageVariant", "EvMentionVariant"}
+    ]
+    assert len(matching_runs) == 1
+    deliveries = brain.store.list_harness_records(
+        "deliveries", "org_acme", where={"run_id": matching_runs[0]["id"]}
+    )
+    assert len(deliveries) == 1
+
+
+def test_slack_channels_are_proactive_by_default_with_explicit_opt_out(brain):
+    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    payload = {
+        "type": "event_callback",
+        "team_id": "TACME",
+        "event_id": "EvDefaultProactive",
+        "event": {
+            "type": "message",
+            "user": "UAJAY",
+            "channel": "CDEFAULT",
+            "channel_type": "channel",
+            "text": "The export pipeline is failing again.",
+            "ts": "150.001",
+        },
+    }
+    normalized = brain.slack_gateway.normalize(payload)
+    assert normalized.payload["proactivity_enabled"] is True
+
+    brain.store.upsert_simple_harness_record(
+        "channel_policies",
+        {
+            "id": "policy_default_opt_out",
+            "organization_id": "org_acme",
+            "source": "slack",
+            "channel_id": "CDEFAULT",
+            "enabled": True,
+            "observe": True,
+            "proactive": False,
+            "free_response": False,
+            "is_private": False,
+        },
+    )
+    opted_out = brain.slack_gateway.normalize(payload)
+    assert opted_out.payload["proactivity_enabled"] is False
+
+
+def test_slack_has_only_public_private_and_dm_conversation_types(brain):
+    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+
+    def normalized(channel: str, channel_type: str, *, private: bool = False):
+        return brain.slack_gateway.normalize(
+            {
+                "type": "event_callback",
+                "team_id": "TACME",
+                "event_id": f"Ev-{channel}",
+                "event": {
+                    "type": "message",
+                    "user": "UAJAY",
+                    "channel": channel,
+                    "channel_type": channel_type,
+                    "is_private": private,
+                    "text": "hello",
+                    "ts": f"1-{channel}",
+                    "client_msg_id": f"msg-{channel}",
+                },
+            }
+        )
+
+    public = normalized("CPUBLIC", "channel")
+    private = normalized("CPRIVATE", "channel", private=True)
+    dm = normalized("DAJAY", "im")
+
+    assert public.scope.visibility == "organization_public"
+    assert private.scope.visibility == "private_channel"
+    assert dm.scope.visibility == "person_private"
+    assert public.payload["context_key"] == "slack:TACME:CPUBLIC"
+    assert private.payload["context_key"] == "slack:TACME:CPRIVATE"
+    assert dm.payload["context_key"] == "slack:TACME:DAJAY"
+    assert public.payload["conversation_key"].startswith(
+        "slack:TACME:CPUBLIC:event:"
+    )
+    assert private.payload["conversation_key"].startswith(
+        "slack:TACME:CPRIVATE:event:"
+    )
+    assert dm.payload["conversation_key"] == "slack:TACME:DAJAY"
+    assert not public.is_direct_agent_request
+    assert not private.is_direct_agent_request
+    assert dm.is_direct_agent_request
+
+
+def test_agent_can_change_current_slack_channel_proactivity_after_approval(brain):
+    destination = {"type": "slack_channel", "id": "CSOCIAL", "is_private": False}
+    decision = brain.authz.resolve(
+        "org_acme", "person_ajay", destination, "reactive_agent"
+    )
+    envelope = InvocationEnvelope(
+        organization_id="org_acme",
+        principal_id="person_ajay",
+        conversation_id="slack:TACME:CSOCIAL:175.001",
+        destination=destination,
+        purpose="reactive_agent",
+        permission_decision_id=decision.id,
+        allowed_scope_ids=decision.allowed_scope_ids,
+    )
+    brain.company_agent.model = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ModelToolCall(
+                        id="call_disable_proactivity",
+                        name="slack_set_channel_proactivity",
+                        arguments={
+                            "enabled": False,
+                            "reason": "The user asked Sally to stay quiet here.",
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(content="Proactive attention is now disabled here."),
+        ]
+    )
+    run = brain.company_agent.create_invocation(
+        envelope=envelope,
+        goal="Stop proactively responding in this channel",
+        trigger_kind="reactive",
+        initial_message="Sally, stop proactively responding in this channel",
+    )
+    waiting = brain.company_agent.run(run["id"])
+    assert waiting.state.value == "waiting_for_approval"
+    completed = brain.company_agent.resume_after_approval(
+        approval_id=waiting.approval_id,
+        approved=True,
+        decided_by="person_ajay",
+    )
+    assert completed.state.value == "completed"
+    policy = brain.store.channel_policy("org_acme", "slack", "CSOCIAL")
+    assert policy["proactive"] is False
 
 
 def test_ambient_slack_uses_contextual_attention_before_waking(brain):
@@ -595,15 +934,97 @@ def test_ambient_slack_uses_contextual_attention_before_waking(brain):
     assert any(item["run_id"] == proactive["id"] for item in interventions)
 
 
-def test_wake_seeds_run_with_recent_channel_context(brain):
-    """H-04: a woken run must see the recent channel history the classifier
-    used to decide to wake it, not just the single triggering message.
+def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
+    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    first_payload = {
+        "type": "event_callback",
+        "team_id": "TACME",
+        "event_id": "EvChannelContextFirst",
+        "event": {
+            "type": "app_mention",
+            "user": "UAJAY",
+            "channel": "CSOCIAL",
+            "text": "Hey <@UBOT>",
+            "ts": "250.001",
+            "client_msg_id": "channel-context-first",
+        },
+    }
+    assert brain.slack_gateway.accept(
+        body=json.dumps(first_payload).encode(), headers={}, allow_unsigned=True
+    )["accepted"]
+    assert brain.harness_worker.drain_until_idle()["failed"] == 0
+    first_run = next(
+        run
+        for run in brain.store.list_harness_records("agent_runs", "org_acme")
+        if run.get("trigger_event_id") == "EvChannelContextFirst"
+    )
+    assert first_run["final_answer"]
 
-    Exercises AttentionPipeline._wake() directly with a controlled thread
-    state and evaluation, rather than through the full classifier + seeded
-    retrieval pipeline, so the assertion is about the wake-context fix itself
-    and not incidental keyword matches against seeded org data.
-    """
+    attention_model = ScriptedModelClient(
+        [
+            ModelResponse(
+                content=json.dumps(
+                    {
+                        "signal_type": "conversation_followup",
+                        "novelty": "continuation",
+                        "urgency": "normal",
+                        "decision": "WAKE_MAIN_AGENT",
+                        "confidence": 0.99,
+                        "reason": "The user is responding to Docket's preceding message.",
+                        "suggested_goal": "Answer the user's conversational follow-up.",
+                        "related_entity_ids": [],
+                        "existing_run_id": None,
+                    }
+                )
+            )
+        ]
+    )
+    brain.attention.model = attention_model
+    followup_payload = {
+        "type": "event_callback",
+        "team_id": "TACME",
+        "event_id": "EvChannelContextFollowup",
+        "event": {
+            "type": "message",
+            "user": "UAJAY",
+            "channel": "CSOCIAL",
+            "channel_type": "channel",
+            "text": "How can you help me?",
+            "ts": "251.001",
+            "client_msg_id": "channel-context-followup",
+        },
+    }
+    assert brain.slack_gateway.accept(
+        body=json.dumps(followup_payload).encode(), headers={}, allow_unsigned=True
+    )["accepted"]
+    assert brain.harness_worker.drain_until_idle()["failed"] == 0
+
+    attention_context = json.loads(
+        attention_model.requests[0]["messages"][1]["content"]
+    )
+    timeline = attention_context["recent_conversation"]
+    assert len(timeline) <= 10
+    assert any(
+        item["author"] == "docket" and item["text"] == first_run["final_answer"]
+        for item in timeline
+    )
+    # The current message is supplied separately as new_event, so the literal
+    # timeline contains only messages that preceded it.
+    assert all(item["text"] != "How can you help me?" for item in timeline)
+
+    followup_run = next(
+        run
+        for run in brain.store.list_harness_records("agent_runs", "org_acme")
+        if run.get("trigger_event_id") == "EvChannelContextFollowup"
+    )
+    main_timeline = brain.company_agent._slack_conversation(followup_run)
+    assert any(
+        item["role"] == "assistant" and item["text"] == first_run["final_answer"]
+        for item in main_timeline
+    )
+
+
+def test_wake_preserves_slack_conversation_address_for_main_context(brain):
     from docket.harness.models import (
         AttentionDecision,
         AttentionEvaluation,
@@ -612,35 +1033,8 @@ def test_wake_seeds_run_with_recent_channel_context(brain):
         NormalizedEvent,
     )
 
-    conversation_key = "slack:TACME:CSUPPORT2:300.001"
-    thread = {
-        "id": "thread_test_context",
-        "organization_id": "org_acme",
-        "conversation_key": conversation_key,
-        "workspace_id": "TACME",
-        "channel_id": "CSUPPORT2",
-        "thread_id": "300.001",
-        "participants": ["person_ravi"],
-        "recent_messages": [
-            {
-                "event_id": "EvContext1",
-                "author": "person_ravi",
-                "text": "Heads up, I'm about to deploy the widget service.",
-                "at": "2026-01-01T00:00:00+00:00",
-            },
-            {
-                "event_id": "EvContext2",
-                "author": "person_ravi",
-                "text": "Widget exports are failing again after deployment.",
-                "at": "2026-01-01T00:01:00+00:00",
-            },
-        ],
-        "active_run_id": None,
-        "last_agent_intervention_at": None,
-        "last_human_acknowledgement_at": None,
-        "possible_topics": [],
-        "status": "active",
-    }
+    context_key = "slack:TACME:CSUPPORT2"
+    conversation_key = f"{context_key}:event:EvContext2"
     event = NormalizedEvent(
         id="EvContext2",
         organization_id="org_acme",
@@ -650,13 +1044,13 @@ def test_wake_seeds_run_with_recent_channel_context(brain):
         scope=EventScope(
             workspace_id="TACME",
             channel_id="CSUPPORT2",
-            thread_id="300.001",
             visibility="organization_public",
             scope_id="scope_org_public",
         ),
         payload={
             "text": "Widget exports are failing again after deployment.",
             "conversation_key": conversation_key,
+            "context_key": context_key,
             "proactivity_enabled": True,
         },
         dedupe_key="dedupe-EvContext2",
@@ -671,17 +1065,15 @@ def test_wake_seeds_run_with_recent_channel_context(brain):
         reason="Deterministic local evaluator found an actionable failure signal.",
     )
 
-    run = brain.attention._wake(event, evaluation, thread)
-    messages = brain.agent_runs.messages(run["session_id"])
-    initial = next(m for m in messages if m["role"] == "user")
-    assert "Recent channel context" in initial["content"]
-    assert "about to deploy the widget service" in initial["content"]
-    # The trigger event itself must not be duplicated inside the context block
-    # — it's already covered by the "Proactive trigger from" line.
-    assert initial["content"].count("Widget exports are failing again") == 1
+    run = brain.attention._wake(event, evaluation)
+    assert run["metadata"]["slack"] == {
+        "workspace_id": "TACME",
+        "channel_id": "CSUPPORT2",
+        "context_key": context_key,
+    }
 
 
-def test_ambient_channel_without_opt_in_does_not_wake(brain):
+def test_ambient_channel_without_policy_is_proactive_by_default(brain):
     brain.slack_gateway.config.slack_bot_user_id = "UBOT"
     payload = {
         "type": "event_callback",
@@ -703,8 +1095,8 @@ def test_ambient_channel_without_opt_in_does_not_wake(brain):
     evaluations = brain.store.list_harness_records(
         "attention_evaluations", "org_acme", where={"event_id": "EvNoWake"}
     )
-    assert evaluations[0]["decision"] == "ADD_TO_DIGEST"
-    assert not any(
+    assert evaluations[0]["decision"] == "WAKE_MAIN_AGENT"
+    assert any(
         run.get("trigger_event_id") == "EvNoWake"
         for run in brain.store.list_harness_records("agent_runs", "org_acme")
     )

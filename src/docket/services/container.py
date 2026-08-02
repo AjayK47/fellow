@@ -41,6 +41,7 @@ from docket.harness.router import EventRouter
 from docket.harness.run_store import AgentRunStore
 from docket.harness.runtime import CompanyAgent
 from docket.harness.slack import SlackGateway, SlackSender
+from docket.harness.skill_validation import SkillResponseValidator
 from docket.harness.tool_output_summary import ToolOutputSummarizer
 from docket.harness.tools import ToolExecutor, build_tool_registry
 from docket.harness.worker import HarnessWorker
@@ -123,6 +124,7 @@ class DocketApp:
                 connected_account_id=kwargs.get("connected_account_id"),
             ),
         )
+        self.slack_sender = SlackSender(bot_token=runtime_settings.slack_bot_token)
         self.tool_registry = build_tool_registry(
             store=self.store,
             retrieval=self.retrieval,
@@ -132,6 +134,7 @@ class DocketApp:
             reality=self.reality,
             artifacts=self.artifacts,
             web_tools=self.web_tools,
+            slack_sender=self.slack_sender,
             run_code_enabled=runtime_settings.run_code_enabled,
             run_code_timeout_seconds=runtime_settings.run_code_timeout_seconds,
             run_code_max_tool_calls=runtime_settings.run_code_max_tool_calls,
@@ -149,11 +152,16 @@ class DocketApp:
             output_summarizer=self.tool_output_summarizer,
         )
         self.history_compactor = HistoryCompactor(model=self.extraction_model)
+        self.skill_response_validator = SkillResponseValidator(
+            model=self.extraction_model
+        )
         self.company_agent = CompanyAgent(
             runs=self.agent_runs,
             context_service=self.context,
             model=self.main_model,
             tools=self.tool_executor,
+            skills=self.skills,
+            skill_validator=self.skill_response_validator,
             audit=self.audit,
             enqueue_job=self.harness_jobs.enqueue,
             graph=self.graph,
@@ -193,7 +201,6 @@ class DocketApp:
             graph=self.graph,
             config=runtime_settings,
         )
-        self.slack_sender = SlackSender(bot_token=runtime_settings.slack_bot_token)
         self.slack_gateway = SlackGateway(
             store=self.store,
             queue=self.harness_jobs,

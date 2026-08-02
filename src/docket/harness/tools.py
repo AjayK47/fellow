@@ -122,6 +122,7 @@ def build_tool_registry(
     reality: Any | None = None,
     artifacts: Any | None = None,
     web_tools: Any | None = None,
+    slack_sender: Any | None = None,
     run_code_enabled: bool = False,
     run_code_timeout_seconds: int = 60,
     run_code_max_tool_calls: int = 20,
@@ -133,12 +134,22 @@ def build_tool_registry(
             name="request_human_input",
             description=(
                 "Pause the current run and ask the Slack user for information "
-                "that is genuinely required to continue."
+                "that is genuinely required to continue. Provide `choices` "
+                "(2-10 short options) when the answer is really a pick from a "
+                "known set — Slack renders it as buttons or a menu instead of "
+                "free text, and the human's selection resumes the run the "
+                "same way a typed reply would."
             ),
             input_schema=_object_schema(
                 {
                     "question": {"type": "string"},
                     "reason": {"type": "string"},
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 2,
+                        "maxItems": 10,
+                    },
                 },
                 ["question", "reason"],
             ),
@@ -148,8 +159,63 @@ def build_tool_registry(
             "waiting_for_human": True,
             "question": args["question"],
             "reason": args["reason"],
+            "choices": args.get("choices") or None,
             "run_id": runtime["run_id"],
         },
+    )
+
+    def _set_slack_channel_proactivity(
+        args: dict[str, Any], runtime: dict[str, Any]
+    ) -> dict[str, Any]:
+        destination = runtime["destination"]
+        if destination.get("type") not in {"slack_channel", "private_channel", "dm"}:
+            raise ValueError("this run is not attached to a Slack conversation")
+        channel_id = str(destination.get("id") or "")
+        if not channel_id:
+            raise ValueError("the current Slack channel could not be resolved")
+        organization_id = runtime["organization_id"]
+        existing = store.channel_policy(organization_id, "slack", channel_id) or {}
+        policy = {
+            **existing,
+            "id": f"channel_policy:{organization_id}:slack:{channel_id}",
+            "organization_id": organization_id,
+            "source": "slack",
+            "channel_id": channel_id,
+            "enabled": existing.get("enabled", True),
+            "observe": existing.get("observe", True),
+            "proactive": args["enabled"],
+            "free_response": existing.get("free_response", False),
+            "is_private": existing.get("is_private", bool(destination.get("is_private"))),
+        }
+        store.upsert_simple_harness_record("channel_policies", policy)
+        return {
+            "channel_id": channel_id,
+            "proactive": policy["proactive"],
+            "message": (
+                "Proactive attention is enabled for this channel."
+                if policy["proactive"]
+                else "Proactive attention is disabled for this channel."
+            ),
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="slack_set_channel_proactivity",
+            description=(
+                "Enable or disable proactive attention for the current Slack "
+                "channel when a user explicitly asks. This changes channel policy."
+            ),
+            input_schema=_object_schema(
+                {
+                    "enabled": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                ["enabled", "reason"],
+            ),
+            risk="write",
+            approval_required=True,
+        ),
+        _set_slack_channel_proactivity,
     )
 
     # Internet content is deliberately isolated from company retrieval. It is
@@ -449,6 +515,58 @@ def build_tool_registry(
             ),
         )
 
+        if slack_sender:
+            def _send_artifact(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+                artifact = artifacts.get(args["artifact_id"])
+                if not artifact or artifact["organization_id"] != runtime["organization_id"]:
+                    raise KeyError("artifact not found")
+                decision = retrieval.authorize(
+                    runtime["organization_id"],
+                    runtime["principal_id"],
+                    runtime["destination"],
+                    runtime["purpose"],
+                )
+                if artifact["scope_id"] not in decision.allowed_scope_ids:
+                    raise PermissionError(
+                        "artifact is outside the acting principal's allowed scopes"
+                    )
+                content = artifact["content"]
+                is_text = isinstance(content, str)
+                body = content if is_text else json.dumps(content, indent=2, default=str)
+                safe_title = "".join(
+                    c if c.isalnum() or c in " ._-" else "_" for c in artifact["title"]
+                ).strip() or artifact["id"]
+                slack_meta = (runtime.get("run_metadata") or {}).get("slack") or {}
+                result = slack_sender.upload_file(
+                    channel_id=slack_meta.get("channel_id") or runtime["destination"]["id"],
+                    filename=f"{safe_title}.{'txt' if is_text else 'json'}",
+                    content=body.encode("utf-8"),
+                    title=artifact["title"],
+                    initial_comment=args.get("initial_comment"),
+                )
+                return {"artifact_id": artifact["id"], "upload_result": result}
+
+            registry.register(
+                ToolDefinition(
+                    name="slack_send_artifact",
+                    description=(
+                        "Share an already-created artifact (report, plan, table) "
+                        "as a real file attachment in the current Slack "
+                        "conversation, instead of pasting its content as text."
+                    ),
+                    input_schema=_object_schema(
+                        {
+                            "artifact_id": {"type": "string"},
+                            "initial_comment": {"type": "string"},
+                        },
+                        ["artifact_id"],
+                    ),
+                    risk="write",
+                    approval_required=True,
+                ),
+                _send_artifact,
+            )
+
     registry.register(
         ToolDefinition(
             name="brain_resolve_owner",
@@ -497,6 +615,107 @@ def build_tool_registry(
                 limit=min(int(args.get("limit", 5)), 10),
             )
         },
+    )
+
+    _skill_step_schema = _object_schema(
+        {
+            "order": {"type": "integer", "minimum": 1},
+            "name": {"type": "string"},
+            "description": {"type": "string"},
+            "required": {"type": "boolean"},
+        },
+        ["name", "description"],
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="skill_propose_create",
+            description=(
+                "Propose a new reusable organizational procedure after a "
+                "non-trivial multi-tool task or a discovered workflow. This "
+                "always creates a draft — it has no effect on any run and is "
+                "not returned by brain_find_skills until a human reviews and "
+                "approves it."
+            ),
+            input_schema=_object_schema(
+                {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "goal": {"type": "string"},
+                    "steps": {"type": "array", "items": _skill_step_schema},
+                    "inputs": {"type": "array", "items": {"type": "string"}},
+                    "preconditions": {"type": "array", "items": {"type": "string"}},
+                    "warnings": {"type": "array", "items": {"type": "string"}},
+                },
+                ["name", "description", "goal"],
+            ),
+            risk="write",
+            approval_required=True,
+        ),
+        lambda args, runtime: {
+            "skill": skills.create(
+                organization_id=runtime["organization_id"],
+                name=args["name"],
+                description=args["description"],
+                goal=args["goal"],
+                steps=args.get("steps") or [],
+                inputs=args.get("inputs") or [],
+                preconditions=args.get("preconditions") or [],
+                warnings=args.get("warnings") or [],
+                owner_id=runtime["principal_id"],
+                status="draft",
+            ),
+            "note": "Created as a draft. A human must approve it before it takes effect.",
+        },
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="skill_propose_update",
+            description=(
+                "Propose a change to an existing approved skill you found "
+                "outdated, incomplete, or wrong. Creates a new draft version "
+                "without altering the currently-approved skill — a human "
+                "must approve the new version before it replaces it."
+            ),
+            input_schema=_object_schema(
+                {
+                    "skill_id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "goal": {"type": "string"},
+                    "steps": {"type": "array", "items": _skill_step_schema},
+                    "inputs": {"type": "array", "items": {"type": "string"}},
+                    "preconditions": {"type": "array", "items": {"type": "string"}},
+                    "warnings": {"type": "array", "items": {"type": "string"}},
+                },
+                ["skill_id"],
+            ),
+            risk="write",
+            approval_required=True,
+        ),
+        lambda args, runtime: (
+            lambda changes: {
+                "proposed_version": skills.propose_update(args["skill_id"], changes),
+                "note": "Created as a draft version. A human must approve it before it replaces the current skill.",
+            }
+        )(
+            {
+                k: v
+                for k, v in args.items()
+                if k
+                in {
+                    "name",
+                    "description",
+                    "goal",
+                    "steps",
+                    "inputs",
+                    "preconditions",
+                    "warnings",
+                }
+                and v is not None
+            }
+        ),
     )
 
     def _connected_accounts(runtime: dict[str, Any]) -> list[dict[str, Any]]:
