@@ -437,6 +437,91 @@ class BrainStore:
                     updated_at TEXT NOT NULL
                 );
 
+                -- Harness capability/provenance projections.  These tables
+                -- deliberately keep the complete record in JSON so package
+                -- and connector schemas can evolve without losing history.
+                CREATE TABLE IF NOT EXISTS skill_packages (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS capabilities (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS run_skill_refs (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS run_capability_refs (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS workspaces (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS plans (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS specialist_tasks (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS handoffs (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS automation_watermarks (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS chunks (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
@@ -1343,6 +1428,15 @@ class BrainStore:
         "checkpoints",
         "episodes",
         "automations",
+        "skill_packages",
+        "capabilities",
+        "run_skill_refs",
+        "run_capability_refs",
+        "workspaces",
+        "plans",
+        "specialist_tasks",
+        "handoffs",
+        "automation_watermarks",
     }
 
     def _checked_harness_table(self, table: str) -> str:
@@ -1760,6 +1854,45 @@ class BrainStore:
             raise ValueError(f"no simple upsert mapping for {table}")
         with self.cursor() as cur:
             cur.execute(sql, values)
+
+    def upsert_harness_projection(
+        self, table: str, record: dict[str, Any]
+    ) -> None:
+        """Persist common run/workspace/capability projections safely."""
+        allowed = {
+            "skill_packages", "capabilities", "run_skill_refs",
+            "run_capability_refs", "workspaces", "plans", "specialist_tasks",
+            "handoffs", "automation_watermarks",
+        }
+        if table not in allowed:
+            raise ValueError(f"unsupported harness projection table: {table}")
+        now = datetime.now(timezone.utc).isoformat()
+        with self.cursor() as cur:
+            cur.execute(
+                f"""INSERT OR REPLACE INTO {table}
+                (id, organization_id, status, run_id, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record["id"],
+                    record["organization_id"],
+                    record.get("status", "active"),
+                    record.get("run_id"),
+                    _ser(record),
+                    record.get("created_at", now),
+                    record.get("updated_at", now),
+                ),
+            )
+
+    def delete_harness_projection(self, table: str, record_id: str) -> None:
+        allowed = {
+            "skill_packages", "capabilities", "run_skill_refs",
+            "run_capability_refs", "workspaces", "plans", "specialist_tasks",
+            "handoffs", "automation_watermarks",
+        }
+        if table not in allowed:
+            raise ValueError(f"unsupported harness projection table: {table}")
+        with self.cursor() as cur:
+            cur.execute(f"DELETE FROM {table} WHERE id = ?", (record_id,))
 
     def identity_mapping(
         self, organization_id: str, source: str, source_user_id: str

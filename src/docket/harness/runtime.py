@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
@@ -19,6 +20,7 @@ from docket.harness.models import (
 from docket.harness.prompts import build_agent_messages, frame_untrusted_tool_result
 from docket.harness.run_store import AgentRunStore
 from docket.harness.tools import ToolExecutor
+from docket.services.scope_resolution import resolve_scope
 
 log = logging.getLogger("docket.runtime")
 
@@ -37,6 +39,7 @@ class CompanyAgent:
         enqueue_job: Callable[..., dict[str, Any]],
         graph: Any | None = None,
         history_compactor: Any | None = None,
+        workspaces: Any | None = None,
         max_iterations: int = 12,
         max_tool_calls: int = 24,
         context_token_budget: int = 12_000,
@@ -52,6 +55,7 @@ class CompanyAgent:
         self.enqueue_job = enqueue_job
         self.graph = graph
         self.history_compactor = history_compactor
+        self.workspaces = workspaces
         self.max_iterations = max_iterations
         self.max_tool_calls = max_tool_calls
         self.context_token_budget = context_token_budget
@@ -103,6 +107,22 @@ class CompanyAgent:
             max_tool_calls=self.max_tool_calls,
             metadata=metadata,
         )
+        if self.workspaces:
+            workspace = self.workspaces.create(
+                organization_id=envelope.organization_id,
+                run_id=run["id"],
+                owner_id=envelope.principal_id,
+                scope_id=resolve_scope(
+                    store=self.runs.store,
+                    organization_id=envelope.organization_id,
+                    principal_id=envelope.principal_id,
+                    destination=envelope.destination.model_dump(mode="json"),
+                ).write_scope_id,
+            )
+            run_metadata = dict(run.get("metadata") or {})
+            run_metadata["workspace_id"] = workspace["id"]
+            run["metadata"] = run_metadata
+            self.runs.update(run)
         if initial_message or goal:
             self.runs.add_message(
                 organization_id=envelope.organization_id,
@@ -296,9 +316,38 @@ class CompanyAgent:
                 conversation_summary=summary,
                 slack_conversation=self._slack_conversation(run),
                 active_skills=active_skills,
+                available_skills=(run.get("metadata") or {}).get("skill_index") or [],
             )
             allowed = self.tools.allowed_definitions(run)
             schemas = [definition.openai_schema() for definition in allowed]
+            run_metadata = dict(run.get("metadata") or {})
+            run_metadata["tool_refs"] = [
+                {
+                    "name": definition.name,
+                    "capability_id": definition.capability_id,
+                    "schema_hash": hashlib.sha256(
+                        json.dumps(definition.input_schema, sort_keys=True).encode("utf-8")
+                    ).hexdigest(),
+                    "risk": definition.risk,
+                    "approval_mode": definition.approval_mode,
+                }
+                for definition in allowed
+            ]
+            for ref in run_metadata["tool_refs"]:
+                now = utcnow().isoformat()
+                self.runs.store.upsert_harness_projection(
+                    "run_capability_refs",
+                    {
+                        "id": f"{run['id']}:{ref['name']}",
+                        "organization_id": run["organization_id"],
+                        "run_id": run["id"],
+                        "status": "active",
+                        **ref,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+            run["metadata"] = run_metadata
             run["iteration_count"] = int(run.get("iteration_count", 0)) + 1
             self.runs.update(run, checkpoint_reason="before_model")
             log.info(
@@ -737,12 +786,39 @@ class CompanyAgent:
         metadata["skill_refs"] = [
             {
                 "id": skill["id"],
+                "name": skill.get("name"),
                 "version": skill["version"],
+                "content_hash": skill.get("content_hash", ""),
+                "origin": skill.get("origin") or {},
+                "loaded_resources": [],
                 "mode": skill["activation_mode"],
                 "reason": skill["activation_reason"],
             }
             for skill in active
         ]
+        for ref in metadata["skill_refs"]:
+            now = utcnow().isoformat()
+            self.runs.store.upsert_harness_projection(
+                "run_skill_refs",
+                {
+                    "id": f"{run['id']}:{ref['id']}:{ref['version']}",
+                    "organization_id": run["organization_id"],
+                    "run_id": run["id"],
+                    "status": "active",
+                    **ref,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+        metadata["skill_index"] = self.skills.index_for_run(
+            organization_id=run["organization_id"],
+            task=run["goal"],
+            allowed_scope_ids=run["envelope"]["allowed_scope_ids"],
+            available_capabilities=self.tools.available_capabilities(run),
+        )
+        metadata["resolved_capabilities"] = sorted(
+            self.tools.available_capabilities(run)
+        )
         run["metadata"] = metadata
         self.runs.update(run)
         self.audit.record(

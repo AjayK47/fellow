@@ -675,8 +675,17 @@ def get_agent_run(run_id: str, request: Request) -> dict[str, Any]:
     run = brain.agent_runs.get(run_id)
     if not run:
         raise HTTPException(404, "agent run not found")
+    edges = brain.graph.neighbors(run["organization_id"], run_id)
+    related_ids = {run_id}
+    for edge in edges:
+        related_ids.add(edge["from_id"])
+        related_ids.add(edge["to_id"])
+    nodes = [brain.store.get_entity(node_id) for node_id in related_ids]
+    nodes = [node for node in nodes if node]
     return {
         "run": run,
+        "nodes": nodes,
+        "edges": edges,
         "messages": brain.agent_runs.messages(run["session_id"]),
         "turns": brain.store.list_harness_records(
             "agent_turns", run["organization_id"], where={"run_id": run_id}
@@ -692,6 +701,21 @@ def get_agent_run(run_id: str, request: Request) -> dict[str, Any]:
         "checkpoints": brain.store.list_harness_records(
             "checkpoints", run["organization_id"], where={"run_id": run_id}
         ),
+        "skill_refs": brain.store.list_harness_records(
+            "run_skill_refs", run["organization_id"], where={"run_id": run_id}
+        ),
+        "capability_refs": brain.store.list_harness_records(
+            "run_capability_refs", run["organization_id"], where={"run_id": run_id}
+        ),
+        "workspace": brain.workspaces.get_for_run(run["organization_id"], run_id),
+        "plan": brain.store.get_harness_record("plans", f"plan:{run_id}"),
+        "specialist_tasks": brain.store.list_harness_records(
+            "specialist_tasks", run["organization_id"], where={"run_id": run_id}
+        ),
+        "handoffs": brain.store.list_harness_records(
+            "handoffs", run["organization_id"], where={"run_id": run_id}
+        ),
+        "artifacts": brain.artifacts.list(run["organization_id"], run_id=run_id),
     }
 
 
@@ -849,6 +873,9 @@ def harness_dashboard(
 def harness_status(request: Request) -> dict[str, Any]:
     brain = _app(request)
     config = Settings()
+    capability_ids = brain.tool_executor.available_capabilities_for_organization(
+        config.default_org_id
+    )
     return {
         "database": {
             "backend": "sqlite",
@@ -892,6 +919,11 @@ def harness_status(request: Request) -> dict[str, Any]:
             "max_parallel": config.specialist_max_parallel,
             "max_depth": config.specialist_max_depth,
             "write_tools_allowed": False,
+        },
+        "capabilities": {
+            "available": sorted(capability_ids),
+            "registered": sorted(brain.tool_registry.capabilities()),
+            "count": len(capability_ids),
         },
         "reality_engine": {
             "canonical_connector_objects": True,
@@ -2393,16 +2425,57 @@ def create_skill(body: SkillCreateRequest, request: Request) -> dict[str, Any]:
         raise HTTPException(400, str(exc)) from exc
 
 
+@router.post("/v1/company-skills")
+def create_company_skill(body: SkillCreateRequest, request: Request) -> dict[str, Any]:
+    """Tenant-owned skill creation alias; immutable packages never use it."""
+    return create_skill(body, request)
+
+
 @router.get("/v1/skills/catalog")
 def skill_catalog(request: Request, organization_id: str = "org_acme") -> dict[str, Any]:
     brain = _app(request)
-    capabilities = brain.tool_registry.capabilities()
-    if not brain.store.list_connector_accounts(organization_id, active_only=True):
-        capabilities.discard("connectors.composio")
+    capabilities = brain.tool_executor.available_capabilities_for_organization(organization_id)
     return {
         "packages": brain.skill_packages.metadata(),
         "readiness": brain.skill_packages.readiness(capabilities),
         "capabilities": sorted(capabilities),
+    }
+
+
+@router.get("/v1/skills/readiness")
+def skill_readiness(request: Request, organization_id: str = "org_acme") -> dict[str, Any]:
+    brain = _app(request)
+    capabilities = brain.tool_executor.available_capabilities_for_organization(organization_id)
+    return {
+        "organization_id": organization_id,
+        "capabilities": sorted(capabilities),
+        "readiness": brain.skill_packages.readiness(capabilities),
+    }
+
+
+@router.get("/v1/capabilities")
+def list_capabilities(request: Request, organization_id: str = "org_acme") -> dict[str, Any]:
+    brain = _app(request)
+    registered = sorted(brain.tool_registry.capabilities())
+    available = brain.tool_executor.available_capabilities_for_organization(organization_id)
+    indexed = {
+        str(item.get("capability_id")): item
+        for item in brain.store.list_harness_records("capabilities", organization_id)
+        if item.get("capability_id")
+    }
+    return {
+        "organization_id": organization_id,
+        "capabilities": [
+            {
+                "id": capability,
+                "registered": True,
+                "available": capability in available,
+                "runtime_ready": bool((indexed.get(capability) or {}).get("runtime_ready", capability in available)),
+                "setup_needed": (indexed.get(capability) or {}).get("setup_needed", []),
+                "tool_names": (indexed.get(capability) or {}).get("tool_names", []),
+            }
+            for capability in registered
+        ],
     }
 
 
@@ -2418,10 +2491,25 @@ def skill_resource(name: str, relative_path: str, request: Request) -> dict[str,
         raise HTTPException(400, str(exc)) from exc
 
 
+@router.get("/v1/skills/{name}/resources/{relative_path:path}")
+def skill_resource_alias(name: str, relative_path: str, request: Request) -> dict[str, Any]:
+    return skill_resource(name, relative_path, request)
+
+
 @router.get("/v1/skills/{skill_id}")
 def get_skill(skill_id: str, request: Request) -> dict[str, Any]:
-    skill = _app(request).skills.get(skill_id)
+    brain = _app(request)
+    skill = brain.skills.get(skill_id)
     if not skill:
+        package = brain.skill_packages.get(skill_id)
+        if package:
+            return {
+                "metadata": next(
+                    item for item in brain.skill_packages.metadata()
+                    if item["name"] == skill_id
+                ),
+                "instructions": package.body,
+            }
         raise HTTPException(404, "skill not found")
     return skill
 
@@ -2431,6 +2519,15 @@ def list_skills(
     request: Request, organization_id: str
 ) -> dict[str, Any]:
     records = _app(request).skills.list(organization_id)
+    return {"skills": records, "count": len(records)}
+
+
+@router.get("/v1/company-skills")
+def list_company_skills(request: Request, organization_id: str) -> dict[str, Any]:
+    records = [
+        skill for skill in _app(request).skills.list(organization_id)
+        if skill.get("kind", "company") == "company" and not skill.get("immutable")
+    ]
     return {"skills": records, "count": len(records)}
 
 
@@ -2468,6 +2565,11 @@ def propose_skill_update(skill_id: str, body: dict[str, Any], request: Request) 
     return proposal
 
 
+@router.post("/v1/company-skills/{skill_id}:propose-update")
+def propose_company_skill_update(skill_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
+    return propose_skill_update(skill_id, body, request)
+
+
 @router.get("/v1/skills/{skill_id}/versions")
 def skill_versions(skill_id: str, request: Request) -> dict[str, Any]:
     versions = _app(request).skills.versions(skill_id)
@@ -2487,6 +2589,11 @@ def approve_skill_version(skill_id: str, version: int, request: Request) -> dict
     return skill
 
 
+@router.post("/v1/company-skills/{skill_id}/versions/{version}:approve")
+def approve_company_skill_version(skill_id: str, version: int, request: Request) -> dict[str, Any]:
+    return approve_skill_version(skill_id, version, request)
+
+
 @router.post("/v1/skills/{skill_id}:deprecate")
 def deprecate_skill(skill_id: str, request: Request) -> dict[str, Any]:
     try:
@@ -2498,7 +2605,142 @@ def deprecate_skill(skill_id: str, request: Request) -> dict[str, Any]:
     return skill
 
 
+@router.post("/v1/company-skills/{skill_id}:deprecate")
+def deprecate_company_skill(skill_id: str, request: Request) -> dict[str, Any]:
+    return deprecate_skill(skill_id, request)
+
+
 # ---- runs ----
+
+
+@router.get("/v1/workspaces")
+def list_workspaces(
+    request: Request, organization_id: str, run_id: str | None = None
+) -> dict[str, Any]:
+    records = _app(request).workspaces.list(organization_id, run_id=run_id)
+    return {"workspaces": records, "count": len(records)}
+
+
+@router.get("/v1/workspaces/{workspace_id}")
+def get_workspace(workspace_id: str, request: Request, organization_id: str) -> dict[str, Any]:
+    record = _app(request).store.get_harness_record("workspaces", workspace_id)
+    if not record or record.get("organization_id") != organization_id:
+        raise HTTPException(404, "workspace not found")
+    return record
+
+
+@router.post("/v1/workspaces/{workspace_id}:expire")
+def expire_workspace(workspace_id: str, request: Request, organization_id: str) -> dict[str, Any]:
+    record = _app(request).workspaces.expire(workspace_id, organization_id)
+    if not record:
+        raise HTTPException(404, "workspace not found")
+    return record
+
+
+@router.get("/v1/plans/{run_id}")
+def get_run_plan(run_id: str, request: Request, organization_id: str) -> dict[str, Any]:
+    plan = _app(request).store.get_harness_record("plans", f"plan:{run_id}")
+    if not plan or plan.get("organization_id") != organization_id:
+        raise HTTPException(404, "plan not found")
+    return plan
+
+
+@router.post("/v1/plans/{run_id}")
+def create_run_plan(run_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
+    brain = _app(request)
+    run = brain.agent_runs.get(run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    now = utcnow().isoformat()
+    plan = {
+        "id": f"plan:{run_id}",
+        "organization_id": run["organization_id"],
+        "run_id": run_id,
+        "title": str(body.get("title") or run.get("goal") or "Plan"),
+        "items": body.get("items") or [],
+        "status": "active",
+        "created_at": now,
+        "updated_at": now,
+    }
+    brain.store.upsert_harness_projection("plans", plan)
+    run["plan"] = plan
+    brain.agent_runs.update(run)
+    return plan
+
+
+@router.patch("/v1/plans/{run_id}")
+def update_run_plan(run_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
+    brain = _app(request)
+    plan = brain.store.get_harness_record("plans", f"plan:{run_id}")
+    if not plan:
+        raise HTTPException(404, "plan not found")
+    if "title" in body:
+        plan["title"] = body["title"]
+    if "items" in body:
+        plan["items"] = body["items"]
+    if "status" in body and body["status"] in {"active", "blocked", "completed", "cancelled"}:
+        plan["status"] = body["status"]
+    plan["updated_at"] = utcnow().isoformat()
+    brain.store.upsert_harness_projection("plans", plan)
+    run = brain.agent_runs.get(run_id)
+    if run:
+        run["plan"] = plan
+        brain.agent_runs.update(run)
+    return plan
+
+
+@router.get("/v1/specialist-tasks")
+def list_specialist_tasks(
+    request: Request, organization_id: str, run_id: str | None = None
+) -> dict[str, Any]:
+    where = {"run_id": run_id} if run_id else None
+    records = _app(request).store.list_harness_records(
+        "specialist_tasks", organization_id, where=where, order_by="updated_at", descending=True
+    )
+    return {"tasks": records, "count": len(records)}
+
+
+@router.get("/v1/specialist-tasks/{task_id}")
+def get_specialist_task(task_id: str, request: Request, organization_id: str) -> dict[str, Any]:
+    record = _app(request).store.get_harness_record("specialist_tasks", task_id)
+    if not record or record.get("organization_id") != organization_id:
+        raise HTTPException(404, "specialist task not found")
+    return record
+
+
+@router.get("/v1/handoffs")
+def list_handoffs(
+    request: Request, organization_id: str, run_id: str | None = None
+) -> dict[str, Any]:
+    where = {"run_id": run_id} if run_id else None
+    records = _app(request).store.list_harness_records(
+        "handoffs", organization_id, where=where, order_by="updated_at", descending=True
+    )
+    return {"handoffs": records, "count": len(records)}
+
+
+@router.post("/v1/handoffs/{handoff_id}:review")
+def review_handoff(handoff_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
+    brain = _app(request)
+    handoff = brain.store.get_harness_record("handoffs", handoff_id)
+    if not handoff:
+        raise HTTPException(404, "handoff not found")
+    decision = str(body.get("decision") or "").lower()
+    if decision not in {"accepted", "rejected", "needs_revision"}:
+        raise HTTPException(400, "decision must be accepted, rejected, or needs_revision")
+    handoff["status"] = decision
+    handoff["reviewed_by"] = body.get("reviewed_by") or "admin"
+    handoff["review_notes"] = str(body.get("notes") or "")[:4000]
+    handoff["updated_at"] = utcnow().isoformat()
+    brain.store.upsert_harness_projection("handoffs", handoff)
+    task_id = handoff.get("specialist_task_id")
+    if task_id:
+        task = brain.store.get_harness_record("specialist_tasks", task_id)
+        if task:
+            task["status"] = "completed" if decision == "accepted" else decision
+            task["updated_at"] = handoff["updated_at"]
+            brain.store.upsert_harness_projection("specialist_tasks", task)
+    return handoff
 
 
 @router.post("/v1/runs")

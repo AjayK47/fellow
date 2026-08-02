@@ -90,9 +90,9 @@ flowchart LR
 | Gateways | Slack Events API, Socket Mode, Composio webhooks, direct events | `harness/slack.py`, `slack_socket.py`, `harness/composio.py`, `api/routes.py` |
 | Authorization | Principal, destination, membership, and scope resolution | `services/authorization.py` |
 | Agent runtime | Bounded model → tool → observation loop and resumable states | `harness/runtime.py`, `harness/run_store.py`, `harness/prompts.py` |
-| Tools and actions | Schema validation, policy checks, previews, approvals, idempotency | `harness/tools.py`, `services/policy.py` |
+| Tools and actions | Capability-aware schemas, readiness, policy checks, previews, approvals, idempotency | `harness/tools.py`, `harness/typed_tools.py`, `services/policy.py` |
 | Skill packages | Immutable file-backed `SKILL.md` procedures, provenance, readiness, and run-level pinning | `services/skill_packages.py`, `builtin_skills/`, `services/skills.py` |
-| Specialists | Parallel read-only child runs with inherited permissions and budgets | `harness/specialists.py` |
+| Specialists | Parallel read-only child runs with inherited scopes, durable task/handoff records, and budgets | `harness/specialists.py`, `services/workspaces.py` |
 | Retrieval | Permission-filtered lexical, FTS5, vector, graph, fact, case, and run context | `services/retrieval.py`, `services/context.py` |
 | Reality | Connector objects, identity resolution, temporal facts, conflicts, and cases | `services/reality.py` |
 | Memory | Atomic memories, temporal revisions, relations, profiles, and extraction | `services/memory.py`, `harness/extraction.py`, `harness/memory_capture.py` |
@@ -170,6 +170,13 @@ always performed for an acting principal and destination.
 - Root-confined per-run workspace list/search/read/write/patch/diff tools,
   session search, durable run plans, explicit Slack actions, and approval-gated
   automation management
+- Capability registry and per-run capability/tool references; typed PDF,
+  DOCX, XLSX, PPTX, OCR, browser, vision, and image contracts report
+  `setup_needed` when optional runtimes are absent instead of accepting
+  arbitrary paths or shell commands
+- Immutable package security scanning, package indexes, workspace expiry and
+  scope ownership, specialist handoff review, and a run inspector exposing
+  skills, capabilities, workspaces, plans, specialists, and artifacts
 - Permission-filtered hybrid retrieval across evidence, memories, FTS5,
   embeddings, graph relationships, temporal facts, cases, profiles, and runs
 - Canonical versioned connector objects, per-stream sync cursors, cross-tool
@@ -366,9 +373,27 @@ API equivalents are:
 3. Channel observation, free-response, and proactive policy with
    `POST /v1/channel-policies`.
 
-DMs and explicit mentions activate the main agent. Ambient messages can be
-stored and learned without waking it. A channel must explicitly opt into
-proactive delivery.
+DMs and explicit mentions activate the main agent. Channels are proactive by
+default: ambient messages are evaluated by attention and may be delivered in
+context; a user or policy must explicitly disable proactive delivery for a
+channel.
+
+## Optional typed runtimes
+
+The gateway remains lightweight by default. Tool contracts are always present
+in the capability catalog, but a missing optional runtime is shown as
+`setup_needed` and is not exposed to a model call. Install the supported extras
+inside the active Conda environment when needed:
+
+```bash
+uv sync --extra documents   # PDF/DOCX/XLSX/PPTX/OCR dependencies
+uv sync --extra browser     # Playwright (also install its browser binaries)
+```
+
+Document tools consume and return Docket artifact IDs; browser tools require an
+explicit allowlisted-domain deployment; vision/image tools require provider
+flags and credentials. None can access arbitrary host paths or silently bypass
+approval.
 
 ## Composio setup
 

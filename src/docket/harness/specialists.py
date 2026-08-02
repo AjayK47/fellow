@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from typing import Any
 
-from docket.domain.models import utcnow
+from docket.domain.models import new_id, utcnow
 from docket.harness.models import (
     DestinationEnvelope,
     InvocationEnvelope,
@@ -79,6 +79,16 @@ class SpecialistWorkerService:
                                     "minimum": 10,
                                     "maximum": 900,
                                 },
+                                "allowed_scope_ids": {
+                                    "type": "array", "items": {"type": "string"}
+                                },
+                                "capabilities": {
+                                    "type": "array", "items": {"type": "string"}
+                                },
+                                "dependency_ids": {
+                                    "type": "array", "items": {"type": "string"}
+                                },
+                                "review_required": {"type": "boolean"},
                             },
                             "required": [
                                 "role",
@@ -117,6 +127,28 @@ class SpecialistWorkerService:
                 raise ValueError("specialist objectives must be distinct")
             seen.add(objective)
         results: list[dict[str, Any]] = []
+        for task in tasks:
+            task_id = new_id("specialist_task")
+            task["_task_id"] = task_id
+            now = utcnow().isoformat()
+            self.agent.runs.store.upsert_harness_projection(
+                "specialist_tasks",
+                {
+                    "id": task_id,
+                    "organization_id": parent["organization_id"],
+                    "run_id": parent["id"],
+                    "status": "queued",
+                    "role": task["role"],
+                    "objective": task["objective"],
+                    "allowed_tools": sorted(set(task.get("allowed_tools") or [])),
+                    "allowed_scope_ids": task.get("allowed_scope_ids") or parent["envelope"].get("allowed_scope_ids") or [],
+                    "capabilities": task.get("capabilities") or [],
+                    "dependency_ids": task.get("dependency_ids") or [],
+                    "review_required": bool(task.get("review_required", False)),
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
         with ThreadPoolExecutor(
             max_workers=min(len(tasks), self.max_parallel),
             thread_name_prefix="company-specialist",
@@ -135,6 +167,14 @@ class SpecialistWorkerService:
     ) -> dict[str, Any]:
         envelope_data = parent["envelope"]
         destination = DestinationEnvelope(**envelope_data["destination"])
+        requested_scopes = set(task.get("allowed_scope_ids") or [])
+        inherited_scopes = set(envelope_data.get("allowed_scope_ids") or [])
+        worker_scope_ids = sorted(requested_scopes & inherited_scopes) if requested_scopes else sorted(inherited_scopes)
+        task_id = task.get("_task_id")
+        if task_id:
+            record = self.agent.runs.store.get_harness_record("specialist_tasks", task_id) or {}
+            record.update({"status": "running", "updated_at": utcnow().isoformat()})
+            self.agent.runs.store.upsert_harness_projection("specialist_tasks", record)
         envelope = InvocationEnvelope(
             organization_id=parent["organization_id"],
             principal_id=envelope_data["principal_id"],
@@ -146,7 +186,7 @@ class SpecialistWorkerService:
             destination=destination,
             purpose="specialist_worker",
             permission_decision_id=envelope_data["permission_decision_id"],
-            allowed_scope_ids=list(envelope_data.get("allowed_scope_ids") or []),
+            allowed_scope_ids=worker_scope_ids,
             delegated_by=parent["id"],
             trace_id=parent["trace_id"],
         )
@@ -175,6 +215,8 @@ class SpecialistWorkerService:
                 "allowed_tools": allowed,
                 "output_contract": task["output_contract"],
                 "suppress_delivery": True,
+                "worker_capabilities": task.get("capabilities") or [],
+                "review_required": bool(task.get("review_required", False)),
             },
         )
         run["max_iterations"] = min(int(task.get("max_iterations", 6)), 10)
@@ -189,6 +231,10 @@ class SpecialistWorkerService:
             )
         ).isoformat()
         self.agent.runs.update(run)
+        if task_id:
+            record = self.agent.runs.store.get_harness_record("specialist_tasks", task_id) or {}
+            record.update({"worker_run_id": run["id"], "updated_at": utcnow().isoformat()})
+            self.agent.runs.store.upsert_harness_projection("specialist_tasks", record)
         outcome = self.agent.run(run["id"])
         answer = outcome.answer or outcome.error or ""
         scope_id = resolve_scope(
@@ -226,6 +272,32 @@ class SpecialistWorkerService:
             principal_id=envelope.principal_id,
             trace_id=parent["trace_id"],
         )
+        if task_id:
+            record = self.agent.runs.store.get_harness_record("specialist_tasks", task_id) or {}
+            record.update(
+                {
+                    "status": outcome.state.value,
+                    "artifact_id": artifact["id"],
+                    "updated_at": utcnow().isoformat(),
+                }
+            )
+            self.agent.runs.store.upsert_harness_projection("specialist_tasks", record)
+            now = utcnow().isoformat()
+            self.agent.runs.store.upsert_harness_projection(
+                "handoffs",
+                {
+                    "id": new_id("handoff"),
+                    "organization_id": parent["organization_id"],
+                    "run_id": parent["id"],
+                    "status": "awaiting_review" if task.get("review_required") else "accepted",
+                    "specialist_task_id": task_id,
+                    "worker_run_id": run["id"],
+                    "artifact_id": artifact["id"],
+                    "summary": answer[:4000],
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
         return {
             "role": task["role"],
             "worker_run_id": run["id"],

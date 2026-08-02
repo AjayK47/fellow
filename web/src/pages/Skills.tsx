@@ -6,6 +6,7 @@ import { Fragment, useState } from "react";
 type Skills = { skills: Json[]; count: number };
 type Versions = { versions: Json[] };
 type Catalog = { packages: Json[]; readiness: Json[]; capabilities: string[] };
+type Capabilities = { capabilities: Json[] };
 
 function VersionsRow({ skillId, currentVersion, onChanged }: { skillId: string; currentVersion: number; onChanged: () => void }) {
   const { data, error, loading } = useAsync<Versions>(
@@ -60,6 +61,7 @@ export default function Skills() {
     [tick]
   );
   const { data: catalog } = useAsync<Catalog>(() => api.get("/v1/skills/catalog", { organization_id: ORG }), []);
+  const { data: capabilities } = useAsync<Capabilities>(() => api.get("/v1/capabilities", { organization_id: ORG }), []);
   async function approveDraft(id: string, version: number) {
     await api.post(`/v1/skills/${id}/versions/${version}:approve`, {});
     setTick((t) => t + 1);
@@ -92,6 +94,19 @@ export default function Skills() {
                 })}
               </tbody>
             </table>
+          )}
+        </Card>
+      </Section>
+      <Section>
+        <Card title="Capability readiness" meta={`${capabilities?.capabilities.length ?? 0} registered`}>
+          {capabilities && (
+            <div className="flex flex-wrap gap-2">
+              {capabilities.capabilities.map((item) => {
+                const value = item as Record<string, unknown>;
+                const ready = Boolean(value.available);
+                return <Pill key={String(value.id)} tone={ready ? "good" : "orange"}>{String(value.id)} · {ready ? "ready" : "setup needed"}</Pill>;
+              })}
+            </div>
           )}
         </Card>
       </Section>

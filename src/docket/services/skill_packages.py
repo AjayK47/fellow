@@ -18,6 +18,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _MAX_BODY_BYTES = 256_000
 _MAX_RESOURCE_BYTES = 1_000_000
+_SECURITY_RULES: tuple[tuple[str, str, str], ...] = (
+    ("prompt_injection", "high", r"ignore\s+(?:all\s+)?previous\s+instructions|system\s+override|reveal\s+(?:the\s+)?system\s+prompt"),
+    ("destructive_command", "high", r"(?:rm\s+-rf|mkfs\b|dd\s+if=|drop\s+database|delete\s+all)"),
+    ("executable_script", "high", r"(?:os\.system|subprocess\.|exec\(|eval\(|curl\s+[^\n|]+\|\s*(?:sh|bash))"),
+    ("secret_access", "high", r"(?:OPENAI_API_KEY|SLACK_BOT_TOKEN|PRIVATE KEY|AWS_SECRET_ACCESS_KEY)"),
+    ("network_exfiltration", "medium", r"(?:requests\.(?:post|put)|httpx\.(?:post|put)|urllib\.request)"),
+)
 
 
 class SkillPackageManifest(BaseModel):
@@ -39,6 +46,8 @@ class SkillPackageManifest(BaseModel):
     inputs: list[str] = Field(default_factory=list)
     preconditions: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    security_verdict: str = "allow"
+    security_findings: list[dict[str, str]] = Field(default_factory=list)
 
     @field_validator("name")
     @classmethod
@@ -85,6 +94,8 @@ class SkillPackage(BaseModel):
             "immutable": manifest.kind in {"builtin", "connector"},
             "instructions": self.body,
             "content_hash": self.content_hash,
+            "security_verdict": manifest.security_verdict,
+            "security_findings": list(manifest.security_findings),
             "package_path": self.package_path,
             "license": manifest.license,
             "origin": dict(manifest.origin),
@@ -134,6 +145,8 @@ class SkillPackageCatalog:
                 "platform_key": package.manifest.platform_key,
                 "required_capabilities": package.manifest.required_capabilities,
                 "content_hash": package.content_hash,
+                "security_verdict": package.manifest.security_verdict,
+                "security_findings": package.manifest.security_findings,
             }
             for package in self.list()
         ]
@@ -158,9 +171,12 @@ class SkillPackageCatalog:
                 {
                     "name": package.manifest.name,
                     "ready": ready,
+                    "status": "ready" if ready else "setup_needed",
                     "required_capabilities": required,
                     "missing_capabilities": missing + ([] if any_satisfied else ["one_of:" + ",".join(sorted(any_of))]),
                     "content_hash": package.content_hash,
+                    "security_verdict": package.manifest.security_verdict,
+                    "security_findings": package.manifest.security_findings,
                 }
             )
         return result
@@ -188,7 +204,19 @@ class SkillPackageCatalog:
         }
 
     @staticmethod
+    def scan_text(text: str) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        for rule, severity, pattern in _SECURITY_RULES:
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                findings.append({"rule": rule, "severity": severity})
+        if ".." in text and any(token in text for token in ("/", "\\")):
+            findings.append({"rule": "path_traversal", "severity": "medium"})
+        return findings
+
+    @staticmethod
     def _load(skill_file: Path) -> SkillPackage:
+        if skill_file.is_symlink():
+            raise ValueError(f"skill package symlinks are not allowed: {skill_file}")
         raw = skill_file.read_text(encoding="utf-8")
         if len(raw.encode("utf-8")) > _MAX_BODY_BYTES + 32_000:
             raise ValueError(f"skill package is too large: {skill_file}")
@@ -204,6 +232,20 @@ class SkillPackageCatalog:
         manifest = SkillPackageManifest.model_validate(frontmatter)
         if manifest.kind not in {"builtin", "connector", "marketplace"}:
             raise ValueError(f"unsupported immutable skill kind: {manifest.kind}")
+        findings = SkillPackageCatalog.scan_text(body)
+        if findings:
+            manifest = manifest.model_copy(
+                update={
+                    "security_verdict": "block"
+                    if any(item["severity"] == "high" for item in findings)
+                    else "require_review",
+                    "security_findings": findings,
+                }
+            )
+            if manifest.kind != "marketplace":
+                raise ValueError(
+                    f"skill package failed static security scan: {skill_file}"
+                )
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         return SkillPackage(
             manifest=manifest,

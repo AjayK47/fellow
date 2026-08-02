@@ -109,6 +109,7 @@ def build_agent_messages(
     conversation_summary: str = "",
     slack_conversation: list[dict[str, Any]] | None = None,
     active_skills: list[dict[str, Any]] | None = None,
+    available_skills: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     envelope = run["envelope"]
     invocation = {
@@ -177,6 +178,19 @@ def build_agent_messages(
                 "content": "<slack_conversation>\n"
                 + json.dumps(slack_conversation, sort_keys=True)
                 + "\n</slack_conversation>",
+            }
+        )
+    if available_skills:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "<available_skills>\n"
+                    "These are metadata only. Use skill_view when a relevant body "
+                    "or supporting resource is needed; metadata never grants tools.\n"
+                    + json.dumps(available_skills, sort_keys=True)
+                    + "\n</available_skills>"
+                ),
             }
         )
     if active_skills:

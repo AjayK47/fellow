@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -11,10 +12,67 @@ from typing import Any, Callable
 from docket.domain.models import new_id, utcnow
 from docket.harness.composio import ComposioClient
 from docket.harness.models import ModelToolCall, ToolDefinition, ToolResult
+from docket.harness.typed_tools import BrowserTools, DocumentTools, VisionMediaTools
 from docket.storage.db import BrainStore
 
 
 ToolHandler = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+
+
+def _infer_capability_id(name: str) -> str:
+    """Map legacy tool names to stable capability IDs.
+
+    Explicit capability IDs can override this mapping, but registering legacy
+    tools still produces a complete capability contract for readiness and run
+    traces.
+    """
+    if name == "web_search":
+        return "web.search"
+    if name == "web_fetch":
+        return "web.fetch"
+    if name in {"workspace_read", "workspace_search", "workspace_list", "workspace_diff"}:
+        return f"workspace.{name.removeprefix('workspace_')}"
+    if name in {"workspace_write", "workspace_patch"}:
+        return "workspace.write" if name == "workspace_write" else "workspace.patch"
+    if name == "run_code":
+        return "code.execute"
+    if name in {"session_search"}:
+        return "session.search"
+    if name in {"plan_create", "plan_get", "plan_update"}:
+        return "plan.manage"
+    if name in {"delegate_work", "delegate_task"}:
+        return "specialist.delegate"
+    if name.startswith("automation_"):
+        return "automation.manage"
+    if name in {"brain_create_artifact", "slack_send_artifact"}:
+        return "artifact.preview"
+    if name == "brain_list_artifacts":
+        return "artifact.read"
+    if name.startswith("slack_"):
+        return "slack.react" if name == "slack_react" else "slack.actions"
+    if name.startswith("composio_") or name.startswith(("linear_", "github_")):
+        return "connector.composio.action"
+    if name.startswith("pdf_"):
+        return f"document.pdf.{name.removeprefix('pdf_')}"
+    if name == "ocr_extract":
+        return "document.ocr"
+    if name.startswith("docx_"):
+        return f"document.docx.{name.removeprefix('docx_')}"
+    if name.startswith("xlsx_"):
+        return f"document.xlsx.{name.removeprefix('xlsx_')}"
+    if name.startswith(("pptx_", "powerpoint_")):
+        return f"document.pptx.{name.split('_', 1)[1]}"
+    if name.startswith("browser_"):
+        return f"browser.{name.removeprefix('browser_')}"
+    if name == "vision_analyze":
+        return "vision.analyze"
+    if name == "image_generate":
+        return "image.generate"
+    if name.startswith("skill_") or name == "skills_list":
+        return "skill.manage"
+    if name.startswith("brain_"):
+        return "memory.read"
+    return f"tool.{name}"
 
 
 @dataclass
@@ -30,6 +88,10 @@ class ToolRegistry:
     def register(self, definition: ToolDefinition, handler: ToolHandler) -> None:
         if definition.name in self._tools:
             raise ValueError(f"duplicate tool: {definition.name}")
+        if not definition.capability_id:
+            definition = definition.model_copy(
+                update={"capability_id": _infer_capability_id(definition.name)}
+            )
         self._tools[definition.name] = RegisteredTool(definition, handler)
 
     def get(self, name: str) -> RegisteredTool | None:
@@ -45,6 +107,10 @@ class ToolRegistry:
         registered = self._tools.get(definition.name)
         if not registered:
             raise KeyError(definition.name)
+        if not definition.capability_id:
+            definition = definition.model_copy(
+                update={"capability_id": _infer_capability_id(definition.name)}
+            )
         self._tools[definition.name] = RegisteredTool(
             definition=definition, handler=registered.handler
         )
@@ -52,33 +118,23 @@ class ToolRegistry:
     def capabilities(self) -> set[str]:
         """Expose stable capability names for skill readiness matching."""
         capabilities: set[str] = set()
-        for name in self._tools:
-            if name in {"brain_create_artifact", "slack_send_artifact"}:
-                capabilities.add("documents.write")
-            elif name == "brain_list_artifacts":
-                capabilities.add("documents.read")
-            elif name == "web_search":
-                capabilities.add("web.search")
-            elif name == "web_fetch":
-                capabilities.add("web.fetch")
-            elif name.startswith("brain_"):
-                capabilities.add("memory.read")
-            elif name.startswith("slack_"):
-                capabilities.add("slack.actions")
-            elif name in {"composio_search", "composio_describe", "composio_execute"}:
-                capabilities.add("connectors.composio")
-            elif name == "workspace_read":
-                capabilities.add("workspace.read")
-            elif name == "workspace_write":
-                capabilities.add("workspace.write")
-            elif name == "workspace_patch":
-                capabilities.add("workspace.write")
-            elif name == "workspace_list":
-                capabilities.add("workspace.list")
+        for registered in self._tools.values():
+            if registered.definition.capability_id:
+                capabilities.add(registered.definition.capability_id)
+                if registered.definition.capability_id.startswith("connector."):
+                    # Keep the original package manifest alias while callers
+                    # migrate to the stable connector.<provider> namespace.
+                    capabilities.add("connectors.composio")
         # The document package can use the artifact surface for extraction and
         # creation; this marker is intentionally coarse and policy-filtered.
-        if "documents.write" in capabilities or "documents.read" in capabilities:
+        if any(capability.startswith("document.") for capability in capabilities):
             capabilities.add("documents.read")
+        if any(
+            capability.startswith("document.")
+            and not capability.endswith((".read", ".inspect", ".extract", ".render", ".validate"))
+            for capability in capabilities
+        ):
+            capabilities.add("documents.write")
         return capabilities
 
 
@@ -160,14 +216,52 @@ def build_tool_registry(
     run_code_timeout_seconds: int = 60,
     run_code_max_tool_calls: int = 20,
     workspace_root: Path | str | None = None,
+    workspace_service: Any | None = None,
+    document_tools: DocumentTools | None = None,
+    browser_tools: BrowserTools | None = None,
+    vision_tools: VisionMediaTools | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
+
+    # Optional typed tool suites are registered even when their runtime is not
+    # installed.  Their definitions remain visible to readiness/catalog APIs,
+    # while ToolExecutor excludes ``runtime_ready=False`` from model calls.
+    for suite in (document_tools, browser_tools, vision_tools):
+        if suite is None:
+            continue
+        for definition in suite.definitions():
+            registry.register(
+                definition,
+                lambda args, runtime, _suite=suite, _name=definition.name: _suite.execute(
+                    args,
+                    {**runtime, "tool_name": _name},
+                ),
+            )
 
     workspace = Path(workspace_root or Path.cwd()).expanduser().resolve()
 
     def _workspace_root(runtime: dict[str, Any] | None = None) -> Path:
         run_id = str((runtime or {}).get("run_id") or "shared")
-        root = (workspace / ".docket-workspaces" / run_id).resolve()
+        record = None
+        if workspace_service and runtime and runtime.get("organization_id"):
+            record = workspace_service.get_for_run(
+                str(runtime["organization_id"]), run_id
+            )
+            if record and record.get("expires_at") and record["expires_at"] <= utcnow().isoformat():
+                workspace_service.expire(record["id"], str(runtime["organization_id"]))
+                record["status"] = "expired"
+            if record and record.get("status") != "active":
+                raise PermissionError("run workspace is not active")
+            if record:
+                principal = str(runtime.get("principal_id") or "")
+                if record.get("owner_id") and record.get("owner_id") != principal:
+                    raise PermissionError("workspace is owned by another principal")
+                allowed_scopes = set((runtime.get("envelope") or {}).get("allowed_scope_ids") or [])
+                scope_id = record.get("scope_id")
+                scope = store.get_scope(scope_id) if scope_id else None
+                if scope_id not in allowed_scopes and not bool((scope or {}).get("is_public")):
+                    raise PermissionError("workspace scope is outside this run's allowed scopes")
+        root = Path(record["path"]).resolve() if record else (workspace / ".docket-workspaces" / run_id).resolve()
         root.mkdir(parents=True, exist_ok=True)
         return root
 
@@ -425,6 +519,9 @@ def build_tool_registry(
                 input_schema=_object_schema({"text": {"type": "string"}, "blocks": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, ["text"]),
                 risk="write",
                 approval_required=True,
+                allowed_destination_types=["slack_channel", "private_channel", "dm", "internal_agent_session"],
+                idempotency_required=True,
+                capability_id="slack.actions",
             ),
             _slack_send_message,
         )
@@ -442,6 +539,9 @@ def build_tool_registry(
                 input_schema=_object_schema({"timestamp": {"type": "string"}, "name": {"type": "string"}}, ["timestamp", "name"]),
                 risk="write",
                 approval_required=True,
+                allowed_destination_types=["slack_channel", "private_channel", "dm", "internal_agent_session"],
+                idempotency_required=True,
+                capability_id="slack.react",
             ),
             _slack_react,
         )
@@ -664,6 +764,30 @@ def build_tool_registry(
         )
 
     if artifacts:
+        def _create_scoped_artifact(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+            from docket.services.scope_resolution import resolve_scope
+
+            envelope = runtime["envelope"]
+            resolved = resolve_scope(
+                store=store,
+                organization_id=runtime["organization_id"],
+                principal_id=runtime["principal_id"],
+                destination=runtime["destination"],
+            )
+            requested = str(args.get("scope_id") or resolved.write_scope_id)
+            if requested not in set(envelope.get("allowed_scope_ids") or []) and requested != resolved.write_scope_id:
+                raise PermissionError("artifact scope is outside this run's allowed scopes")
+            return artifacts.create(
+                organization_id=runtime["organization_id"],
+                artifact_type=args["artifact_type"],
+                title=args["title"],
+                content=args["content"],
+                scope_id=resolved.write_scope_id,
+                run_id=runtime["run_id"],
+                created_by=runtime["principal_id"],
+                metadata=args.get("metadata") or {},
+            )
+
         def _list_artifacts(
             args: dict[str, Any], runtime: dict[str, Any]
         ) -> dict[str, Any]:
@@ -731,16 +855,7 @@ def build_tool_registry(
                 risk="write",
                 approval_required=True,
             ),
-            lambda args, runtime: artifacts.create(
-                organization_id=runtime["organization_id"],
-                artifact_type=args["artifact_type"],
-                title=args["title"],
-                content=args["content"],
-                scope_id=args["scope_id"],
-                run_id=runtime["run_id"],
-                created_by=runtime["principal_id"],
-                metadata=args.get("metadata") or {},
-            ),
+            lambda args, runtime: _create_scoped_artifact(args, runtime),
         )
 
         if slack_sender:
@@ -902,6 +1017,38 @@ def build_tool_registry(
                 result["resource"] = skills.package_catalog.resource(
                     package.manifest.name, str(args["resource_path"])
                 )
+                # Pin the exact supporting resource to the originating run so
+                # replay/audit can distinguish metadata-only discovery from a
+                # body/reference that actually entered model context.
+                run = skills.store.get_harness_record("agent_runs", runtime["run_id"])
+                if run:
+                    metadata = dict(run.get("metadata") or {})
+                    refs = list(metadata.get("skill_refs") or [])
+                    resource_ref = {
+                        "path": str(args["resource_path"]),
+                        "content_hash": result["resource"]["content_hash"],
+                    }
+                    for ref in refs:
+                        if ref.get("name") == package.manifest.name:
+                            loaded = list(ref.get("loaded_resources") or [])
+                            if resource_ref not in loaded:
+                                loaded.append(resource_ref)
+                            ref["loaded_resources"] = loaded
+                            skills.store.upsert_harness_projection(
+                                "run_skill_refs",
+                                {
+                                    "id": f"{run['id']}:{ref.get('id')}:{ref.get('version')}",
+                                    "organization_id": run["organization_id"],
+                                    "run_id": run["id"],
+                                    "status": "active",
+                                    **ref,
+                                    "created_at": run.get("created_at") or utcnow().isoformat(),
+                                    "updated_at": utcnow().isoformat(),
+                                },
+                            )
+                    metadata["skill_refs"] = refs
+                    run["metadata"] = metadata
+                    skills.store.upsert_agent_run(run)
             return result
         matches = skills.search(runtime["organization_id"], args["name"], limit=10)
         exact = next((item for item in matches if item.get("name") == args["name"]), None)
@@ -968,25 +1115,78 @@ def build_tool_registry(
             raise KeyError("run not found")
         return record
 
+    def _normalize_plan_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        ids: set[str] = set()
+        for index, raw in enumerate(items, 1):
+            item = dict(raw)
+            item_id = str(item.get("id") or f"step_{index}")
+            if item_id in ids:
+                raise ValueError(f"duplicate plan step id: {item_id}")
+            ids.add(item_id)
+            status = str(item.get("status") or "pending")
+            if status not in {"pending", "active", "blocked", "completed", "cancelled"}:
+                raise ValueError(f"invalid plan step status: {status}")
+            item.update(
+                {
+                    "id": item_id,
+                    "title": str(item.get("title") or item.get("name") or f"Step {index}"),
+                    "status": status,
+                    "owner": item.get("owner") or item.get("worker_role"),
+                    "dependencies": list(item.get("dependencies") or item.get("dependency_ids") or []),
+                    "evidence": list(item.get("evidence") or []),
+                    "blocker": item.get("blocker"),
+                }
+            )
+            normalized.append(item)
+        for item in normalized:
+            unknown = set(item["dependencies"]) - ids
+            if unknown:
+                raise ValueError(f"plan step {item['id']} has unknown dependencies: {sorted(unknown)}")
+        return normalized
+
     def _plan_create(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
         run = _plan_record(runtime)
-        plan = {"title": args["title"], "items": args.get("items") or [], "updated_at": utcnow().isoformat()}
+        now = utcnow().isoformat()
+        plan = {
+            "id": f"plan:{run['id']}",
+            "organization_id": runtime["organization_id"],
+            "run_id": run["id"],
+            "envelope": run.get("envelope") or {},
+            "title": args["title"],
+            "items": _normalize_plan_items(args.get("items") or []),
+            "status": "active",
+            "updated_at": now,
+            "created_at": now,
+        }
+        store.upsert_harness_projection("plans", plan)
         run["plan"] = plan
         run["updated_at"] = plan["updated_at"]
         store.upsert_agent_run(run)
         return {"plan": plan}
 
     def _plan_get(_args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
-        return {"plan": _plan_record(runtime).get("plan")}
+        run = _plan_record(runtime)
+        plan = store.get_harness_record("plans", f"plan:{run['id']}") or run.get("plan")
+        return {"plan": plan}
 
     def _plan_update(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
         run = _plan_record(runtime)
-        plan = dict(run.get("plan") or {"title": "", "items": []})
+        plan = dict(
+            store.get_harness_record("plans", f"plan:{run['id']}")
+            or run.get("plan")
+            or {"id": f"plan:{run['id']}", "title": "", "items": []}
+        )
         if args.get("title") is not None:
             plan["title"] = args["title"]
         if args.get("items") is not None:
-            plan["items"] = args["items"]
+            plan["items"] = _normalize_plan_items(args["items"])
         plan["updated_at"] = utcnow().isoformat()
+        plan.setdefault("organization_id", runtime["organization_id"])
+        plan.setdefault("run_id", run["id"])
+        plan.setdefault("status", "active")
+        plan.setdefault("created_at", plan["updated_at"])
+        store.upsert_harness_projection("plans", plan)
         run["plan"] = plan
         run["updated_at"] = plan["updated_at"]
         store.upsert_agent_run(run)
@@ -1350,6 +1550,9 @@ def build_tool_registry(
                 risk="write" if risk == "write" else "read",
                 approval_required=risk == "write",
                 toolkits=[toolkit],
+                idempotency_required=risk == "write",
+                audit_redaction=["token", "secret", "authorization"],
+                connector_readiness={"toolkit": toolkit},
             ),
             _handler,
         )
@@ -1391,6 +1594,28 @@ def build_tool_registry(
             ),
             lambda args, runtime: sandbox.run(args["code"], runtime=runtime),
         )
+    # A separate typed contract keeps test execution distinguishable from
+    # inline data transformation.  The full workspace command runner is an
+    # optional specialist runtime; never silently turn this into a shell.
+    registry.register(
+        ToolDefinition(
+            name="code_test",
+            description="Run an allow-listed test command inside a specialist workspace and return structured evidence.",
+            input_schema=_object_schema(
+                {"command": {"type": "string"}, "path": {"type": "string"}},
+                ["command"],
+            ),
+            capability_id="code.test",
+            runtime_ready=False,
+            setup_needed=["specialist_test_runner"],
+            risk="read",
+            specialist_only=True,
+        ),
+        lambda _args, _runtime: {
+            "status": "setup_needed",
+            "required_capabilities": ["specialist_test_runner"],
+        },
+    )
     return registry
 
 
@@ -1453,16 +1678,42 @@ class ToolExecutor:
     def allowed_definitions(self, run: dict[str, Any]) -> list[ToolDefinition]:
         org = run["organization_id"]
         metadata = run.get("metadata") or {}
+        envelope = run.get("envelope") or {}
+        destination_type = str((envelope.get("destination") or {}).get("type") or "")
+        principal_id = str(envelope.get("principal_id") or "")
+        trigger_kind = str(run.get("trigger_kind") or "")
         worker_allowed = (
             set(metadata.get("allowed_tools") or [])
             if metadata.get("specialist_worker")
+            else None
+        )
+        worker_capabilities = (
+            set(metadata.get("worker_capabilities") or [])
+            if metadata.get("specialist_worker") and metadata.get("worker_capabilities")
             else None
         )
         definitions: list[ToolDefinition] = []
         for definition in self.registry.definitions():
             if worker_allowed is not None and definition.name not in worker_allowed:
                 continue
+            if worker_capabilities is not None and definition.capability_id not in worker_capabilities:
+                continue
             if metadata.get("specialist_worker") and definition.risk != "read":
+                continue
+            if definition.specialist_only and not metadata.get("specialist_worker"):
+                continue
+            if not definition.main_agent_visible and not metadata.get("specialist_worker"):
+                continue
+            if definition.allowed_principals and principal_id not in definition.allowed_principals:
+                continue
+            worker_role = str(metadata.get("worker_role") or "")
+            if definition.allowed_roles and worker_role not in definition.allowed_roles:
+                continue
+            if definition.allowed_destination_types and destination_type not in definition.allowed_destination_types:
+                continue
+            if definition.allowed_trigger_types and trigger_kind not in definition.allowed_trigger_types:
+                continue
+            if not definition.runtime_ready:
                 continue
             policy = self._policy(org, definition.name)
             if policy.get("enabled", True) and definition.risk != "destructive":
@@ -1472,31 +1723,58 @@ class ToolExecutor:
     def available_capabilities(self, run: dict[str, Any]) -> set[str]:
         """Return capabilities that are actually enabled for this run."""
         org = run["organization_id"]
-        names = {definition.name for definition in self.allowed_definitions(run)}
-        capabilities = self.registry.capabilities()
-        # A disabled policy or specialist allow-list must remove the associated
-        # capability rather than merely hiding individual tool schemas.
-        if "web_search" not in names:
-            capabilities.discard("web.search")
-        if "web_fetch" not in names:
-            capabilities.discard("web.fetch")
-        if not any(name.startswith("brain_") for name in names):
-            capabilities.discard("memory.read")
-        if not any(name in {"brain_create_artifact", "brain_list_artifacts", "slack_send_artifact"} for name in names):
-            capabilities.discard("documents.read")
-            capabilities.discard("documents.write")
-        if not any(name.startswith("slack_") for name in names):
-            capabilities.discard("slack.actions")
-        if not any(name in {"composio_search", "composio_describe", "composio_execute"} for name in names):
-            capabilities.discard("connectors.composio")
-        elif not self.store.list_connector_accounts(org, active_only=True):
-            capabilities.discard("connectors.composio")
-        if "workspace_read" not in names:
-            capabilities.discard("workspace.read")
-        if not any(name in {"workspace_write", "workspace_patch"} for name in names):
-            capabilities.discard("workspace.write")
-        if "workspace_list" not in names:
-            capabilities.discard("workspace.list")
+        definitions = self.allowed_definitions(run)
+        capabilities = {
+            definition.capability_id
+            for definition in definitions
+            if definition.capability_id
+        }
+        if not self.store.list_connector_accounts(org, active_only=True):
+            capabilities = {
+                capability
+                for capability in capabilities
+                if not capability.startswith("connector.")
+                and capability != "connectors.composio"
+            }
+        return capabilities
+
+    def available_capabilities_for_organization(self, organization_id: str) -> set[str]:
+        """Return runtime/provider-ready capabilities for catalog/readiness APIs.
+
+        Run-specific ACLs are applied later by ``available_capabilities``; this
+        method intentionally answers only installation, connector-account, and
+        organization tool-policy readiness.
+        """
+        capabilities: set[str] = set()
+        has_connector = bool(
+            self.store.list_connector_accounts(organization_id, active_only=True)
+        )
+        for definition in self.registry.definitions():
+            if not definition.runtime_ready:
+                continue
+            policy = self._policy(organization_id, definition.name)
+            if not policy.get("enabled", True) or definition.risk == "destructive":
+                continue
+            toolkit = str((definition.connector_readiness or {}).get("toolkit") or "")
+            if toolkit and not any(
+                str(account.get("toolkit") or "").lower() == toolkit.lower()
+                for account in self.store.list_connector_accounts(organization_id, active_only=True)
+            ):
+                continue
+            if definition.capability_id and (
+                has_connector or not definition.capability_id.startswith("connector.")
+            ):
+                capabilities.add(definition.capability_id)
+        if has_connector:
+            capabilities.add("connectors.composio")
+        if any(capability.startswith("document.") for capability in capabilities):
+            capabilities.add("documents.read")
+        if any(
+            capability.startswith("document.")
+            and not capability.endswith((".read", ".inspect", ".extract", ".render", ".validate"))
+            for capability in capabilities
+        ):
+            capabilities.add("documents.write")
         return capabilities
 
     def execute(
@@ -1516,6 +1794,13 @@ class ToolExecutor:
             )
         definition = registered.definition
         metadata = run.get("metadata") or {}
+        if definition.name not in {item.name for item in self.allowed_definitions(run)}:
+            return ToolResult(
+                call_id=call.id,
+                tool_name=call.name,
+                status="disabled",
+                error="Tool is outside this run's resolved capability envelope.",
+            )
         if metadata.get("specialist_worker"):
             worker_allowed = set(metadata.get("allowed_tools") or [])
             if definition.name not in worker_allowed or definition.risk != "read":
@@ -1583,6 +1868,7 @@ class ToolExecutor:
         requires_approval = (
             definition.approval_required
             or definition.risk == "write"
+            or definition.approval_mode in {"always", "conditional"}
             or policy.get("approval_required", False)
             or conditional.get("approval_required", False)
         )
@@ -1954,11 +2240,12 @@ class ToolExecutor:
         definition: ToolDefinition,
     ) -> dict[str, Any]:
         if isinstance(output, dict):
-            value = output
+            value = self._redact_output(output, definition.audit_redaction)
         else:
-            value = {"result": output}
+            value = {"result": self._redact_output(output, definition.audit_redaction)}
         serialized = json.dumps(value, default=str)
-        if len(serialized) <= 20_000:
+        max_chars = max(1_000, int(definition.max_result_chars or 20_000))
+        if len(serialized) <= max_chars:
             return value
 
         # H-14: an oversized result gets summarized (or, with no live
@@ -1973,7 +2260,7 @@ class ToolExecutor:
         else:
             bounded = {
                 "truncated": True,
-                "content": serialized[:20_000],
+                "content": serialized[:max_chars],
                 "original_characters": len(serialized),
             }
 
@@ -2008,3 +2295,28 @@ class ToolExecutor:
                 # the model still gets its (summarized/truncated) result.
                 pass
         return bounded
+
+    @staticmethod
+    def _redact_output(value: Any, extra_keys: list[str] | None = None) -> Any:
+        """Remove obvious credentials from tool results before model/audit use."""
+        secret_keys = {
+            "authorization", "api_key", "access_token", "refresh_token",
+            "client_secret", "password", "secret", "token", "webhook_secret",
+            *(str(item).lower() for item in (extra_keys or [])),
+        }
+        if isinstance(value, dict):
+            return {
+                key: "[REDACTED]"
+                if str(key).lower() in secret_keys or any(marker in str(key).lower() for marker in ("token", "secret", "password", "api_key"))
+                else ToolExecutor._redact_output(item, extra_keys)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [ToolExecutor._redact_output(item, extra_keys) for item in value]
+        if isinstance(value, str):
+            return re.sub(
+                r"(?i)(?:sk|xoxb|xapp|fc)-[A-Za-z0-9._-]{12,}|Bearer\s+[A-Za-z0-9._-]+",
+                "[REDACTED]",
+                value,
+            )
+        return value

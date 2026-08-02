@@ -46,7 +46,12 @@ def resolve_room_scope_id(
     if dest_type in _DM_DESTINATION_TYPES:
         scope_id = f"scope_person_{principal_id}"
         scope = store.get_scope(scope_id)
-        return scope_id, bool(scope.get("is_public")) if scope else False
+        # Internal/API sessions may not have a materialized personal scope.
+        # In that case use the organization-public fallback rather than
+        # inventing a scope that cannot be authorized or used for artifacts.
+        if not scope:
+            return "scope_org_public", True
+        return scope_id, bool(scope.get("is_public"))
     dest_id = destination.get("id")
     if dest_id:
         for scope in store.list_scopes(organization_id):

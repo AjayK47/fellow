@@ -4,13 +4,18 @@ import { PageHeader, Section, Card, Empty, StatePill } from "../components";
 import { useParams, Link } from "react-router-dom";
 import { useState } from "react";
 
-type GraphView = { run: Record<string, unknown>; nodes: Json[]; edges: Json[] };
+type GraphView = {
+  run: Record<string, unknown>; nodes: Json[]; edges: Json[];
+  skill_refs?: Json[]; capability_refs?: Json[]; workspace?: Json | null;
+  plan?: Json | null; specialist_tasks?: Json[]; handoffs?: Json[]; artifacts?: Json[];
+  messages?: Json[]; turns?: Json[]; tool_calls?: Json[];
+};
 
 export default function RunDetail() {
   const { runId } = useParams<{ runId: string }>();
   const [tab, setTab] = useState<"turns" | "messages" | "graph">("turns");
   const { data, error, loading } = useAsync<GraphView>(
-    () => api.get(`/v1/runs/${runId}/graph`),
+    () => api.get(`/v1/agent/runs/${runId}`),
     [runId]
   );
   const run = (data?.run || {}) as any;
@@ -66,6 +71,28 @@ export default function RunDetail() {
           </Card>
         </Section>
       )}
+      <Section>
+        <div className="grid gap-5 lg:grid-cols-2">
+          <Card title="Resolved skills" meta={String(data?.skill_refs?.length ?? 0)}>
+            {(data?.skill_refs?.length ?? 0) === 0 && <Empty>none recorded</Empty>}
+            {data?.skill_refs && data.skill_refs.length > 0 && (
+              <pre className="max-h-56 overflow-auto p-4 font-mono text-[11px]">{JSON.stringify(data.skill_refs, null, 2)}</pre>
+            )}
+          </Card>
+          <Card title="Resolved capabilities" meta={String(data?.capability_refs?.length ?? 0)}>
+            {(data?.capability_refs?.length ?? 0) === 0 && <Empty>none recorded</Empty>}
+            {data?.capability_refs && data.capability_refs.length > 0 && (
+              <pre className="max-h-56 overflow-auto p-4 font-mono text-[11px]">{JSON.stringify(data.capability_refs, null, 2)}</pre>
+            )}
+          </Card>
+          <Card title="Workspace" meta={data?.workspace ? "active" : "none"}>
+            <pre className="max-h-40 overflow-auto p-4 font-mono text-[11px]">{JSON.stringify(data?.workspace || {}, null, 2)}</pre>
+          </Card>
+          <Card title="Artifacts and handoffs" meta={`${data?.artifacts?.length ?? 0} artifacts · ${data?.handoffs?.length ?? 0} handoffs`}>
+            <pre className="max-h-40 overflow-auto p-4 font-mono text-[11px]">{JSON.stringify({ artifacts: data?.artifacts || [], handoffs: data?.handoffs || [] }, null, 2)}</pre>
+          </Card>
+        </div>
+      </Section>
       <Section>
         <div className="flex gap-2 border-b border-ink">
           {(["turns", "messages", "graph"] as const).map((t) => (

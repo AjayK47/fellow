@@ -120,6 +120,22 @@ class ToolDefinition(BaseModel):
     risk: Literal["read", "write", "destructive"] = "read"
     approval_required: bool = False
     toolkits: list[str] = Field(default_factory=list)
+    capability_id: str | None = None
+    approval_mode: Literal["never", "on_write", "always", "conditional"] = "on_write"
+    allowed_principals: list[str] = Field(default_factory=list)
+    allowed_roles: list[str] = Field(default_factory=list)
+    allowed_destination_types: list[str] = Field(default_factory=list)
+    allowed_trigger_types: list[str] = Field(default_factory=list)
+    main_agent_visible: bool = True
+    specialist_only: bool = False
+    connector_readiness: dict[str, Any] = Field(default_factory=dict)
+    runtime_ready: bool = True
+    setup_needed: list[str] = Field(default_factory=list)
+    idempotency_required: bool = False
+    max_result_chars: int = 20_000
+    timeout_seconds: float = 60.0
+    retry_policy: dict[str, Any] = Field(default_factory=dict)
+    audit_redaction: list[str] = Field(default_factory=list)
 
     def openai_schema(self) -> dict[str, Any]:
         return {

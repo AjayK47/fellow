@@ -23,6 +23,7 @@ from docket.services.web_tools import WebTools
 from docket.services.runs import RunsService
 from docket.services.skills import SkillsService
 from docket.services.skill_packages import SkillPackageCatalog
+from docket.services.workspaces import WorkspaceService
 from docket.services.signals import SignalsService
 from docket.services.reality import RealityEngine
 from docket.services.policy import PolicyEngine
@@ -45,6 +46,7 @@ from docket.harness.slack import SlackGateway, SlackSender
 from docket.harness.skill_validation import SkillResponseValidator
 from docket.harness.tool_output_summary import ToolOutputSummarizer
 from docket.harness.tools import ToolExecutor, ToolDefinition, build_tool_registry
+from docket.harness.typed_tools import BrowserTools, DocumentTools, VisionMediaTools
 from docket.harness.worker import HarnessWorker
 from docket.harness.specialists import SpecialistWorkerService
 
@@ -79,7 +81,11 @@ class DocketApp:
         )
         self.context = ContextService(self.store, self.retrieval, self.graph, self.audit)
         self.profiles = ProfilesService(self.store, self.retrieval, self.graph, self.audit)
+        runtime_settings = type(settings)()
         self.skill_packages = SkillPackageCatalog()
+        self.workspaces = WorkspaceService(
+            self.store, self.audit, runtime_settings.workspace_root
+        )
         self.skills = SkillsService(
             self.store,
             self.audit,
@@ -93,7 +99,6 @@ class DocketApp:
 
         # Managed company-wide harness. These are deliberately composed from
         # small first-party primitives rather than an agent framework.
-        runtime_settings = type(settings)()
         (
             self.main_model,
             self.attention_model,
@@ -121,6 +126,22 @@ class DocketApp:
             fetch_enabled=runtime_settings.web_fetch_enabled,
             max_chars=runtime_settings.web_fetch_max_chars,
         )
+        self.document_tools = DocumentTools(self.artifacts)
+        self.browser_tools = BrowserTools(
+            self.artifacts,
+            enabled=runtime_settings.browser_enabled,
+            allowed_domains=[
+                item.strip().lower()
+                for item in runtime_settings.browser_allowed_domains.split(",")
+                if item.strip()
+            ],
+        )
+        self.vision_tools = VisionMediaTools(
+            self.artifacts,
+            model=self.main_model,
+            vision_enabled=runtime_settings.vision_enabled,
+            image_generation_enabled=runtime_settings.image_generation_enabled,
+        )
         self.policy = PolicyEngine(
             self.store,
             self.audit,
@@ -145,6 +166,10 @@ class DocketApp:
             run_code_timeout_seconds=runtime_settings.run_code_timeout_seconds,
             run_code_max_tool_calls=runtime_settings.run_code_max_tool_calls,
             workspace_root=runtime_settings.workspace_root,
+            workspace_service=self.workspaces,
+            document_tools=self.document_tools,
+            browser_tools=self.browser_tools,
+            vision_tools=self.vision_tools,
         )
         self.tool_output_summarizer = ToolOutputSummarizer(
             model=self.tool_output_summary_model
@@ -173,6 +198,7 @@ class DocketApp:
             enqueue_job=self.harness_jobs.enqueue,
             graph=self.graph,
             history_compactor=self.history_compactor,
+            workspaces=self.workspaces,
             max_iterations=runtime_settings.agent_max_iterations,
             max_tool_calls=runtime_settings.agent_max_tool_calls,
             context_token_budget=runtime_settings.agent_context_token_budget,
@@ -187,6 +213,15 @@ class DocketApp:
         )
         self.tool_registry.register(
             self.specialists.tool_definition(), self.specialists.execute
+        )
+        self.tool_registry.register(
+            self.specialists.tool_definition().model_copy(
+                update={
+                    "name": "delegate_task",
+                    "description": "Delegate bounded specialist tasks with explicit scopes, capabilities, budgets, and handoff contracts.",
+                }
+            ),
+            self.specialists.execute,
         )
         self.attention = AttentionPipeline(
             store=self.store,
@@ -334,6 +369,48 @@ class DocketApp:
             store=self.store, audit=self.audit, reality=self.reality
         )
         self.retention = RetentionService(store=self.store, audit=self.audit)
+        # Materialize the immutable package/capability indexes for the default
+        # tenant.  These are projections only; package files and registry
+        # definitions remain authoritative and can recreate them after reset.
+        try:
+            self.skills.ensure_platform_skills(runtime_settings.default_org_id)
+        except RuntimeError:
+            # A developer may intentionally run a stripped package checkout;
+            # readiness endpoints will report the missing mandatory package.
+            pass
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+        seen_capabilities: set[str] = set()
+        for definition in self.tool_registry.definitions():
+            capability = definition.capability_id
+            if not capability or capability in seen_capabilities:
+                continue
+            seen_capabilities.add(capability)
+            self.store.upsert_harness_projection(
+                "capabilities",
+                {
+                    "id": f"capability:{capability}",
+                    "organization_id": runtime_settings.default_org_id,
+                    "status": "registered",
+                    "capability_id": capability,
+                    "tool_names": [
+                        item.name
+                        for item in self.tool_registry.definitions()
+                        if item.capability_id == capability
+                    ],
+                    "runtime_ready": any(
+                        item.capability_id == capability and item.runtime_ready
+                        for item in self.tool_registry.definitions()
+                    ),
+                    "setup_needed": sorted({
+                        need
+                        for item in self.tool_registry.definitions()
+                        if item.capability_id == capability
+                        for need in item.setup_needed
+                    }),
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
 
     def _run_automation_now(self, automation: dict[str, object]) -> dict[str, object]:
         """Queue one automation immediately while retaining normal tick semantics."""

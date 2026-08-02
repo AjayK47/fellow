@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8080
     data_dir: Path = _default_data_dir()
-    workspace_root: Path = Field(default_factory=lambda: Path.cwd())
+    workspace_root: Path = Field(default_factory=lambda: _default_data_dir() / "workspaces")
     db_name: str = "brain.db"
     default_org_id: str = "org_acme"
     log_level: str = "info"
@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     agent_max_total_tokens: int = 100_000
     specialist_max_parallel: int = 3
     specialist_max_depth: int = 1
+    browser_enabled: bool = False
+    browser_allowed_domains: str = ""
+    vision_enabled: bool = False
+    image_generation_enabled: bool = False
 
     # Slack Events API / Web API.
     slack_signing_secret: str | None = None

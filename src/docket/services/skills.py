@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import re
 
 from docket.domain.models import (
     Skill,
@@ -60,6 +61,14 @@ class SkillsService:
     ) -> dict[str, Any]:
         if kind != SkillKind.COMPANY.value or immutable:
             raise ValueError("only mutable company skills may be created through this API")
+        required = required_capabilities or {}
+        for group in ("all_of", "any_of"):
+            values = required.get(group, [])
+            if not isinstance(values, list) or any(
+                not isinstance(value, str) or not re.fullmatch(r"[a-z0-9_.-]{1,120}", value)
+                for value in values
+            ):
+                raise ValueError("required capabilities must be stable capability IDs")
         validation = self.validate_definition(
             {
                 "name": name,
@@ -140,6 +149,27 @@ class SkillsService:
             old = existing.get(platform_key)
             skill_id = old.get("id") if old else new_id("skill_builtin")
             data = package.as_record(organization_id=organization_id, skill_id=skill_id)
+            package_now = utcnow().isoformat()
+            self.store.upsert_harness_projection(
+                "skill_packages",
+                {
+                    "id": f"package:{manifest.name}",
+                    "organization_id": organization_id,
+                    "status": manifest.security_verdict,
+                    "package_path": package.package_path,
+                    "name": manifest.name,
+                    "version": manifest.version,
+                    "kind": manifest.kind,
+                    "content_hash": package.content_hash,
+                    "origin": manifest.origin,
+                    "license": manifest.license,
+                    "security_findings": manifest.security_findings,
+                    "created_at": package_now,
+                    "updated_at": package_now,
+                },
+            )
+            if manifest.security_verdict == "block":
+                raise RuntimeError(f"immutable skill package is blocked: {manifest.name}")
             if old and old.get("created_at"):
                 data["created_at"] = old["created_at"]
             else:
@@ -265,6 +295,59 @@ class SkillsService:
             for skill in optional
         ]
 
+    def index_for_run(
+        self,
+        *,
+        organization_id: str,
+        task: str,
+        allowed_scope_ids: list[str],
+        available_capabilities: set[str] | None = None,
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        """Return compact metadata for progressive-disclosure prompting."""
+        self.ensure_platform_skills(organization_id)
+        allowed = set(allowed_scope_ids)
+        ready_caps = available_capabilities
+        records: list[dict[str, Any]] = []
+        for skill in self.search(organization_id, task, limit=max(limit * 2, 20)):
+            if skill.get("status") != SkillStatus.APPROVED.value:
+                continue
+            if not (
+                skill.get("platform_key")
+                or skill.get("immutable")
+                or skill.get("kind") in {"builtin", "connector"}
+                or not skill.get("scope_id")
+                or skill.get("scope_id") in allowed
+                or bool((self.store.get_scope(skill.get("scope_id")) or {}).get("is_public"))
+            ):
+                continue
+            required = skill.get("required_capabilities") or {}
+            all_of = {str(value) for value in required.get("all_of", [])}
+            any_of = {str(value) for value in required.get("any_of", [])}
+            ready = (
+                ready_caps is None
+                or (all_of <= ready_caps and (not any_of or bool(any_of & ready_caps)))
+            )
+            records.append(
+                {
+                    "id": skill.get("id"),
+                    "name": skill.get("name"),
+                    "description": skill.get("description"),
+                    "version": skill.get("version", 1),
+                    "kind": skill.get("kind", "company"),
+                    "immutable": bool(skill.get("immutable")),
+                    "activation_mode": skill.get("activation_mode", "optional"),
+                    "activation": skill.get("activation") or {},
+                    "required_capabilities": required,
+                    "readiness": "ready" if ready else "setup_needed",
+                    "content_hash": skill.get("content_hash", ""),
+                    "origin": skill.get("origin") or {},
+                }
+            )
+            if len(records) >= limit:
+                break
+        return records
+
     @staticmethod
     def _active_skill(skill: dict[str, Any], *, reason: str) -> dict[str, Any]:
         return {
@@ -357,8 +440,12 @@ class SkillsService:
             if not step.get("name") or not step.get("description"):
                 errors.append(f"steps[{index}] requires name and description")
         text = " ".join(str(definition.get(key) or "") for key in ("description", "goal", "instructions"))
-        if any(marker in text.lower() for marker in ("ignore previous instructions", "system override", "reveal the system prompt")):
-            errors.append("skill text contains a prompt-injection marker")
+        findings = SkillPackageCatalog.scan_text(text)
+        if findings:
+            errors.append(
+                "skill text failed static security scan: "
+                + ", ".join(item["rule"] for item in findings)
+            )
         if not definition.get("warnings"):
             warnings.append("add explicit warnings for privacy, approvals, and failure handling")
         if not definition.get("response_validation"):
