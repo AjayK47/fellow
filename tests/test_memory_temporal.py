@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from company_brain.domain.models import MemoryType
+from docket.domain.models import MemoryType
 
 
 def test_newer_fact_supersedes_older_without_deleting_history(empty_brain):

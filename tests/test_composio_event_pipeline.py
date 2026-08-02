@@ -296,7 +296,7 @@ def test_connection_sync_link_and_trigger_creation_are_org_scoped(
     )
     assert linked.status_code == 200
     assert linked_args == {
-        "user_id": "company-brain:org_acme",
+        "user_id": "docket:org_acme",
         "auth_config_id": "ac_github",
         "callback_url": "https://brain.test/integrations",
         "alias": None,
@@ -320,7 +320,7 @@ def test_connection_sync_link_and_trigger_creation_are_org_scoped(
     )
     assert created.status_code == 200, created.text
     assert trigger_args["connected_account_id"] == "ca_synced_github"
-    assert trigger_args["user_id"] == "company-brain:org_acme"
+    assert trigger_args["user_id"] == "docket:org_acme"
 
     wrong_org = api_client.post(
         "/v1/composio/triggers",

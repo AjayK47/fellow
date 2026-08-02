@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from company_brain.mcp_tools import bind_mcp_handlers, mcp_tool_specs
+from docket.mcp_tools import bind_mcp_handlers, mcp_tool_specs
 
 
 def test_mcp_tools_cover_core_brain_operations(brain):

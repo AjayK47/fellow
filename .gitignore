@@ -1,7 +1,9 @@
+# Environment and secrets
 .env
 .env.*
 !.env.example
 
+# Python tooling caches and build artifacts
 .venv/
 __pycache__/
 *.py[cod]
@@ -12,17 +14,10 @@ __pycache__/
 .coverage
 htmlcov/
 
-data/
-reports/
-*.db
-*.sqlite
-*.sqlite3
-*.log
-.DS_Store
+# Web console build outputs (React + Vite under web/)
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
 
-# Local research, superseded specifications, and implementation audit notes.
-old/
-evals/
-final_company_wide_agent_harness_architecture.md
-IMPLEMENTATION_STATUS.md
-SECURITY_REVIEW.md
+# macOS
+.DS_Store

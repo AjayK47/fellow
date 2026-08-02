@@ -1,7 +1,7 @@
 import hashlib
 import hmac
 
-from company_brain.adapters import (
+from docket.adapters import (
     normalize_composio_trigger,
     normalize_slack_event,
     verify_slack_signature,

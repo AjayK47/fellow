@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from company_brain.domain.models import ProactiveCandidate, ProactiveDecision
-from company_brain.services.proactive import decide
+from docket.domain.models import ProactiveCandidate, ProactiveDecision
+from docket.services.proactive import decide
 
 
 def test_proactive_silence_when_permission_unsafe():

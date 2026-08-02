@@ -6,7 +6,7 @@ import json
 
 import httpx
 
-from company_brain import CompanyBrain
+from docket import CompanyBrain
 
 
 def test_sdk_context_and_run_operations():

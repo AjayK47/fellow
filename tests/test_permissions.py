@@ -201,6 +201,78 @@ def test_api_get_memory_and_source_require_authz_query_params(client_authz):
     assert r.json().get("permission_decision_id")
 
 
+def test_shared_member_of_two_private_channels_does_not_leak_between_them(brain):
+    """AuthorizationService._destination_allows_private() used to key off the
+    destination's *type* only, so being a member of private channel B could
+    leak B's content into a conversation happening in private channel A. It
+    must key off the specific room instead: A's own scope + org-wide only."""
+    org = "org_acme"
+    brain.store.upsert_scope(
+        {
+            "id": "scope_channel_alpha_private",
+            "organization_id": org,
+            "kind": "private_channel",
+            "label": "alpha",
+            "channel_id": "channel_alpha",
+            "principal_ids": [],
+            "is_public": False,
+        }
+    )
+    brain.store.upsert_scope(
+        {
+            "id": "scope_channel_bravo_private",
+            "organization_id": org,
+            "kind": "private_channel",
+            "label": "bravo",
+            "channel_id": "channel_bravo",
+            "principal_ids": [],
+            "is_public": False,
+        }
+    )
+    brain.store.add_membership(org, "person_dual", "scope_channel_alpha_private")
+    brain.store.add_membership(org, "person_dual", "scope_channel_bravo_private")
+    brain.ingestion.ingest(
+        organization_id=org,
+        source_system="slack",
+        source_type="slack.channel_message",
+        external_id="ev_bravo_secret",
+        content="bravo channel roadmap: sunset the legacy billing system in Q3",
+        scope_id="scope_channel_bravo_private",
+        author_entity_id="person_dual",
+        channel_id="channel_bravo",
+        is_private_channel=True,
+        learn=True,
+        processing_mode="memory",
+    )
+
+    result = brain.retrieval.search(
+        organization_id=org,
+        query="bravo channel roadmap billing system",
+        acting_principal_id="person_dual",
+        destination={"type": "private_channel", "id": "channel_alpha", "is_private": True},
+        purpose="reactive_agent",
+        limit=50,
+    )
+    contents = " ".join((r["memory"].get("content") or "") for r in result["results"]).lower()
+    assert "sunset the legacy billing system" not in contents
+    assert "scope_channel_bravo_private" not in result["allowed_scope_ids"]
+
+    # Sanity check: the same person, asking from channel bravo itself, can
+    # still see it — this isn't a membership bug, it's a room-identity bug.
+    same_channel = brain.retrieval.search(
+        organization_id=org,
+        query="bravo channel roadmap billing system",
+        acting_principal_id="person_dual",
+        destination={"type": "private_channel", "id": "channel_bravo", "is_private": True},
+        purpose="reactive_agent",
+        limit=50,
+    )
+    same_contents = " ".join(
+        (r["memory"].get("content") or "") for r in same_channel["results"]
+    ).lower()
+    assert "sunset the legacy billing system" in same_contents
+
+
 def test_source_revocation_removes_content_from_search(brain):
     org = "org_acme"
     # Find a public source about launch date

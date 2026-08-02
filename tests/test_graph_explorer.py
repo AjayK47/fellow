@@ -11,4 +11,4 @@ def test_explorer_exposes_org_graph_and_page(api_client):
     assert all(edge["edge_type"] not in {"UPDATES", "SUPPORTED_BY", "ABOUT"} or edge["edge_type"] == "ABOUT" for edge in body["edges"])
     page = api_client.get("/explorer")
     assert page.status_code == 200
-    assert "Operations" in page.text
+    assert "<div id=\"root\"></div>" in page.text or "Operations" in page.text

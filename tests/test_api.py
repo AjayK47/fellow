@@ -8,25 +8,25 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from company_brain.fixtures.seed import seed_synthetic_org
-from company_brain.services.container import BrainApp
+from docket.fixtures.seed import seed_synthetic_org
+from docket.services.container import DocketApp
 
 
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     db = tmp_path / "api_brain.db"
-    monkeypatch.setenv("COMPANY_BRAIN_DB", str(db))
-    brain = BrainApp(db_path=db)
+    monkeypatch.setenv("DOCKET_DB", str(db))
+    brain = DocketApp(db_path=db)
     seed_synthetic_org(brain)
     brain.close()
 
-    from company_brain import main as main_mod
+    from docket import main as main_mod
 
     app = main_mod.create_app()
 
     @asynccontextmanager
     async def test_lifespan(app):
-        b = BrainApp(db_path=db)
+        b = DocketApp(db_path=db)
         app.state.brain = b
         yield
         b.close()
@@ -59,6 +59,70 @@ def test_organization_bootstrap_api(client):
     assert "org_newco" in {
         item["id"] for item in listed.json()["organizations"]
     }
+
+
+def test_local_gateway_setup_configures_models_and_slack(
+    client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    env_file = tmp_path / ".env"
+    monkeypatch.setenv("DOCKET_ENV_FILE", str(env_file))
+
+    class SlackResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "ok": True,
+                "team_id": "T_SETUP",
+                "team": "Setup Workspace",
+                "user_id": "U_SALLY",
+                "user": "docket",
+            }
+
+    monkeypatch.setattr(
+        "docket.services.gateway_setup.httpx.post",
+        lambda *args, **kwargs: SlackResponse(),
+    )
+    initial = client.get("/v1/gateway/setup/status")
+    assert initial.status_code == 200
+    assert initial.json()["model"]["configured"] is False
+    model = client.post(
+        "/v1/gateway/setup/openrouter",
+        json={"api_key": "test-openrouter-key"},
+    )
+    assert model.status_code == 200
+    assert model.json()["restart_required"] is True
+    assert "openai/gpt-5.6-luna" in env_file.read_text()
+    assert "test-openrouter-key" in env_file.read_text()
+    connected = client.post(
+        "/v1/gateway/setup/slack",
+        json={
+            "organization_id": "org_setup",
+            "organization_name": "Setup Co",
+            "bot_token": "xoxb-test",
+            "app_token": "xapp-test",
+            "signing_secret": "test-secret",
+            "admin_slack_user_id": "U_ADMIN",
+            "admin_name": "Setup Admin",
+            "channel_id": "C_SETUP",
+            "proactive": True,
+        },
+    )
+    assert connected.status_code == 200
+    body = connected.json()
+    assert body["workspace"]["id"] == "T_SETUP"
+    assert body["bot"]["user_id"] == "U_SALLY"
+    assert "xoxb-test" not in body.__str__()
+    status = client.get("/v1/gateway/setup/status").json()
+    assert status["slack"]["bot_token_configured"] is True
+    assert any(
+        item["workspace_id"] == "T_SETUP"
+        for item in status["slack"]["installations"]
+    )
+    manifest = client.get("/v1/gateway/setup/slack-manifest")
+    assert manifest.status_code == 200
+    assert "socket_mode_enabled: true" in manifest.json()["manifest"]
 
 
 def test_five_reactive_operations(client):
@@ -131,13 +195,13 @@ def test_five_reactive_operations(client):
         "/v1/projects:context",
         json={
             "organization_id": org,
-            "project_id": "project_company_brain",
+            "project_id": "project_docket",
             "acting_principal_id": "person_ajay",
             "destination": dest,
         },
     )
     assert proj.status_code == 200
-    assert proj.json()["project"]["id"] == "project_company_brain"
+    assert proj.json()["project"]["id"] == "project_docket"
 
 
 def test_ingest_and_proactive_via_api(client):
@@ -148,10 +212,10 @@ def test_ingest_and_proactive_via_api(client):
             "source_system": "api",
             "source_type": "message",
             "external_id": "api_test_1",
-            "content": "The launch date is 20 September for Company Brain.",
+            "content": "The launch date is 20 September for Docket.",
             "scope_id": "scope_org_public",
             "author_entity_id": "person_ajay",
-            "entity_ids": ["project_company_brain"],
+            "entity_ids": ["project_docket"],
         },
     )
     assert r.status_code == 200
@@ -184,3 +248,30 @@ def test_ingest_and_proactive_via_api(client):
     assert p.status_code == 200
     assert p.json()["decision"]
     assert p.json()["policy_explanation"]
+
+
+def test_gateway_lifespan_uses_prebuilt_brain_and_stops_slack_first(tmp_path: Path):
+    """H-03: `gateway` must share one DocketApp instance between the API and
+    Slack Socket Mode, and must stop the Slack transport before the app's
+    own database connection is closed on shutdown."""
+    from docket.main import create_app
+
+    db = tmp_path / "gateway_shared.db"
+    brain = DocketApp(db_path=db)
+    seed_synthetic_org(brain)
+
+    stop_calls: list[str] = []
+
+    def slack_stopper() -> None:
+        stop_calls.append("stopped")
+        # The brain must still be open and usable when Slack is told to stop
+        # — stopping Slack must happen before the database is closed.
+        assert brain.store.get_organization("org_acme") is not None
+
+    app = create_app(prebuilt_brain=brain, slack_stopper=slack_stopper)
+    with TestClient(app, raise_server_exceptions=True) as client:
+        assert client.app.state.brain is brain
+        response = client.get("/health")
+        assert response.status_code == 200
+
+    assert stop_calls == ["stopped"]

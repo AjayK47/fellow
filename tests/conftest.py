@@ -8,32 +8,39 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from company_brain.fixtures.seed import seed_synthetic_org
-from company_brain.services.container import BrainApp
+from docket.fixtures.seed import seed_synthetic_org
+from docket.services.container import DocketApp
 
 
 @pytest.fixture(autouse=True)
 def offline_embeddings(monkeypatch: pytest.MonkeyPatch):
-    """Tests never call a configured external embedding provider."""
-    monkeypatch.setenv("COMPANY_BRAIN_EMBEDDING_PROVIDER", "deterministic")
+    """Tests never call configured external inference providers."""
+    monkeypatch.setenv("DOCKET_EMBEDDING_PROVIDER", "deterministic")
+    monkeypatch.setenv("DOCKET_MODEL_PROVIDER", "deterministic")
+    monkeypatch.setenv("DOCKET_SLACK_BOT_TOKEN", "")
+    monkeypatch.setenv("DOCKET_SLACK_APP_TOKEN", "")
+    monkeypatch.setenv("DOCKET_BRAVE_SEARCH_API_KEY", "")
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "")
+    monkeypatch.setenv("DOCKET_FIRECRAWL_API_KEY", "")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "")
 
 
 @pytest.fixture
 def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Fresh seeded API client available to all HTTP integration tests."""
     db = tmp_path / "api_brain.db"
-    monkeypatch.setenv("COMPANY_BRAIN_DB", str(db))
-    brain = BrainApp(db_path=db)
+    monkeypatch.setenv("DOCKET_DB", str(db))
+    brain = DocketApp(db_path=db)
     seed_synthetic_org(brain)
     brain.close()
 
-    from company_brain.main import create_app
+    from docket.main import create_app
 
     app = create_app()
 
     @asynccontextmanager
     async def test_lifespan(app):
-        b = BrainApp(db_path=db)
+        b = DocketApp(db_path=db)
         app.state.brain = b
         yield
         b.close()
@@ -44,18 +51,18 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def brain(tmp_path) -> BrainApp:
+def brain(tmp_path) -> DocketApp:
     db = tmp_path / "test_brain.db"
-    app = BrainApp(db_path=db)
+    app = DocketApp(db_path=db)
     seed_synthetic_org(app)
     yield app
     app.close()
 
 
 @pytest.fixture
-def empty_brain(tmp_path) -> BrainApp:
+def empty_brain(tmp_path) -> DocketApp:
     db = tmp_path / "empty_brain.db"
-    app = BrainApp(db_path=db)
+    app = DocketApp(db_path=db)
     yield app
     app.close()
 
@@ -64,7 +71,7 @@ def empty_brain(tmp_path) -> BrainApp:
 def client_authz(tmp_path: Path):
     """Seeded API client plus private memory/source ids for authz HTTP tests."""
     db = tmp_path / "authz_api.db"
-    brain = BrainApp(db_path=db)
+    brain = DocketApp(db_path=db)
     seed_synthetic_org(brain)
     private_mems = [
         m
@@ -81,13 +88,13 @@ def client_authz(tmp_path: Path):
     src_id = private_sources[0]["id"]
     brain.close()
 
-    from company_brain.main import create_app
+    from docket.main import create_app
 
     app = create_app()
 
     @asynccontextmanager
     async def test_lifespan(app):
-        b = BrainApp(db_path=db)
+        b = DocketApp(db_path=db)
         app.state.brain = b
         yield
         b.close()

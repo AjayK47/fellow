@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end verification script for Company Brain (writes evidence artifacts)."""
+"""End-to-end verification script for Docket (writes evidence artifacts)."""
 
 from __future__ import annotations
 
@@ -13,13 +13,13 @@ import httpx
 
 SCRATCH = Path(
     os.environ.get(
-        "COMPANY_BRAIN_SCRATCH",
+        "DOCKET_SCRATCH",
         "/var/folders/g7/jnbsr5mx65sdhpxwhsd5mfmc0000gn/T/grok-goal-17676d6b3ae8/implementer",
     )
 )
 SCRATCH.mkdir(parents=True, exist_ok=True)
 
-BASE = os.environ.get("COMPANY_BRAIN_URL", "http://127.0.0.1:8080")
+BASE = os.environ.get("DOCKET_URL", "http://127.0.0.1:8080")
 ORG = "org_acme"
 DEST = {"type": "internal_agent_session", "id": "verify_session", "is_private": True}
 
@@ -125,7 +125,7 @@ def main() -> int:
         "/v1/projects:context",
         json={
             "organization_id": ORG,
-            "project_id": "project_company_brain",
+            "project_id": "project_docket",
             "acting_principal_id": "person_ajay",
             "destination": DEST,
         },
@@ -133,8 +133,8 @@ def main() -> int:
     write("reactive-project.json", proj)
 
     # temporal memory via ingest
-    from company_brain.services.container import BrainApp
-    from company_brain.config import settings
+    from docket.services.container import DocketApp
+    from docket.config import settings
 
     # exercise via API
     i1 = client.post(
@@ -144,9 +144,9 @@ def main() -> int:
             "source_system": "verify",
             "source_type": "message",
             "external_id": "verify_launch_a",
-            "content": "The launch date is 1 October for Company Brain.",
+            "content": "The launch date is 1 October for Docket.",
             "scope_id": "scope_org_public",
-            "entity_ids": ["project_company_brain"],
+            "entity_ids": ["project_docket"],
             "author_entity_id": "person_ajay",
         },
     ).json()
@@ -157,9 +157,9 @@ def main() -> int:
             "source_system": "verify",
             "source_type": "message",
             "external_id": "verify_launch_b",
-            "content": "The launch date is 10 October for Company Brain.",
+            "content": "The launch date is 10 October for Docket.",
             "scope_id": "scope_org_public",
-            "entity_ids": ["project_company_brain"],
+            "entity_ids": ["project_docket"],
             "author_entity_id": "person_ajay",
         },
     ).json()

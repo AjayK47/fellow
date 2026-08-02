@@ -10,7 +10,7 @@ def test_prepare_context_structured_and_budgeted(brain):
         acting_principal_id="person_ajay",
         destination={"type": "internal_agent_session", "id": "session_1", "is_private": True},
         purpose="incident_investigation",
-        entity_ids=["customer_acme", "project_company_brain"],
+        entity_ids=["customer_acme", "project_docket"],
         token_budget=500,
     )
     data = pkg.model_dump(mode="json")
@@ -61,18 +61,18 @@ def test_relationship_context_surfaces_shared_decisions(brain):
     )
     assert result["graph_paths"] or result["shared_decisions"] or result["open_commitments"]
     assert result["permission_decision_id"]
-    # Ajay and Ravi both WORKS_ON project_company_brain
+    # Ajay and Ravi both WORKS_ON project_docket
     assert result["graph_paths"]
 
 
 def test_project_context(brain):
     result = brain.context.project_context(
         organization_id="org_acme",
-        project_id="project_company_brain",
+        project_id="project_docket",
         acting_principal_id="person_ajay",
         destination={"type": "internal_agent_session", "id": "s", "is_private": True},
     )
-    assert result["project"]["id"] == "project_company_brain"
+    assert result["project"]["id"] == "project_docket"
     assert any(m["id"] in {"person_ajay", "person_ravi"} for m in result["members"])
     assert result["permission_decision_id"]
 

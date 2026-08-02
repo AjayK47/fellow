@@ -1,6 +1,6 @@
-# Company Brain
+# Docket
 
-Company Brain is a company-wide agent harness: one accountable main agent can
+Docket is a company-wide agent harness: one accountable main agent can
 observe organizational events, retrieve permission-safe company context,
 reason with tools, create bounded specialist workers, request approval for
 writes, and preserve what happened as durable organizational memory.
@@ -153,6 +153,8 @@ always performed for an acting principal and destination.
   maximum depth one, parallelism limits, and durable result artifacts
 - OpenRouter clients for chat, attention, extraction, and embeddings, plus
   deterministic zero-cost providers for tests and local development
+- Optional Brave Search and a safe public-page fetch tool; both are read-only,
+  and fetched web content is explicitly treated as untrusted evidence
 - Permission-filtered hybrid retrieval across evidence, memories, FTS5,
   embeddings, graph relationships, temporal facts, cases, profiles, and runs
 - Canonical versioned connector objects, per-stream sync cursors, cross-tool
@@ -184,23 +186,37 @@ uv sync --extra dev
 cp .env.example .env
 ```
 
-Start in deterministic offline mode:
+Start the local gateway:
 
 ```bash
-uv run company-brain
+uv run docket gateway
 ```
+
+Open the onboarding UI at <http://127.0.0.1:8080/setup>. It configures
+OpenRouter, generates the Slack app manifest, validates local Slack credentials,
+maps the workspace to a Docket tenant, and writes only to the local
+ignored `.env`. Restart the same command after saving a connection; configured
+Slack Socket Mode starts alongside the API and durable worker.
+
+The same local UI optionally accepts Brave Search and Firecrawl keys. Brave
+finds public sources; Firecrawl converts public pages and URL-addressable PDFs
+to clean markdown. Without Firecrawl, `web_fetch` uses a safe, read-only direct
+fetch fallback; without Brave, the agent does not get web search. Browser
+automation, shell execution, and general computer control are not part of the
+company gateway's trusted tool surface.
 
 The API automatically creates the SQLite database and seeds the synthetic Acme
 organization when the configured default organization does not exist. You can
 also seed it explicitly:
 
 ```bash
-uv run company-brain-seed
+uv run docket-seed
 ```
 
 Open:
 
 - Control room: <http://127.0.0.1:8080/admin>
+- Gateway setup: <http://127.0.0.1:8080/setup>
 - Graph explorer: <http://127.0.0.1:8080/explorer>
 - OpenAPI documentation: <http://127.0.0.1:8080/docs>
 - Runtime readiness: <http://127.0.0.1:8080/v1/harness/status>
@@ -209,8 +225,8 @@ The API starts an in-process durable worker by default. To run API and worker
 separately:
 
 ```bash
-COMPANY_BRAIN_WORKER_ENABLED=false uv run company-brain
-uv run company-brain-worker
+DOCKET_WORKER_ENABLED=false uv run docket
+uv run docket-worker
 ```
 
 ## Configuration
@@ -222,11 +238,11 @@ Settings are loaded from `.env`. See `.env.example` for the complete template.
 No external key is required:
 
 ```dotenv
-COMPANY_BRAIN_DATA_DIR=data
-COMPANY_BRAIN_DB_NAME=brain.db
-COMPANY_BRAIN_EMBEDDING_PROVIDER=deterministic
-COMPANY_BRAIN_MODEL_PROVIDER=deterministic
-COMPANY_BRAIN_WORKER_ENABLED=true
+DOCKET_DATA_DIR=data
+DOCKET_DB_NAME=brain.db
+DOCKET_EMBEDDING_PROVIDER=deterministic
+DOCKET_MODEL_PROVIDER=deterministic
+DOCKET_WORKER_ENABLED=true
 ```
 
 This mode exercises the complete ingestion, permission, memory, graph, policy,
@@ -238,16 +254,16 @@ are deterministic test behavior, not production reasoning.
 ```dotenv
 OPENROUTER_API_KEY=...
 
-COMPANY_BRAIN_EMBEDDING_PROVIDER=openrouter
-COMPANY_BRAIN_EMBEDDING_MODEL=qwen/qwen3-embedding-8b
+DOCKET_EMBEDDING_PROVIDER=openrouter
+DOCKET_EMBEDDING_MODEL=qwen/qwen3-embedding-8b
 
-COMPANY_BRAIN_MODEL_PROVIDER=openrouter
-COMPANY_BRAIN_CHAT_MODEL=openai/gpt-4.1-mini
-COMPANY_BRAIN_ATTENTION_MODEL=openai/gpt-4.1-mini
-COMPANY_BRAIN_EXTRACTION_MODEL=openai/gpt-4.1-mini
+DOCKET_MODEL_PROVIDER=openrouter
+DOCKET_CHAT_MODEL=openai/gpt-5.6-luna
+DOCKET_ATTENTION_MODEL=openai/gpt-5.6-luna
+DOCKET_EXTRACTION_MODEL=openai/gpt-5.6-luna
 ```
 
-`COMPANY_BRAIN_EXTRACTION_MODEL` may be omitted; extraction then uses the main
+`DOCKET_EXTRACTION_MODEL` may be omitted; extraction then uses the main
 chat model. Model inference and embeddings are offloaded to OpenRouter, so
 local compute remains light.
 
@@ -261,21 +277,21 @@ same service boundary.
 ### Runtime and proactivity controls
 
 ```dotenv
-COMPANY_BRAIN_AGENT_MAX_ITERATIONS=12
-COMPANY_BRAIN_AGENT_MAX_TOOL_CALLS=24
-COMPANY_BRAIN_AGENT_CONTEXT_TOKEN_BUDGET=12000
-COMPANY_BRAIN_AGENT_MAX_TOTAL_TOKENS=100000
+DOCKET_AGENT_MAX_ITERATIONS=12
+DOCKET_AGENT_MAX_TOOL_CALLS=24
+DOCKET_AGENT_CONTEXT_TOKEN_BUDGET=12000
+DOCKET_AGENT_MAX_TOTAL_TOKENS=100000
 
-COMPANY_BRAIN_SPECIALIST_MAX_PARALLEL=3
-COMPANY_BRAIN_SPECIALIST_MAX_DEPTH=1
+DOCKET_SPECIALIST_MAX_PARALLEL=3
+DOCKET_SPECIALIST_MAX_DEPTH=1
 
-COMPANY_BRAIN_WORKER_ENABLED=true
-COMPANY_BRAIN_WORKER_POLL_INTERVAL_SECONDS=0.5
-COMPANY_BRAIN_WORKER_CONCURRENCY=4
+DOCKET_WORKER_ENABLED=true
+DOCKET_WORKER_POLL_INTERVAL_SECONDS=0.5
+DOCKET_WORKER_CONCURRENCY=4
 
-COMPANY_BRAIN_ATTENTION_MINIMUM_CONFIDENCE=0.72
-COMPANY_BRAIN_PROACTIVE_COOLDOWN_SECONDS=900
-COMPANY_BRAIN_EPISODE_QUIET_SECONDS=300
+DOCKET_ATTENTION_MINIMUM_CONFIDENCE=0.72
+DOCKET_PROACTIVE_COOLDOWN_SECONDS=900
+DOCKET_EPISODE_QUIET_SECONDS=300
 ```
 
 Specialists are additionally capped per task by iterations, tool calls, token
@@ -289,9 +305,9 @@ direct or malformed model call attempts to bypass their advertised tool list.
 Configure:
 
 ```dotenv
-COMPANY_BRAIN_SLACK_SIGNING_SECRET=...
-COMPANY_BRAIN_SLACK_BOT_TOKEN=xoxb-...
-COMPANY_BRAIN_SLACK_BOT_USER_ID=U...
+DOCKET_SLACK_SIGNING_SECRET=...
+DOCKET_SLACK_BOT_TOKEN=xoxb-...
+DOCKET_SLACK_BOT_USER_ID=U...
 ```
 
 Expose the API over HTTPS and configure the Slack app:
@@ -306,17 +322,19 @@ POST https://your-host/v1/slack/interactions
 Add an app-level token:
 
 ```dotenv
-COMPANY_BRAIN_SLACK_APP_TOKEN=xapp-...
+DOCKET_SLACK_APP_TOKEN=xapp-...
 ```
 
-Run the API and Socket Mode gateway:
+Run the unified gateway:
 
 ```bash
-uv run company-brain
-uv run company-brain-slack
+uv run docket gateway
 ```
 
-Then register:
+The setup UI creates the installation, identity mapping, and optional first
+channel policy. `uv run docket-slack` remains available when you
+intentionally want the Slack listener as a separate process. The lower-level
+API equivalents are:
 
 1. The Slack installation with `POST /v1/slack/installations`.
 2. Slack-user-to-principal mappings with `POST /v1/identity-mappings`.
@@ -332,9 +350,9 @@ proactive delivery.
 Configure:
 
 ```dotenv
-COMPANY_BRAIN_COMPOSIO_API_KEY=...
-COMPANY_BRAIN_COMPOSIO_WEBHOOK_SECRET=...
-COMPANY_BRAIN_COMPOSIO_TOOLKIT_VERSIONS=latest
+DOCKET_COMPOSIO_API_KEY=...
+DOCKET_COMPOSIO_WEBHOOK_SECRET=...
+DOCKET_COMPOSIO_TOOLKIT_VERSIONS=latest
 ```
 
 The typical onboarding flow is:
@@ -465,11 +483,35 @@ capture, job processing, and deduplication.
 
 Current release validation:
 
-- 75 automated tests
+- 81 automated tests
 - 18/18 deterministic organization simulation checks
 - 18/18 live OpenRouter embedding simulation checks using
   `qwen/qwen3-embedding-8b`
 - 109 generated API paths
+
+## Data retention
+
+Retention cleanup is a CLI command, not something that runs on its own —
+nothing is deleted without an explicit invocation.
+
+```bash
+# Dry run: count what's older than 90 days without deleting anything
+uv run docket retention --organization-id org_acme --older-than-days 90
+
+# Actually delete it
+uv run docket retention --organization-id org_acme --older-than-days 90 \
+  --apply --confirmed-by alice@example.com
+
+# Permanently delete an entire organization and all of its data
+uv run docket retention --organization-id org_acme \
+  --delete-organization --confirm org_acme
+```
+
+`--apply` and `--delete-organization` both require an explicit
+confirmation flag (`--confirmed-by`, `--confirm=<organization_id>`) so a
+bare command is always a preview. The same operations are available over
+HTTP at `POST /v1/admin/retention` and the organization-deletion admin
+endpoint.
 
 ## Deployment boundaries
 

@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-paper text-ink font-sans antialiased;
+    background-image: linear-gradient(rgba(21, 23, 19, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(21, 23, 19, 0.035) 1px, transparent 1px);
+    background-size: 28px 28px;
+  }
+  * {
+    @apply border-line;
+  }
+}
+
+@layer components {
+  .card {
+    @apply border border-ink bg-panel;
+  }
+  .card-head {
+    @apply flex items-center justify-between border-b border-ink px-4 py-3;
+  }
+  .card-head h2 {
+    @apply m-0 font-mono text-[12px] uppercase tracking-wider;
+  }
+  .card-head span {
+    @apply font-mono text-[10px] text-muted;
+  }
+  .btn {
+    @apply border border-ink bg-ink px-3.5 py-2 font-mono text-[12px] text-white cursor-pointer transition-colors;
+  }
+  .btn:hover {
+    @apply bg-orange;
+  }
+  .btn-ghost {
+    @apply border border-ink bg-paper text-ink;
+  }
+  .btn-ghost:hover {
+    @apply bg-panel;
+  }
+  .input,
+  .select {
+    @apply border border-ink bg-panel px-3 py-2 font-mono text-[12px] outline-none;
+  }
+  .input:focus,
+  .select:focus {
+    @apply ring-1 ring-orange;
+  }
+  .table {
+    @apply w-full border-collapse table-fixed;
+  }
+  .table th {
+    @apply border-b border-ink bg-panel px-3 py-2 text-left font-mono text-[10px] uppercase tracking-wider text-muted;
+  }
+  .table td {
+    @apply border-b border-line px-3 py-2 font-mono text-[12px] align-top overflow-hidden;
+  }
+  .table tr:hover td {
+    @apply bg-panel;
+  }
+  .pill {
+    @apply inline-block px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider;
+  }
+  .pill-good {
+    @apply bg-acid text-ink;
+  }
+  .pill-bad {
+    @apply bg-bad text-white;
+  }
+  .pill-muted {
+    @apply bg-line/60 text-ink;
+  }
+  .pill-orange {
+    @apply bg-orange text-white;
+  }
+}

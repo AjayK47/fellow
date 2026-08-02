@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Docket — Control Room</title>
+  <style>
+    @import url("https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Manrope:wght@400;500;600;700&display=swap");
+    :root {
+      --ink: #151713; --paper: #ecebdc; --acid: #d8ff45; --orange: #ff7043;
+      --muted: #77796e; --line: #c7c7b8; --panel: #f5f4e8; --good: #146c43;
+      --bad: #a72822;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--paper); color: var(--ink);
+      font-family: "Manrope", sans-serif; min-height: 100vh;
+      background-image: linear-gradient(rgba(21,23,19,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(21,23,19,.035) 1px, transparent 1px);
+      background-size: 28px 28px;
+    }
+    .shell { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+    aside {
+      background: var(--ink); color: var(--paper); padding: 28px 24px;
+      display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
+    }
+    .mark { display: flex; align-items: center; gap: 12px; font-weight: 700; letter-spacing: -.04em; }
+    .mark i { width: 25px; height: 25px; background: var(--acid); border-radius: 50% 50% 42% 58%; display: block; }
+    .eyebrow { font: 500 10px/1 "DM Mono"; text-transform: uppercase; letter-spacing: .16em; color: var(--muted); }
+    nav { margin-top: 72px; display: grid; gap: 8px; }
+    nav button {
+      appearance: none; border: 0; background: transparent; color: #8d9086; text-align: left;
+      padding: 11px 0; cursor: pointer; font: 500 13px "DM Mono"; border-bottom: 1px solid #292c27;
+    }
+    nav button.active { color: var(--acid); }
+    .pulse { margin-top: auto; border-top: 1px solid #3b3e38; padding-top: 20px; }
+    .pulse strong { color: var(--acid); font: 500 11px "DM Mono"; }
+    main { padding: 34px 42px 64px; max-width: 1500px; width: 100%; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; }
+    h1 { font-size: clamp(38px, 5vw, 78px); line-height: .9; letter-spacing: -.075em; margin: 16px 0 0; max-width: 760px; }
+    .controls { display: flex; gap: 8px; align-items: center; }
+    input, select, button { font: 500 12px "DM Mono"; }
+    input, select { border: 1px solid var(--ink); background: var(--panel); padding: 11px 12px; }
+    .button { border: 1px solid var(--ink); background: var(--ink); color: white; padding: 11px 15px; cursor: pointer; }
+    .button:hover { background: var(--orange); }
+    .statusline { display: flex; align-items: center; gap: 8px; margin-top: 26px; font: 400 11px "DM Mono"; color: var(--muted); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--orange); }
+    .dot.live { background: var(--good); box-shadow: 0 0 0 5px rgba(20,108,67,.1); }
+    .metrics { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 46px; border: 1px solid var(--ink); }
+    .metric { min-height: 148px; padding: 20px; background: var(--panel); border-right: 1px solid var(--ink); position: relative; overflow: hidden; }
+    .metric:last-child { border-right: 0; }
+    .metric b { display: block; font-size: 46px; letter-spacing: -.07em; margin-top: 25px; }
+    .metric small { color: var(--muted); font: 400 10px "DM Mono"; text-transform: uppercase; }
+    .metric.acid { background: var(--acid); }
+    .grid { display: grid; grid-template-columns: 1.6fr .9fr; gap: 18px; margin-top: 18px; }
+    .panel { border: 1px solid var(--ink); background: var(--panel); min-height: 270px; }
+    .panel-head { padding: 15px 18px; border-bottom: 1px solid var(--ink); display: flex; align-items: center; justify-content: space-between; }
+    .panel-head h2 { margin: 0; font: 600 12px "DM Mono"; text-transform: uppercase; letter-spacing: .08em; }
+    .panel-head span { font: 400 10px "DM Mono"; color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--line); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    th { font: 400 9px "DM Mono"; text-transform: uppercase; color: var(--muted); }
+    td { font-size: 12px; }
+    tr[data-id] { cursor: pointer; }
+    tr[data-id]:hover td { background: #fff; }
+    .badge { display: inline-block; border: 1px solid currentColor; border-radius: 12px; padding: 3px 7px; font: 500 9px "DM Mono"; text-transform: uppercase; }
+    .completed, .wake_main_agent { color: var(--good); }
+    .failed, .dead_letter { color: var(--bad); }
+    .waiting_for_approval { color: #9a5700; }
+    .feed { padding: 5px 17px; }
+    .feed-item { padding: 13px 0; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 84px 1fr; gap: 12px; }
+    .feed-item time { font: 400 9px "DM Mono"; color: var(--muted); }
+    .feed-item p { margin: 0; font-size: 12px; line-height: 1.45; }
+    .empty { padding: 35px 18px; color: var(--muted); font: 400 11px "DM Mono"; }
+    dialog { width: min(920px, 90vw); max-height: 86vh; border: 1px solid var(--ink); padding: 0; background: var(--panel); }
+    dialog::backdrop { background: rgba(21,23,19,.72); backdrop-filter: blur(4px); }
+    .dialog-head { display: flex; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--ink); }
+    .dialog-head button { border: 0; background: none; cursor: pointer; font-size: 20px; }
+    pre { margin: 0; padding: 22px; overflow: auto; font: 400 11px/1.6 "DM Mono"; white-space: pre-wrap; }
+    @media (max-width: 900px) {
+      .shell { display: block; } aside { height: auto; position: static; } nav { display: none; }
+      main { padding: 26px 18px; } header { display: block; } .controls { margin-top: 25px; }
+      .metrics { grid-template-columns: 1fr 1fr; } .metric:nth-child(2) { border-right: 0; }
+      .metric:nth-child(-n+2) { border-bottom: 1px solid var(--ink); } .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <div class="mark"><i></i><span>Docket</span></div>
+      <nav>
+        <button onclick="location.href='/setup'">00 / Gateway setup</button>
+        <button class="active">01 / Control room</button>
+        <button onclick="location.href='/explorer'">02 / Knowledge graph</button>
+        <button onclick="location.href='/docs'">03 / API surface</button>
+      </nav>
+      <div class="pulse">
+        <div class="eyebrow">Runtime</div>
+        <p><strong>● SQLITE DURABLE CORE</strong></p>
+        <small style="color:#74786e;font:10px DM Mono">Hermes-style loop · permission-first context · proactive attention</small>
+      </div>
+    </aside>
+    <main>
+      <header>
+        <div>
+          <div class="eyebrow">Operational intelligence / live</div>
+          <h1>Agent<br>control room.</h1>
+          <div class="statusline"><span class="dot" id="health-dot"></span><span id="status">Connecting to harness…</span></div>
+        </div>
+        <div class="controls">
+          <input id="org" value="org_acme" aria-label="Organization ID">
+          <button class="button" id="refresh">Refresh ↗</button>
+        </div>
+      </header>
+      <section class="metrics">
+        <div class="metric acid"><small>Agent runs</small><b id="m-runs">—</b></div>
+        <div class="metric"><small>Completed</small><b id="m-completed">—</b></div>
+        <div class="metric"><small>Attention wakes</small><b id="m-wakes">—</b></div>
+        <div class="metric"><small>Queued work</small><b id="m-jobs">—</b></div>
+      </section>
+      <section class="grid">
+        <div class="panel">
+          <div class="panel-head"><h2>Durable agent runs</h2><span>click for full record</span></div>
+          <table><thead><tr><th style="width:24%">State</th><th>Goal</th><th style="width:18%">Trigger</th><th style="width:17%">Turns</th></tr></thead><tbody id="runs"></tbody></table>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Attention stream</h2><span>policy decisions</span></div>
+          <div class="feed" id="attention"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Approvals</h2><span>human write boundary</span></div>
+          <table><thead><tr><th style="width:26%">Status</th><th>Tool</th><th style="width:28%">Requester</th></tr></thead><tbody id="approvals"></tbody></table>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Queue health</h2><span>leased + retryable</span></div>
+          <div class="feed" id="jobs"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <dialog id="detail"><div class="dialog-head"><b>Record inspector</b><button onclick="detail.close()">×</button></div><pre id="detail-json"></pre></dialog>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const safe = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    const badge = (value) => `<span class="badge ${safe(value).toLowerCase()}">${safe(value)}</span>`;
+    const show = (record) => { $("detail-json").textContent = JSON.stringify(record, null, 2); $("detail").showModal(); };
+    async function load() {
+      const org = $("org").value.trim();
+      $("status").textContent = "Refreshing operational state…";
+      try {
+        const [health, response] = await Promise.all([fetch("/health"), fetch(`/v1/harness/dashboard?organization_id=${encodeURIComponent(org)}`)]);
+        if (!health.ok || !response.ok) throw new Error(`API ${response.status}`);
+        const data = await response.json(), evaluation = data.evaluation;
+        $("health-dot").classList.add("live");
+        $("status").textContent = `Live · ${org} · ${new Date().toLocaleTimeString()}`;
+        $("m-runs").textContent = evaluation.runs.count;
+        $("m-completed").textContent = evaluation.runs.states.completed || 0;
+        $("m-wakes").textContent = evaluation.attention.wake_count || 0;
+        $("m-jobs").textContent = data.jobs.counts.queued || 0;
+        $("runs").innerHTML = data.runs.length ? data.runs.map((r, i) => `<tr data-id="${i}"><td>${badge(r.state)}</td><td title="${safe(r.goal)}">${safe(r.goal)}</td><td>${safe(r.trigger_kind)}</td><td>${safe(r.iteration_count || 0)}</td></tr>`).join("") : `<tr><td colspan="4" class="empty">No runs yet.</td></tr>`;
+        [...$("runs").querySelectorAll("tr[data-id]")].forEach(row => row.onclick = () => show(data.runs[Number(row.dataset.id)]));
+        $("approvals").innerHTML = data.approvals.length ? data.approvals.map((a, i) => `<tr data-id="${i}"><td>${badge(a.status)}</td><td>${safe(a.tool_name)}</td><td>${safe(a.requested_by)}</td></tr>`).join("") : `<tr><td colspan="3" class="empty">No approval requests.</td></tr>`;
+        [...$("approvals").querySelectorAll("tr[data-id]")].forEach(row => row.onclick = () => show(data.approvals[Number(row.dataset.id)]));
+        $("attention").innerHTML = data.attention.length ? data.attention.slice(0, 12).map(a => `<div class="feed-item"><time>${safe((a.created_at || "").slice(11,19))}</time><p>${badge(a.decision)}<br>${safe(a.reason || a.event_id)}</p></div>`).join("") : `<div class="empty">No ambient decisions yet.</div>`;
+        const counts = data.jobs.counts;
+        $("jobs").innerHTML = Object.keys(counts).length ? Object.entries(counts).map(([name, count]) => `<div class="feed-item"><time>${safe(name)}</time><p><b>${safe(count)}</b> jobs</p></div>`).join("") : `<div class="empty">Queue is empty.</div>`;
+      } catch (error) {
+        $("health-dot").classList.remove("live");
+        $("status").textContent = `Unavailable · ${error.message}`;
+      }
+    }
+    $("refresh").onclick = load; $("org").onkeydown = e => { if (e.key === "Enter") load(); }; load();
+  </script>
+</body>
+</html>

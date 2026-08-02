@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "company-brain"
+name = "docket"
 version = "0.1.0"
 description = "Graph-native organizational memory and context platform for enterprise agents"
 readme = "README.md"
@@ -24,10 +24,11 @@ dev = [
 ]
 
 [project.scripts]
-company-brain = "company_brain.main:main"
-company-brain-seed = "company_brain.fixtures.seed:main"
-company-brain-slack = "company_brain.slack_socket:main"
-company-brain-worker = "company_brain.worker_main:main"
+docket = "docket.main:main"
+docket-gateway = "docket.main:main"
+docket-seed = "docket.fixtures.seed:main"
+docket-slack = "docket.slack_socket:main"
+docket-worker = "docket.worker_main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
