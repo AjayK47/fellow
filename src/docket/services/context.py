@@ -244,7 +244,7 @@ class ContextService:
                         }
                     )
             judgment_guidance = self.retrieval.reality.judgment_guidance(
-                organization_id, acting_principal_id
+                organization_id, acting_principal_id, query=task
             )
 
         # Budget by priority (spec §8.11)

@@ -748,7 +748,15 @@ def build_tool_registry(
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 20,
-                        }
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "What you're about to do (e.g. the tool or "
+                                "entity involved). Ranks guidance by "
+                                "relevance instead of only recency."
+                            ),
+                        },
                     },
                     [],
                 ),
@@ -759,6 +767,7 @@ def build_tool_registry(
                     runtime["organization_id"],
                     runtime["principal_id"],
                     limit=min(int(args.get("limit", 10)), 20),
+                    query=args.get("query"),
                 )
             },
         )

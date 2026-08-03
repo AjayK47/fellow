@@ -152,6 +152,28 @@ class AgentRunStore:
     def get(self, run_id: str) -> dict[str, Any] | None:
         return self.store.get_harness_record("agent_runs", run_id)
 
+    def push_signal(
+        self,
+        run_id: str,
+        organization_id: str,
+        *,
+        kind: str,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        return self.store.push_agent_run_signal(
+            {
+                "id": new_id("rsig"),
+                "organization_id": organization_id,
+                "run_id": run_id,
+                "kind": kind,
+                "message": message,
+                "created_at": utcnow().isoformat(),
+            }
+        )
+
+    def pop_signal(self, run_id: str) -> dict[str, Any] | None:
+        return self.store.pop_agent_run_signal(run_id)
+
     def transition(
         self,
         run_id: str,

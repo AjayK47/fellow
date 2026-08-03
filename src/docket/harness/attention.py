@@ -234,7 +234,10 @@ class AttentionPipeline:
             "related_cases": related_cases[:5],
             "judgment_guidance": (
                 self.retrieval.reality.judgment_guidance(
-                    event.organization_id, event.actor.id, limit=5
+                    event.organization_id,
+                    event.actor.id,
+                    limit=5,
+                    query=event.payload.get("text") or "",
                 )
                 if self.retrieval.reality
                 else []

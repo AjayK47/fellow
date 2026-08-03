@@ -32,12 +32,15 @@ _TIMED_TABLES: dict[str, str] = {
     "policy_versions": "created_at",
     "action_preconditions": "created_at",
     "artifacts": "created_at",
+    "agent_run_signals": "created_at",
 }
 
 _TENANT_TABLES = [
     "chunks_fts",
     "memories_fts",
     "memory_embeddings",
+    "judgment_embeddings",
+    "agent_run_signals",
     "chunks",
     "principal_memberships",
     "skill_versions",

@@ -290,11 +290,19 @@ def test_running_agent_receives_a_steer_signal_instead_of_a_duplicate_run(brain)
     assert result["signal"] == "steer"
     assert result["run_id"] == run["id"]
 
-    refreshed = brain.agent_runs.get(run["id"])
-    assert refreshed["pending_signal"] == {
-        "kind": "steer",
-        "message": "Actually also check the billing service",
-    }
+    with brain.store.cursor() as cur:
+        cur.execute(
+            "SELECT run_id, kind, message FROM agent_run_signals WHERE run_id = ?",
+            (run["id"],),
+        )
+        pending = [dict(row) for row in cur.fetchall()]
+    assert pending == [
+        {
+            "run_id": run["id"],
+            "kind": "steer",
+            "message": "Actually also check the billing service",
+        }
+    ]
     matching = [
         r
         for r in brain.store.list_harness_records("agent_runs", "org_acme")
@@ -323,8 +331,13 @@ def test_running_agent_receives_an_abort_signal_on_stop_like_message(brain):
     )
     assert result["route"] == "run_signal"
     assert result["signal"] == "abort"
-    refreshed = brain.agent_runs.get(run["id"])
-    assert refreshed["pending_signal"] == {"kind": "abort", "message": "stop"}
+    with brain.store.cursor() as cur:
+        cur.execute(
+            "SELECT kind, message FROM agent_run_signals WHERE run_id = ?",
+            (run["id"],),
+        )
+        pending = [dict(row) for row in cur.fetchall()]
+    assert pending == [{"kind": "abort", "message": "stop"}]
 
 
 def test_steer_signal_is_injected_before_the_next_model_call(brain):
@@ -347,8 +360,7 @@ def test_steer_signal_is_injected_before_the_next_model_call(brain):
     request = model.requests[0]
     assert any(m.get("content") == "Focus on Q3 only" for m in request["messages"])
 
-    refreshed = brain.agent_runs.get(run["id"])
-    assert not refreshed.get("pending_signal")
+    assert brain.company_agent.runs.pop_signal(run["id"]) is None
 
 
 def test_abort_signal_cancels_the_run_before_any_model_call(brain):

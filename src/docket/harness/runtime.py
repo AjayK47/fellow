@@ -222,10 +222,11 @@ class CompanyAgent:
                     state=AgentRunState.CANCELLED,
                     trace_id=run["trace_id"],
                 )
-            if persisted and persisted.get("pending_signal"):
-                signal = persisted.pop("pending_signal")
+            if persisted:
+                run = persisted
+            signal = self.runs.pop_signal(run["id"])
+            if signal:
                 if signal.get("kind") == "abort":
-                    self.runs.update(persisted)
                     cancelled = self.runs.transition(
                         run["id"],
                         AgentRunState.CANCELLED,
@@ -241,15 +242,13 @@ class CompanyAgent:
                     )
                 if signal.get("kind") == "steer" and signal.get("message"):
                     self.runs.add_message(
-                        organization_id=persisted["organization_id"],
-                        session_id=persisted["session_id"],
-                        run_id=persisted["id"],
+                        organization_id=run["organization_id"],
+                        session_id=run["session_id"],
+                        run_id=run["id"],
                         role="user",
                         content=signal["message"],
                         metadata={"steered": True},
                     )
-                self.runs.update(persisted)
-                run = persisted
             if int(run.get("tool_call_count", 0)) >= int(run["max_tool_calls"]):
                 raise RuntimeError("tool_call_limit")
             if int((run.get("usage") or {}).get("total_tokens", 0)) >= int(
@@ -686,23 +685,21 @@ class CompanyAgent:
 
         `kind="abort"` cancels the run at its next iteration boundary;
         `kind="steer"` injects `message` as a new user turn the run picks up
-        on its next iteration, without pausing it. Checked by `_loop()` at
-        the same point it already checks for external cancellation.
+        on its next iteration, without pausing it.
 
-        Known limitation: this writes onto the run record's own JSON blob,
-        which `_loop()` also periodically overwrites wholesale mid-iteration
-        (`AgentRunStore.update()`). A signal landing in the narrow window
-        between `_loop()`'s last per-iteration refresh and its next refresh
-        can be overwritten before it's ever read. The failure mode is a
-        dropped signal requiring a retry, not incorrect execution — a
-        dedicated signals table would close this fully if it ever matters
-        in practice.
+        Signals live in their own `agent_run_signals` table, claimed with
+        the same atomic immediate-transaction pop used for job leasing
+        (`pop_agent_run_signal`) — not on the run record's own JSON blob.
+        That means a signal sent concurrently with `_loop()`'s per-iteration
+        `AgentRunStore.update()` can never be silently overwritten before
+        it's read: the two writes touch different rows.
         """
         run = self.runs.get(run_id)
         if not run:
             raise KeyError(run_id)
-        run["pending_signal"] = {"kind": kind, "message": message}
-        self.runs.update(run)
+        self.runs.push_signal(
+            run_id, run["organization_id"], kind=kind, message=message
+        )
         return run
 
     def _append_tool_result(self, run: dict[str, Any], result: Any) -> None:

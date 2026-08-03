@@ -268,6 +268,15 @@ class BrainStore:
                     UNIQUE (run_id, turn_number)
                 );
 
+                CREATE TABLE IF NOT EXISTS agent_run_signals (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    message TEXT,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS harness_tool_calls (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
@@ -683,6 +692,13 @@ class BrainStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS judgment_embeddings (
+                    judgment_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    embedding TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS policy_versions (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
@@ -762,6 +778,8 @@ class BrainStore:
                     ON agent_messages(session_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_calls_run
                     ON harness_tool_calls(run_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_agent_run_signals_run
+                    ON agent_run_signals(run_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_approvals_run_status
                     ON approvals(run_id, status);
                 CREATE INDEX IF NOT EXISTS idx_attention_event
@@ -1081,6 +1099,30 @@ class BrainStore:
         with self.cursor() as cur:
             cur.execute(f"SELECT memory_id, embedding FROM memory_embeddings WHERE memory_id IN ({placeholders})", memory_ids)
             return {row["memory_id"]: _de(row["embedding"]) for row in cur.fetchall()}
+
+    def upsert_judgment_embedding(
+        self, *, judgment_id: str, organization_id: str, model: str,
+        embedding: list[float],
+    ) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO judgment_embeddings
+                (judgment_id, organization_id, model, embedding)
+                VALUES (?, ?, ?, ?)""",
+                (judgment_id, organization_id, model, _ser(embedding)),
+            )
+
+    def judgment_embeddings(self, judgment_ids: list[str]) -> dict[str, list[float]]:
+        if not judgment_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in judgment_ids)
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT judgment_id, embedding FROM judgment_embeddings "
+                f"WHERE judgment_id IN ({placeholders})",
+                judgment_ids,
+            )
+            return {row["judgment_id"]: _de(row["embedding"]) for row in cur.fetchall()}
 
     def list_chunks(
         self,
@@ -1562,6 +1604,50 @@ class BrainStore:
             )
             row = cur.fetchone()
             return _de(row["payload"]) if row else None
+
+    def push_agent_run_signal(self, signal: dict[str, Any]) -> dict[str, Any]:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT INTO agent_run_signals
+                (id, organization_id, run_id, kind, message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    signal["id"],
+                    signal["organization_id"],
+                    signal["run_id"],
+                    signal["kind"],
+                    signal.get("message"),
+                    signal["created_at"],
+                ),
+            )
+        return signal
+
+    def pop_agent_run_signal(self, run_id: str) -> dict[str, Any] | None:
+        """Atomically claim and remove the oldest pending signal for a run.
+
+        Uses the same immediate-transaction claim pattern as job leasing
+        (`lease_harness_jobs`) so a signal read here can never be silently
+        overwritten by a concurrent `_loop()` iteration's run-row update —
+        it lives in its own table, not the run's JSON blob.
+        """
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """SELECT id, kind, message, created_at FROM agent_run_signals
+                WHERE run_id = ? ORDER BY created_at ASC LIMIT 1""",
+                (run_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cur.execute(
+                "DELETE FROM agent_run_signals WHERE id = ?", (row["id"],)
+            )
+            return {
+                "id": row["id"],
+                "kind": row["kind"],
+                "message": row["message"],
+                "created_at": row["created_at"],
+            }
 
     def append_agent_message(self, message: dict[str, Any]) -> None:
         with self.cursor() as cur:

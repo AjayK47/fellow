@@ -62,7 +62,9 @@ class DocketApp:
         self.embeddings = build_embedding_provider()
         self.indexing = IndexingService(self.store, self.embeddings)
         self.memory = MemoryService(self.store, self.graph, self.audit, indexing=self.indexing)
-        self.reality = RealityEngine(self.store, self.graph, self.audit)
+        self.reality = RealityEngine(
+            self.store, self.graph, self.audit, embeddings=self.embeddings
+        )
         self.artifacts = ArtifactService(self.store, self.audit)
         self.ingestion = IngestionService(
             self.store,

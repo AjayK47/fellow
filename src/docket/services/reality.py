@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -63,10 +64,13 @@ class RealityEngine:
     }
     CASE_MEMORY_TYPES = {"issue", "commitment", "decision", "outcome"}
 
-    def __init__(self, store: Any, graph: Any, audit: Any) -> None:
+    def __init__(
+        self, store: Any, graph: Any, audit: Any, embeddings: Any | None = None
+    ) -> None:
         self.store = store
         self.graph = graph
         self.audit = audit
+        self.embeddings = embeddings
 
     # ------------------------------------------------------------------
     # Canonical connector objects and resumable syncs
@@ -1323,6 +1327,24 @@ class RealityEngine:
         reason: str | None = None,
     ) -> dict[str, Any]:
         now = _now()
+        reinforcement_key = self._judgment_reinforcement_key(
+            judgment_type, decision, subject
+        )
+        if reinforcement_key:
+            existing = self._find_reinforceable_judgment(
+                organization_id, principal_id, reinforcement_key
+            )
+            if existing:
+                existing["reinforcement_count"] = (
+                    int(existing.get("reinforcement_count", 1)) + 1
+                )
+                existing["last_reinforced_at"] = now
+                if reason:
+                    existing["reason"] = reason
+                existing["subject"] = subject
+                self._save_judgment(existing)
+                self._embed_judgment(existing)
+                return existing
         judgment = {
             "id": new_id("judgment"),
             "organization_id": organization_id,
@@ -1331,6 +1353,9 @@ class RealityEngine:
             "decision": decision,
             "reason": reason,
             "subject": subject,
+            "reinforcement_key": reinforcement_key,
+            "reinforcement_count": 1,
+            "last_reinforced_at": now,
             "status": "active",
             "created_at": now,
         }
@@ -1350,7 +1375,78 @@ class RealityEngine:
                     now,
                 ),
             )
+        self._embed_judgment(judgment)
         return judgment
+
+    @staticmethod
+    def _judgment_reinforcement_key(
+        judgment_type: str, decision: str, subject: dict[str, Any]
+    ) -> str | None:
+        """Group repeated corrections on the same anchor so they reinforce
+        one guidance record instead of accumulating as unrelated entries.
+
+        Only fires when the subject names something stable across
+        occurrences (a tool, entity, or capability) — call sites like
+        ``tool_approval`` already include ``tool_name``; open-ended
+        subjects (e.g. a bare ``run_id``) are left alone rather than
+        guessed at.
+        """
+        anchor = (
+            subject.get("tool_name")
+            or subject.get("entity_id")
+            or subject.get("capability_id")
+        )
+        if not anchor:
+            return None
+        return f"{judgment_type}:{decision}:{anchor}"
+
+    def _find_reinforceable_judgment(
+        self, organization_id: str, principal_id: str | None, reinforcement_key: str
+    ) -> dict[str, Any] | None:
+        for item in self._list_payloads(
+            "judgment_events",
+            "organization_id = ?",
+            (organization_id,),
+            "created_at DESC",
+        ):
+            if item.get("status") != "active":
+                continue
+            if item.get("principal_id") != principal_id:
+                continue
+            if item.get("reinforcement_key") == reinforcement_key:
+                return item
+        return None
+
+    def _save_judgment(self, judgment: dict[str, Any]) -> None:
+        with self.store.cursor() as cur:
+            cur.execute(
+                "UPDATE judgment_events SET payload = ? WHERE id = ?",
+                (_dump(judgment), judgment["id"]),
+            )
+
+    def _embed_judgment(self, judgment: dict[str, Any]) -> None:
+        if not self.embeddings:
+            return
+        subject_text = " ".join(
+            str(value) for value in (judgment.get("subject") or {}).values()
+        )
+        text = " ".join(
+            [
+                judgment.get("judgment_type") or "",
+                judgment.get("decision") or "",
+                judgment.get("reason") or "",
+                subject_text,
+            ]
+        ).strip()
+        if not text:
+            return
+        vector = self.embeddings.embed([text])[0]
+        self.store.upsert_judgment_embedding(
+            judgment_id=judgment["id"],
+            organization_id=judgment["organization_id"],
+            model=self.embeddings.model,
+            embedding=vector,
+        )
 
     def list_judgments(
         self,
@@ -1373,15 +1469,109 @@ class RealityEngine:
         ]
 
     def judgment_guidance(
-        self, organization_id: str, principal_id: str, *, limit: int = 10
+        self,
+        organization_id: str,
+        principal_id: str,
+        *,
+        limit: int = 10,
+        query: str | None = None,
     ) -> list[dict[str, Any]]:
-        values = self.list_judgments(organization_id)
+        """Rank past corrections by relevance to `query`, not insertion order.
+
+        Combines semantic similarity (when an embedding provider and query
+        are available), lexical token overlap, a bounded reinforcement bonus
+        for corrections that keep recurring on the same anchor (see
+        `_judgment_reinforcement_key`), and a recency decay so a judgment
+        nobody has reinforced in months fades rather than staying pinned at
+        the top forever. Without a query, ranks on reinforcement + recency
+        only — still an improvement over the previous plain insertion order.
+        """
         applicable = [
             item
-            for item in values
+            for item in self.list_judgments(organization_id)
             if item.get("principal_id") in {None, principal_id}
         ]
-        return applicable[:limit]
+        if not applicable:
+            return []
+        query_tokens = self._case_tokens(query) if query else set()
+        query_vector = (
+            self.embeddings.embed([query])[0]
+            if query and query.strip() and self.embeddings
+            else []
+        )
+        embeddings = (
+            self.store.judgment_embeddings([item["id"] for item in applicable])
+            if query_vector
+            else {}
+        )
+        now = utcnow()
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for item in applicable:
+            reinforcement_bonus = (
+                min(int(item.get("reinforcement_count") or 1), 5) * 0.04
+            )
+            age_days = self._judgment_age_days(
+                item.get("last_reinforced_at") or item.get("created_at"), now
+            )
+            recency_bonus = 0.5 ** (age_days / 30.0) * 0.15
+            if query_tokens or query_vector:
+                text = " ".join(
+                    [
+                        item.get("reason") or "",
+                        " ".join(
+                            str(value)
+                            for value in (item.get("subject") or {}).values()
+                        ),
+                    ]
+                )
+                lexical = (
+                    len(query_tokens & self._case_tokens(text))
+                    / max(len(query_tokens), 1)
+                    if query_tokens
+                    else 0.0
+                )
+                memory_vector = embeddings.get(item["id"]) or []
+                semantic = (
+                    self._cosine(query_vector, memory_vector)
+                    if query_vector and memory_vector
+                    else 0.0
+                )
+                score = (
+                    semantic * 0.5
+                    + lexical * 0.25
+                    + reinforcement_bonus
+                    + recency_bonus
+                )
+            else:
+                score = reinforcement_bonus + recency_bonus
+            scored.append((score, item))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [item for _, item in scored[:limit]]
+
+    @staticmethod
+    def _judgment_age_days(timestamp: str | None, now: datetime) -> float:
+        if not timestamp:
+            return 365.0
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+        except ValueError:
+            return 365.0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max((now - parsed).total_seconds() / 86400.0, 0.0)
+
+    @staticmethod
+    def _cosine(left: list[float], right: list[float]) -> float:
+        if len(left) != len(right) or not left:
+            return 0.0
+        denominator = math.sqrt(sum(v * v for v in left)) * math.sqrt(
+            sum(v * v for v in right)
+        )
+        return (
+            sum(a * b for a, b in zip(left, right)) / denominator
+            if denominator
+            else 0.0
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
