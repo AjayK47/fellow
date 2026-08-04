@@ -22,6 +22,8 @@ from docket.harness.prompts import (
 
 log = logging.getLogger("docket.attention")
 
+_TERMINAL_RUN_STATES = {"completed", "failed", "cancelled"}
+
 
 class AttentionPipeline:
     def __init__(
@@ -145,6 +147,19 @@ class AttentionPipeline:
     def process_event_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.process(NormalizedEvent(**payload))
 
+    def _author_name(self, principal_id: str | None) -> str:
+        """Resolve a principal id to a human-readable name for the attention
+        classifier. Without this, every participant is an opaque
+        person_slack_* string, which makes it look like there's only one
+        undifferentiated speaker in a channel — the classifier then has no
+        cheap way to notice that a question was addressed by one named human
+        to another, not to Docket, and treats topical relevance as if it
+        were being spoken to."""
+        if not principal_id:
+            return "unknown"
+        entity = self.store.get_entity(principal_id)
+        return (entity or {}).get("name") or principal_id
+
     def _build_context(
         self, event: NormalizedEvent, conversation: dict[str, Any]
     ) -> dict[str, Any]:
@@ -193,27 +208,29 @@ class AttentionPipeline:
                             "source_ids": case.get("source_ids") or [],
                         }
                     )
+        recent_conversation = [
+            {**item, "author_name": self._author_name(item.get("author"))}
+            for item in (
+                self.store.recent_slack_messages(
+                    event.organization_id,
+                    workspace_id=event.scope.workspace_id or "",
+                    channel_id=event.scope.channel_id or "",
+                    limit=11,
+                )
+                if event.source == "slack" and event.scope.channel_id
+                else []
+            )
+            if item.get("message_id") != event.id
+        ][-10:]
         return {
             "new_event": {
                 "id": event.id,
                 "text": event.payload.get("text") or "",
                 "author": event.actor.id,
+                "author_name": self._author_name(event.actor.id),
                 "channel": event.scope.channel_id,
             },
-            "recent_conversation": [
-                item
-                for item in (
-                    self.store.recent_slack_messages(
-                        event.organization_id,
-                        workspace_id=event.scope.workspace_id or "",
-                        channel_id=event.scope.channel_id or "",
-                        limit=11,
-                    )
-                    if event.source == "slack" and event.scope.channel_id
-                    else []
-                )
-                if item.get("message_id") != event.id
-            ][-10:],
+            "recent_conversation": recent_conversation,
             "related_state": {
                 "active_run_id": active_run["id"] if active_run else None,
                 "active_run_state": active_run.get("state")
@@ -259,12 +276,34 @@ class AttentionPipeline:
             evaluation.decision = AttentionDecision.IGNORE
             evaluation.reason = "Direct requests bypass the attention pipeline."
             return evaluation
-        if conversation.get("active_run_id") and evaluation.decision in {
+        active_run_id = conversation.get("active_run_id")
+        if active_run_id:
+            active_run = self.store.get_harness_record("agent_runs", active_run_id)
+            if not active_run or active_run.get("state") in _TERMINAL_RUN_STATES:
+                # Stale pointer: that run already finished (or was never
+                # cleared after finishing — nothing currently clears
+                # active_run_id on completion). Attaching to it would
+                # silently strand this message with no further processing
+                # ever happening, so clear it and let this event get a
+                # fresh decision instead of a dead reference.
+                conversation["active_run_id"] = None
+                conversation["updated_at"] = utcnow().isoformat()
+                self.store.upsert_conversation_state(conversation)
+                active_run_id = None
+                if evaluation.decision in {
+                    AttentionDecision.ATTACH_TO_EXISTING_RUN,
+                    AttentionDecision.ESCALATE_EXISTING_RUN,
+                }:
+                    evaluation.decision = AttentionDecision.WAKE_MAIN_AGENT
+                    evaluation.reason = (
+                        "Referenced run already finished; treating as a new request."
+                    )
+        if active_run_id and evaluation.decision in {
             AttentionDecision.WAKE_MAIN_AGENT,
             AttentionDecision.DM_OWNER,
         }:
             evaluation.decision = AttentionDecision.ATTACH_TO_EXISTING_RUN
-            evaluation.existing_run_id = conversation["active_run_id"]
+            evaluation.existing_run_id = active_run_id
             evaluation.reason = "An active run already owns this conversation."
             return evaluation
         since = (

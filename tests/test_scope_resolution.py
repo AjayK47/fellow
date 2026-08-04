@@ -132,6 +132,48 @@ def test_capture_run_writes_to_the_conversations_own_scope(brain):
     assert source["scope_id"] == "scope_priv_f"
 
 
+def test_recurring_run_goal_gets_proposed_as_a_skill_draft(brain):
+    """Self-improvement layer: the same underlying ask across three SEPARATE
+    runs gets flagged as a pattern and drafted as a skill for review -- a
+    single run's own in-task reasoning has no visibility into runs other
+    than itself, so nothing inside one run could ever notice this."""
+    goal = "Check the export worker queue for backlog and report anything stuck"
+    destination = {"type": "internal_agent_session", "id": "pattern-test", "is_private": True}
+    for i in range(3):
+        decision = brain.authz.resolve("org_acme", "person_ajay", destination, "reactive_agent")
+        envelope = InvocationEnvelope(
+            organization_id="org_acme",
+            principal_id="person_ajay",
+            conversation_id=f"api:pattern-test:{i}",
+            destination=destination,
+            purpose="reactive_agent",
+            permission_decision_id=decision.id,
+            allowed_scope_ids=decision.allowed_scope_ids,
+        )
+        run = brain.company_agent.create_invocation(
+            envelope=envelope,
+            goal=goal,
+            trigger_kind="reactive",
+            initial_message=goal,
+        )
+        outcome = brain.company_agent.run(run["id"])
+        assert outcome.state.value == "completed"
+        brain.harness_memory.capture_run(run["id"])
+
+    signals = brain.store.list_harness_records(
+        "run_pattern_signals", "org_acme", where={"status": "proposed"}
+    )
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal["occurrence_count"] == 3
+    assert signal["proposed_skill_id"]
+
+    skill = brain.skills.get(signal["proposed_skill_id"])
+    assert skill is not None
+    assert skill["status"] == "draft"
+    assert skill["goal"] == goal
+
+
 def _run_dict(*, organization_id: str, principal_id: str, destination: dict, final_answer: str) -> dict:
     return {
         "id": "arun_test_disclosure",

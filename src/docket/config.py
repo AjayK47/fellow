@@ -77,10 +77,10 @@ class Settings(BaseSettings):
     run_code_enabled: bool = True
     run_code_timeout_seconds: int = 60
     run_code_max_tool_calls: int = 20
-    agent_max_iterations: int = 12
-    agent_max_tool_calls: int = 24
-    agent_context_token_budget: int = 12_000
-    agent_max_total_tokens: int = 100_000
+    agent_max_iterations: int = 100
+    agent_max_tool_calls: int = 150
+    agent_context_token_budget: int = 200_000
+    agent_max_total_tokens: int = 2_000_000
     specialist_max_parallel: int = 3
     specialist_max_depth: int = 1
     browser_enabled: bool = False
@@ -99,6 +99,20 @@ class Settings(BaseSettings):
     slack_proactive_channels: str = ""
     slack_signature_tolerance_seconds: int = 300
 
+    # OAuth app-distribution credentials (identify the Slack App itself, the
+    # same pair for every workspace that installs it) — distinct from
+    # slack_bot_token/slack_app_token above, which configure this operator's
+    # own primary workspace directly. Required only for the public
+    # /slack/install -> /v1/slack/oauth/callback flow.
+    slack_client_id: str | None = None
+    slack_client_secret: str | None = None
+    slack_oauth_scopes: str = (
+        "app_mentions:read,channels:history,channels:read,chat:write,"
+        "chat:write.public,groups:history,groups:read,im:history,im:read,"
+        "im:write,mpim:history,mpim:read,reactions:write,users:read,"
+        "files:write"
+    )
+
     # Composio connections, triggers, webhook ingestion, and tool execution.
     composio_api_key: str | None = None
     composio_base_url: str = "https://backend.composio.dev/api/v3.1"
@@ -111,13 +125,26 @@ class Settings(BaseSettings):
     # auto-register the Composio webhook target on startup.
     public_url: str | None = None
 
+    # Console dashboard login (Sign in with Slack). If unset, the session
+    # cookie-signing secret falls back to slack_client_secret, then to a
+    # random per-process key (sessions won't survive a restart in that case).
+    dashboard_session_secret: str | None = None
+    dashboard_auth_disabled: bool = False
+
+    # Dev-only: auto-resolve every write approval instead of pausing for a
+    # human. The approval record is still created and immediately marked
+    # approved (full audit/judgment trail intact) rather than skipped
+    # outright. Off by default — real deployments keep human approval
+    # mandatory for every write, this setting exists only for local testing.
+    auto_approve_writes: bool = False
+
     # Durable local worker. PostgreSQL/Redis can replace these interfaces at
     # deployment time; SQLite remains the fully runnable local backend.
     worker_enabled: bool = True
     worker_poll_interval_seconds: float = 0.5
     worker_lease_seconds: int = 60
     worker_batch_size: int = 20
-    worker_concurrency: int = 4
+    worker_concurrency: int = 30
     attention_minimum_confidence: float = 0.72
     proactive_cooldown_seconds: int = 900
     episode_quiet_seconds: int = 300

@@ -531,6 +531,16 @@ class BrainStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS run_pattern_signals (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    run_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS chunks (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
@@ -1479,6 +1489,7 @@ class BrainStore:
         "specialist_tasks",
         "handoffs",
         "automation_watermarks",
+        "run_pattern_signals",
     }
 
     def _checked_harness_table(self, table: str) -> str:
@@ -1948,7 +1959,7 @@ class BrainStore:
         allowed = {
             "skill_packages", "capabilities", "run_skill_refs",
             "run_capability_refs", "workspaces", "plans", "specialist_tasks",
-            "handoffs", "automation_watermarks",
+            "handoffs", "automation_watermarks", "run_pattern_signals",
         }
         if table not in allowed:
             raise ValueError(f"unsupported harness projection table: {table}")
@@ -1973,7 +1984,7 @@ class BrainStore:
         allowed = {
             "skill_packages", "capabilities", "run_skill_refs",
             "run_capability_refs", "workspaces", "plans", "specialist_tasks",
-            "handoffs", "automation_watermarks",
+            "handoffs", "automation_watermarks", "run_pattern_signals",
         }
         if table not in allowed:
             raise ValueError(f"unsupported harness projection table: {table}")

@@ -25,27 +25,33 @@ export default function Reality() {
         subtitle="Bi-temporal company facts, semantic contradictions, cross-source cases, and human judgment guidance."
       />
       <Section>
-        <div className="flex gap-2 border-b border-ink">
-          {(["facts", "conflicts", "cases", "judgments"] as const).map((t) => (
-            <button
-              key={t}
-              onClick={() => setTab(t)}
-              className={`px-4 py-2 font-mono text-[12px] uppercase tracking-wider ${
-                tab === t ? "bg-ink text-white" : "text-muted"
-              }`}
-            >
-              {t}
-            </button>
-          ))}
-        </div>
-      </Section>
-      <Section>
-        <Card title={tab}>
+        <Card className="p-0">
+          <div className="flex gap-1 border-b border-line px-2 pt-2">
+            {(["facts", "conflicts", "cases", "judgments"] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                className={`rounded-t-lg px-4 py-2 text-[12px] font-medium capitalize transition-colors ${
+                  tab === t ? "bg-brand-soft text-brand" : "text-muted hover:text-ink"
+                }`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
           {active.loading && <Empty>loading…</Empty>}
           {active.error && <Empty>error: {active.error}</Empty>}
           {tab === "facts" && facts.data && (
             <table className="table">
-              <thead><tr><th>subject</th><th>predicate</th><th>object</th><th>valid</th><th>source</th></tr></thead>
+              <thead>
+                <tr>
+                  <th className="whitespace-nowrap">subject</th>
+                  <th className="whitespace-nowrap">predicate</th>
+                  <th className="w-full">object</th>
+                  <th className="whitespace-nowrap">valid</th>
+                  <th className="whitespace-nowrap">source</th>
+                </tr>
+              </thead>
               <tbody>
                 {(facts.data.facts || []).slice(0, 200).map((f, i) => {
                   const fo = f as Record<string, unknown>;
@@ -64,7 +70,15 @@ export default function Reality() {
           )}
           {tab === "conflicts" && conflicts.data && (
             <table className="table">
-              <thead><tr><th>id</th><th>subject</th><th>predicate</th><th>status</th><th>claims</th></tr></thead>
+              <thead>
+                <tr>
+                  <th className="whitespace-nowrap">id</th>
+                  <th className="whitespace-nowrap">subject</th>
+                  <th className="whitespace-nowrap">predicate</th>
+                  <th className="whitespace-nowrap">status</th>
+                  <th className="w-full">claims</th>
+                </tr>
+              </thead>
               <tbody>
                 {(conflicts.data.conflicts || []).slice(0, 200).map((c) => {
                   const co = c as Record<string, unknown>;
@@ -85,7 +99,15 @@ export default function Reality() {
           )}
           {tab === "cases" && cases.data && (
             <table className="table">
-              <thead><tr><th>id</th><th>title</th><th>status</th><th>entities</th><th>tokens</th></tr></thead>
+              <thead>
+                <tr>
+                  <th className="whitespace-nowrap">id</th>
+                  <th className="w-full">title</th>
+                  <th className="whitespace-nowrap">status</th>
+                  <th className="whitespace-nowrap">entities</th>
+                  <th className="whitespace-nowrap">tokens</th>
+                </tr>
+              </thead>
               <tbody>
                 {(cases.data.cases || []).slice(0, 200).map((c) => {
                   const co = c as Record<string, unknown>;
@@ -104,7 +126,14 @@ export default function Reality() {
           )}
           {tab === "judgments" && judgments.data && (
             <table className="table">
-              <thead><tr><th>id</th><th>type</th><th>principal</th><th>summary</th></tr></thead>
+              <thead>
+                <tr>
+                  <th className="whitespace-nowrap">id</th>
+                  <th className="whitespace-nowrap">type</th>
+                  <th className="whitespace-nowrap">principal</th>
+                  <th className="w-full">summary</th>
+                </tr>
+              </thead>
               <tbody>
                 {(judgments.data.judgments || []).slice(0, 200).map((j) => {
                   const jo = j as Record<string, unknown>;

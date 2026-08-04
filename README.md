@@ -50,10 +50,20 @@ flowchart LR
 
     subgraph Durable["Durable execution"]
         Runs["Runs, turns, messages, checkpoints"]
+        Signals["Atomically-claimed run signals"]
         Jobs["Leased background jobs"]
         Artifacts["Reports and worker artifacts"]
         Audit["Audit and evaluation"]
     end
+
+    subgraph Operate["Operator surface"]
+        Console["Docket Console — React SPA"]
+    end
+
+    Console -->|same /v1 API as any client| Runs
+    Console --> Policy
+    Console --> Jobs
+    Runs --> Signals
 
     Slack --> Verify
     Composio --> Verify
@@ -98,6 +108,7 @@ flowchart LR
 | Memory | Atomic memories, temporal revisions, relations, profiles, and extraction | `services/memory.py`, `harness/extraction.py`, `harness/memory_capture.py` |
 | Proactivity | Retrieval-first attention followed by deterministic delivery policy | `harness/attention.py`, `services/proactive.py` |
 | Durability | SQLite state, leased jobs, retries, artifacts, traces, and audit | `storage/db.py`, `harness/jobs.py`, `harness/worker.py`, `services/artifacts.py` |
+| Console | Operator-facing React SPA: dashboard, run/approval/job inspection, per-tool policy, skill draft approval, automation authoring, and a force-directed graph explorer | `web/src/` |
 
 Built-in and connector procedures are not database-only rows. The authoritative
 content lives in validated `src/docket/builtin_skills/**/SKILL.md` packages.
@@ -106,6 +117,51 @@ versioned independently. Each run resolves mandatory destination skills and
 relevant optional skills, checks declared capabilities, and pins the package
 hash and instructions into its trace. Use `GET /v1/skills/catalog` to inspect
 the package inventory and readiness; the Skills console shows the same view.
+
+### Docket Console
+
+The console (`web/`) is a React, Vite, and Tailwind single-page app served as
+static files by the same FastAPI process (`web/dist`, mounted at `/`). It has
+no backend of its own and no elevated access — every read and write goes
+through the same versioned `/v1/*` API a Slack event, a scheduled automation,
+or a direct `curl` invocation would use. Toggling a tool's policy, approving a
+skill draft, or creating an automation from the console produces the exact
+same schema-validated, policy-checked, audit-logged call as any other client.
+
+Pages are organized by what they let an operator do, not by data source:
+
+- **Dashboard** — active runs, pending approvals, and a permission-scoped
+  activity feed, refreshed on a short poll rather than a push channel.
+- **Sessions / Session detail** — the primary way to browse conversations. A
+  session is one conversation key (a Slack DM, channel, or thread) — there is
+  no user-facing "start a new session" action, since a session begins
+  implicitly the first time someone messages Docket there and every
+  subsequent message in that same place reuses it. Session detail shows the
+  full cross-run transcript plus the list of runs it contains, since one
+  session commonly spans several runs over time. `GET /v1/sessions` and
+  `GET /v1/sessions/{id}` back this view.
+- **Runs / Run detail** — still reachable (`/runs/:runId`, linked from session
+  detail), for inspecting a single run's turns (model request/response with
+  tool calls and token usage), resolved skills and capabilities, workspace,
+  artifacts, and specialist handoffs.
+- **Approvals / Tools** — decide pending write approvals; set each tool's
+  organization policy to allow, always ask for approval, or forbid outright.
+  Write-risk tools always require approval regardless of this setting — the
+  policy only controls read-risk tools and whether the tool is offered to the
+  model at all.
+- **Skills** — approve or deprecate versioned procedures, with agent-proposed
+  drafts surfaced separately from the immutable platform catalog.
+- **Setup / Integrations / Channels** — configure the model provider, web
+  tools, and Slack directly from the console (writing only to the local,
+  gitignored `.env`), and connect Composio-backed tools through the same
+  hosted OAuth flow Composio's API drives everywhere else.
+- **Automations** — interval or cron-scheduled goals that re-enter the same
+  main-agent runtime as any reactive request.
+- **Graph** — a force-directed, permission-filtered view of the company graph
+  (`/v1/graph/explorer`): nodes sized by connection count, colored by entity
+  type, searchable, with a click-to-inspect panel over each entity's edges.
+- **Reality / Jobs / Audit** — bitemporal facts and conflicts, the durable
+  job queue, and the append-only audit log.
 
 ### How an event becomes action and memory
 
@@ -135,14 +191,23 @@ The harness deliberately keeps several related representations:
 - **Atomic memories** represent decisions, commitments, issues, outcomes, and
   reusable knowledge.
 - **Graph entities and edges** represent people, teams, projects, services,
-  customers, ownership, membership, and dependencies.
+  customers, ownership, membership, and dependencies. Edges carry the same
+  valid-time/system-time split as facts: superseding an edge (ownership
+  transferred, on-call rotated) closes its validity window in place rather
+  than leaving a stale relationship queryable alongside its replacement, and
+  `edges_as_of()` answers "who owned this then?", not only "who owns this
+  now?"
 - **Bi-temporal facts** answer both “what was true then?” and “what did we know
   at that time?”
 - **Conflicts** preserve competing claims instead of silently overwriting them.
 - **Cases** correlate related Slack, ticket, code, CRM, and other events into an
   evolving situation.
 - **Judgment memory** turns approvals, rejections, corrections, edits, and
-  explicit feedback into retrievable guidance.
+  explicit feedback into retrievable guidance. Repeated corrections on the
+  same tool or entity reinforce one record instead of accumulating as
+  unrelated duplicates, and guidance is ranked by semantic and lexical
+  relevance to the current task plus recency — not returned in a flat,
+  insertion-ordered list.
 - **Artifacts** preserve durable reports and specialist results.
 
 Every representation retains organization and scope boundaries. Retrieval is
@@ -157,9 +222,31 @@ always performed for an acting principal and destination.
   management, signed webhooks, dynamic tool search/describe/execute, and
   historical backfill
 - Hermes-style bounded main-agent loop with durable messages, turns,
-  checkpoints, cancellation, resumable human waits, and token/tool/time budgets
-- Dynamic specialist workers with inherited scopes, read-only tool subsets,
-  maximum depth one, parallelism limits, and durable result artifacts
+  checkpoints, resumable human waits, and token/tool/time budgets.
+  Abort/steer interrupts are claimed from a dedicated table with the same
+  atomic immediate-transaction pattern used for job leasing, so a signal sent
+  mid-iteration can't be silently overwritten by the run's own checkpoint
+  write. Exact-duplicate `(tool, arguments)` calls within a single model turn
+  are dropped before execution — a model occasionally requests the identical
+  call twice, which otherwise burns real tool-call budget for zero new
+  information (ported from Hermes's `_deduplicate_tool_calls`)
+- A self-improvement pass after every reactive/proactive run: goals are
+  compared by embedding similarity against other recently completed runs —
+  something no single run's own in-task reasoning has visibility into, since
+  it only ever sees itself. Detection is pure embedding comparison, no LLM
+  call, so it doesn't add to the tool/model call volume it exists to reduce;
+  once a pattern repeats often enough to not be a coincidence, it's drafted
+  as a skill for human review, never auto-approved
+- A React/Vite/Tailwind operator console served by the same process: run and
+  approval inspection, per-tool allow/ask-approval/forbid policy, skill draft
+  approval, cron or interval automation authoring, live setup forms for the
+  model provider/web tools/Slack, and a force-directed graph explorer — all
+  calling the same policy-checked, audit-logged API as any other client
+- Dynamic specialist workers with inherited scopes, maximum depth one,
+  parallelism limits, and durable result artifacts. A worker's tool set is
+  whatever the delegating task explicitly named — including write tools —
+  not forced read-only; a write call still pauses for the same approval it
+  would need from the main agent
 - OpenRouter clients for chat, attention, extraction, and embeddings, plus
   deterministic zero-cost providers for tests and local development
 - Optional Brave Search and a safe public-page fetch tool; both are read-only,
@@ -180,8 +267,12 @@ always performed for an acting principal and destination.
 - Permission-filtered hybrid retrieval across evidence, memories, FTS5,
   embeddings, graph relationships, temporal facts, cases, profiles, and runs
 - Canonical versioned connector objects, per-stream sync cursors, cross-tool
-  identifiers, fuzzy entity review, temporal facts, contradiction handling,
-  case correlation, and judgment memory
+  identifiers, temporal facts, contradiction handling, case correlation, and
+  judgment memory. Entity resolution is tiered rather than one flat fuzzy
+  threshold: an exact normalized name/alias match short-circuits scoring,
+  and a short or low-entropy label is refused rather than trusted — it
+  routes to a new entity or a review candidate instead of a confident-looking
+  false-positive merge
 - Versioned conditional policies, explicit forbids, approval-gated writes,
   idempotency, and execution-time state preconditions
 - Retrieval-first proactive attention with opt-in channel policy, confidence
@@ -197,15 +288,22 @@ always performed for an acting principal and destination.
 Requirements:
 
 - Python 3.11 or newer
-- The `kys` conda environment
-- `uv`
+- [`uv`](https://docs.astral.sh/uv/)
+- Node.js, only to build the console (`web/`)
 
 Install and create the local configuration:
 
 ```bash
-conda activate kys
 uv sync --extra dev
 cp .env.example .env
+```
+
+Build the console once (the gateway serves `web/dist` as static files; skip
+this and the API still works, just without the UI):
+
+```bash
+npm --prefix web install
+npm --prefix web run build
 ```
 
 Start the local gateway:
@@ -247,6 +345,7 @@ touch `.env` or source code.
 
 Open:
 
+- Docket Console: <http://127.0.0.1:8080/>
 - Control room: <http://127.0.0.1:8080/admin>
 - Gateway setup: <http://127.0.0.1:8080/setup>
 - Graph explorer: <http://127.0.0.1:8080/explorer>
@@ -327,8 +426,19 @@ DOCKET_EPISODE_QUIET_SECONDS=300
 ```
 
 Specialists are additionally capped per task by iterations, tool calls, token
-budget, and deadline. They cannot delegate or execute write tools, even if a
-direct or malformed model call attempts to bypass their advertised tool list.
+budget, and deadline, and can never delegate further regardless of what a
+direct or malformed model call requests — delegation depth is capped at one
+independently of tool access. A worker can be granted a write tool by the
+delegating task, but that write still requires the same human approval any
+main-agent write would need.
+
+**Known limitation:** approving a write that a specialist is waiting on does
+not currently resume that specialist run — nothing re-invokes it after the
+approval is decided, so the worker stays parked in
+`waiting_for_approval` and its result artifact says so explicitly rather
+than silently returning an empty finding. Treat specialist write access as
+useful for actions a human is watching and will approve promptly, not yet
+for unattended multi-step specialist work.
 
 ## Slack setup
 
@@ -377,6 +487,35 @@ DMs and explicit mentions activate the main agent. Channels are proactive by
 default: ambient messages are evaluated by attention and may be delivered in
 context; a user or policy must explicitly disable proactive delivery for a
 channel.
+
+### Public multi-workspace install (OAuth)
+
+Everything above configures *this operator's own* Slack workspace directly
+through `.env`. A distributed Slack app also needs a standard OAuth "Add to
+Slack" flow so any other workspace can install it without the operator
+touching their config or restarting the process. That flow is a separate,
+additive path:
+
+```dotenv
+DOCKET_SLACK_CLIENT_ID=...
+DOCKET_SLACK_CLIENT_SECRET=...
+DOCKET_PUBLIC_URL=https://your-host
+```
+
+```text
+GET  /slack/install               # redirects to Slack's own authorize screen
+GET  /v1/slack/oauth/callback     # Slack redirects back here with a code
+```
+
+Each installing workspace gets its own tenant (`organization_id` derived
+deterministically from the Slack team id) and its own bot token, stored in the
+`slack_installations` table rather than `.env` — a public app has as many bot
+tokens as it has installs, and routing the right token to the right workspace
+happens per-request (`SlackSender._token_for`, `SlackGateway._fetch_user_profile`)
+rather than through a single global `DOCKET_SLACK_BOT_TOKEN`. Reinstalling
+(revoke and re-authorize) updates the same tenant rather than creating a
+duplicate. The single-workspace `.env` flow above still works unmodified and
+takes priority as a fallback wherever a workspace has no stored installation.
 
 ## Optional typed runtimes
 
@@ -427,6 +566,12 @@ POST https://your-host/v1/composio/webhooks
 Incoming webhooks are signature checked, timestamp checked, deduplicated, and
 resolved to a tenant only through the server-side connected-account registry.
 The harness does not trust an organization ID supplied by the webhook payload.
+
+Every outbound Composio action execution resolves both the connected
+account's id and its own `composio_user_id` fresh from the connector-account
+registry on each call — Composio's execute API rejects a connected account
+without the entity id it was linked under, so this pairing is never cached or
+assumed from a single default account.
 
 Historical records can be loaded through `POST /v1/connectors/backfill` using
 either supplied records or a paginated Composio list action. Backfilled records
@@ -533,7 +678,8 @@ capture, job processing, and deduplication.
 
 Current release validation:
 
-- 81 automated tests
+- 199 of 200 automated tests passing (one pre-existing, unrelated gap: a
+  red-team fixture missing dummy arguments for a newly added document tool)
 - 18/18 deterministic organization simulation checks
 - 18/18 live OpenRouter embedding simulation checks using
   `qwen/qwen3-embedding-8b`
@@ -581,3 +727,13 @@ arbitrary code execution, dynamic code loading, or automatic unapproved
 production writes. Raw evidence is treated as untrusted data, never as
 instructions. External mutations remain policy checked, approval gated,
 idempotent, and auditable.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, the test commands
+expected to pass before a PR, and the working principles this codebase holds
+to.
+
+## License
+
+[MIT](LICENSE)

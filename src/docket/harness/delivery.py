@@ -55,6 +55,7 @@ class DeliveryService:
         result = self.slack.send(
             channel_id=channel_id,
             text=run["final_answer"],
+            workspace_id=slack.get("workspace_id"),
         )
         delivery = self._record(
             run=run,
@@ -134,6 +135,7 @@ class DeliveryService:
             channel_id=slack.get("channel_id") or envelope["destination"]["id"],
             text=text,
             blocks=blocks,
+            workspace_id=slack.get("workspace_id"),
         )
         delivery = self._record(
             run=run,
@@ -147,6 +149,71 @@ class DeliveryService:
             idempotency_key=f"slack.approval:{approval_id}",
         )
         return {"approval_id": approval_id, "delivery": delivery}
+
+    def mark_approval_decided(
+        self, approval_id: str, *, approved: bool, decided_by: str
+    ) -> None:
+        """Replace the Approve/Deny buttons on the original Slack message
+        with the actual decision, once one is made. Best-effort: an
+        approval decided from the dashboard (no Slack delivery), a
+        dry-run/unconfigured Slack sender, or any lookup failure here must
+        never surface as an error to the caller — the approval itself is
+        already resolved regardless of whether this cosmetic follow-up
+        succeeds.
+        """
+        try:
+            approval = self.store.get_harness_record("approvals", approval_id)
+            if not approval:
+                return
+            # list_harness_records' generic filter only covers real, indexed
+            # columns on this table (run_id, status, id, organization_id —
+            # not idempotency_key, and "kind" isn't a deliveries column at
+            # all despite being in the generic allowlist) — narrow by
+            # run_id, then match the exact delivery in Python.
+            candidates = self.store.list_harness_records(
+                "deliveries",
+                approval["organization_id"],
+                where={"run_id": approval["run_id"]},
+            )
+            deliveries = [
+                d
+                for d in candidates
+                if d.get("idempotency_key") == f"slack.approval:{approval_id}"
+            ]
+            if not deliveries:
+                return
+            provider_result = deliveries[0].get("provider_result") or {}
+            channel_id = provider_result.get("channel")
+            ts = provider_result.get("ts")
+            if not channel_id or not ts:
+                return
+            run = self.store.get_harness_record(
+                "agent_runs", deliveries[0]["run_id"]
+            )
+            workspace_id = ((run or {}).get("metadata") or {}).get("slack", {}).get(
+                "workspace_id"
+            )
+            label = "Approved" if approved else "Denied"
+            self.slack.update_message(
+                channel_id=channel_id,
+                timestamp=ts,
+                text=f"{label} by {decided_by}",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*{label}* by {decided_by}",
+                        },
+                    }
+                ],
+                workspace_id=workspace_id,
+            )
+        except Exception:
+            log.warning(
+                "Could not update Slack approval message for %s", approval_id,
+                exc_info=True,
+            )
 
     def deliver_question(
         self, run_id: str, question: str, *, choices: list[str] | None = None
@@ -162,6 +229,7 @@ class DeliveryService:
             channel_id=slack.get("channel_id") or envelope["destination"]["id"],
             text=question,
             blocks=blocks,
+            workspace_id=slack.get("workspace_id"),
         )
         delivery = self._record(
             run=run,

@@ -135,6 +135,163 @@ def test_write_tool_pauses_and_resumes_from_approval(brain):
     assert "not configured" in calls[0]["error"]
 
 
+def test_auto_approve_writes_flag_still_creates_an_approved_record(
+    brain, monkeypatch
+):
+    """The dev-only auto_approve_writes flag must skip the human pause, not
+    the approval trail itself — a real approval record should still exist,
+    just already resolved rather than pending."""
+    from docket.harness import tools as tools_module
+
+    monkeypatch.setattr(tools_module.settings, "auto_approve_writes", True)
+    brain.company_agent.model = ScriptedModelClient(
+        [
+            ModelResponse(
+                content="",
+                tool_calls=[
+                    ModelToolCall(
+                        id="call_create_linear_auto",
+                        name="linear_create_issue",
+                        arguments={
+                            "arguments": {
+                                "title": "Auto-approved issue",
+                                "description": "Created under auto_approve_writes",
+                            }
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(content="Done."),
+        ]
+    )
+    run = brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation="api:auto-approve:thread"),
+        goal="Create a Linear issue",
+        trigger_kind="reactive",
+        initial_message="Create a Linear issue",
+    )
+    outcome = brain.company_agent.run(run["id"])
+    assert outcome.state.value == "completed"
+    calls = brain.store.list_harness_records(
+        "harness_tool_calls", "org_acme", where={"run_id": run["id"]}
+    )
+    approval = brain.store.get_harness_record("approvals", calls[0]["approval_id"])
+    assert approval["status"] == "approved"
+    assert approval["decided_by"] == "person_ajay"
+
+
+def test_resolving_an_approval_updates_the_original_slack_message(brain):
+    """The Approve/Deny buttons must not be left live forever on a message
+    whose approval has already been decided — resolving it should edit the
+    original Slack message in place, regardless of whether the decision
+    came from a Slack button click or the dashboard."""
+    from docket.domain.models import utcnow
+
+    now = utcnow().isoformat()
+    approval_id = "approval_slack_update_test"
+    brain.store.upsert_approval(
+        {
+            "id": approval_id,
+            "organization_id": "org_acme",
+            "run_id": "arun_does_not_need_to_exist",
+            "tool_call_id": "call_test",
+            "status": "pending",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    brain.store.upsert_delivery(
+        {
+            "id": "delivery_slack_update_test",
+            "organization_id": "org_acme",
+            "run_id": "arun_does_not_need_to_exist",
+            "kind": "approval_request",
+            "status": "completed",
+            "idempotency_key": f"slack.approval:{approval_id}",
+            "provider_result": {"ok": True, "channel": "C_TEST", "ts": "111.222"},
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+
+    calls: list[dict] = []
+    brain.delivery.slack.update_message = lambda **kwargs: calls.append(kwargs)
+
+    brain.delivery.mark_approval_decided(
+        approval_id, approved=True, decided_by="person_ajay"
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["channel_id"] == "C_TEST"
+    assert calls[0]["timestamp"] == "111.222"
+    assert "Approved" in calls[0]["text"]
+    assert "person_ajay" in calls[0]["text"]
+    assert calls[0]["blocks"][0]["text"]["text"] == "*Approved* by person_ajay"
+
+
+def test_resume_after_approval_failure_does_not_leave_a_zombie_run(brain):
+    """run() has always wrapped _loop() in a try/except that marks the run
+    FAILED on any exception. resume_after_approval() called _loop()
+    directly with no such protection — a crash right after a human
+    approved a write (a model API error, anything) left the run stuck at
+    RUNNING forever: no failure recorded, nothing to retry, no answer or
+    error ever surfacing to the human who just approved it."""
+
+    class CrashesOnResume:
+        model = "crashes-on-resume"
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return ModelResponse(
+                    content="",
+                    tool_calls=[
+                        ModelToolCall(
+                            id="call_zombie",
+                            name="linear_create_issue",
+                            arguments={
+                                "arguments": {
+                                    "title": "Zombie test issue",
+                                    "description": "Should not hang the run",
+                                }
+                            },
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            raise RuntimeError(
+                "OpenRouter 400 for model crashes-on-resume: context length exceeded"
+            )
+
+        def context_length(self):
+            return 128_000
+
+    brain.company_agent.model = CrashesOnResume()
+    run = brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation="api:zombie:thread"),
+        goal="Create a Linear issue",
+        trigger_kind="reactive",
+        initial_message="Create a Linear issue",
+    )
+    outcome = brain.company_agent.run(run["id"])
+    assert outcome.state.value == "waiting_for_approval"
+
+    resumed = brain.company_agent.resume_after_approval(
+        approval_id=outcome.approval_id,
+        approved=True,
+        decided_by="person_ajay",
+    )
+    assert resumed.state.value == "failed"
+    assert "context length" in resumed.error
+
+    persisted = brain.agent_runs.get(run["id"])
+    assert persisted["state"] == "failed"
+
+
 def test_parallel_read_tool_calls_execute_concurrently(brain):
     """H-08: independent read-risk tool calls proposed in one iteration must
     run concurrently, not one after another."""
@@ -244,6 +401,50 @@ def test_read_and_write_calls_in_one_iteration_still_pause_correctly(brain):
     tool_messages = [m for m in messages if m["role"] == "tool"]
     assert any(m.get("tool_call_id") == "call_read" for m in tool_messages)
     assert not any(m.get("tool_call_id") == "call_write" for m in tool_messages)
+
+
+def test_duplicate_tool_calls_in_one_turn_execute_only_once(brain):
+    """A single model turn requesting the identical (name, arguments) call
+    twice must only execute it once -- the repeat is dropped before
+    execution, turn persistence, or the transcript ever see it."""
+    brain.company_agent.model = ScriptedModelClient(
+        [
+            ModelResponse(
+                content="",
+                tool_calls=[
+                    ModelToolCall(
+                        id="call_a", name="brain_search", arguments={"query": "Acme export"}
+                    ),
+                    ModelToolCall(
+                        id="call_b", name="brain_search", arguments={"query": "Acme export"}
+                    ),
+                ],
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(content="Found the relevant context.", finish_reason="stop"),
+        ]
+    )
+    run = brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation="api:dup-tool-call:thread"),
+        goal="Look up export context",
+        trigger_kind="reactive",
+        initial_message="Look up export context",
+    )
+    outcome = brain.company_agent.run(run["id"])
+    assert outcome.state.value == "completed"
+
+    completed = brain.agent_runs.get(run["id"])
+    assert completed["tool_call_count"] == 1
+
+    calls = brain.store.list_harness_records(
+        "harness_tool_calls", "org_acme", where={"run_id": run["id"]}
+    )
+    assert len(calls) == 1
+
+    messages = brain.agent_runs.messages(run["session_id"])
+    tool_messages = [m for m in messages if m["role"] == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0]["tool_call_id"] == "call_a"
 
 
 def _reactive_event_payload(
@@ -1088,6 +1289,95 @@ def test_wake_preserves_slack_conversation_address_for_main_context(brain):
             "display_name": "person_ravi",
         },
     }
+
+
+def test_stale_active_run_id_does_not_strand_ambient_messages(brain):
+    """A conversation's active_run_id is only ever set by attention's own
+    wake path and is never cleared on completion — if that run finished
+    (e.g. a direct-mention run answered and completed, bypassing attention
+    entirely) and a later ambient message references the same conversation,
+    the old code would silently attach the new message to the dead run and
+    never process it. It must instead treat the stale pointer as no active
+    run and wake a fresh one."""
+    from docket.domain.models import utcnow
+    from docket.harness.model_client import ScriptedModelClient
+    from docket.harness.models import EventActor, EventScope, NormalizedEvent
+
+    context_key = "slack:TACME:CSTALE"
+    envelope = _envelope(brain, conversation=context_key)
+    stale_run = brain.company_agent.create_invocation(
+        envelope=envelope,
+        goal="Earlier finished task",
+        trigger_kind="reactive",
+        initial_message="Earlier finished task",
+    )
+    brain.agent_runs.transition(stale_run["id"], "completed", force=True)
+    assert brain.agent_runs.get(stale_run["id"])["state"] == "completed"
+
+    brain.store.upsert_conversation_state(
+        {
+            "id": "conversation_state_stale_test",
+            "organization_id": "org_acme",
+            "conversation_key": context_key,
+            "workspace_id": "TACME",
+            "channel_id": "CSTALE",
+            "participants": [],
+            "recent_messages": [],
+            "active_run_id": stale_run["id"],
+            "last_agent_intervention_at": None,
+            "last_human_acknowledgement_at": None,
+            "updated_at": utcnow().isoformat(),
+        }
+    )
+
+    brain.attention.model = ScriptedModelClient(
+        [
+            {
+                "content": json.dumps(
+                    {
+                        "signal_type": "possible_operational_issue",
+                        "novelty": "new",
+                        "urgency": "high",
+                        "decision": "WAKE_MAIN_AGENT",
+                        "confidence": 0.95,
+                        "reason": "New actionable issue.",
+                        "suggested_goal": "Investigate the new issue.",
+                        "related_entity_ids": [],
+                        "existing_run_id": None,
+                    }
+                )
+            }
+        ]
+    )
+    event = NormalizedEvent(
+        id="EvStaleFollowup",
+        organization_id="org_acme",
+        source="slack",
+        type="slack.channel_message",
+        actor=EventActor(id="person_ajay", source_id="UAJAY", type="person"),
+        scope=EventScope(
+            workspace_id="TACME",
+            channel_id="CSTALE",
+            visibility="organization_public",
+            scope_id="scope_org_public",
+        ),
+        payload={
+            "text": "try again!",
+            "conversation_key": f"{context_key}:event:EvStaleFollowup",
+            "context_key": context_key,
+            "proactivity_enabled": True,
+        },
+        dedupe_key="dedupe-EvStaleFollowup",
+        is_direct_agent_request=False,
+    )
+
+    result = brain.attention.process(event)
+    assert result["evaluation"]["decision"] == "WAKE_MAIN_AGENT"
+    assert "run_id" in result and result["run_id"] != stale_run["id"]
+    assert "job_id" in result
+
+    updated_conversation = brain.store.conversation_state("org_acme", context_key)
+    assert updated_conversation["active_run_id"] == result["run_id"]
 
 
 def test_ambient_channel_without_policy_is_proactive_by_default(brain):

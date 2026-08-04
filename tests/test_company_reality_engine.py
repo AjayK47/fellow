@@ -147,7 +147,7 @@ def test_connector_backfill_paginates_remote_action_and_persists_cursor(brain):
         },
     ]
 
-    def execute(action_slug, arguments, *, connected_account_id):
+    def execute(action_slug, arguments, *, connected_account_id, user_id=None):
         calls.append((action_slug, arguments, connected_account_id))
         return pages.pop(0)
 
@@ -370,7 +370,7 @@ def test_approved_tool_is_not_executed_when_precondition_changes(brain):
         organization_id="org_acme",
         policy_key="linear-safe-update",
         effect="permit",
-        actions=["composio_execute"],
+        actions=["COMPOSIO_EXECUTE"],
         approval_required=True,
         precondition={
             "action_slug": "LINEAR_GET_ISSUE",
@@ -405,7 +405,7 @@ def test_approved_tool_is_not_executed_when_precondition_changes(brain):
         run=run,
         call=ModelToolCall(
             id="call-precondition",
-            name="composio_execute",
+            name="COMPOSIO_EXECUTE",
             arguments={
                 "tool_slug": "LINEAR_UPDATE_ISSUE",
                 "arguments": {"issue_id": "LIN-1", "status": "closed"},
@@ -424,7 +424,7 @@ def test_approved_tool_is_not_executed_when_precondition_changes(brain):
     assert "changed after approval" in result.error
 
 
-def test_specialist_worker_is_child_read_only_and_returns_artifact(brain):
+def test_specialist_worker_is_scoped_to_granted_tools_and_returns_artifact(brain):
     decision = brain.authz.resolve(
         organization_id="org_acme",
         acting_principal_id="person_ajay",
@@ -494,6 +494,72 @@ def test_specialist_worker_is_child_read_only_and_returns_artifact(brain):
     assert artifact["run_id"] == child["id"]
     assert artifact["metadata"]["parent_run_id"] == parent["id"]
     assert artifact["scope_id"] == "scope_channel_eng"
+
+
+def test_specialist_worker_can_be_granted_a_write_tool_that_still_needs_approval(brain):
+    """Specialists are no longer forced read-only (H-13): a write tool named
+    in allowed_tools is exposed, but it still pauses for the same human
+    approval it would need from the main agent -- being a specialist grants
+    no exemption from that gate."""
+    decision = brain.authz.resolve(
+        organization_id="org_acme",
+        acting_principal_id="person_ajay",
+        destination={"type": "slack_channel", "id": "channel_eng", "is_private": False},
+        purpose="reactive_agent",
+    )
+    parent = brain.company_agent.create_invocation(
+        envelope=InvocationEnvelope(
+            organization_id="org_acme",
+            principal_id="person_ajay",
+            conversation_id="specialist-write-parent",
+            destination=DestinationEnvelope(type="slack_channel", id="channel_eng", is_private=False),
+            purpose="reactive_agent",
+            permission_decision_id=decision.id,
+            allowed_scope_ids=decision.allowed_scope_ids,
+        ),
+        goal="Record a finding",
+        trigger_kind="reactive",
+        initial_message="Record a finding",
+    )
+    result = brain.specialists.execute(
+        {
+            "tasks": [
+                {
+                    "role": "note-taker",
+                    "objective": "Record findings as a durable artifact",
+                    "allowed_tools": ["brain_search", "brain_create_artifact"],
+                    "output_contract": "The created artifact id",
+                    "max_iterations": 2,
+                    "max_tool_calls": 3,
+                }
+            ]
+        },
+        {"run_id": parent["id"]},
+    )
+    worker = result["workers"][0]
+    child = brain.agent_runs.get(worker["worker_run_id"])
+    assert child["metadata"]["worker_has_write_tools"] is True
+
+    exposed = {
+        definition.name
+        for definition in brain.tool_executor.allowed_definitions(child)
+    }
+    assert "brain_create_artifact" in exposed
+
+    granted_write = brain.tool_executor.execute(
+        run=child,
+        call=ModelToolCall(
+            id="granted-specialist-write",
+            name="brain_create_artifact",
+            arguments={
+                "artifact_type": "report",
+                "title": "Specialist finding",
+                "content": {"note": "ok"},
+                "scope_id": "scope_org_public",
+            },
+        ),
+    )
+    assert granted_write.status == "waiting_for_approval"
 
 
 def test_reality_api_exposes_permission_filtered_facts_and_artifacts(api_client):
@@ -646,3 +712,48 @@ def test_tenant_deletion_covers_reality_and_artifact_tables(empty_brain):
     )
     assert result["deleted"]["reality_facts"] == 1
     assert result["deleted"]["artifacts"] == 1
+
+
+def test_short_generic_label_does_not_fuzzy_merge_into_unrelated_entity(brain):
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {"id": "person_al_chen", "organization_id": org, "entity_type": "person", "name": "Al Chen"}
+    )
+    # "al" is short and low-entropy -- a fuzzy ratio against "Al Chen" can
+    # score deceptively high, which is exactly the false-positive-merge
+    # scenario the entropy gate (ported from Graphiti's dedup_helpers)
+    # exists to catch. Should refuse to guess rather than silently merge.
+    match = brain.reality._candidate_entity(
+        org, {"namespace": "user_id", "value": "al", "label": "al", "strength": "hard"}
+    )
+    assert match is None
+
+
+def test_exact_label_match_resolves_via_fast_path(brain):
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {
+            "id": "person_priya",
+            "organization_id": org,
+            "entity_type": "person",
+            "name": "Priya Nair",
+            "aliases": ["priya"],
+        }
+    )
+    match = brain.reality._candidate_entity(
+        org, {"namespace": "user_id", "value": "priya", "label": "priya", "strength": "hard"}
+    )
+    assert match is not None
+    assert match["id"] == "person_priya"
+
+
+def test_long_distinctive_label_still_fuzzy_resolves(brain):
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {"id": "person_sarah", "organization_id": org, "entity_type": "person", "name": "Sarah Lee"}
+    )
+    match = brain.reality._candidate_entity(
+        org, {"namespace": "user_id", "value": "sara-lee", "label": "sara lee", "strength": "hard"}
+    )
+    assert match is not None
+    assert match["id"] == "person_sarah"

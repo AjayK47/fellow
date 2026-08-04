@@ -12,10 +12,68 @@ from websockets.asyncio.client import connect
 
 from docket.config import settings
 from docket.services.container import DocketApp
+from docket.services.gateway_setup import GatewaySetupService
 
 log = logging.getLogger("docket.slack_socket")
 
 _RECV_POLL_SECONDS = 1.0
+
+
+async def _ensure_installation(brain: DocketApp) -> None:
+    """Bootstrap the tenant/installation record for a Slack app configured
+    directly through ``.env`` rather than the setup wizard.
+
+    Socket Mode itself only needs the app token to open a connection —
+    without a matching ``slack_installations`` row, organization resolution
+    for every incoming event silently falls back to ``default_org_id``
+    instead of a real per-workspace mapping, and no admin identity or
+    channel policy ever gets created. This mirrors exactly what
+    ``GatewaySetupService.connect_slack`` does, so a workspace connected via
+    the setup wizard is unaffected (already registered, so this is a no-op).
+    """
+    if not settings.slack_bot_token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://slack.com/api/auth.test",
+                headers={"Authorization": f"Bearer {settings.slack_bot_token}"},
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            log.warning(
+                "Slack auth.test failed while bootstrapping installation: %s",
+                payload.get("error"),
+            )
+            return
+        team_id = str(payload["team_id"])
+    except Exception as exc:
+        log.warning(
+            "Could not verify Slack bot identity for installation bootstrap: %s", exc
+        )
+        return
+    if brain.store.slack_installation_by_workspace(team_id):
+        return
+    setup = GatewaySetupService(
+        brain.store, brain.graph, brain.audit, skills=brain.skills
+    )
+    try:
+        await asyncio.to_thread(
+            setup.connect_slack,
+            organization_id=settings.default_org_id,
+            organization_name=settings.default_org_id,
+            bot_token=settings.slack_bot_token,
+            app_token=settings.slack_app_token or "",
+            signing_secret=settings.slack_signing_secret or "",
+        )
+        log.info(
+            "Slack installation bootstrapped: workspace=%s organization=%s",
+            team_id,
+            settings.default_org_id,
+        )
+    except Exception as exc:
+        log.warning("Slack installation bootstrap failed: %s", exc)
 
 
 async def _socket_url(app_token: str) -> str:
@@ -64,6 +122,8 @@ async def run_socket_mode(
                 )
 
         worker = asyncio.create_task(worker_loop())
+
+    await _ensure_installation(brain)
 
     stop_event = stop_event or threading.Event()
     try:

@@ -23,6 +23,7 @@ async function request<T>(
   const res = await fetch(url.pathname + url.search, {
     method,
     headers,
+    credentials: "same-origin",
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -48,8 +49,39 @@ export const api = {
   del: <T>(p: string) => request<T>("DELETE", p),
 };
 
-export const ORG = "org_acme";
-export const PRINCIPAL = "person_ajay";
+// Populated once at boot from GET /v1/session (see fetchSession below).
+// Exported as `let`, not `const`: ES module bindings are live, so every
+// page that imported ORG/PRINCIPAL before session load sees the resolved
+// values automatically once fetchSession() assigns them, with no need to
+// route every one of the ~45 existing call sites through a context.
+export let ORG = "";
+export let PRINCIPAL = "";
+
+export interface DashboardSession {
+  organization_id: string;
+  principal_id: string;
+  workspace_name: string | null;
+  auth_disabled: boolean;
+}
+
+/** Resolves the signed-in workspace/person from the server session cookie.
+ * Returns null (never throws) on 401 — "not signed in" — so callers can
+ * render a login page instead of treating it as a transient fetch error. */
+export async function fetchSession(): Promise<DashboardSession | null> {
+  try {
+    const session = await request<DashboardSession>("GET", "/v1/session");
+    ORG = session.organization_id;
+    PRINCIPAL = session.principal_id;
+    return session;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401) return null;
+    throw e;
+  }
+}
+
+export async function logout(): Promise<void> {
+  await request("POST", "/v1/session/logout");
+}
 
 export type Json = Record<string, unknown> | unknown[];
 

@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from docket.domain.models import new_id, utcnow
 from docket.services.scope_resolution import resolve_scope
+
+# Pattern-recurrence detection (self-improvement layer): tuned to be
+# noticeable without nagging. 0.85 cosine is stricter than typical semantic
+# search thresholds -- this is deciding "the same underlying ask", not
+# "topically related". 3 occurrences before proposing mirrors Hermes's own
+# "noticed a recurring ask" framing, and its MAX_PENDING-style discipline of
+# not surfacing a proposal on the first sighting.
+_PATTERN_SIMILARITY_THRESHOLD = 0.85
+_PATTERN_PROPOSAL_THRESHOLD = 3
+_PATTERN_TRACKED_TRIGGER_KINDS = {"reactive", "proactive"}
 
 
 class HarnessMemoryCapture:
@@ -17,11 +28,15 @@ class HarnessMemoryCapture:
         ingestion: Any,
         audit: Any,
         model_extractor: Any | None = None,
+        embeddings: Any | None = None,
+        skills: Any | None = None,
     ) -> None:
         self.store = store
         self.ingestion = ingestion
         self.audit = audit
         self.model_extractor = model_extractor
+        self.embeddings = embeddings
+        self.skills = skills
 
     def capture_run(self, run_id: str) -> dict[str, Any]:
         run = self.store.get_harness_record("agent_runs", run_id)
@@ -91,12 +106,130 @@ class HarnessMemoryCapture:
             principal_id=envelope["principal_id"],
             trace_id=run["trace_id"],
         )
+        pattern_signal = self._track_pattern_and_maybe_propose(run)
         return {
             "run_id": run_id,
             "captured": True,
             "source_id": result["source"]["id"],
             "memory_ids": [memory["id"] for memory in memories],
+            "pattern_signal": pattern_signal,
         }
+
+    def _track_pattern_and_maybe_propose(
+        self, run: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Notice when a run's goal semantically repeats a recent one, and
+        once it has repeated enough to be a real pattern (not a coincidence),
+        draft a skill for a human to review.
+
+        This is the "bigger picture" pass a single run's own model call can
+        never have: it compares THIS run's goal against other SEPARATE runs
+        completed earlier, something no in-task reasoning has visibility
+        into. Detection is a pure embedding-similarity comparison — no LLM
+        call — so this stays cheap and doesn't add to the very tool/model
+        call volume it exists to eventually reduce; only the (much rarer)
+        proposal step, gated behind a real repetition threshold, writes
+        anything.
+        """
+        if not self.embeddings or not self.skills:
+            return None
+        if run.get("trigger_kind") not in _PATTERN_TRACKED_TRIGGER_KINDS:
+            return None
+        if (run.get("metadata") or {}).get("specialist_worker"):
+            return None
+        goal = (run.get("goal") or "").strip()
+        if len(goal) < 12:
+            return None
+
+        org = run["organization_id"]
+        vector = self.embeddings.embed([goal])[0]
+        now = utcnow().isoformat()
+        existing = self.store.list_harness_records(
+            "run_pattern_signals", org, where={"status": "open"}
+        )
+        best: tuple[float, dict[str, Any]] | None = None
+        for candidate in existing:
+            score = self._cosine(vector, candidate.get("embedding") or [])
+            if score >= _PATTERN_SIMILARITY_THRESHOLD and (
+                best is None or score > best[0]
+            ):
+                best = (score, candidate)
+
+        if best is None:
+            signal = {
+                "id": new_id("pattern"),
+                "organization_id": org,
+                "status": "open",
+                "run_id": run["id"],
+                "sample_goal": goal,
+                "embedding": vector,
+                "occurrence_count": 1,
+                "run_ids": [run["id"]],
+                "created_at": now,
+                "updated_at": now,
+            }
+            self.store.upsert_harness_projection("run_pattern_signals", signal)
+            return signal
+
+        signal = best[1]
+        signal["occurrence_count"] = int(signal.get("occurrence_count", 1)) + 1
+        signal["run_ids"] = (list(signal.get("run_ids") or []) + [run["id"]])[-10:]
+        signal["updated_at"] = now
+        if signal["occurrence_count"] >= _PATTERN_PROPOSAL_THRESHOLD:
+            self._propose_skill_from_pattern(signal)
+        else:
+            self.store.upsert_harness_projection("run_pattern_signals", signal)
+        return signal
+
+    def _propose_skill_from_pattern(self, signal: dict[str, Any]) -> None:
+        run_ids = signal.get("run_ids") or []
+        skill = self.skills.create(
+            organization_id=signal["organization_id"],
+            name=f"Recurring request: {signal['sample_goal'][:60]}",
+            description=(
+                f"Auto-detected: {signal['occurrence_count']} separate requests "
+                f"since {signal.get('created_at', '')[:10]} looked like the same "
+                f"underlying ask (runs: {', '.join(run_ids[-5:])}). Drafted for "
+                "review — steps are not filled in yet."
+            ),
+            goal=signal["sample_goal"],
+            steps=[],
+            inputs=[],
+            preconditions=[],
+            warnings=[
+                "Auto-drafted from a recurring pattern across separate runs, "
+                "not authored by a human or reviewed in context. Verify the "
+                "steps before approving.",
+            ],
+            owner_id=None,
+            status="draft",
+        )
+        signal["status"] = "proposed"
+        signal["proposed_skill_id"] = skill["id"]
+        self.store.upsert_harness_projection("run_pattern_signals", signal)
+        self.audit.record(
+            signal["organization_id"],
+            "skill.pattern_detected",
+            {
+                "pattern_signal_id": signal["id"],
+                "occurrence_count": signal["occurrence_count"],
+                "run_ids": run_ids,
+                "proposed_skill_id": skill["id"],
+            },
+        )
+
+    @staticmethod
+    def _cosine(left: list[float], right: list[float]) -> float:
+        if not left or not right or len(left) != len(right):
+            return 0.0
+        denominator = math.sqrt(sum(v * v for v in left)) * math.sqrt(
+            sum(v * v for v in right)
+        )
+        return (
+            sum(a * b for a, b in zip(left, right)) / denominator
+            if denominator
+            else 0.0
+        )
 
     def consolidate_conversation(
         self,

@@ -14,6 +14,9 @@ from docket.domain.models import new_id
 from docket.harness.models import ModelResponse, ModelToolCall
 
 
+_DEFAULT_CONTEXT_LENGTH = 128_000
+
+
 class ModelClient(Protocol):
     model: str
 
@@ -26,6 +29,8 @@ class ModelClient(Protocol):
         temperature: float = 0.1,
         max_tokens: int = 1500,
     ) -> ModelResponse: ...
+
+    def context_length(self) -> int: ...
 
 
 class OpenRouterModelClient:
@@ -43,6 +48,34 @@ class OpenRouterModelClient:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self._context_length: int | None = None
+
+    def context_length(self) -> int:
+        """Resolve and cache this model's real context window from
+        OpenRouter's model catalog (ported from Hermes's
+        get_model_context_length — compaction should trigger relative to
+        what the model actually supports, not a number picked independent
+        of which model is configured). Falls back to a conservative default
+        on any lookup failure so a transient network issue never breaks the
+        run loop itself."""
+        if self._context_length is not None:
+            return self._context_length
+        try:
+            response = httpx.get(
+                f"{self.base_url}/models", timeout=self.timeout_seconds
+            )
+            response.raise_for_status()
+            for entry in response.json().get("data") or []:
+                if entry.get("id") == self.model:
+                    length = entry.get("context_length")
+                    if isinstance(length, int) and length > 0:
+                        self._context_length = length
+                        return length
+                    break
+        except Exception:
+            pass
+        self._context_length = _DEFAULT_CONTEXT_LENGTH
+        return self._context_length
 
     def generate(
         self,
@@ -85,7 +118,18 @@ class OpenRouterModelClient:
             json=body,
             timeout=self.timeout_seconds,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # Bare raise_for_status() only gives "400 Bad Request" with no
+            # indication of *why* — the response body is where OpenRouter
+            # actually says what was wrong (e.g. context length, invalid
+            # tool schema), and that's exactly the detail that ends up in
+            # the run's own error field and this codebase's own logs.
+            raise RuntimeError(
+                f"OpenRouter {response.status_code} for model {self.model}: "
+                f"{response.text[:2000]}"
+            ) from exc
         payload = response.json()
         choices = payload.get("choices") or []
         if not choices:
@@ -135,6 +179,9 @@ class ScriptedModelClient:
             raise RuntimeError("scripted model exhausted")
         return self.responses.popleft()
 
+    def context_length(self) -> int:
+        return _DEFAULT_CONTEXT_LENGTH
+
 
 class DeterministicHarnessModel:
     """Useful zero-cost local fallback, not a substitute for the live model.
@@ -145,6 +192,9 @@ class DeterministicHarnessModel:
     """
 
     model = "deterministic-harness-v1"
+
+    def context_length(self) -> int:
+        return _DEFAULT_CONTEXT_LENGTH
 
     def generate(
         self,

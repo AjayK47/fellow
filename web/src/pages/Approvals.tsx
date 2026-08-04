@@ -38,7 +38,14 @@ export default function Approvals() {
           {data && data.approvals.length > 0 && (
             <table className="table">
               <thead>
-                <tr><th>id</th><th>run</th><th>tool</th><th>preview</th><th>status</th><th>action</th></tr>
+                <tr>
+                  <th className="whitespace-nowrap">id</th>
+                  <th className="whitespace-nowrap">run</th>
+                  <th className="whitespace-nowrap">tool</th>
+                  <th className="w-full">preview</th>
+                  <th className="whitespace-nowrap">status</th>
+                  <th className="whitespace-nowrap">action</th>
+                </tr>
               </thead>
               <tbody>
                 {data.approvals.map((a) => {

@@ -48,7 +48,18 @@ class GraphService:
         to_id: str,
         properties: dict[str, Any] | None = None,
         source_ids: list[str] | None = None,
+        replaces: str | None = None,
     ) -> dict[str, Any]:
+        """Create an edge, optionally closing the edge it replaces.
+
+        Pass `replaces=<edge_id>` when the caller knows this edge supersedes
+        a specific prior one (ownership transferred, on-call rotated, a
+        membership ended and a new one began) — the old edge is closed via
+        `supersede_edge` rather than left as a stale, still-"current" row
+        alongside its replacement.
+        """
+        if replaces:
+            self.supersede_edge(replaces, reason=f"replaced by a new {edge_type} edge")
         et = edge_type.value if hasattr(edge_type, "value") else str(edge_type)
         edge = GraphEdge(
             id=new_id("edge"),
@@ -63,6 +74,64 @@ class GraphService:
         data = edge.model_dump(mode="json")
         self.store.upsert_edge(data)
         return data
+
+    def get_edge(self, edge_id: str) -> dict[str, Any] | None:
+        return self.store.get_json("edges", edge_id)
+
+    def supersede_edge(
+        self,
+        edge_id: str,
+        *,
+        valid_until: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Close an edge's validity window in place instead of deleting it.
+
+        The row is never removed — `edges_as_of()` can still reconstruct it
+        for any point in time before the close — it just stops being
+        "current" for `list_edges(active_only=True)` and everything built on
+        that default (`resolve_owners`, `on_call_for`, the graph explorer).
+        """
+        edge = self.get_edge(edge_id)
+        if not edge:
+            return None
+        now = utcnow().isoformat()
+        edge["valid_until"] = valid_until or now
+        edge["system_to"] = now
+        if reason:
+            edge["superseded_reason"] = reason
+        self.store.upsert_edge(edge)
+        return edge
+
+    def edges_as_of(
+        self,
+        organization_id: str,
+        *,
+        valid_at: str | None = None,
+        edge_type: str | None = None,
+        from_id: str | None = None,
+        to_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Edges whose validity window covers `valid_at` (default: now).
+
+        Answers "who owned this then?", not just "who owns this now?" —
+        the same question `RealityEngine.current_facts(valid_at=...)`
+        answers for facts, applied to the graph's structural relationships.
+        """
+        as_of = valid_at or utcnow().isoformat()
+        edges = self.store.list_edges(
+            organization_id,
+            edge_type=edge_type,
+            from_id=from_id,
+            to_id=to_id,
+            active_only=False,
+        )
+        return [
+            e
+            for e in edges
+            if (e.get("valid_from") or "") <= as_of
+            and (not e.get("valid_until") or e["valid_until"] > as_of)
+        ]
 
     def list_edges(
         self,
@@ -238,12 +307,28 @@ class GraphService:
             out.append({"person": person, "edge": e})
         return out
 
-    def explorer_view(self, organization_id: str, allowed_source_ids: set[str] | None = None) -> dict[str, Any]:
-        """Return stable organization graph edges, respecting evidence visibility."""
+    def explorer_view(
+        self,
+        organization_id: str,
+        allowed_source_ids: set[str] | None = None,
+        *,
+        valid_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Return stable organization graph edges, respecting evidence visibility.
+
+        Pass `valid_at` to view the graph as it stood at a point in time
+        instead of its current state — a closed OWNS edge still appears if
+        `valid_at` falls before it was superseded.
+        """
         nodes = self.store.list_entities(organization_id)
         edges = []
         memory_edge_types = {edge.value for edge in MemoryEdgeType}
-        for edge in self.store.list_edges(organization_id):
+        candidate_edges = (
+            self.edges_as_of(organization_id, valid_at=valid_at)
+            if valid_at
+            else self.store.list_edges(organization_id)
+        )
+        for edge in candidate_edges:
             if edge.get("edge_type") in memory_edge_types:
                 continue
             source_ids = set(edge.get("source_ids") or [])

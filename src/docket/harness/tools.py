@@ -9,6 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from docket.config import settings
 from docket.domain.models import new_id, utcnow
 from docket.harness.composio import ComposioClient
 from docket.harness.models import ModelToolCall, ToolDefinition, ToolResult
@@ -50,7 +51,7 @@ def _infer_capability_id(name: str) -> str:
         return "artifact.read"
     if name.startswith("slack_"):
         return "slack.react" if name == "slack_react" else "slack.actions"
-    if name.startswith("composio_") or name.startswith(("linear_", "github_")):
+    if name.lower().startswith("composio_") or name.startswith(("linear_", "github_")):
         return "connector.composio.action"
     if name.startswith("pdf_"):
         return f"document.pdf.{name.removeprefix('pdf_')}"
@@ -510,7 +511,13 @@ def build_tool_registry(
             destination = runtime["destination"]
             if destination.get("type") not in {"slack_channel", "private_channel", "dm"}:
                 raise ValueError("outbound Slack action requires the current Slack destination")
-            return slack_sender.send(channel_id=str(destination["id"]), text=args["text"], blocks=args.get("blocks"))
+            workspace_id = (runtime.get("run_metadata") or {}).get("slack", {}).get("workspace_id")
+            return slack_sender.send(
+                channel_id=str(destination["id"]),
+                text=args["text"],
+                blocks=args.get("blocks"),
+                workspace_id=workspace_id,
+            )
 
         registry.register(
             ToolDefinition(
@@ -530,7 +537,13 @@ def build_tool_registry(
             destination = runtime["destination"]
             if destination.get("type") not in {"slack_channel", "private_channel", "dm"}:
                 raise ValueError("Slack reactions require the current Slack destination")
-            return slack_sender.react(channel_id=str(destination["id"]), timestamp=args["timestamp"], name=args["name"])
+            workspace_id = (runtime.get("run_metadata") or {}).get("slack", {}).get("workspace_id")
+            return slack_sender.react(
+                channel_id=str(destination["id"]),
+                timestamp=args["timestamp"],
+                name=args["name"],
+                workspace_id=workspace_id,
+            )
 
         registry.register(
             ToolDefinition(
@@ -895,6 +908,7 @@ def build_tool_registry(
                     content=body.encode("utf-8"),
                     title=artifact["title"],
                     initial_comment=args.get("initial_comment"),
+                    workspace_id=slack_meta.get("workspace_id"),
                 )
                 return {"artifact_id": artifact["id"], "upload_result": result}
 
@@ -1451,6 +1465,125 @@ def build_tool_registry(
         _describe_composio,
     )
 
+    # Composio's own Tool Router meta-tools (COMPOSIO_SEARCH_TOOLS,
+    # COMPOSIO_GET_TOOL_SCHEMAS) — richer than composio_search/composio_describe
+    # above (guided plan, known pitfalls, dependency-aware suggestions across
+    # all of Composio's toolkits, not just this org's connected ones). The
+    # session backing them is opened with execute/workbench/manage_connections
+    # explicitly disabled (confirmed against the live API: execute defaults ON
+    # otherwise), so this session structurally cannot execute anything or run
+    # code — discovery only. Actual execution always goes through
+    # COMPOSIO_EXECUTE, this codebase's own approval-gated path.
+    _tool_router_sessions: dict[str, str] = {}
+
+    def _tool_router_session_id(organization_id: str, *, refresh: bool = False) -> str:
+        if refresh:
+            _tool_router_sessions.pop(organization_id, None)
+        cached = _tool_router_sessions.get(organization_id)
+        if cached:
+            return cached
+        # A session has no visibility into a user's existing connections at
+        # all unless they're bound explicitly here (confirmed against the
+        # live API — user_id matching alone is not enough). Known
+        # limitation: this snapshot is taken once per org for the process's
+        # lifetime (cached below) — connecting or disconnecting a toolkit
+        # afterward won't be reflected until this process restarts or the
+        # cache entry is invalidated via the refresh path.
+        connected_by_toolkit: dict[str, list[str]] = {}
+        for account in store.list_connector_accounts(organization_id, active_only=True):
+            connected_by_toolkit.setdefault(account["toolkit"], []).append(
+                account["connected_account_id"]
+            )
+        session = composio.create_tool_router_session(
+            user_id=f"docket:{organization_id}",
+            connected_accounts=connected_by_toolkit or None,
+        )
+        session_id = str(session["session_id"])
+        _tool_router_sessions[organization_id] = session_id
+        return session_id
+
+    def _call_tool_router(
+        organization_id: str, tool_slug: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        session_id = _tool_router_session_id(organization_id)
+        try:
+            return composio.execute_tool_router_action(
+                session_id=session_id, tool_slug=tool_slug, arguments=arguments
+            )
+        except Exception:
+            # Session may have expired — one retry against a freshly opened one.
+            session_id = _tool_router_session_id(organization_id, refresh=True)
+            return composio.execute_tool_router_action(
+                session_id=session_id, tool_slug=tool_slug, arguments=arguments
+            )
+
+    registry.register(
+        ToolDefinition(
+            name="COMPOSIO_SEARCH_TOOLS",
+            description=(
+                "Composio's own tool-discovery meta-tool: describe a use case in "
+                "plain English and get back matching actions across ALL of "
+                "Composio's connected toolkits, plus a recommended step-by-step "
+                "plan and known pitfalls. Call this before COMPOSIO_EXECUTE "
+                "whenever the right action isn't already known, and before "
+                "asking the user to supply information (a repo, a ticket, an "
+                "item) that a listing/discovery action might find instead."
+            ),
+            input_schema=_object_schema(
+                {
+                    "use_case": {"type": "string"},
+                    "known_fields": {"type": "string"},
+                },
+                ["use_case"],
+            ),
+            risk="read",
+        ),
+        lambda args, runtime: _call_tool_router(
+            runtime["organization_id"],
+            "COMPOSIO_SEARCH_TOOLS",
+            {
+                "queries": [
+                    {
+                        k: v
+                        for k, v in {
+                            "use_case": args["use_case"],
+                            "known_fields": args.get("known_fields"),
+                        }.items()
+                        if v is not None
+                    }
+                ],
+                "session": {"generate_id": True},
+            },
+        ),
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="COMPOSIO_GET_TOOL_SCHEMAS",
+            description=(
+                "Fetch exact input schemas for action slugs returned by "
+                "COMPOSIO_SEARCH_TOOLS. Only pass slugs it actually returned — "
+                "never guess or fabricate one."
+            ),
+            input_schema=_object_schema(
+                {
+                    "tool_slugs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    }
+                },
+                ["tool_slugs"],
+            ),
+            risk="read",
+        ),
+        lambda args, runtime: _call_tool_router(
+            runtime["organization_id"],
+            "COMPOSIO_GET_TOOL_SCHEMAS",
+            {"tool_slugs": args["tool_slugs"]},
+        ),
+    )
+
     def _execute_composio(
         args: dict[str, Any], runtime: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1483,6 +1616,7 @@ def build_tool_registry(
             args["tool_slug"],
             args.get("arguments") or {},
             connected_account_id=matching[0]["connected_account_id"],
+            user_id=matching[0].get("composio_user_id"),
         )
         if result.get("successful") is False:
             raise RuntimeError(
@@ -1492,10 +1626,13 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="composio_execute",
+            name="COMPOSIO_EXECUTE",
             description=(
-                "Execute an exact action slug previously returned by "
-                "composio_search and inspected with composio_describe. Dynamic "
+                "Execute an exact action slug previously found via "
+                "COMPOSIO_SEARCH_TOOLS/composio_search and inspected with "
+                "COMPOSIO_GET_TOOL_SCHEMAS/composio_describe. This is this "
+                "codebase's own approval-gated executor — the only path any "
+                "Composio action ever actually runs through. Dynamic "
                 "external actions require human approval."
             ),
             input_schema=_object_schema(
@@ -1549,6 +1686,7 @@ def build_tool_registry(
                 connected_account_id=(
                     account.get("connected_account_id") if account else None
                 ),
+                user_id=account.get("composio_user_id") if account else None,
             )
 
         registry.register(
@@ -1707,8 +1845,13 @@ class ToolExecutor:
                 continue
             if worker_capabilities is not None and definition.capability_id not in worker_capabilities:
                 continue
-            if metadata.get("specialist_worker") and definition.risk != "read":
-                continue
+            # H-13: specialists may be granted write/edit tools by the main
+            # agent's task spec (worker_allowed) — no longer forced
+            # read-only. The remaining safety layers still apply in full:
+            # write-risk tools still require approval (definition.risk ==
+            # "write" in execute()), delegation stays capped at depth 1, and
+            # a worker still can't reach a tool the main agent didn't
+            # explicitly name in worker_allowed.
             if definition.specialist_only and not metadata.get("specialist_worker"):
                 continue
             if not definition.main_agent_visible and not metadata.get("specialist_worker"):
@@ -1812,12 +1955,12 @@ class ToolExecutor:
             )
         if metadata.get("specialist_worker"):
             worker_allowed = set(metadata.get("allowed_tools") or [])
-            if definition.name not in worker_allowed or definition.risk != "read":
+            if definition.name not in worker_allowed:
                 return ToolResult(
                     call_id=call.id,
                     tool_name=call.name,
                     status="disabled",
-                    error="Tool is outside this specialist worker's read-only capability envelope.",
+                    error="Tool is outside this specialist worker's granted capability envelope.",
                 )
         policy = self._policy(run["organization_id"], definition.name)
         if not policy.get("enabled", True) or definition.risk == "destructive":
@@ -1898,6 +2041,18 @@ class ToolExecutor:
             record["approval_id"] = approval["id"]
             record["updated_at"] = utcnow().isoformat()
             self.store.upsert_harness_tool_call(record)
+            if settings.auto_approve_writes:
+                # Dev-only bypass: the approval record and tool_call linkage
+                # above still exist and still go through the same
+                # resolve_approval path (judgment recording, precondition
+                # revalidation) — this only skips the human actually
+                # clicking it, never the audit trail.
+                _, result = self.resolve_approval(
+                    approval_id=approval["id"],
+                    approved=True,
+                    decided_by=run["envelope"]["principal_id"],
+                )
+                return result
             return ToolResult(
                 call_id=call.id,
                 tool_name=call.name,

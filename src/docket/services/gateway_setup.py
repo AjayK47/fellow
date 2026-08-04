@@ -202,6 +202,7 @@ class GatewaySetupService:
             "workspace_id": team_id,
             "workspace_name": slack.get("team") or team_id,
             "bot_user_id": bot_user_id,
+            "bot_token": bot_token.strip(),
             "created_at": now,
             "updated_at": now,
         }
@@ -267,10 +268,68 @@ class GatewaySetupService:
         return {
             "workspace": {"id": team_id, "name": slack.get("team")},
             "bot": {"user_id": bot_user_id, "name": slack.get("user")},
-            "installation": installation,
+            "installation": {k: v for k, v in installation.items() if k != "bot_token"},
             "admin_mapping": admin,
             "channel_policy": policy,
             "restart_required": True,
+        }
+
+    def install_via_oauth(
+        self,
+        *,
+        workspace_id: str,
+        workspace_name: str,
+        bot_token: str,
+        bot_user_id: str,
+    ) -> dict[str, Any]:
+        """Bootstrap a tenant from a public OAuth install — a stranger
+        clicking "Add to Slack", not this operator's own .env-configured
+        workspace.
+
+        Unlike connect_slack(), this never touches the local .env file: a
+        publicly distributed app installs into many different people's
+        workspaces, each with its own bot token, and those have to live in
+        the database (one row per workspace) rather than a single shared
+        local config file that only ever describes one workspace.
+
+        organization_id is derived deterministically from workspace_id, so
+        reinstalling (revoke and re-authorize) updates the same tenant and
+        installation row rather than creating a duplicate.
+        """
+        for label, value in {
+            "Slack workspace id": workspace_id,
+            "Slack bot token": bot_token,
+            "Slack bot user id": bot_user_id,
+        }.items():
+            if not str(value or "").strip():
+                raise ValueError(f"{label} is required")
+        organization_id = f"org_slack_{_slug(workspace_id)}"
+        public_scope_id = self._bootstrap_tenant(
+            organization_id, workspace_name or workspace_id
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        installation = {
+            "id": f"slack:{organization_id}:{workspace_id}",
+            "organization_id": organization_id,
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name or workspace_id,
+            "bot_user_id": bot_user_id,
+            "bot_token": bot_token,
+            "created_at": now,
+            "updated_at": now,
+        }
+        self.store.upsert_slack_installation(installation)
+        if self.skills:
+            self.skills.ensure_platform_skills(organization_id)
+        self.audit.record(
+            organization_id,
+            "gateway.slack.installed_via_oauth",
+            {"workspace_id": workspace_id, "bot_user_id": bot_user_id},
+        )
+        return {
+            "organization_id": organization_id,
+            "workspace": {"id": workspace_id, "name": workspace_name},
+            "scope_id": public_scope_id,
         }
 
     def _bootstrap_tenant(self, organization_id: str, organization_name: str) -> str:
@@ -287,7 +346,13 @@ class GatewaySetupService:
         )
         if existing:
             return str(existing["id"])
-        scope_id = f"scope_{_slug(organization_id)}_public"
+        # Every other default in the codebase (seed fixtures, connector
+        # ingestion fallbacks, skill packages, scope resolution) assumes the
+        # literal id "scope_org_public" for the organization's public scope.
+        # An org-id-prefixed id here would silently mismatch every one of
+        # them — including the Composio connect flow, which resolves this
+        # scope by that exact literal default rather than looking it up.
+        scope_id = "scope_org_public"
         if not self.store.get_scope(scope_id):
             self.store.upsert_scope(
                 {

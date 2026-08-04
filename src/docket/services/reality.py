@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any
@@ -27,6 +28,35 @@ def _now() -> str:
 
 def _normalize(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().split())
+
+
+# Entity-resolution safety gate, ported from Graphiti's dedup_helpers entropy
+# check (github.com/getzep/graphiti): a name that is both short and low in
+# character variety ("Al", "Jo", "the app") is exactly where a fuzzy-ratio
+# score produces confident-looking false-positive merges. Below this bar,
+# resolution should create a new entity or queue a review candidate instead
+# of trusting the fuzzy match — see `_is_resolvable_label`.
+_MIN_LABEL_LENGTH = 6
+_MIN_LABEL_TOKENS = 2
+_LABEL_ENTROPY_THRESHOLD = 1.5
+
+
+def _shannon_entropy(text: str) -> float:
+    if not text:
+        return 0.0
+    counts = Counter(text)
+    length = len(text)
+    return -sum(
+        (count / length) * math.log2(count / length) for count in counts.values()
+    )
+
+
+def _is_resolvable_label(label: str) -> bool:
+    """Long/multi-word labels are trusted directly; short ones only pass if
+    they're character-diverse enough that a fuzzy match means something."""
+    if len(label) >= _MIN_LABEL_LENGTH and len(label.split()) >= _MIN_LABEL_TOKENS:
+        return True
+    return _shannon_entropy(label) >= _LABEL_ENTROPY_THRESHOLD
 
 
 class RealityEngine:
@@ -755,8 +785,23 @@ class RealityEngine:
         if identifier["namespace"] == "email":
             local = value.split("@", 1)[0].replace(".", " ").replace("_", " ")
             label = local
+        entities = self.store.list_entities(organization_id)
+        # Fast path: an exact normalized name/alias match is unambiguous —
+        # no need to trust a fuzzy score for it, and it can't be beaten by
+        # a merely-similar name on a different entity.
+        for entity in entities:
+            candidates = [entity.get("name") or "", *(entity.get("aliases") or [])]
+            if any(_normalize(name) == label for name in candidates if name):
+                return entity
+        if not _is_resolvable_label(label):
+            # Too short/generic for a fuzzy ratio to mean anything — the
+            # caller (resolve_source_entities) treats "no match" as reason
+            # to create a new entity or queue a review candidate rather than
+            # silently merging into whichever existing entity happens to
+            # score highest on a near-meaningless comparison.
+            return None
         best: tuple[float, dict[str, Any]] | None = None
-        for entity in self.store.list_entities(organization_id):
+        for entity in entities:
             candidates = [entity.get("name") or "", *(entity.get("aliases") or [])]
             score = max(
                 (

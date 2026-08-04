@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import json
+import secrets
 from datetime import datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -22,7 +24,7 @@ from docket.services.container import DocketApp
 from docket.config import Settings
 from docket.domain.models import utcnow
 from docket.harness.models import InvocationEnvelope, TriggerKind
-from docket.harness.slack import UnauthorizedApprover
+from docket.harness.slack import UnauthorizedApprover, resolve_slack_principal
 from docket.harness.tools import refresh_composio_tool_schemas
 from docket.services.gateway_setup import GatewaySetupService, SLACK_MANIFEST
 
@@ -144,6 +146,7 @@ class EdgeRequest(BaseModel):
     to_id: str
     properties: dict[str, Any] = Field(default_factory=dict)
     source_ids: list[str] = Field(default_factory=list)
+    replaces: str | None = None
 
 
 class SkillCreateRequest(BaseModel):
@@ -719,6 +722,69 @@ def get_agent_run(run_id: str, request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/v1/sessions")
+def list_sessions(
+    request: Request,
+    organization_id: str,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Sessions, not runs, are the primary unit of conversation: one Slack
+    thread/DM/channel key maps to one session, and every run inside it
+    shares that session's messages. Each listed session carries a light
+    preview (its most recent run's goal, if any) and counts so the console
+    can render a list without a detail fetch per row."""
+    brain = _app(request)
+    sessions = brain.store.list_harness_records(
+        "agent_sessions",
+        organization_id,
+        descending=True,
+        limit=min(limit, 500),
+    )
+    results = []
+    for session in sessions:
+        runs = brain.store.list_harness_records(
+            "agent_runs",
+            organization_id,
+            where={"session_id": session["id"]},
+            order_by="created_at",
+            descending=True,
+        )
+        latest_run = runs[0] if runs else None
+        messages = brain.store.session_messages(session["id"], limit=1)
+        results.append(
+            {
+                "session": session,
+                "run_count": len(runs),
+                "latest_run": latest_run,
+                "message_count": len(
+                    brain.store.session_messages(session["id"], limit=10_000)
+                ),
+                "last_message_preview": (messages[-1] if messages else None),
+            }
+        )
+    return {"sessions": results, "count": len(results)}
+
+
+@router.get("/v1/sessions/{session_id}")
+def get_session(session_id: str, request: Request) -> dict[str, Any]:
+    brain = _app(request)
+    session = brain.store.get_harness_record("agent_sessions", session_id)
+    if not session:
+        raise HTTPException(404, "session not found")
+    runs = brain.store.list_harness_records(
+        "agent_runs",
+        session["organization_id"],
+        where={"session_id": session_id},
+        order_by="created_at",
+        descending=False,
+    )
+    return {
+        "session": session,
+        "runs": runs,
+        "messages": brain.store.session_messages(session_id, limit=1000),
+    }
+
+
 @router.post("/v1/agent/runs/{run_id}:cancel")
 def cancel_agent_run(
     run_id: str, request: Request, cancelled_by: str
@@ -1051,7 +1117,8 @@ def list_slack_installations(
     records = _app(request).store.list_harness_records(
         "slack_installations", organization_id
     )
-    return {"installations": records, "count": len(records)}
+    redacted = [{k: v for k, v in record.items() if k != "bot_token"} for record in records]
+    return {"installations": redacted, "count": len(redacted)}
 
 
 @router.post("/v1/identity-mappings")
@@ -1113,6 +1180,32 @@ def refresh_agent_tools(request: Request) -> dict[str, Any]:
     )
 
 
+def _supersede_other_active_connector_accounts(
+    brain: DocketApp, organization_id: str, toolkit: str, keep_connected_account_id: str
+) -> None:
+    """Enforce at most one active connector_account per (organization, toolkit).
+
+    Composio mints a brand-new connected_account_id on every fresh OAuth
+    completion, and connector_accounts rows are keyed on that id — so
+    without this, reconnecting (or a sync pass that sees several accounts
+    for the same toolkit) just accumulates rows instead of replacing the
+    old one. Called after any active row is saved; best-effort revokes the
+    superseded connections on Composio's side too, since the point is one
+    real connection, not just one row that looks canonical locally.
+    """
+    for other in brain.store.list_connector_accounts(organization_id, active_only=True):
+        if other.get("toolkit") != toolkit:
+            continue
+        if other.get("connected_account_id") == keep_connected_account_id:
+            continue
+        try:
+            brain.composio.delete_connected_account(other["connected_account_id"])
+        except Exception:
+            pass  # best-effort revoke; still supersede the local row regardless
+        other["status"] = "disconnected"
+        brain.store.upsert_connector_account(other)
+
+
 @router.post("/v1/connector-accounts")
 def upsert_connector_account(
     body: ConnectorAccountRequest, request: Request
@@ -1151,6 +1244,10 @@ def upsert_connector_account(
         data["organization_id"], data["principal_id"], data["scope_id"]
     )
     brain.store.upsert_connector_account(data)
+    if data.get("status") == "active":
+        _supersede_other_active_connector_accounts(
+            brain, data["organization_id"], data["toolkit"], data["connected_account_id"]
+        )
     return data
 
 
@@ -1178,7 +1275,15 @@ def sync_composio_connections(
     except Exception as exc:
         raise HTTPException(502, f"Composio connection sync failed: {exc}") from exc
     saved: list[dict[str, Any]] = []
-    for remote in response.get("items") or []:
+    # Oldest-first: when Composio reports several accounts for the same
+    # toolkit (e.g. repeated reconnects), each active upsert supersedes any
+    # prior active row for that toolkit, so processing in creation order
+    # leaves the genuinely newest connection as the sole survivor rather
+    # than whichever happened to be listed last by Composio.
+    remote_items = sorted(
+        response.get("items") or [], key=lambda item: str(item.get("created_at") or "")
+    )
+    for remote in remote_items:
         toolkit_data = remote.get("toolkit") or {}
         toolkit = toolkit_data.get("slug") or remote.get("toolkit_slug")
         account_id = remote.get("id") or remote.get("nanoid")
@@ -1570,8 +1675,243 @@ async def slack_interactions(request: Request) -> dict[str, Any]:
         raise HTTPException(403, str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(400, f"Invalid interaction payload: {exc}") from exc
+
+
+@router.get("/slack/install", include_in_schema=False)
+def slack_install() -> RedirectResponse:
+    """Public entry point for "Add to Slack" — redirects to Slack's own
+    authorize screen. Requires DOCKET_SLACK_CLIENT_ID and a reachable
+    DOCKET_PUBLIC_URL for the redirect_uri; distinct from the
+    slack_bot_token/slack_app_token pair that configures this operator's own
+    primary workspace directly."""
+    from docket.config import settings as _settings
+
+    if not _settings.slack_client_id or not _settings.public_url:
+        raise HTTPException(
+            503,
+            "Slack app installation is not configured "
+            "(DOCKET_SLACK_CLIENT_ID and DOCKET_PUBLIC_URL are required)",
+        )
+    redirect_uri = f"{_settings.public_url.rstrip('/')}/v1/slack/oauth/callback"
+    params = {
+        "client_id": _settings.slack_client_id,
+        "scope": _settings.slack_oauth_scopes,
+        "redirect_uri": redirect_uri,
+    }
+    return RedirectResponse(f"https://slack.com/oauth/v2/authorize?{urlencode(params)}")
+
+
+@router.get("/v1/slack/oauth/callback", include_in_schema=False)
+def slack_oauth_callback(request: Request, code: str | None = None, error: str | None = None) -> HTMLResponse:
+    """Slack redirects here after the installer approves (or denies) the
+    authorize screen. Exchanges the one-time code for that workspace's own
+    bot token, bootstraps its tenant, and stores the installation — never
+    touches .env, since this can run for any number of different installers'
+    workspaces, each needing its own stored token."""
+    from docket.config import settings as _settings
+
+    def _page(title: str, body: str, ok: bool) -> HTMLResponse:
+        color = "#1c7a4d" if ok else "#c23b2c"
+        return HTMLResponse(
+            f"<!doctype html><html><head><meta charset=utf-8>"
+            f"<title>{title}</title></head>"
+            f"<body style=\"font-family:system-ui,sans-serif;max-width:480px;"
+            f"margin:80px auto;text-align:center;color:#141a15\">"
+            f"<h1 style=\"color:{color};font-size:20px\">{title}</h1>"
+            f"<p style=\"color:#6b7268;font-size:14px\">{body}</p>"
+            f"</body></html>"
+        )
+
+    if error:
+        return _page("Installation cancelled", f"Slack reported: {error}", ok=False)
+    if not code:
+        raise HTTPException(400, "Missing OAuth code")
+    if not _settings.slack_client_id or not _settings.slack_client_secret:
+        raise HTTPException(503, "Slack OAuth is not configured on this gateway")
+
+    redirect_uri = f"{(_settings.public_url or '').rstrip('/')}/v1/slack/oauth/callback"
+    response = httpx.post(
+        "https://slack.com/api/oauth.v2.access",
+        data={
+            "client_id": _settings.slack_client_id,
+            "client_secret": _settings.slack_client_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        },
+        timeout=20.0,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        return _page(
+            "Installation failed",
+            f"Slack error: {payload.get('error', 'unknown error')}",
+            ok=False,
+        )
+
+    team = payload.get("team") or {}
+    brain = _app(request)
+    setup = GatewaySetupService(brain.store, brain.graph, brain.audit, skills=brain.skills)
+    try:
+        setup.install_via_oauth(
+            workspace_id=str(team.get("id") or ""),
+            workspace_name=str(team.get("name") or ""),
+            bot_token=str(payload.get("access_token") or ""),
+            bot_user_id=str(payload.get("bot_user_id") or ""),
+        )
+    except ValueError as exc:
+        return _page("Installation failed", str(exc), ok=False)
+
+    return _page(
+        f"Docket is connected to {team.get('name') or 'your workspace'}",
+        "You can close this tab and go back to Slack. "
+        "Mention @Docket in a channel or send it a DM to get started.",
+        ok=True,
+    )
+
+
+# ---- console dashboard login (Sign in with Slack) ----
+#
+# Distinct from the /slack/install <-> /v1/slack/oauth/callback pair above:
+# that flow provisions a *tenant* (a workspace's bot install) and never sets
+# up anything a human logs into. This flow authenticates one *person* — any
+# member of an already-installed workspace — against the tenant that
+# install already created, using Slack's lighter OpenID Connect scopes
+# rather than re-requesting bot permissions.
+
+
+@router.get("/slack/login", include_in_schema=False)
+def slack_login(request: Request) -> RedirectResponse:
+    from docket.config import settings as _settings
+
+    if not _settings.slack_client_id or not _settings.public_url:
+        raise HTTPException(
+            503,
+            "Slack sign-in is not configured "
+            "(DOCKET_SLACK_CLIENT_ID and DOCKET_PUBLIC_URL are required)",
+        )
+    state = secrets.token_urlsafe(24)
+    request.session["oauth_state"] = state
+    redirect_uri = f"{_settings.public_url.rstrip('/')}/v1/slack/oidc/callback"
+    params = {
+        "response_type": "code",
+        "client_id": _settings.slack_client_id,
+        "scope": "openid email profile",
+        "redirect_uri": redirect_uri,
+        "state": state,
+    }
+    return RedirectResponse(
+        f"https://slack.com/openid/connect/authorize?{urlencode(params)}"
+    )
+
+
+@router.get("/v1/slack/oidc/callback", include_in_schema=False)
+def slack_oidc_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse:
+    """Slack redirects here after a person approves the Sign in with Slack
+    consent screen. Resolves them to the organization that workspace's bot
+    install already created (never creates a new tenant here — if nobody
+    has run /slack/install for this workspace yet, there is no dashboard to
+    log into), maps them to a principal, and starts a browser session."""
+    from docket.config import settings as _settings
+
+    if error:
+        return RedirectResponse(f"/login?error={urlencode({'reason': error})}")
+    expected_state = request.session.pop("oauth_state", None)
+    if not code or not state or not expected_state or not secrets.compare_digest(state, expected_state):
+        return RedirectResponse("/login?error=invalid_state")
+    if not _settings.slack_client_id or not _settings.slack_client_secret:
+        raise HTTPException(503, "Slack sign-in is not configured on this gateway")
+
+    redirect_uri = f"{(_settings.public_url or '').rstrip('/')}/v1/slack/oidc/callback"
+    token_response = httpx.post(
+        "https://slack.com/api/openid.connect.token",
+        data={
+            "client_id": _settings.slack_client_id,
+            "client_secret": _settings.slack_client_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        },
+        timeout=20.0,
+    )
+    token_response.raise_for_status()
+    token_payload = token_response.json()
+    if not token_payload.get("ok", True) or not token_payload.get("access_token"):
+        return RedirectResponse("/login?error=token_exchange_failed")
+
+    userinfo_response = httpx.get(
+        "https://slack.com/api/openid.connect.userInfo",
+        headers={"Authorization": f"Bearer {token_payload['access_token']}"},
+        timeout=20.0,
+    )
+    userinfo_response.raise_for_status()
+    userinfo = userinfo_response.json()
+    workspace_id = str(userinfo.get("https://slack.com/team_id") or "")
+    workspace_name = str(userinfo.get("https://slack.com/team_name") or "")
+    slack_user_id = str(userinfo.get("https://slack.com/user_id") or userinfo.get("sub") or "")
+    if not workspace_id or not slack_user_id:
+        return RedirectResponse("/login?error=incomplete_userinfo")
+
+    brain = _app(request)
+    installation = brain.store.slack_installation_by_workspace(workspace_id)
+    if not installation:
+        # Nobody has installed the bot into this workspace yet — there is no
+        # tenant to log into. Send them through "Add to Slack" first.
+        return RedirectResponse("/slack/install")
+
+    organization_id = installation["organization_id"]
+    principal_id = resolve_slack_principal(
+        brain.store,
+        brain.graph,
+        organization_id,
+        workspace_id,
+        slack_user_id,
+        user_profile={
+            "display_name": userinfo.get("name"),
+            "real_name": userinfo.get("name"),
+            "email": userinfo.get("email"),
+        },
+    )
+    request.session["organization_id"] = organization_id
+    request.session["principal_id"] = principal_id
+    request.session["workspace_name"] = workspace_name or installation.get("workspace_name") or workspace_id
+    brain.audit.record(
+        organization_id, "dashboard.session.login", {"principal_id": principal_id, "workspace_id": workspace_id}
+    )
+    return RedirectResponse("/")
+
+
+@router.get("/v1/session")
+def get_dashboard_session(request: Request) -> dict[str, Any]:
+    from docket.config import settings as _settings
+
+    if _settings.dashboard_auth_disabled:
+        return {
+            "organization_id": _settings.default_org_id,
+            "principal_id": "person_ajay",
+            "workspace_name": "Local Dev",
+            "auth_disabled": True,
+        }
+    organization_id = request.session.get("organization_id")
+    principal_id = request.session.get("principal_id")
+    if not organization_id or not principal_id:
+        raise HTTPException(401, "Not signed in")
+    return {
+        "organization_id": organization_id,
+        "principal_id": principal_id,
+        "workspace_name": request.session.get("workspace_name"),
+        "auth_disabled": False,
+    }
+
+
+@router.post("/v1/session/logout")
+def logout_dashboard_session(request: Request) -> dict[str, Any]:
+    request.session.clear()
+    return {"ok": True}
 
 
 # ---- company reality engine ----
@@ -2114,7 +2454,16 @@ def add_edge(body: EdgeRequest, request: Request) -> dict[str, Any]:
         to_id=body.to_id,
         properties=body.properties,
         source_ids=body.source_ids,
+        replaces=body.replaces,
     )
+
+
+@router.post("/v1/edges/{edge_id}:supersede")
+def supersede_edge(edge_id: str, request: Request) -> dict[str, Any]:
+    edge = _app(request).graph.supersede_edge(edge_id)
+    if not edge:
+        raise HTTPException(404, "edge not found")
+    return edge
 
 
 @router.get("/v1/graph/explorer")
@@ -2122,6 +2471,7 @@ def graph_explorer_data(
     request: Request, organization_id: str, acting_principal_id: str,
     destination_type: str = "internal_agent_session", destination_id: str = "default",
     destination_is_private: bool = True, purpose: str | None = None,
+    valid_at: str | None = None,
 ) -> dict[str, Any]:
     brain = _app(request)
     decision = brain.authz.resolve(
@@ -2130,7 +2480,11 @@ def graph_explorer_data(
         purpose=purpose or "graph_explorer",
     )
     allowed_sources = brain.authz.filter_sources(decision, brain.store.list_sources(organization_id))
-    view = brain.graph.explorer_view(organization_id, {source["id"] for source in allowed_sources})
+    view = brain.graph.explorer_view(
+        organization_id,
+        {source["id"] for source in allowed_sources},
+        valid_at=valid_at,
+    )
     view["permission_decision_id"] = decision.id
     return view
 

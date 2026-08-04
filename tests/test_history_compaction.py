@@ -207,6 +207,12 @@ def test_compaction_is_incremental_across_two_runs_on_the_same_conversation(brai
     messages added since the first pass, not re-derive from everything."""
     spy = _SpyCompactor(HistoryCompactor(model=DeterministicHarnessModel()))
     brain.company_agent.history_compactor = spy
+    # Compaction now triggers relative to the configured model's actual
+    # context window (H-05 follow-up, ported from Hermes), not a fixed
+    # message count — force a small window here so 55 short seed messages
+    # actually cross the threshold, the same way a real, larger history
+    # would against a real model's window.
+    brain.company_agent.model.context_length = lambda: 200
 
     conversation = "compaction-test:thread"
     envelope = _envelope(brain, conversation=conversation)
@@ -217,7 +223,7 @@ def test_compaction_is_incremental_across_two_runs_on_the_same_conversation(brai
         initial_message="Investigate the export failure",
     )
     session_id = run_a["session_id"]
-    # Seed 55 plain messages directly so the >50 threshold is already
+    # Seed 55 plain messages directly so the token threshold is already
     # crossed before the first run() call, without needing dozens of real
     # tool-call iterations.
     for i in range(55):

@@ -1,5 +1,28 @@
-import { NavLink, Route, Routes } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, NavLink, Route, Routes, useNavigate } from "react-router-dom";
+import {
+  Activity,
+  Bell,
+  BookOpen,
+  CheckCircle2,
+  Clock,
+  Database,
+  ExternalLink,
+  ListChecks,
+  LogOut,
+  MessageSquare,
+  Plug,
+  ScrollText,
+  Search,
+  Settings2,
+  Share2,
+  ShieldCheck,
+  Sparkles,
+  Wrench,
+} from "lucide-react";
 import Overview from "./pages/Overview";
+import Sessions from "./pages/Sessions";
+import SessionDetail from "./pages/SessionDetail";
 import Runs from "./pages/Runs";
 import RunDetail from "./pages/RunDetail";
 import Approvals from "./pages/Approvals";
@@ -14,118 +37,324 @@ import Graph from "./pages/Graph";
 import Reality from "./pages/Reality";
 import Jobs from "./pages/Jobs";
 import Audit from "./pages/Audit";
+import Login from "./pages/Login";
+import { api, ORG, fetchSession, logout, DashboardSession } from "./api";
+import { useVisibleInterval } from "./components";
 
-type NavItem = { to: string; label: string; end?: boolean };
+type NavItem = { to: string; label: string; end?: boolean; icon: typeof Activity };
 type NavGroup = { title: string; items: NavItem[] };
 
 const GROUPS: NavGroup[] = [
   {
     title: "Observe",
     items: [
-      { to: "/", label: "Overview", end: true },
-      { to: "/runs", label: "Runs" },
-      { to: "/approvals", label: "Approvals" },
+      { to: "/", label: "Dashboard", end: true, icon: Activity },
+      { to: "/sessions", label: "Sessions", icon: Sparkles },
+      { to: "/approvals", label: "Approvals", icon: CheckCircle2 },
     ],
   },
   {
     title: "Govern",
     items: [
-      { to: "/policies", label: "Policies" },
-      { to: "/tools", label: "Tools" },
-      { to: "/skills", label: "Skills" },
+      { to: "/policies", label: "Policies", icon: ShieldCheck },
+      { to: "/tools", label: "Tools", icon: Wrench },
+      { to: "/skills", label: "Skills", icon: BookOpen },
     ],
   },
   {
     title: "Wire",
     items: [
-      { to: "/setup", label: "Setup" },
-      { to: "/connections", label: "Connections" },
-      { to: "/channels", label: "Channels" },
-      { to: "/automations", label: "Automations" },
+      { to: "/setup", label: "Setup", icon: Settings2 },
+      { to: "/connections", label: "Integrations", icon: Plug },
+      { to: "/channels", label: "Channels", icon: MessageSquare },
+      { to: "/automations", label: "Automations", icon: Clock },
     ],
   },
   {
     title: "Know",
     items: [
-      { to: "/graph", label: "Graph" },
-      { to: "/reality", label: "Reality" },
-    ],
-  },
-  {
-    title: "Operate",
-    items: [
-      { to: "/jobs", label: "Jobs" },
-      { to: "/audit", label: "Audit" },
+      { to: "/graph", label: "Graph", icon: Share2 },
+      { to: "/reality", label: "Reality", icon: Database },
     ],
   },
 ];
 
-export default function App() {
+const OPERATIONS: NavItem[] = [
+  { to: "/jobs", label: "Jobs", icon: ListChecks },
+  { to: "/audit", label: "Audit", icon: ScrollText },
+];
+
+const ALL_NAV = [...GROUPS.flatMap((g) => g.items), ...OPERATIONS];
+
+function NavRow({ item, badge }: { item: NavItem; badge?: number }) {
+  const Icon = item.icon;
   return (
-    <div className="grid h-screen grid-cols-[248px_1fr] overflow-hidden">
-      <aside className="flex flex-col overflow-y-auto bg-ink text-paper p-6">
-        <div className="flex items-center gap-3 font-bold tracking-tight">
-          <i className="block h-6 w-6 rounded-[50%_50%_42%_58%] bg-acid" />
-          <span>Docket</span>
-          <span className="font-mono text-[10px] uppercase tracking-widest text-muted">
-            by Ajay
-          </span>
-        </div>
-        <nav className="mt-10 grid gap-5">
-          {GROUPS.map((g) => (
-            <div key={g.title} className="grid gap-1.5">
-              <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted">
-                {g.title}
-              </div>
-              {g.items.map((it) => (
-                <NavLink
-                  key={it.to}
-                  to={it.to}
-                  end={it.end}
-                  className={({ isActive }) =>
-                    `border-b border-[#292c27] py-2.5 font-mono text-[13px] no-underline transition-colors ${
-                      isActive ? "text-acid" : "text-[#8d9086] hover:text-paper"
-                    }`
-                  }
-                >
-                  {it.label}
-                </NavLink>
-              ))}
+    <NavLink
+      to={item.to}
+      end={item.end}
+      className={({ isActive }) =>
+        `group flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] font-medium no-underline transition-colors ${
+          isActive ? "bg-brand-soft text-brand" : "text-ink/70 hover:bg-paper hover:text-ink"
+        }`
+      }
+    >
+      {({ isActive }) => (
+        <>
+          <Icon size={16} strokeWidth={isActive ? 2.4 : 2} className="flex-none" />
+          <span className="flex-1">{item.label}</span>
+          {!!badge && (
+            <span className="flex h-4 min-w-[16px] items-center justify-center rounded-full bg-bad px-1 text-[9px] font-semibold text-white">
+              {badge > 99 ? "99+" : badge}
+            </span>
+          )}
+        </>
+      )}
+    </NavLink>
+  );
+}
+
+function Sidebar({
+  pendingApprovals,
+  workspaceName,
+  showSignOut,
+  onSignOut,
+}: {
+  pendingApprovals: number;
+  workspaceName?: string | null;
+  showSignOut: boolean;
+  onSignOut: () => void;
+}) {
+  return (
+    <aside className="flex h-screen flex-col overflow-y-auto border-r border-line bg-panel px-4 py-5">
+      <Link to="/" className="flex items-center gap-2.5 px-2 no-underline">
+        <span className="flex h-8 w-8 items-center justify-center rounded-[10px] bg-brand text-acid">
+          <Sparkles size={16} strokeWidth={2.4} />
+        </span>
+        <span className="text-[15px] font-semibold tracking-tight text-ink">Docket</span>
+      </Link>
+
+      <nav className="mt-8 grid gap-6">
+        {GROUPS.map((g) => (
+          <div key={g.title} className="grid gap-0.5">
+            <div className="px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted">
+              {g.title}
             </div>
-          ))}
-        </nav>
-        <div className="mt-auto border-t border-[#3b3e38] pt-5 font-mono text-[11px] text-muted">
-          <a
-            href="/docs"
-            target="_blank"
-            rel="noreferrer"
-            className="text-[#8d9086] no-underline hover:text-acid"
-          >
-            API docs ↗
-          </a>
+            {g.items.map((it) => (
+              <NavRow key={it.to} item={it} badge={it.to === "/approvals" ? pendingApprovals : 0} />
+            ))}
+          </div>
+        ))}
+      </nav>
+
+      <div className="mt-6 grid gap-0.5 border-t border-line pt-5">
+        <div className="px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted">
+          Operations
         </div>
-      </aside>
-      <main className="overflow-y-auto">
-        <div className="mx-auto w-full max-w-[1500px] p-8 pb-20">
-          <Routes>
-            <Route path="/runs" element={<Runs />} />
-            <Route path="/runs/:runId" element={<RunDetail />} />
-            <Route path="/approvals" element={<Approvals />} />
-            <Route path="/policies" element={<Policies />} />
-            <Route path="/tools" element={<Tools />} />
-            <Route path="/skills" element={<Skills />} />
-            <Route path="/setup" element={<Setup />} />
-            <Route path="/connections" element={<Connections />} />
-            <Route path="/channels" element={<Channels />} />
-            <Route path="/automations" element={<Automations />} />
-            <Route path="/graph" element={<Graph />} />
-            <Route path="/reality" element={<Reality />} />
-            <Route path="/jobs" element={<Jobs />} />
-            <Route path="/audit" element={<Audit />} />
-            <Route path="/" element={<Overview />} />
-          </Routes>
+        {OPERATIONS.map((it) => (
+          <NavRow key={it.to} item={it} />
+        ))}
+      </div>
+
+      <div className="mt-auto grid gap-3 border-t border-line pt-5">
+        <a
+          href="/docs"
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center gap-2 px-3 text-[12px] font-medium text-muted no-underline hover:text-brand"
+        >
+          API docs <ExternalLink size={12} />
+        </a>
+        <div className="flex items-center gap-2.5 rounded-lg border border-line bg-paper px-3 py-2.5">
+          <span className="flex h-7 w-7 flex-none items-center justify-center rounded-full bg-brand-dark text-[11px] font-semibold text-white">
+            {ORG.slice(-2).toUpperCase()}
+          </span>
+          <div className="min-w-0 flex-1 leading-tight">
+            <div className="truncate text-[12px] font-medium text-ink">{workspaceName || ORG}</div>
+            <div className="text-[10px] text-muted">organization</div>
+          </div>
+          {showSignOut && (
+            <button
+              onClick={onSignOut}
+              className="flex h-7 w-7 flex-none items-center justify-center rounded-md text-muted transition-colors hover:bg-line/60 hover:text-ink"
+              aria-label="Sign out"
+              title="Sign out"
+            >
+              <LogOut size={14} />
+            </button>
+          )}
         </div>
-      </main>
+      </div>
+    </aside>
+  );
+}
+
+function NavSearch() {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const boxRef = useRef<HTMLDivElement>(null);
+  const navigate = useNavigate();
+
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    return ALL_NAV.filter((it) => it.label.toLowerCase().includes(q)).slice(0, 6);
+  }, [query]);
+
+  useEffect(() => {
+    function onClick(e: MouseEvent) {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
+  function go(item: NavItem) {
+    navigate(item.to);
+    setQuery("");
+    setOpen(false);
+  }
+
+  return (
+    <div ref={boxRef} className="relative w-full max-w-[380px]">
+      <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
+      <input
+        className="input w-full pl-9"
+        placeholder="Search pages, runs, or tools…"
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && matches[0]) go(matches[0]);
+          if (e.key === "Escape") setOpen(false);
+        }}
+      />
+      {open && matches.length > 0 && (
+        <div className="card absolute left-0 right-0 top-[calc(100%+6px)] z-40 overflow-hidden p-1 shadow-popover">
+          {matches.map((m) => {
+            const Icon = m.icon;
+            return (
+              <button
+                key={m.to}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink transition-colors hover:bg-brand-soft hover:text-brand"
+                onClick={() => go(m)}
+              >
+                <Icon size={14} />
+                {m.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Topbar({ pendingApprovals }: { pendingApprovals: number }) {
+  return (
+    <div className="sticky top-0 z-30 flex items-center gap-4 border-b border-line bg-panel/90 px-8 py-3.5 backdrop-blur">
+      <NavSearch />
+      <div className="ml-auto flex items-center gap-2">
+        <Link
+          to="/approvals"
+          className="relative flex h-9 w-9 items-center justify-center rounded-full border border-line bg-panel text-ink/70 no-underline transition-colors hover:bg-paper hover:text-ink"
+          aria-label="Pending approvals"
+        >
+          <Bell size={16} />
+          {pendingApprovals > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-bad px-1 text-[9px] font-semibold text-white">
+              {pendingApprovals > 99 ? "99+" : pendingApprovals}
+            </span>
+          )}
+        </Link>
+        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-brand-dark text-[11px] font-semibold text-white">
+          {ORG.slice(-2).toUpperCase()}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type SessionState = "pending" | DashboardSession | null;
+
+export default function App() {
+  const [pendingApprovals, setPendingApprovals] = useState(0);
+  const [session, setSession] = useState<SessionState>("pending");
+  const [loginError, setLoginError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const err = params.get("error");
+    if (err) {
+      setLoginError(err);
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    fetchSession()
+      .then(setSession)
+      .catch(() => setSession(null));
+  }, []);
+
+  const pollApprovals = useCallback(async () => {
+    if (!session || session === "pending") return;
+    try {
+      const res = await api.get<{ count: number }>("/v1/approvals", {
+        organization_id: ORG,
+        status: "pending",
+      });
+      setPendingApprovals(res.count ?? 0);
+    } catch {
+      // transient — next poll retries
+    }
+  }, [session]);
+  // Pending-approval count is a passive badge, not the actual notification —
+  // approvals are delivered to Slack with Approve/Deny buttons regardless.
+  // 20s (and paused entirely while the tab isn't visible) is plenty.
+  useVisibleInterval(pollApprovals, 20_000);
+
+  if (session === "pending") return null;
+  if (!session) return <Login error={loginError} />;
+
+  async function handleSignOut() {
+    await logout();
+    window.location.href = "/";
+  }
+
+  return (
+    <div className="grid h-screen grid-cols-[256px_1fr] overflow-hidden bg-paper">
+      <Sidebar
+        pendingApprovals={pendingApprovals}
+        workspaceName={session.workspace_name}
+        showSignOut={!session.auth_disabled}
+        onSignOut={handleSignOut}
+      />
+      <div className="grid h-screen grid-rows-[auto_1fr] overflow-hidden">
+        <Topbar pendingApprovals={pendingApprovals} />
+        <main className="overflow-y-auto">
+          <div className="mx-auto w-full max-w-[1400px] p-8 pb-20">
+            <Routes>
+              <Route path="/sessions" element={<Sessions />} />
+              <Route path="/sessions/:sessionId" element={<SessionDetail />} />
+              <Route path="/runs" element={<Runs />} />
+              <Route path="/runs/:runId" element={<RunDetail />} />
+              <Route path="/approvals" element={<Approvals />} />
+              <Route path="/policies" element={<Policies />} />
+              <Route path="/tools" element={<Tools />} />
+              <Route path="/skills" element={<Skills />} />
+              <Route path="/setup" element={<Setup />} />
+              <Route path="/connections" element={<Connections />} />
+              <Route path="/channels" element={<Channels />} />
+              <Route path="/automations" element={<Automations />} />
+              <Route path="/graph" element={<Graph />} />
+              <Route path="/reality" element={<Reality />} />
+              <Route path="/jobs" element={<Jobs />} />
+              <Route path="/audit" element={<Audit />} />
+              <Route path="/" element={<Overview />} />
+            </Routes>
+          </div>
+        </main>
+      </div>
     </div>
   );
 }

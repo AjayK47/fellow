@@ -209,8 +209,16 @@ class GraphEdge(BaseModel):
     to_id: str
     properties: dict[str, Any] = Field(default_factory=dict)
     source_ids: list[str] = Field(default_factory=list)
+    # valid_from/valid_until is when the relationship was/is true in the real
+    # world; created_at (never revised) is this row's system time; system_to
+    # is when we recorded that it stopped being current — the same
+    # valid-time/system-time split reality_facts already has, so "who owns X"
+    # and "who owned X last quarter" are both answerable without stale edges
+    # silently coexisting with their replacements.
     valid_from: datetime = Field(default_factory=utcnow)
     valid_until: datetime | None = None
+    system_to: datetime | None = None
+    superseded_reason: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
 
 

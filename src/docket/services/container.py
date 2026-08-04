@@ -147,13 +147,9 @@ class DocketApp:
         self.policy = PolicyEngine(
             self.store,
             self.audit,
-            external_reader=lambda **kwargs: self.composio.execute(
-                kwargs["action_slug"],
-                kwargs["arguments"],
-                connected_account_id=kwargs.get("connected_account_id"),
-            ),
+            external_reader=self._composio_precondition_reader,
         )
-        self.slack_sender = SlackSender(bot_token=runtime_settings.slack_bot_token)
+        self.slack_sender = SlackSender(bot_token=runtime_settings.slack_bot_token, store=self.store)
         self.tool_registry = build_tool_registry(
             store=self.store,
             retrieval=self.retrieval,
@@ -263,6 +259,8 @@ class DocketApp:
             ingestion=self.ingestion,
             audit=self.audit,
             model_extractor=self.model_memory_extractor,
+            embeddings=self.embeddings,
+            skills=self.skills,
         )
         self.delivery = DeliveryService(
             store=self.store,
@@ -414,6 +412,20 @@ class DocketApp:
                 },
             )
 
+    def _composio_precondition_reader(self, **kwargs: object) -> dict[str, object]:
+        connected_account_id = kwargs.get("connected_account_id")
+        account = (
+            self.store.connector_account_by_external_id(str(connected_account_id))
+            if connected_account_id
+            else None
+        )
+        return self.composio.execute(
+            str(kwargs["action_slug"]),
+            dict(kwargs["arguments"]),  # type: ignore[arg-type]
+            connected_account_id=str(connected_account_id) if connected_account_id else None,
+            user_id=(account or {}).get("composio_user_id"),
+        )
+
     def _run_automation_now(self, automation: dict[str, object]) -> dict[str, object]:
         """Queue one automation immediately while retaining normal tick semantics."""
         from docket.domain.models import utcnow
@@ -453,6 +465,7 @@ class DocketApp:
                         str(payload["action_slug"]),
                         arguments,
                         connected_account_id=account["connected_account_id"],
+                        user_id=account.get("composio_user_id"),
                     )
                     records = list(
                         self._nested_value(

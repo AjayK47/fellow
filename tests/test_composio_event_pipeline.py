@@ -241,7 +241,7 @@ def test_agent_catalog_is_scoped_to_organization_connections(
     )
     assert isolated["tools"] == []
     assert brain.tool_registry.get(
-        "composio_execute"
+        "COMPOSIO_EXECUTE"
     ).definition.approval_required is True
 
 

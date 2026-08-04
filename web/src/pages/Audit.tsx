@@ -36,7 +36,14 @@ export default function Audit() {
           {data && data.events.length === 0 && <Empty>no events</Empty>}
           {data && (
             <table className="table">
-              <thead><tr><th>type</th><th>at</th><th>principal</th><th>payload</th></tr></thead>
+              <thead>
+                <tr>
+                  <th className="whitespace-nowrap">type</th>
+                  <th className="whitespace-nowrap">at</th>
+                  <th className="whitespace-nowrap">principal</th>
+                  <th className="w-full">payload</th>
+                </tr>
+              </thead>
               <tbody>
                 {data.events.map((e, i) => {
                   const eo = e as Record<string, unknown>;

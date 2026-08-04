@@ -45,6 +45,86 @@ class UnauthorizedApprover(Exception):
     """Raised when a Slack user who is not an allowed approver tries to decide an approval."""
 
 
+def _profile_attributes(profile: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: profile[key]
+        for key in ("tz", "tz_label", "title")
+        if profile.get(key)
+    }
+
+
+def _update_user_entity(graph: Any, principal_id: str, profile: dict[str, Any]) -> None:
+    if not profile:
+        return
+    entity = graph.get_entity(principal_id)
+    if not entity:
+        return
+    name = profile.get("display_name") or profile.get("real_name") or profile.get("name")
+    if name:
+        entity["name"] = name
+    entity["aliases"] = list(dict.fromkeys([*(entity.get("aliases") or []), profile.get("name") or ""]))
+    entity["aliases"] = [alias for alias in entity["aliases"] if alias]
+    entity["attributes"] = {
+        **(entity.get("attributes") or {}),
+        **_profile_attributes(profile),
+    }
+    graph.upsert_entity(entity)
+
+
+def resolve_slack_principal(
+    store: BrainStore,
+    graph: Any,
+    organization_id: str,
+    workspace_id: str,
+    source_user_id: str,
+    *,
+    user_profile: dict[str, Any] | None = None,
+) -> str:
+    """Map a Slack user in a workspace to a stable principal_id, creating the
+    identity mapping and graph entity on first sight.
+
+    Shared by SlackGateway's message-ingestion path and the console's "Sign
+    in with Slack" login route (api/routes.py) — the latter has no
+    SlackGateway instance of its own, only brain.store/brain.graph, so this
+    lives as a plain function rather than an instance method to avoid the
+    two call sites drifting apart.
+    """
+    mapping = store.identity_mapping(organization_id, "slack", source_user_id)
+    if mapping:
+        _update_user_entity(graph, mapping["principal_id"], user_profile or {})
+        return mapping["principal_id"]
+    principal_id = f"person_slack_{workspace_id}_{source_user_id}".lower()
+    if source_user_id and not store.get_entity(principal_id):
+        graph.upsert_entity(
+            {
+                "id": principal_id,
+                "organization_id": organization_id,
+                "entity_type": "person",
+                "name": (user_profile or {}).get("display_name")
+                or (user_profile or {}).get("real_name")
+                or (user_profile or {}).get("name")
+                or source_user_id,
+                "aliases": [source_user_id],
+                "attributes": {
+                    "slack_user_id": source_user_id,
+                    "workspace_id": workspace_id,
+                    **_profile_attributes(user_profile or {}),
+                },
+            }
+        )
+    else:
+        _update_user_entity(graph, principal_id, user_profile or {})
+    mapping = {
+        "id": new_id("identity"),
+        "organization_id": organization_id,
+        "source": "slack",
+        "source_user_id": source_user_id,
+        "principal_id": principal_id,
+    }
+    store.upsert_simple_harness_record("identity_mappings", mapping)
+    return principal_id
+
+
 class SlackGateway:
     def __init__(
         self,
@@ -386,42 +466,14 @@ class SlackGateway:
         *,
         user_profile: dict[str, Any] | None = None,
     ) -> str:
-        mapping = self.store.identity_mapping(
-            organization_id, "slack", source_user_id
+        return resolve_slack_principal(
+            self.store,
+            self.graph,
+            organization_id,
+            workspace_id,
+            source_user_id,
+            user_profile=user_profile,
         )
-        if mapping:
-            self._update_user_entity(mapping["principal_id"], user_profile or {})
-            return mapping["principal_id"]
-        principal_id = f"person_slack_{workspace_id}_{source_user_id}".lower()
-        if source_user_id and not self.store.get_entity(principal_id):
-            self.graph.upsert_entity(
-                {
-                    "id": principal_id,
-                    "organization_id": organization_id,
-                    "entity_type": "person",
-                    "name": user_profile.get("display_name")
-                    or user_profile.get("real_name")
-                    or user_profile.get("name")
-                    or source_user_id,
-                    "aliases": [source_user_id],
-                    "attributes": {
-                        "slack_user_id": source_user_id,
-                        "workspace_id": workspace_id,
-                        **self._profile_attributes(user_profile or {}),
-                    },
-                }
-            )
-        else:
-            self._update_user_entity(principal_id, user_profile or {})
-        mapping = {
-            "id": new_id("identity"),
-            "organization_id": organization_id,
-            "source": "slack",
-            "source_user_id": source_user_id,
-            "principal_id": principal_id,
-        }
-        self.store.upsert_simple_harness_record("identity_mappings", mapping)
-        return principal_id
 
     def _fetch_user_profile(self, workspace_id: str, source_user_id: str) -> dict[str, Any]:
         """Resolve a Slack display profile once per event when configured.
@@ -429,7 +481,9 @@ class SlackGateway:
         Slack events carry only the user ID. Failure to enrich must never block
         ingestion, so the ID remains the safe fallback.
         """
-        if not source_user_id or not self.config.slack_bot_token:
+        installation = self.store.slack_installation_by_workspace(workspace_id)
+        token = (installation or {}).get("bot_token") or self.config.slack_bot_token
+        if not source_user_id or not token:
             return {}
         cache_key = f"{workspace_id}:{source_user_id}"
         if cache_key in self._user_profile_cache:
@@ -437,7 +491,7 @@ class SlackGateway:
         try:
             response = httpx.get(
                 "https://slack.com/api/users.info",
-                headers={"Authorization": f"Bearer {self.config.slack_bot_token}"},
+                headers={"Authorization": f"Bearer {token}"},
                 params={"user": source_user_id},
                 timeout=5.0,
             )
@@ -449,31 +503,6 @@ class SlackGateway:
         except Exception:
             self._user_profile_cache[cache_key] = {}
             return {}
-
-    @staticmethod
-    def _profile_attributes(profile: dict[str, Any]) -> dict[str, Any]:
-        return {
-            key: profile[key]
-            for key in ("tz", "tz_label", "title")
-            if profile.get(key)
-        }
-
-    def _update_user_entity(self, principal_id: str, profile: dict[str, Any]) -> None:
-        if not profile:
-            return
-        entity = self.graph.get_entity(principal_id)
-        if not entity:
-            return
-        name = profile.get("display_name") or profile.get("real_name") or profile.get("name")
-        if name:
-            entity["name"] = name
-        entity["aliases"] = list(dict.fromkeys([*(entity.get("aliases") or []), profile.get("name") or ""]))
-        entity["aliases"] = [alias for alias in entity["aliases"] if alias]
-        entity["attributes"] = {
-            **(entity.get("attributes") or {}),
-            **self._profile_attributes(profile),
-        }
-        self.graph.upsert_entity(entity)
 
     def _channel_policy(
         self, organization_id: str, channel_id: str, is_dm: bool
@@ -558,12 +587,26 @@ class SlackGateway:
 
 
 class SlackSender:
-    def __init__(self, *, bot_token: str | None) -> None:
+    def __init__(self, *, bot_token: str | None, store: Any | None = None) -> None:
+        # bot_token is the fallback for this operator's own single primary
+        # workspace (configured via .env). store, when given, is checked
+        # first for a per-workspace token — every OAuth-installed workspace
+        # has its own bot token, and using the wrong one isn't just wrong,
+        # it's a different tenant's credential.
         self.bot_token = bot_token
+        self.store = store
 
     @property
     def configured(self) -> bool:
-        return bool(self.bot_token)
+        return bool(self.bot_token) or bool(self.store)
+
+    def _token_for(self, workspace_id: str | None) -> str | None:
+        if workspace_id and self.store:
+            installation = self.store.slack_installation_by_workspace(workspace_id)
+            token = (installation or {}).get("bot_token")
+            if token:
+                return token
+        return self.bot_token
 
     def send(
         self,
@@ -571,8 +614,10 @@ class SlackSender:
         channel_id: str,
         text: str,
         blocks: list[dict[str, Any]] | None = None,
+        workspace_id: str | None = None,
     ) -> dict[str, Any]:
-        if not self.bot_token:
+        token = self._token_for(workspace_id)
+        if not token:
             return {
                 "ok": False,
                 "dry_run": True,
@@ -586,7 +631,7 @@ class SlackSender:
         response = httpx.post(
             "https://slack.com/api/chat.postMessage",
             headers={
-                "Authorization": f"Bearer {self.bot_token}",
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json; charset=utf-8",
             },
             json=body,
@@ -598,13 +643,55 @@ class SlackSender:
             raise RuntimeError(f"Slack delivery failed: {payload.get('error')}")
         return payload
 
-    def react(self, *, channel_id: str, timestamp: str, name: str) -> dict[str, Any]:
-        if not self.bot_token:
+    def update_message(
+        self,
+        *,
+        channel_id: str,
+        timestamp: str,
+        text: str,
+        blocks: list[dict[str, Any]] | None = None,
+        workspace_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Edit an already-sent message in place — used to replace an
+        approval's Approve/Deny buttons with the actual decision once one
+        is made, instead of leaving live buttons on a message whose
+        decision has already been acted on."""
+        token = self._token_for(workspace_id)
+        if not token:
+            return {"ok": False, "dry_run": True, "channel": channel_id, "ts": timestamp}
+        body: dict[str, Any] = {"channel": channel_id, "ts": timestamp, "text": text}
+        if blocks is not None:
+            body["blocks"] = blocks
+        response = httpx.post(
+            "https://slack.com/api/chat.update",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json=body,
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError(f"Slack message update failed: {payload.get('error')}")
+        return payload
+
+    def react(
+        self,
+        *,
+        channel_id: str,
+        timestamp: str,
+        name: str,
+        workspace_id: str | None = None,
+    ) -> dict[str, Any]:
+        token = self._token_for(workspace_id)
+        if not token:
             return {"ok": False, "dry_run": True, "channel": channel_id, "timestamp": timestamp, "name": name}
         response = httpx.post(
             "https://slack.com/api/reactions.add",
             headers={
-                "Authorization": f"Bearer {self.bot_token}",
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json; charset=utf-8",
             },
             json={"channel": channel_id, "timestamp": timestamp, "name": name},
@@ -624,11 +711,13 @@ class SlackSender:
         content: bytes,
         title: str | None = None,
         initial_comment: str | None = None,
+        workspace_id: str | None = None,
     ) -> dict[str, Any]:
         """Share a file using Slack's current 3-step external upload flow
         (files.upload is deprecated): get an upload URL, PUT the bytes, then
         complete the upload into the destination channel."""
-        if not self.bot_token:
+        token = self._token_for(workspace_id)
+        if not token:
             return {
                 "ok": False,
                 "dry_run": True,
@@ -636,7 +725,7 @@ class SlackSender:
                 "filename": filename,
                 "size": len(content),
             }
-        headers = {"Authorization": f"Bearer {self.bot_token}"}
+        headers = {"Authorization": f"Bearer {token}"}
         get_url = httpx.post(
             "https://slack.com/api/files.getUploadURLExternal",
             headers=headers,

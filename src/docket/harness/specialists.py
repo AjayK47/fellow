@@ -8,6 +8,7 @@ from typing import Any
 
 from docket.domain.models import new_id, utcnow
 from docket.harness.models import (
+    AgentRunState,
     DestinationEnvelope,
     InvocationEnvelope,
     ToolDefinition,
@@ -37,10 +38,13 @@ class SpecialistWorkerService:
         return ToolDefinition(
             name="delegate_work",
             description=(
-                "Create one to three bounded specialist workers for independent, "
-                "read-only investigation or analysis. Use only when separate "
-                "context windows or parallel work materially help. Each worker "
-                "must have a distinct objective and structured return contract."
+                "Create one to three bounded specialist workers for independent "
+                "investigation, analysis, or action. A worker can be granted any "
+                "tool named in allowed_tools, including write tools — write-risk "
+                "tools still pause for the same human approval they'd need from "
+                "the main agent. Use only when separate context windows or "
+                "parallel work materially help. Each worker must have a distinct "
+                "objective and structured return contract."
             ),
             input_schema={
                 "type": "object",
@@ -194,13 +198,23 @@ class SpecialistWorkerService:
             set(task.get("allowed_tools") or [])
             - {"delegate_work", "request_human_input"}
         )
+        has_write_tools = any(
+            registered and registered.definition.risk != "read"
+            for registered in (self.agent.tools.registry.get(name) for name in allowed)
+        )
         worker_goal = (
             f"Role: {task['role']}\n"
             f"Objective: {task['objective']}\n"
             f"Return contract: {task['output_contract']}\n"
             "Return only findings supported by tool evidence. Include source IDs, "
-            "uncertainties, and recommended next steps. Do not address the user "
-            "and do not perform external writes."
+            "uncertainties, and recommended next steps. Do not address the user."
+            + (
+                " Any write tool you were granted still pauses for the same "
+                "human approval it would need from the main agent — you are not "
+                "exempt from that gate."
+                if has_write_tools
+                else " Do not perform external writes."
+            )
         )
         run = self.agent.create_invocation(
             envelope=envelope,
@@ -213,6 +227,7 @@ class SpecialistWorkerService:
                 "worker_role": task["role"],
                 "worker_depth": depth,
                 "allowed_tools": allowed,
+                "worker_has_write_tools": has_write_tools,
                 "output_contract": task["output_contract"],
                 "suppress_delivery": True,
                 "worker_capabilities": task.get("capabilities") or [],
@@ -236,7 +251,19 @@ class SpecialistWorkerService:
             record.update({"worker_run_id": run["id"], "updated_at": utcnow().isoformat()})
             self.agent.runs.store.upsert_harness_projection("specialist_tasks", record)
         outcome = self.agent.run(run["id"])
-        answer = outcome.answer or outcome.error or ""
+        if outcome.state == AgentRunState.WAITING_FOR_APPROVAL:
+            # Nothing resumes this automatically today — a human has to act
+            # on the approval, and the parent has no way to be woken back up
+            # when they do. Say so plainly instead of returning an empty
+            # "finding" that looks like the worker had nothing to report.
+            answer = (
+                f"Paused: a write action from this worker is waiting on human "
+                f"approval (approval_id={outcome.approval_id}). It will not "
+                "resume on its own — decide the approval, then re-run this "
+                "task if the result is still needed."
+            )
+        else:
+            answer = outcome.answer or outcome.error or ""
         scope_id = resolve_scope(
             store=self.agent.runs.store,
             organization_id=parent["organization_id"],
@@ -289,7 +316,12 @@ class SpecialistWorkerService:
                     "id": new_id("handoff"),
                     "organization_id": parent["organization_id"],
                     "run_id": parent["id"],
-                    "status": "awaiting_review" if task.get("review_required") else "accepted",
+                    "status": (
+                        "awaiting_review"
+                        if task.get("review_required")
+                        or outcome.state == AgentRunState.WAITING_FOR_APPROVAL
+                        else "accepted"
+                    ),
                     "specialist_task_id": task_id,
                     "worker_run_id": run["id"],
                     "artifact_id": artifact["id"],

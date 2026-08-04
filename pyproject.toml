@@ -7,6 +7,7 @@ name = "docket"
 version = "0.1.0"
 description = "Graph-native organizational memory and context platform for enterprise agents"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115.0",
@@ -16,6 +17,7 @@ dependencies = [
   "httpx>=0.27.0",
   "websockets>=15.0",
   "PyYAML>=6.0",
+  "itsdangerous>=2.2.0",
 ]
 
 [project.optional-dependencies]

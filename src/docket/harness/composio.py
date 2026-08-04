@@ -75,6 +75,7 @@ class ComposioClient:
         arguments: dict[str, Any],
         *,
         connected_account_id: str | None = None,
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         account_id = connected_account_id or self.connected_account_id
         if not self.api_key or not account_id:
@@ -82,14 +83,22 @@ class ComposioClient:
                 "Composio is not configured; set DOCKET_COMPOSIO_API_KEY "
                 "and connect an organization account"
             )
+        # Composio's v3 execute API rejects a connected_account_id without
+        # the entity/user id it was linked under (error
+        # ActionExecute_ConnectedAccountEntityIdRequired) — every connected
+        # account in this codebase is created with composio_user_id set, so
+        # callers should always have one to pass through.
+        body: dict[str, Any] = {
+            "connected_account_id": account_id,
+            "arguments": arguments,
+        }
+        if user_id:
+            body["entity_id"] = user_id
         return self._request(
             "POST",
             f"tools/execute/{tool_slug}",
             params={"toolkit_versions": self.toolkit_versions},
-            body={
-                "connected_account_id": account_id,
-                "arguments": arguments,
-            },
+            body=body,
             timeout=60.0,
         )
 
@@ -98,6 +107,49 @@ class ComposioClient:
             "GET",
             f"tools/{tool_slug}",
             params={"toolkit_versions": self.toolkit_versions},
+        )
+
+    def create_tool_router_session(
+        self,
+        *,
+        user_id: str,
+        connected_accounts: dict[str, list[str]] | None = None,
+    ) -> dict[str, Any]:
+        """Open a discovery-only Tool Router session: COMPOSIO_SEARCH_TOOLS
+        and COMPOSIO_GET_TOOL_SCHEMAS only. Execute, workbench, and
+        connection-management are explicitly disabled here — confirmed
+        against the live API that execute defaults ON otherwise (it appears
+        in tool_router_tools even when never requested). Actual write
+        execution stays exclusively on this codebase's own approval-gated
+        COMPOSIO_EXECUTE tool; this session can never reach it, by
+        construction, not just by choosing not to call it.
+
+        connected_accounts must be passed explicitly (toolkit slug -> list
+        of connected_account_id) — confirmed against the live API that a
+        session otherwise has no visibility into a user's existing
+        connections at all, even when user_id matches exactly. Without
+        this, COMPOSIO_SEARCH_TOOLS reports every toolkit as unconnected
+        regardless of real connector_accounts state.
+        """
+        body: dict[str, Any] = {
+            "user_id": user_id,
+            "search": {"enable": True},
+            "execute": {"enable_multi_execute": False},
+            "workbench": {"enable": False},
+            "manage_connections": {"enable": False},
+        }
+        if connected_accounts:
+            body["connected_accounts"] = connected_accounts
+        return self._request("POST", "tool_router/session", body=body)
+
+    def execute_tool_router_action(
+        self, *, session_id: str, tool_slug: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"tool_router/session/{session_id}/execute",
+            body={"tool_slug": tool_slug, "arguments": arguments},
+            timeout=60.0,
         )
 
     def search_tools(

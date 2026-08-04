@@ -197,6 +197,11 @@ class HarnessWorker:
             decided_by=payload["decided_by"],
             edited_arguments=payload.get("edited_arguments"),
         )
+        self.delivery.mark_approval_decided(
+            payload["approval_id"],
+            approved=bool(payload["approved"]),
+            decided_by=payload["decided_by"],
+        )
         data = outcome.model_dump(mode="json")
         if data["state"] == "waiting_for_approval" and data.get("approval_id"):
             run = self.agent.runs.get(data["run_id"])

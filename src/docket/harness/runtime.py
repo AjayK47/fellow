@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
 from docket.domain.models import new_id, utcnow
-from docket.harness.model_client import ModelClient
+from docket.harness.model_client import _DEFAULT_CONTEXT_LENGTH, ModelClient
 from docket.harness.models import (
     AgentOutcome,
     AgentRunState,
@@ -23,6 +23,42 @@ from docket.harness.tools import ToolExecutor
 from docket.services.scope_resolution import resolve_scope
 
 log = logging.getLogger("docket.runtime")
+
+# H-05 follow-up: compaction trigger ported from Hermes's context_compressor —
+# a threshold relative to the configured model's actual context window,
+# not a number picked independent of which model is running. Hermes's
+# default is 50% of context, raised to a 75% floor for models under this
+# window size (most real models today are under it, so 75% is the
+# practical default for almost everyone; only very-large-context models
+# get the more conservative 50%).
+_SMALL_CTX_WINDOW_LIMIT = 512_000
+_SMALL_CTX_THRESHOLD_PERCENT = 0.75
+_DEFAULT_THRESHOLD_PERCENT = 0.5
+_CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+def _model_context_length(model: Any) -> int:
+    """context_length() is part of the ModelClient protocol, but ad-hoc
+    test doubles and other lightweight callers may not implement it —
+    compaction timing degrading to a fixed default is a far better failure
+    mode than the whole run loop breaking on an AttributeError."""
+    getter = getattr(model, "context_length", None)
+    if not callable(getter):
+        return _DEFAULT_CONTEXT_LENGTH
+    try:
+        return int(getter())
+    except Exception:
+        return _DEFAULT_CONTEXT_LENGTH
+
+
+def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
+    """Cheap, provider-agnostic token estimate for a compaction trigger —
+    doesn't need to be exact, just proportional. A real tokenizer would be
+    per-model-family anyway; this is the same class of approximation
+    Hermes itself falls back to when a model's exact tokenizer isn't
+    available."""
+    total_chars = sum(len(json.dumps(message)) for message in messages)
+    return total_chars // _CHARS_PER_TOKEN_ESTIMATE
 
 
 class CompanyAgent:
@@ -192,10 +228,24 @@ class CompanyAgent:
             run.get("trigger_kind"),
             run["envelope"]["principal_id"],
         )
+        run = self.runs.transition(
+            run_id, AgentRunState.RUNNING, force=run["state"] == "running"
+        )
+        return self._run_loop_protected(run)
+
+    def _run_loop_protected(self, run: dict[str, Any]) -> AgentOutcome:
+        """Every entrypoint that re-enters _loop() (initial run, resume
+        after approval, resume with a human reply) must go through this,
+        not call _loop() directly. Without it, any exception mid-loop
+        (a model API error, a network failure, anything) leaves the run
+        permanently stuck at RUNNING with no failure ever recorded — a
+        zombie that nothing will retry and no human will get an answer or
+        error from. run() always had this protection; resume_after_approval
+        and resume_with_human_message did not, which is exactly how a run
+        could hang forever right after a human approved its next step.
+        """
+        run_id = run["id"]
         try:
-            run = self.runs.transition(
-                run_id, AgentRunState.RUNNING, force=run["state"] == "running"
-            )
             return self._loop(run)
         except Exception as exc:
             failed = self.runs.fail(run_id, str(exc))
@@ -271,7 +321,14 @@ class CompanyAgent:
             full_history = self.runs.messages(run["session_id"], limit=200)
             summary = ""
             history = full_history
-            if len(full_history) > 50:
+            context_length = _model_context_length(self.model)
+            threshold_percent = (
+                _SMALL_CTX_THRESHOLD_PERCENT
+                if context_length < _SMALL_CTX_WINDOW_LIMIT
+                else _DEFAULT_THRESHOLD_PERCENT
+            )
+            threshold_tokens = int(context_length * threshold_percent)
+            if len(full_history) > 30 and _estimate_tokens(full_history) > threshold_tokens:
                 session = self.runs.store.get_harness_record(
                     "agent_sessions", run["session_id"]
                 )
@@ -363,6 +420,10 @@ class CompanyAgent:
                 temperature=0.1,
                 max_tokens=1800,
             )
+            if response.tool_calls:
+                response.tool_calls = self._deduplicate_tool_calls(
+                    run["id"], response.tool_calls
+                )
             usage = dict(run.get("usage") or {})
             response_usage = response.usage or {}
             for key in (
@@ -642,7 +703,7 @@ class CompanyAgent:
         if result:
             self._append_tool_result(run, result)
         self.runs.transition(run["id"], AgentRunState.RUNNING)
-        return self._loop(self.runs.get(run["id"]) or run)
+        return self._run_loop_protected(self.runs.get(run["id"]) or run)
 
     def resume_with_human_message(
         self, run_id: str, *, message: str, principal_id: str
@@ -659,7 +720,7 @@ class CompanyAgent:
             metadata={"principal_id": principal_id, "continuation": True},
         )
         self.runs.transition(run_id, AgentRunState.RUNNING)
-        return self._loop(self.runs.get(run_id) or run)
+        return self._run_loop_protected(self.runs.get(run_id) or run)
 
     def cancel(self, run_id: str, *, cancelled_by: str) -> dict[str, Any]:
         run = self.runs.get(run_id)
@@ -881,6 +942,34 @@ class CompanyAgent:
                 trace_id=run["trace_id"],
             )
         return validation
+
+    def _deduplicate_tool_calls(
+        self, run_id: str, tool_calls: list[ModelToolCall]
+    ) -> list[ModelToolCall]:
+        """Drop exact-repeat (name, arguments) calls within a single model
+        turn — ported from Hermes's ``run_agent.py:_deduplicate_tool_calls``.
+
+        A response occasionally requests the identical call twice (same tool,
+        same arguments); executing both burns real tool-call budget and a
+        genuine round trip for zero new information, and for a write tool it
+        would mean two approval previews for one action. Only the first
+        occurrence survives; later ones are dropped before anything —
+        execution, turn persistence, or the transcript — ever sees them.
+        """
+        seen: set[tuple[str, str]] = set()
+        unique: list[ModelToolCall] = []
+        for call in tool_calls:
+            key = (call.name, json.dumps(call.arguments, sort_keys=True, default=str))
+            if key in seen:
+                log.warning(
+                    "Dropped duplicate tool call in the same turn: run_id=%s tool=%s",
+                    run_id,
+                    call.name,
+                )
+                continue
+            seen.add(key)
+            unique.append(call)
+        return unique
 
     @staticmethod
     def _compact_history(messages: list[dict[str, Any]]) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import asyncio
+import secrets
 import time
 import argparse
 import logging
@@ -15,12 +16,30 @@ from typing import AsyncIterator, Callable
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
+from starlette.middleware.sessions import SessionMiddleware
 
 from docket.api.routes import router
 from docket.config import settings
 from docket.services.container import DocketApp, get_app, reset_app
 
 log = logging.getLogger("docket")
+
+
+def _dashboard_session_secret() -> str:
+    """Resolve the key SessionMiddleware signs the console login cookie
+    with. Falls back through the Slack OAuth app secret before generating a
+    random per-process key, so a bare local run still works — just without
+    sessions surviving a restart."""
+    if settings.dashboard_session_secret:
+        return settings.dashboard_session_secret
+    if settings.slack_client_secret:
+        return settings.slack_client_secret
+    log.warning(
+        "No DOCKET_DASHBOARD_SESSION_SECRET or DOCKET_SLACK_CLIENT_SECRET configured; "
+        "using a random per-process session secret. Dashboard logins will not "
+        "survive a restart of this process."
+    )
+    return secrets.token_urlsafe(32)
 
 
 @asynccontextmanager
@@ -79,6 +98,12 @@ def create_app(
     app.state.prebuilt_brain = prebuilt_brain
     app.state.slack_stopper = slack_stopper
     app.include_router(router)
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=_dashboard_session_secret(),
+        session_cookie="docket_session",
+        same_site="lax",
+    )
 
     @app.middleware("http")
     async def request_telemetry(request: Request, call_next):
@@ -110,6 +135,12 @@ def serve(target_app: FastAPI | str | None = None) -> None:
         port=settings.port,
         reload=False,
         log_level=settings.log_level,
+        # Every request is already recorded as an `http.request` audit event
+        # (request_telemetry above) — uvicorn's own access-log line for it is
+        # pure duplication, and it's mostly the console's own 8s polling
+        # (approvals badge, dashboard refresh), which drowns out log lines
+        # that actually matter (e.g. "Slack event received: ...").
+        access_log=False,
     )
 
 

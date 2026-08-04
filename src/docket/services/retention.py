@@ -33,6 +33,7 @@ _TIMED_TABLES: dict[str, str] = {
     "action_preconditions": "created_at",
     "artifacts": "created_at",
     "agent_run_signals": "created_at",
+    "run_pattern_signals": "created_at",
 }
 
 _TENANT_TABLES = [
@@ -41,6 +42,7 @@ _TENANT_TABLES = [
     "memory_embeddings",
     "judgment_embeddings",
     "agent_run_signals",
+    "run_pattern_signals",
     "chunks",
     "principal_memberships",
     "skill_versions",

@@ -37,13 +37,13 @@ export default function Runs() {
             <table className="table">
               <thead>
                 <tr>
-                  <th className="w-[28%]">goal</th>
-                  <th>state</th>
-                  <th>trigger</th>
-                  <th>iter</th>
-                  <th>tools</th>
-                  <th>specialist</th>
-                  <th>created</th>
+                  <th className="w-full">goal</th>
+                  <th className="whitespace-nowrap">state</th>
+                  <th className="whitespace-nowrap">trigger</th>
+                  <th className="whitespace-nowrap">iter</th>
+                  <th className="whitespace-nowrap">tools</th>
+                  <th className="whitespace-nowrap">specialist</th>
+                  <th className="whitespace-nowrap">created</th>
                 </tr>
               </thead>
               <tbody>

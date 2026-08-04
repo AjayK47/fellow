@@ -5,73 +5,89 @@
 @layer base {
   body {
     @apply bg-paper text-ink font-sans antialiased;
-    background-image: linear-gradient(rgba(21, 23, 19, 0.035) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(21, 23, 19, 0.035) 1px, transparent 1px);
-    background-size: 28px 28px;
   }
   * {
     @apply border-line;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-line;
+  }
+  :focus-visible {
+    @apply outline-none ring-2 ring-brand ring-offset-2 ring-offset-paper;
   }
 }
 
 @layer components {
   .card {
-    @apply border border-ink bg-panel;
+    @apply rounded-xl2 border border-line bg-panel shadow-card;
   }
   .card-head {
-    @apply flex items-center justify-between border-b border-ink px-4 py-3;
+    @apply flex items-center justify-between border-b border-line px-5 py-4;
   }
   .card-head h2 {
-    @apply m-0 font-mono text-[12px] uppercase tracking-wider;
+    @apply m-0 text-[14px] font-semibold tracking-tight text-ink;
   }
   .card-head span {
-    @apply font-mono text-[10px] text-muted;
+    @apply font-mono text-[10px] uppercase tracking-wider text-muted;
   }
   .btn {
-    @apply border border-ink bg-ink px-3.5 py-2 font-mono text-[12px] text-white cursor-pointer transition-colors;
+    @apply cursor-pointer rounded-lg border border-brand bg-brand px-3.5 py-2 text-[13px] font-medium text-white transition-colors;
   }
   .btn:hover {
-    @apply bg-orange;
+    @apply border-brand-dark bg-brand-dark;
+  }
+  .btn:disabled {
+    @apply cursor-not-allowed opacity-50;
   }
   .btn-ghost {
-    @apply border border-ink bg-paper text-ink;
+    @apply cursor-pointer rounded-lg border border-line bg-panel px-3.5 py-2 text-[13px] font-medium text-ink transition-colors;
   }
   .btn-ghost:hover {
-    @apply bg-panel;
+    @apply border-ink/20 bg-paper;
   }
   .input,
   .select {
-    @apply border border-ink bg-panel px-3 py-2 font-mono text-[12px] outline-none;
+    @apply rounded-lg border border-line bg-panel px-3 py-2 text-[13px] text-ink outline-none placeholder:text-muted;
   }
   .input:focus,
   .select:focus {
-    @apply ring-1 ring-orange;
+    @apply border-brand ring-1 ring-brand;
   }
   .table {
-    @apply w-full border-collapse table-fixed;
+    /* Auto layout, not table-fixed: columns size to their actual content
+       (a 12-character hash column shouldn't claim the same width as a
+       name column) instead of splitting the row into equal shares. */
+    @apply w-full border-collapse;
   }
   .table th {
-    @apply border-b border-ink bg-panel px-3 py-2 text-left font-mono text-[10px] uppercase tracking-wider text-muted;
+    @apply border-b border-line bg-paper/60 px-3 py-2.5 text-left font-mono text-[10px] font-medium uppercase tracking-wider text-muted;
   }
   .table td {
-    @apply border-b border-line px-3 py-2 font-mono text-[12px] align-top overflow-hidden;
+    @apply border-b border-line px-3 py-3 align-top text-[13px] text-ink overflow-hidden;
+  }
+  .table tr:last-child td {
+    @apply border-b-0;
   }
   .table tr:hover td {
-    @apply bg-panel;
+    @apply bg-brand-soft/40;
   }
   .pill {
-    @apply inline-block px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider;
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium leading-none;
   }
   .pill-good {
-    @apply bg-acid text-ink;
+    @apply bg-good-soft text-good;
   }
   .pill-bad {
-    @apply bg-bad text-white;
+    @apply bg-bad-soft text-bad;
   }
   .pill-muted {
-    @apply bg-line/60 text-ink;
+    @apply bg-line/50 text-muted;
   }
   .pill-orange {
-    @apply bg-orange text-white;
+    @apply bg-orange-soft text-orange;
   }
 }

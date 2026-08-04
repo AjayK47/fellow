@@ -333,8 +333,8 @@ def seed_starter_skills(brain: DocketApp, organization_id: str = ORG) -> list[di
                 },
             ],
             "warnings": [
-                "Never call composio_execute with a guessed action slug — always composio_search "
-                "or composio_describe first.",
+                "Never call COMPOSIO_EXECUTE with a guessed action slug — always "
+                "COMPOSIO_SEARCH_TOOLS/composio_search or composio_describe first.",
                 "If more than one connected account could own this action, ask which account "
                 "rather than guessing.",
             ],

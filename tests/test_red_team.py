@@ -55,7 +55,7 @@ _WRITE_TOOL_DUMMY_ARGS: dict[str, dict] = {
         "content": "c",
         "scope_id": "scope_org_public",
     },
-    "composio_execute": {"tool_slug": "FAKE_SLUG", "arguments": {}},
+    "COMPOSIO_EXECUTE": {"tool_slug": "FAKE_SLUG", "arguments": {}},
     "run_code": {"code": "print(1)"},
     "workspace_write": {"path": "redteam.txt", "content": "x"},
     "workspace_patch": {"path": "redteam.txt", "old_text": "x", "new_text": "y"},
@@ -282,6 +282,6 @@ def test_run_code_stub_cannot_even_name_a_non_read_tool(brain):
         "github_create_issue",
         "brain_update_case",
         "brain_create_artifact",
-        "composio_execute",
+        "COMPOSIO_EXECUTE",
     ):
         assert candidate_name not in registered.definition.description
