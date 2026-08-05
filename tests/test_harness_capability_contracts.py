@@ -15,10 +15,15 @@ def test_typed_document_contracts_are_registered_and_report_setup(brain):
         "pptx_read", "pptx_create", "pptx_edit", "pptx_render",
         "browser_navigate", "browser_snapshot", "vision_analyze", "image_generate",
     } <= names
+    # pdf/docx/xlsx/pptx dependencies are now core (pyproject.toml), so
+    # pdf_inspect etc. are expected to be ready wherever tests run. Only
+    # browser_navigate/vision_analyze stay off by default -- gated by their
+    # own explicit config flags (browser_enabled/vision_enabled), not by
+    # whether a package happens to be installed.
     unavailable = {
         definition.name: definition
         for definition in brain.tool_registry.definitions()
-        if definition.name in {"pdf_inspect", "browser_navigate", "vision_analyze"}
+        if definition.name in {"browser_navigate", "vision_analyze"}
     }
     assert all(not item.runtime_ready and item.setup_needed for item in unavailable.values())
 
@@ -38,9 +43,8 @@ def test_skill_static_scan_blocks_injection_and_command_patterns():
 
 def test_workspace_scope_is_enforced(brain):
     with pytest.raises(ValueError):
-        brain.workspaces.create(
+        brain.workspaces.get_or_create(
             organization_id="org_acme",
-            run_id="run_bad_scope",
             owner_id="person_ajay",
             scope_id="not-a-real-scope",
         )

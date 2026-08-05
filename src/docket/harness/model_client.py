@@ -125,7 +125,7 @@ class OpenRouterModelClient:
             # indication of *why* — the response body is where OpenRouter
             # actually says what was wrong (e.g. context length, invalid
             # tool schema), and that's exactly the detail that ends up in
-            # the run's own error field and this codebase's own logs.
+            # the Task's own error field and this codebase's own logs.
             raise RuntimeError(
                 f"OpenRouter {response.status_code} for model {self.model}: "
                 f"{response.text[:2000]}"
@@ -143,7 +143,20 @@ class OpenRouterModelClient:
             try:
                 arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             except json.JSONDecodeError as exc:
-                raise RuntimeError(f"invalid model tool arguments: {exc}") from exc
+                # A JSONDecodeError position alone doesn't say which tool or
+                # how long the argument string was -- both matter for
+                # telling "the model wrote a malformed call" apart from
+                # "the completion got cut off mid-argument because
+                # max_tokens was too small for what this turn needed"
+                # (e.g. finish_reason == "length", or a raw_args length
+                # suspiciously close to the configured max_tokens).
+                raise RuntimeError(
+                    f"invalid model tool arguments for tool "
+                    f"{function.get('name') or '<unknown>'!r} "
+                    f"(finish_reason={choice.get('finish_reason')!r}, "
+                    f"arguments_length={len(raw_args) if isinstance(raw_args, str) else 'n/a'}): "
+                    f"{exc}"
+                ) from exc
             calls.append(
                 ModelToolCall(
                     id=call.get("id") or new_id("call"),
@@ -240,8 +253,8 @@ class DeterministicHarnessModel:
                 word in lower for word in ("acknowledged", "investigating", "already active")
             )
             decision = (
-                "ATTACH_TO_EXISTING_RUN"
-                if "active_run_id" in lower and not re.search(r"active_run_id[\"']?\s*:\s*null", lower)
+                "ATTACH_TO_EXISTING_TASK"
+                if "active_task_id" in lower and not re.search(r"active_task_id[\"']?\s*:\s*null", lower)
                 else "OBSERVE"
                 if acknowledged
                 else "WAKE_MAIN_AGENT"
@@ -265,7 +278,7 @@ class DeterministicHarnessModel:
                 if incident
                 else None,
                 "related_entity_ids": [],
-                "existing_run_id": None,
+                "existing_task_id": None,
             }
             return ModelResponse(
                 content=json.dumps(data),

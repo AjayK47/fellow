@@ -42,6 +42,66 @@ def test_health(client):
     assert r.json()["status"] == "ok"
 
 
+def test_task_api_invocation_uses_session_dispatch_and_exposes_task_tree(client):
+    """The operator API is Task-native from enqueue through inspection."""
+    body = {
+        "organization_id": "org_acme",
+        "principal_id": "person_ajay",
+        "conversation_id": "api-task-session",
+        "destination": {
+            "type": "internal_agent_session",
+            "id": "api-task-session",
+            "is_private": True,
+        },
+        "prompt": "Summarize the launch status.",
+    }
+    invoked = client.post("/v1/tasks/invoke", json=body)
+    assert invoked.status_code == 200
+    invoked_body = invoked.json()
+    assert invoked_body["job"]["kind"] == "session.dispatch"
+    assert invoked_body["wake"]["session_id"] == invoked_body["session"]["id"]
+    assert invoked_body["job"]["payload"]["session_id"] == invoked_body["session"]["id"]
+    jobs = client.get(
+        "/v1/harness/jobs", params={"organization_id": "org_acme"}
+    ).json()["jobs"]
+    assert all(job["kind"] != "session.dispatch.legacy" for job in jobs)
+
+    # Drain through the durable Manager path. The deterministic test model
+    # completes without a network call, so this also creates a root Task.
+    invoked_now = client.post("/v1/tasks/invoke", json={**body, "run_now": True})
+    assert invoked_now.status_code == 200
+    tasks = invoked_now.json()["tasks"]
+    assert tasks
+    task = tasks[-1]
+    task_id = task["id"]
+    assert task["session_id"] == invoked_now.json()["session"]["id"]
+    assert task["root_task_id"] == task_id
+
+    listed = client.get(
+        "/v1/tasks", params={"organization_id": "org_acme", "session_id": task["session_id"]}
+    )
+    assert listed.status_code == 200
+    assert any(item["id"] == task_id for item in listed.json()["tasks"])
+
+    detail = client.get(
+        f"/v1/tasks/{task_id}", params={"organization_id": "org_acme"}
+    )
+    assert detail.status_code == 200
+    detail_body = detail.json()
+    assert detail_body["task"]["id"] == task_id
+    assert detail_body["session"]["id"] == task["session_id"]
+    assert isinstance(detail_body["attempts"], list)
+    assert client.get(
+        f"/v1/tasks/{task_id}/attempts", params={"organization_id": "org_acme"}
+    ).status_code == 200
+    assert client.get(
+        f"/v1/tasks/{task_id}/children", params={"organization_id": "org_acme"}
+    ).status_code == 200
+    assert client.get(
+        f"/v1/tasks/{task_id}/artifacts", params={"organization_id": "org_acme"}
+    ).status_code == 200
+
+
 def test_organization_bootstrap_api(client):
     created = client.post(
         "/v1/organizations",
@@ -59,6 +119,28 @@ def test_organization_bootstrap_api(client):
     assert "org_newco" in {
         item["id"] for item in listed.json()["organizations"]
     }
+
+
+def test_organization_about_can_be_set_and_is_surfaced_in_context(client):
+    client.post(
+        "/v1/organizations",
+        json={"id": "org_newco", "name": "NewCo"},
+    )
+    updated = client.patch(
+        "/v1/organizations/org_newco", json={"about": "NewCo sells widgets."}
+    )
+    assert updated.status_code == 200
+    assert updated.json()["about"] == "NewCo sells widgets."
+
+    missing = client.patch(
+        "/v1/organizations/org_does_not_exist", json={"about": "x"}
+    )
+    assert missing.status_code == 404
+
+    fetched = client.get("/v1/organizations").json()["organizations"]
+    assert next(o for o in fetched if o["id"] == "org_newco")["about"] == (
+        "NewCo sells widgets."
+    )
 
 
 def test_local_gateway_setup_configures_models_and_slack(

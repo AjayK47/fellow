@@ -75,49 +75,30 @@ class SignalsClient(_Resource):
         return self._client._request("POST", f"/v1/signals/{signal_id}:acknowledge", {"acting_principal_id": acting_principal_id})
 
 
-class RunsClient(_Resource):
-    def start(self, **payload: Any) -> dict[str, Any]:
-        return self._client._request("POST", "/v1/runs", payload)
-
-    def record_action(self, run_id: str, **payload: Any) -> dict[str, Any]:
-        return self._client._request("POST", f"/v1/runs/{run_id}/events", payload)
-
-    def complete(self, run_id: str, **payload: Any) -> dict[str, Any]:
-        return self._client._request("POST", f"/v1/runs/{run_id}:complete", payload)
-
-    def evaluate(self, run_id: str) -> dict[str, Any]:
-        return self._client._request("POST", f"/v1/runs/{run_id}:evaluate")
-
-
-class AgentClient(_Resource):
-    """Managed company-agent runs, including full durable traces."""
+class TasksClient(_Resource):
+    """Session Manager Tasks and their durable execution traces."""
 
     def invoke(self, **payload: Any) -> dict[str, Any]:
-        return self._client._request("POST", "/v1/agent/invoke", payload)
+        return self._client._request("POST", "/v1/tasks/invoke", payload)
 
-    def get(self, run_id: str) -> dict[str, Any]:
-        return self._client._request("GET", f"/v1/agent/runs/{run_id}")
-
-    def list(
-        self,
-        organization_id: str,
-        *,
-        state: str | None = None,
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        params: dict[str, Any] = {
-            "organization_id": organization_id,
-            "limit": limit,
-        }
-        if state:
-            params["state"] = state
-        return self._client._request("GET", "/v1/agent/runs", params=params)
-
-    def cancel(self, run_id: str, cancelled_by: str) -> dict[str, Any]:
+    def get(self, task_id: str, organization_id: str) -> dict[str, Any]:
         return self._client._request(
-            "POST",
-            f"/v1/agent/runs/{run_id}:cancel",
-            params={"cancelled_by": cancelled_by},
+            "GET", f"/v1/tasks/{task_id}", params={"organization_id": organization_id}
+        )
+
+    def list(self, organization_id: str, **filters: Any) -> dict[str, Any]:
+        return self._client._request(
+            "GET", "/v1/tasks", params={"organization_id": organization_id, **filters}
+        )
+
+    def cancel(self, task_id: str, organization_id: str) -> dict[str, Any]:
+        return self._client._request(
+            "POST", f"/v1/tasks/{task_id}:cancel", params={"organization_id": organization_id}
+        )
+
+    def retry(self, task_id: str, organization_id: str) -> dict[str, Any]:
+        return self._client._request(
+            "POST", f"/v1/tasks/{task_id}:retry", params={"organization_id": organization_id}
         )
 
 
@@ -307,8 +288,7 @@ class CompanyBrain:
         self.context = ContextClient(self)
         self.events = EventsClient(self)
         self.skills = SkillsClient(self)
-        self.runs = RunsClient(self)
-        self.agent = AgentClient(self)
+        self.tasks = TasksClient(self)
         self.approvals = ApprovalsClient(self)
         self.automations = AutomationsClient(self)
         self.harness = HarnessClient(self)

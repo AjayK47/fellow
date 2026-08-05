@@ -5,8 +5,8 @@ import { Link } from "react-router-dom";
 
 type SessionRow = {
   session: Record<string, unknown>;
-  run_count: number;
-  latest_run: Record<string, unknown> | null;
+  task_count: number;
+  latest_task: Record<string, unknown> | null;
   message_count: number;
   last_message_preview: Record<string, unknown> | null;
 };
@@ -22,7 +22,7 @@ export default function Sessions() {
     <>
       <PageHeader
         title="Sessions"
-        subtitle="One conversation key — a Slack thread, DM, or channel — is one session. Every run inside it shares the same transcript; there's no separate 'new session' action, a session starts implicitly the first time someone messages Docket there."
+        subtitle="One Slack conversation has one Session Manager. Root and child Tasks share its transcript and execute independently where parallel work helps."
       />
       <Section>
         <Card title="Conversations" meta={String(data?.count ?? 0)}>
@@ -36,7 +36,7 @@ export default function Sessions() {
                   <th className="w-full">preview</th>
                   <th className="whitespace-nowrap">destination</th>
                   <th className="whitespace-nowrap">state</th>
-                  <th className="whitespace-nowrap">runs</th>
+                  <th className="whitespace-nowrap">tasks</th>
                   <th className="whitespace-nowrap">messages</th>
                   <th className="whitespace-nowrap">last active</th>
                 </tr>
@@ -46,7 +46,7 @@ export default function Sessions() {
                   const session = row.session;
                   const destination = (session.destination as Record<string, unknown>) || {};
                   const preview =
-                    (row.latest_run?.goal as string) ||
+                    (row.latest_task?.prompt as string) ||
                     (row.last_message_preview?.content as string) ||
                     "(no messages yet)";
                   return (
@@ -61,9 +61,9 @@ export default function Sessions() {
                         <span className="font-mono text-[11px] text-muted">{fmt(destination.id, 24)}</span>
                       </td>
                       <td>
-                        <StatePill state={String(session.state)} />
+                      <StatePill state={String(session.manager_state)} />
                       </td>
-                      <td>{row.run_count}</td>
+                      <td>{row.task_count}</td>
                       <td>{row.message_count}</td>
                       <td>{reltime(String(session.updated_at))}</td>
                     </tr>

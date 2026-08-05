@@ -1,4 +1,4 @@
-"""End-to-end requirements for the company reality engine and specialist workers."""
+"""End-to-end requirements for the company reality engine and child Tasks."""
 
 from __future__ import annotations
 
@@ -275,7 +275,7 @@ def test_judgments_become_retrievable_guidance(brain):
         organization_id="org_acme",
         judgment_type="agent_feedback",
         principal_id="person_ajay",
-        subject={"run_id": "run-1"},
+        subject={"task_id": "task-1"},
         decision="correction",
         reason="Always include the customer impact.",
     )
@@ -423,143 +423,6 @@ def test_approved_tool_is_not_executed_when_precondition_changes(brain):
     assert result.status == "failed"
     assert "changed after approval" in result.error
 
-
-def test_specialist_worker_is_scoped_to_granted_tools_and_returns_artifact(brain):
-    decision = brain.authz.resolve(
-        organization_id="org_acme",
-        acting_principal_id="person_ajay",
-        destination={
-            "type": "slack_channel",
-            "id": "channel_eng",
-            "is_private": False,
-        },
-        purpose="reactive_agent",
-    )
-    parent = brain.company_agent.create_invocation(
-        envelope=InvocationEnvelope(
-            organization_id="org_acme",
-            principal_id="person_ajay",
-            conversation_id="specialist-parent",
-            destination=DestinationEnvelope(
-                type="slack_channel", id="channel_eng", is_private=False
-            ),
-            purpose="reactive_agent",
-            permission_decision_id=decision.id,
-            allowed_scope_ids=decision.allowed_scope_ids,
-        ),
-        goal="Investigate export failures",
-        trigger_kind="reactive",
-        initial_message="Investigate export failures",
-    )
-    result = brain.specialists.execute(
-        {
-            "tasks": [
-                {
-                    "role": "incident-investigator",
-                    "objective": "Find evidence about export-worker failures",
-                    "allowed_tools": ["brain_search"],
-                    "output_contract": "Findings with source IDs",
-                    "max_iterations": 2,
-                    "max_tool_calls": 3,
-                }
-            ]
-        },
-        {"run_id": parent["id"]},
-    )
-    worker = result["workers"][0]
-    child = brain.agent_runs.get(worker["worker_run_id"])
-    assert child["parent_run_id"] == parent["id"]
-    assert child["metadata"]["specialist_worker"] is True
-    assert "delegate_work" not in child["metadata"]["allowed_tools"]
-    exposed = {
-        definition.name
-        for definition in brain.tool_executor.allowed_definitions(child)
-    }
-    assert exposed == {"brain_search"}
-    forced_write = brain.tool_executor.execute(
-        run=child,
-        call=ModelToolCall(
-            id="forced-specialist-write",
-            name="brain_create_artifact",
-            arguments={
-                "artifact_type": "report",
-                "title": "Should not exist",
-                "content": {"unsafe": True},
-                "scope_id": "scope_org_public",
-            },
-        ),
-    )
-    assert forced_write.status == "disabled"
-    artifact = brain.artifacts.get(worker["artifact_id"])
-    assert artifact["run_id"] == child["id"]
-    assert artifact["metadata"]["parent_run_id"] == parent["id"]
-    assert artifact["scope_id"] == "scope_channel_eng"
-
-
-def test_specialist_worker_can_be_granted_a_write_tool_that_still_needs_approval(brain):
-    """Specialists are no longer forced read-only (H-13): a write tool named
-    in allowed_tools is exposed, but it still pauses for the same human
-    approval it would need from the main agent -- being a specialist grants
-    no exemption from that gate."""
-    decision = brain.authz.resolve(
-        organization_id="org_acme",
-        acting_principal_id="person_ajay",
-        destination={"type": "slack_channel", "id": "channel_eng", "is_private": False},
-        purpose="reactive_agent",
-    )
-    parent = brain.company_agent.create_invocation(
-        envelope=InvocationEnvelope(
-            organization_id="org_acme",
-            principal_id="person_ajay",
-            conversation_id="specialist-write-parent",
-            destination=DestinationEnvelope(type="slack_channel", id="channel_eng", is_private=False),
-            purpose="reactive_agent",
-            permission_decision_id=decision.id,
-            allowed_scope_ids=decision.allowed_scope_ids,
-        ),
-        goal="Record a finding",
-        trigger_kind="reactive",
-        initial_message="Record a finding",
-    )
-    result = brain.specialists.execute(
-        {
-            "tasks": [
-                {
-                    "role": "note-taker",
-                    "objective": "Record findings as a durable artifact",
-                    "allowed_tools": ["brain_search", "brain_create_artifact"],
-                    "output_contract": "The created artifact id",
-                    "max_iterations": 2,
-                    "max_tool_calls": 3,
-                }
-            ]
-        },
-        {"run_id": parent["id"]},
-    )
-    worker = result["workers"][0]
-    child = brain.agent_runs.get(worker["worker_run_id"])
-    assert child["metadata"]["worker_has_write_tools"] is True
-
-    exposed = {
-        definition.name
-        for definition in brain.tool_executor.allowed_definitions(child)
-    }
-    assert "brain_create_artifact" in exposed
-
-    granted_write = brain.tool_executor.execute(
-        run=child,
-        call=ModelToolCall(
-            id="granted-specialist-write",
-            name="brain_create_artifact",
-            arguments={
-                "artifact_type": "report",
-                "title": "Specialist finding",
-                "content": {"note": "ok"},
-                "scope_id": "scope_org_public",
-            },
-        ),
-    )
-    assert granted_write.status == "waiting_for_approval"
 
 
 def test_reality_api_exposes_permission_filtered_facts_and_artifacts(api_client):

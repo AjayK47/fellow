@@ -27,7 +27,7 @@ def _de(value: str | None) -> Any:
 
 
 class BrainStore:
-    """Tenant-aware store for evidence, graph, memories, skills, runs, audit."""
+    """Tenant-aware store for evidence, graph, memories, Tasks, and audit."""
 
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = Path(db_path)
@@ -145,13 +145,6 @@ class BrainStore:
                     UNIQUE (organization_id, id, version)
                 );
 
-                CREATE TABLE IF NOT EXISTS runs (
-                    id TEXT PRIMARY KEY,
-                    organization_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    payload TEXT NOT NULL
-                );
-
                 CREATE TABLE IF NOT EXISTS signals (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
@@ -222,65 +215,20 @@ class BrainStore:
                     PRIMARY KEY (skill_id, version)
                 );
 
-                CREATE TABLE IF NOT EXISTS agent_sessions (
+                CREATE TABLE IF NOT EXISTS task_turns (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
-                    conversation_key TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE (organization_id, conversation_key)
-                );
-
-                CREATE TABLE IF NOT EXISTS agent_runs (
-                    id TEXT PRIMARY KEY,
-                    organization_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    trigger_kind TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    trace_id TEXT NOT NULL,
-                    parent_run_id TEXT,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS agent_messages (
-                    id TEXT PRIMARY KEY,
-                    organization_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    run_id TEXT,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    tool_call_id TEXT,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS agent_turns (
-                    id TEXT PRIMARY KEY,
-                    organization_id TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
                     turn_number INTEGER NOT NULL,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    UNIQUE (run_id, turn_number)
-                );
-
-                CREATE TABLE IF NOT EXISTS agent_run_signals (
-                    id TEXT PRIMARY KEY,
-                    organization_id TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    message TEXT,
-                    created_at TEXT NOT NULL
+                    UNIQUE (task_id, turn_number)
                 );
 
                 CREATE TABLE IF NOT EXISTS harness_tool_calls (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
                     tool_name TEXT NOT NULL,
                     status TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL,
@@ -293,7 +241,7 @@ class BrainStore:
                 CREATE TABLE IF NOT EXISTS approvals (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
                     tool_call_id TEXT NOT NULL,
                     status TEXT NOT NULL,
                     payload TEXT NOT NULL,
@@ -319,11 +267,11 @@ class BrainStore:
                     created_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS agent_interventions (
+                CREATE TABLE IF NOT EXISTS task_interventions (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
                     conversation_key TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
@@ -331,7 +279,7 @@ class BrainStore:
                 CREATE TABLE IF NOT EXISTS agent_feedback (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
                     attention_evaluation_id TEXT,
                     feedback_type TEXT NOT NULL,
                     payload TEXT NOT NULL,
@@ -341,7 +289,7 @@ class BrainStore:
                 CREATE TABLE IF NOT EXISTS deliveries (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
                     status TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL,
                     payload TEXT NOT NULL,
@@ -419,11 +367,11 @@ class BrainStore:
                 CREATE TABLE IF NOT EXISTS checkpoints (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    UNIQUE (run_id, sequence)
+                    UNIQUE (task_id, sequence)
                 );
 
                 CREATE TABLE IF NOT EXISTS episodes (
@@ -453,7 +401,7 @@ class BrainStore:
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -462,25 +410,25 @@ class BrainStore:
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS run_skill_refs (
+                CREATE TABLE IF NOT EXISTS task_skill_refs (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS run_capability_refs (
+                CREATE TABLE IF NOT EXISTS task_capability_refs (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -489,7 +437,7 @@ class BrainStore:
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -498,25 +446,7 @@ class BrainStore:
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    run_id TEXT,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS specialist_tasks (
-                    id TEXT PRIMARY KEY,
-                    organization_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    run_id TEXT,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS handoffs (
-                    id TEXT PRIMARY KEY,
-                    organization_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -525,17 +455,104 @@ class BrainStore:
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS run_pattern_signals (
+                CREATE TABLE IF NOT EXISTS task_pattern_signals (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                -- Session/Task architecture: one durable Session per Slack
+                -- conversation, one logical Session Manager per Session
+                -- (atomically claimed -- manager_owner/manager_lease_expires_at
+                -- form a compare-and-swap lock, same pattern as
+                -- lease_harness_jobs), and one unified Task type. Real
+                -- columns exist only where claims/filtering/uniqueness need
+                -- them; everything else lives in payload.
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    conversation_key TEXT NOT NULL,
+                    manager_state TEXT NOT NULL DEFAULT 'idle',
+                    manager_owner TEXT,
+                    manager_lease_expires_at TEXT,
+                    manager_revision INTEGER NOT NULL DEFAULT 0,
+                    processed_revision INTEGER NOT NULL DEFAULT 0,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, conversation_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS session_messages (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    task_id TEXT,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tool_call_id TEXT,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    parent_task_id TEXT,
+                    root_task_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    worker_type TEXT NOT NULL,
+                    execution_owner TEXT,
+                    execution_lease_expires_at TEXT,
+                    wake_revision INTEGER NOT NULL DEFAULT 0,
+                    processed_revision INTEGER NOT NULL DEFAULT 0,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS task_attempts (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS task_signals (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    message TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                -- A standing, semantic trigger: whenever a company event's text
+                -- matches trigger_description, the attention pipeline wakes the
+                -- main agent with the bound goal/skill bundle activated, the same
+                -- way related_cases already surfaces token-overlap matches. Not
+                -- bound to any channel/scope by default since real companies
+                -- don't have clean, purpose-specific channel structures.
+                CREATE TABLE IF NOT EXISTS roles (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -734,7 +751,7 @@ class BrainStore:
                 CREATE TABLE IF NOT EXISTS artifacts (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
-                    run_id TEXT,
+                    task_id TEXT,
                     artifact_type TEXT NOT NULL,
                     title TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -748,6 +765,10 @@ class BrainStore:
                     ON memories(organization_id, is_latest, status);
                 CREATE INDEX IF NOT EXISTS idx_edges_org_type
                     ON edges(organization_id, edge_type);
+                CREATE INDEX IF NOT EXISTS idx_edges_from_id
+                    ON edges(from_id);
+                CREATE INDEX IF NOT EXISTS idx_edges_to_id
+                    ON edges(to_id);
                 CREATE INDEX IF NOT EXISTS idx_sources_org
                     ON sources(organization_id);
                 CREATE INDEX IF NOT EXISTS idx_entities_org
@@ -782,24 +803,36 @@ class BrainStore:
                 CREATE INDEX IF NOT EXISTS idx_processing_jobs_org ON processing_jobs(organization_id, status);
                 CREATE INDEX IF NOT EXISTS idx_profiles_org_entity ON profiles(organization_id, entity_id);
                 CREATE INDEX IF NOT EXISTS idx_skill_versions_org ON skill_versions(organization_id, skill_id);
-                CREATE INDEX IF NOT EXISTS idx_agent_runs_org_state
-                    ON agent_runs(organization_id, state, updated_at);
-                CREATE INDEX IF NOT EXISTS idx_agent_messages_session
-                    ON agent_messages(session_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_tool_calls_run
-                    ON harness_tool_calls(run_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_agent_run_signals_run
-                    ON agent_run_signals(run_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_approvals_run_status
-                    ON approvals(run_id, status);
+                CREATE INDEX IF NOT EXISTS idx_task_turns_task
+                    ON task_turns(task_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_tool_calls_task
+                    ON harness_tool_calls(task_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_approvals_task_status
+                    ON approvals(task_id, status);
                 CREATE INDEX IF NOT EXISTS idx_attention_event
                     ON attention_evaluations(organization_id, event_id);
                 CREATE INDEX IF NOT EXISTS idx_interventions_conversation
-                    ON agent_interventions(organization_id, conversation_key, created_at);
+                    ON task_interventions(organization_id, conversation_key, created_at);
                 CREATE INDEX IF NOT EXISTS idx_agent_feedback_org
                     ON agent_feedback(organization_id, feedback_type, created_at);
                 CREATE INDEX IF NOT EXISTS idx_harness_jobs_ready
                     ON harness_jobs(status, available_at, lease_expires_at);
+                CREATE INDEX IF NOT EXISTS idx_sessions_manager_state
+                    ON sessions(organization_id, manager_state);
+                CREATE INDEX IF NOT EXISTS idx_session_messages_session
+                    ON session_messages(session_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_tasks_session
+                    ON tasks(session_id, state);
+                CREATE INDEX IF NOT EXISTS idx_tasks_parent
+                    ON tasks(parent_task_id);
+                CREATE INDEX IF NOT EXISTS idx_tasks_root
+                    ON tasks(root_task_id);
+                CREATE INDEX IF NOT EXISTS idx_tasks_org_state
+                    ON tasks(organization_id, state, worker_type);
+                CREATE INDEX IF NOT EXISTS idx_task_attempts_task
+                    ON task_attempts(task_id, attempt_number);
+                CREATE INDEX IF NOT EXISTS idx_task_signals_task
+                    ON task_signals(task_id, created_at);
                 """
             )
 
@@ -1255,7 +1288,7 @@ class BrainStore:
             )
             return [r["scope_id"] for r in cur.fetchall()]
 
-    # ---- skills / runs / signals / audit ----
+    # ---- skills / signals / audit ----
 
     def upsert_skill(self, skill: dict[str, Any]) -> None:
         with self.cursor() as cur:
@@ -1300,24 +1333,6 @@ class BrainStore:
         with self.cursor() as cur:
             cur.execute("SELECT payload FROM skill_versions WHERE skill_id = ? ORDER BY version", (skill_id,))
             return [_de(row["payload"]) for row in cur.fetchall()]
-
-    def upsert_run(self, run: dict[str, Any]) -> None:
-        with self.cursor() as cur:
-            cur.execute(
-                "INSERT OR REPLACE INTO runs(id, organization_id, status, payload) VALUES (?, ?, ?, ?)",
-                (
-                    run["id"],
-                    run["organization_id"],
-                    run["status"] if isinstance(run["status"], str) else run["status"].value,
-                    _ser(run),
-                ),
-            )
-
-    def get_run(self, run_id: str) -> dict[str, Any] | None:
-        return self.get_json("runs", run_id)
-
-    def list_runs(self, organization_id: str) -> list[dict[str, Any]]:
-        return self.list_by_org("runs", organization_id)
 
     def upsert_signal(self, signal: dict[str, Any]) -> None:
         with self.cursor() as cur:
@@ -1461,15 +1476,12 @@ class BrainStore:
     # ---- durable agent harness ----
 
     _HARNESS_TABLES = {
-        "agent_sessions",
-        "agent_runs",
-        "agent_messages",
-        "agent_turns",
+        "task_turns",
         "harness_tool_calls",
         "approvals",
         "conversation_states",
         "attention_evaluations",
-        "agent_interventions",
+        "task_interventions",
         "agent_feedback",
         "deliveries",
         "slack_installations",
@@ -1480,16 +1492,15 @@ class BrainStore:
         "checkpoints",
         "episodes",
         "automations",
+        "roles",
         "skill_packages",
         "capabilities",
-        "run_skill_refs",
-        "run_capability_refs",
+        "task_skill_refs",
+        "task_capability_refs",
         "workspaces",
         "plans",
-        "specialist_tasks",
-        "handoffs",
         "automation_watermarks",
-        "run_pattern_signals",
+        "task_pattern_signals",
     }
 
     def _checked_harness_table(self, table: str) -> str:
@@ -1521,7 +1532,7 @@ class BrainStore:
             "state",
             "status",
             "session_id",
-            "run_id",
+            "task_id",
             "event_id",
             "conversation_key",
             "workspace_id",
@@ -1554,124 +1565,237 @@ class BrainStore:
             cur.execute(sql, params)
             return [_de(row["payload"]) for row in cur.fetchall()]
 
-    def upsert_agent_session(self, session: dict[str, Any]) -> None:
+    # ---- Session / Task architecture ----
+    #
+    # These tables carry their own ownership/lease/revision columns
+    # (manager_state/manager_owner/manager_lease_expires_at/manager_revision
+    # on sessions; state/execution_owner/execution_lease_expires_at/
+    # wake_revision on tasks) as the SOURCE OF TRUTH for concurrency control.
+    # `update_session`/`update_task` touch only `payload` + `updated_at` --
+    # never the ownership columns -- so a caller holding a stale in-memory
+    # copy can never clobber a concurrently-changed lease by saving the
+    # whole record back. Ownership only ever changes through
+    # claim_*/release_*/renew_*_lease, each a single atomic UPDATE guarded
+    # by an immediate transaction, same pattern as lease_harness_jobs.
+
+    @staticmethod
+    def _session_row(row: Any) -> dict[str, Any]:
+        record = _de(row["payload"])
+        record.update(
+            {
+                "manager_state": row["manager_state"],
+                "manager_owner": row["manager_owner"],
+                "manager_lease_expires_at": row["manager_lease_expires_at"],
+                "manager_revision": row["manager_revision"],
+                "processed_revision": row["processed_revision"],
+            }
+        )
+        return record
+
+    @staticmethod
+    def _task_row(row: Any) -> dict[str, Any]:
+        record = _de(row["payload"])
+        record.update(
+            {
+                "state": row["state"],
+                "execution_owner": row["execution_owner"],
+                "execution_lease_expires_at": row["execution_lease_expires_at"],
+                "wake_revision": row["wake_revision"],
+                "processed_revision": row["processed_revision"],
+            }
+        )
+        return record
+
+    _SESSION_COLUMNS = (
+        "payload, manager_state, manager_owner, manager_lease_expires_at, "
+        "manager_revision, processed_revision"
+    )
+    _TASK_COLUMNS = (
+        "payload, state, execution_owner, execution_lease_expires_at, "
+        "wake_revision, processed_revision"
+    )
+
+    def create_session(self, session: dict[str, Any]) -> dict[str, Any]:
+        session = dict(session)
+        session.setdefault("manager_state", "idle")
+        session.setdefault("manager_owner", None)
+        session.setdefault("manager_lease_expires_at", None)
+        session.setdefault("manager_revision", 0)
+        session.setdefault("processed_revision", 0)
         with self.cursor() as cur:
             cur.execute(
-                """INSERT OR REPLACE INTO agent_sessions
-                (id, organization_id, conversation_key, state, payload, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO sessions
+                (id, organization_id, conversation_key, manager_state, manager_owner,
+                 manager_lease_expires_at, manager_revision, processed_revision,
+                 payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session["id"],
                     session["organization_id"],
                     session["conversation_key"],
-                    session["state"],
+                    session["manager_state"],
+                    session["manager_owner"],
+                    session["manager_lease_expires_at"],
+                    int(session["manager_revision"]),
+                    int(session["processed_revision"]),
                     _ser(session),
                     session["created_at"],
                     session["updated_at"],
                 ),
             )
+        return session
 
-    def session_by_conversation(
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT {self._SESSION_COLUMNS} FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = cur.fetchone()
+            return self._session_row(row) if row else None
+
+    def list_sessions(
+        self,
+        organization_id: str,
+        *,
+        manager_state: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses = ["organization_id = ?"]
+        params: list[Any] = [organization_id]
+        if manager_state:
+            clauses.append("manager_state = ?")
+            params.append(manager_state)
+        params.append(int(limit))
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT {self._SESSION_COLUMNS} FROM sessions
+                WHERE {' AND '.join(clauses)}
+                ORDER BY updated_at DESC LIMIT ?""",
+                params,
+            )
+            return [self._session_row(row) for row in cur.fetchall()]
+
+    def find_session_by_conversation(
         self, organization_id: str, conversation_key: str
     ) -> dict[str, Any] | None:
         with self.cursor() as cur:
             cur.execute(
-                """SELECT payload FROM agent_sessions
+                f"""SELECT {self._SESSION_COLUMNS} FROM sessions
                 WHERE organization_id = ? AND conversation_key = ?""",
                 (organization_id, conversation_key),
             )
             row = cur.fetchone()
-            return _de(row["payload"]) if row else None
+            return self._session_row(row) if row else None
 
-    def upsert_agent_run(self, run: dict[str, Any]) -> None:
+    def update_session(self, session: dict[str, Any]) -> None:
+        """Persist ordinary session fields (summary, participants, metadata).
+        Never touches manager_state/owner/lease/revision -- those are
+        exclusively owned by claim_session_manager/release_session_manager/
+        bump_session_revision."""
         with self.cursor() as cur:
             cur.execute(
-                """INSERT OR REPLACE INTO agent_runs
-                (id, organization_id, session_id, trigger_kind, state, trace_id,
-                 parent_run_id, payload, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    run["id"],
-                    run["organization_id"],
-                    run["session_id"],
-                    run["trigger_kind"],
-                    run["state"],
-                    run["trace_id"],
-                    run.get("parent_run_id"),
-                    _ser(run),
-                    run["created_at"],
-                    run["updated_at"],
-                ),
+                "UPDATE sessions SET payload = ?, updated_at = ? WHERE id = ?",
+                (_ser(session), session["updated_at"], session["id"]),
             )
 
-    def active_run_for_session(self, session_id: str) -> dict[str, Any] | None:
-        terminal = ("completed", "failed", "cancelled")
-        with self.cursor() as cur:
-            cur.execute(
-                """SELECT payload FROM agent_runs
-                WHERE session_id = ? AND state NOT IN (?, ?, ?)
-                ORDER BY updated_at DESC LIMIT 1""",
-                (session_id, *terminal),
-            )
-            row = cur.fetchone()
-            return _de(row["payload"]) if row else None
-
-    def push_agent_run_signal(self, signal: dict[str, Any]) -> dict[str, Any]:
-        with self.cursor() as cur:
-            cur.execute(
-                """INSERT INTO agent_run_signals
-                (id, organization_id, run_id, kind, message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    signal["id"],
-                    signal["organization_id"],
-                    signal["run_id"],
-                    signal["kind"],
-                    signal.get("message"),
-                    signal["created_at"],
-                ),
-            )
-        return signal
-
-    def pop_agent_run_signal(self, run_id: str) -> dict[str, Any] | None:
-        """Atomically claim and remove the oldest pending signal for a run.
-
-        Uses the same immediate-transaction claim pattern as job leasing
-        (`lease_harness_jobs`) so a signal read here can never be silently
-        overwritten by a concurrent `_loop()` iteration's run-row update —
-        it lives in its own table, not the run's JSON blob.
-        """
+    def claim_session_manager(
+        self, session_id: str, *, owner: str, lease_seconds: int
+    ) -> bool:
+        """Atomic compare-and-swap: succeeds only if the session is
+        `queued` (fresh wake) or `running` with an expired lease (crashed
+        executor) and unowned or owned by a lease that's expired."""
+        now = datetime.now(timezone.utc)
+        now_s = now.isoformat()
+        expiry = (now + timedelta(seconds=lease_seconds)).isoformat()
         with self.cursor(immediate=True) as cur:
             cur.execute(
-                """SELECT id, kind, message, created_at FROM agent_run_signals
-                WHERE run_id = ? ORDER BY created_at ASC LIMIT 1""",
-                (run_id,),
+                """UPDATE sessions
+                SET manager_state = 'running', manager_owner = ?,
+                    manager_lease_expires_at = ?, updated_at = ?
+                WHERE id = ?
+                  AND manager_state IN ('queued', 'running')
+                  AND (manager_owner IS NULL OR manager_lease_expires_at < ?)""",
+                (owner, expiry, now_s, session_id, now_s),
             )
-            row = cur.fetchone()
-            if not row:
-                return None
-            cur.execute(
-                "DELETE FROM agent_run_signals WHERE id = ?", (row["id"],)
-            )
-            return {
-                "id": row["id"],
-                "kind": row["kind"],
-                "message": row["message"],
-                "created_at": row["created_at"],
-            }
+            return cur.rowcount > 0
 
-    def append_agent_message(self, message: dict[str, Any]) -> None:
+    def renew_session_manager_lease(
+        self, session_id: str, *, owner: str, lease_seconds: int
+    ) -> bool:
+        now = datetime.now(timezone.utc)
+        expiry = (now + timedelta(seconds=lease_seconds)).isoformat()
         with self.cursor() as cur:
             cur.execute(
-                """INSERT OR REPLACE INTO agent_messages
-                (id, organization_id, session_id, run_id, role, content,
+                """UPDATE sessions SET manager_lease_expires_at = ?, updated_at = ?
+                WHERE id = ? AND manager_owner = ?""",
+                (expiry, now.isoformat(), session_id, owner),
+            )
+            return cur.rowcount > 0
+
+    def release_session_manager(
+        self, session_id: str, *, owner: str, idle: bool
+    ) -> bool:
+        """Guarded by `manager_owner = ?` so a stale/expired owner can never
+        release (and thus corrupt) a session someone else has since
+        claimed -- the old-owner-cannot-commit-after-losing-lease
+        invariant."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.cursor() as cur:
+            cur.execute(
+                """UPDATE sessions
+                SET manager_state = CASE
+                        WHEN ? = 0 THEN 'queued'
+                        WHEN processed_revision >= manager_revision THEN 'idle'
+                        ELSE 'queued'
+                    END,
+                    manager_owner = NULL,
+                    manager_lease_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND manager_owner = ?""",
+                (1 if idle else 0, now, session_id, owner),
+            )
+            return cur.rowcount > 0
+
+    def bump_session_revision(self, session_id: str) -> int:
+        """Increment manager_revision (new input needs attention) and, if
+        the session is currently idle, flip it to queued so a dispatcher
+        picks it up -- a currently-running session just sees the higher
+        revision at its next iteration boundary instead."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """UPDATE sessions
+                SET manager_revision = manager_revision + 1,
+                    manager_state = CASE WHEN manager_state = 'idle' THEN 'queued' ELSE manager_state END,
+                    updated_at = ?
+                WHERE id = ?""",
+                (now, session_id),
+            )
+            cur.execute(
+                "SELECT manager_revision FROM sessions WHERE id = ?", (session_id,)
+            )
+            row = cur.fetchone()
+            return int(row["manager_revision"]) if row else 0
+
+    def mark_session_revision_processed(self, session_id: str, revision: int) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET processed_revision = ? WHERE id = ? AND processed_revision < ?",
+                (revision, session_id, revision),
+            )
+
+    def append_session_message(self, message: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT INTO session_messages
+                (id, organization_id, session_id, task_id, role, content,
                  tool_call_id, payload, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message["id"],
                     message["organization_id"],
                     message["session_id"],
-                    message.get("run_id"),
+                    message.get("task_id"),
                     message["role"],
                     message.get("content") or "",
                     message.get("tool_call_id"),
@@ -1680,28 +1804,385 @@ class BrainStore:
                 ),
             )
 
-    def session_messages(
-        self, session_id: str, *, limit: int = 100
+    def list_session_messages(
+        self,
+        session_id: str,
+        *,
+        limit: int = 200,
+        task_id: str | None = None,
     ) -> list[dict[str, Any]]:
         with self.cursor() as cur:
-            cur.execute(
-                """SELECT payload FROM agent_messages WHERE session_id = ?
-                ORDER BY created_at DESC LIMIT ?""",
-                (session_id, limit),
-            )
+            if task_id is None:
+                cur.execute(
+                    """SELECT payload FROM session_messages WHERE session_id = ?
+                    ORDER BY created_at DESC LIMIT ?""",
+                    (session_id, limit),
+                )
+            else:
+                cur.execute(
+                    """SELECT payload FROM session_messages
+                    WHERE session_id = ? AND task_id = ?
+                    ORDER BY created_at DESC LIMIT ?""",
+                    (session_id, task_id, limit),
+                )
             rows = [_de(row["payload"]) for row in cur.fetchall()]
         return list(reversed(rows))
 
-    def append_agent_turn(self, turn: dict[str, Any]) -> None:
+    def create_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        task = dict(task)
+        task.setdefault("execution_owner", None)
+        task.setdefault("execution_lease_expires_at", None)
+        task.setdefault("wake_revision", 0)
+        task.setdefault("processed_revision", 0)
+        task.setdefault("completed_at", None)
         with self.cursor() as cur:
             cur.execute(
-                """INSERT OR REPLACE INTO agent_turns
-                (id, organization_id, run_id, turn_number, payload, created_at)
+                """INSERT INTO tasks
+                (id, organization_id, session_id, parent_task_id, root_task_id,
+                 state, worker_type, execution_owner, execution_lease_expires_at,
+                 wake_revision, processed_revision, payload, created_at,
+                 updated_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    task["id"],
+                    task["organization_id"],
+                    task["session_id"],
+                    task.get("parent_task_id"),
+                    task["root_task_id"],
+                    task["state"],
+                    task["worker_type"],
+                    task.get("execution_owner"),
+                    task.get("execution_lease_expires_at"),
+                    int(task.get("wake_revision", 0)),
+                    int(task.get("processed_revision", 0)),
+                    _ser(task),
+                    task["created_at"],
+                    task["updated_at"],
+                    task.get("completed_at"),
+                ),
+            )
+        return task
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT {self._TASK_COLUMNS} FROM tasks WHERE id = ?", (task_id,)
+            )
+            row = cur.fetchone()
+            return self._task_row(row) if row else None
+
+    def list_tasks(
+        self,
+        organization_id: str,
+        *,
+        session_id: str | None = None,
+        parent_task_id: str | None = None,
+        root_task_id: str | None = None,
+        state: str | None = None,
+        worker_type: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["organization_id = ?"]
+        params: list[Any] = [organization_id]
+        for column, value in (
+            ("session_id", session_id),
+            ("parent_task_id", parent_task_id),
+            ("root_task_id", root_task_id),
+            ("state", state),
+            ("worker_type", worker_type),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        sql = (
+            f"SELECT {self._TASK_COLUMNS} FROM tasks WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self.cursor() as cur:
+            cur.execute(sql, params)
+            return [self._task_row(row) for row in cur.fetchall()]
+
+    def update_task(self, task: dict[str, Any]) -> None:
+        """Persist ordinary task fields (result, error, prompt revisions,
+        iteration/usage counters, metadata). Never touches
+        state/execution_owner/execution_lease_expires_at/wake_revision --
+        those are exclusively owned by claim_task/release_task/
+        renew_task_lease/bump_task_revision."""
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE tasks SET payload = ?, updated_at = ? WHERE id = ?",
+                (_ser(task), task["updated_at"], task["id"]),
+            )
+
+    def update_task_owned(self, task: dict[str, Any], *, owner: str) -> bool:
+        """Persist executor-owned payload only while its lease is still owned.
+
+        This closes the stale-executor race left by update_task(): once another
+        executor has reclaimed the Task, the old process cannot overwrite its
+        counters, prompt, result, or metadata with an obsolete snapshot.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self.cursor() as cur:
+            cur.execute(
+                """UPDATE tasks SET payload = ?, updated_at = ?
+                WHERE id = ? AND execution_owner = ?
+                  AND execution_lease_expires_at >= ?""",
+                (_ser(task), task["updated_at"], task["id"], owner, now),
+            )
+            return cur.rowcount > 0
+
+    def update_unclaimed_task(self, task: dict[str, Any]) -> bool:
+        """Update a newly-created Task before its first executor claim.
+
+        Workspace/capability metadata is attached between ``create_task``
+        and enqueueing execution.  Keep that legitimate initialization
+        atomic without reopening the stale-executor hole: once any executor
+        claims the Task (or its state changes), this compare-and-swap fails.
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """UPDATE tasks SET payload = ?, updated_at = ?
+                WHERE id = ? AND state = 'queued' AND execution_owner IS NULL""",
+                (_ser(task), task["updated_at"], task["id"]),
+            )
+            return cur.rowcount > 0
+
+    def claim_task(self, task_id: str, *, owner: str, lease_seconds: int) -> bool:
+        # Claimable from any non-terminal state, not just queued/running --
+        # a Task resuming from waiting_for_approval/waiting_for_human/
+        # waiting_for_tool back into RUNNING must be re-claimable exactly
+        # like a fresh queued Task. Only completed/failed/cancelled (and
+        # whatever's currently held under a live lease) are ineligible.
+        now = datetime.now(timezone.utc)
+        now_s = now.isoformat()
+        expiry = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """UPDATE tasks
+                SET state = 'running', execution_owner = ?,
+                    execution_lease_expires_at = ?, updated_at = ?
+                WHERE id = ?
+                  AND state NOT IN ('completed', 'failed', 'cancelled')
+                  AND (execution_owner IS NULL OR execution_lease_expires_at < ?)""",
+                (owner, expiry, now_s, task_id, now_s),
+            )
+            return cur.rowcount > 0
+
+    def renew_task_lease(self, task_id: str, *, owner: str, lease_seconds: int) -> bool:
+        now = datetime.now(timezone.utc)
+        now_s = now.isoformat()
+        expiry = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self.cursor() as cur:
+            cur.execute(
+                """UPDATE tasks SET execution_lease_expires_at = ?, updated_at = ?
+                WHERE id = ? AND execution_owner = ?
+                  AND execution_lease_expires_at >= ?""",
+                (expiry, now_s, task_id, owner, now_s),
+            )
+            return cur.rowcount > 0
+
+    def release_task(
+        self,
+        task_id: str,
+        *,
+        owner: str,
+        next_state: str,
+        task: dict[str, Any] | None = None,
+    ) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        terminal = next_state in ("completed", "failed", "cancelled")
+        with self.cursor() as cur:
+            if terminal:
+                cur.execute(
+                    """UPDATE tasks SET state = ?, execution_owner = NULL,
+                    execution_lease_expires_at = NULL, updated_at = ?, completed_at = ?,
+                    payload = COALESCE(?, payload)
+                    WHERE id = ? AND execution_owner = ?
+                      AND execution_lease_expires_at >= ?""",
+                    (next_state, now, now, _ser(task) if task else None, task_id, owner, now),
+                )
+            else:
+                cur.execute(
+                    """UPDATE tasks SET state = ?, execution_owner = NULL,
+                    execution_lease_expires_at = NULL, updated_at = ?,
+                    payload = COALESCE(?, payload)
+                    WHERE id = ? AND execution_owner = ?
+                      AND execution_lease_expires_at >= ?""",
+                    (next_state, now, _ser(task) if task else None, task_id, owner, now),
+                )
+            return cur.rowcount > 0
+
+    def cancel_task(self, task_id: str) -> bool:
+        """Unconditional cancel -- unlike release_task, does not require
+        matching the current execution_owner. Cancellation always wins,
+        whether the task is queued (never claimed), actively claimed by a
+        live executor, or paused waiting on something: an active executor's
+        own _loop() detects this at its next iteration-top re-fetch
+        (`persisted["state"] == CANCELLED`) and stops itself; nothing here
+        has to know who currently holds the lease, or even whether anyone
+        does. Only touches ownership/state columns -- callers wanting a
+        reason recorded in the payload (error/events) do that separately
+        via update_task, the same split release_task/update_task already
+        use elsewhere."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.cursor() as cur:
+            cur.execute(
+                """UPDATE tasks SET state = 'cancelled', execution_owner = NULL,
+                execution_lease_expires_at = NULL, updated_at = ?, completed_at = ?
+                WHERE id = ? AND state NOT IN ('completed', 'failed', 'cancelled')""",
+                (now, now, task_id),
+            )
+            return cur.rowcount > 0
+
+    def retry_task(self, task_id: str) -> bool:
+        """Requeue a terminal Task for an explicit operator retry."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.cursor(immediate=True) as cur:
+            cur.execute("SELECT payload FROM tasks WHERE id = ?", (task_id,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            task = _de(row["payload"])
+            if task.get("state") not in {"failed", "cancelled"}:
+                return False
+            task["state"] = "queued"
+            task["error"] = None
+            task["updated_at"] = now
+            task.setdefault("events", []).append(
+                {"type": "task.retried", "at": now}
+            )
+            cur.execute(
+                """UPDATE tasks SET state = 'queued', execution_owner = NULL,
+                execution_lease_expires_at = NULL,
+                payload = ?, updated_at = ?, completed_at = NULL
+                WHERE id = ? AND state IN ('failed', 'cancelled')""",
+                (_ser(task), now, task_id),
+            )
+            return cur.rowcount > 0
+
+    def bump_task_revision(self, task_id: str) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                "UPDATE tasks SET wake_revision = wake_revision + 1, updated_at = ? WHERE id = ?",
+                (now, task_id),
+            )
+            cur.execute("SELECT wake_revision FROM tasks WHERE id = ?", (task_id,))
+            row = cur.fetchone()
+            return int(row["wake_revision"]) if row else 0
+
+    def mark_task_revision_processed(self, task_id: str, revision: int) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE tasks SET processed_revision = ? WHERE id = ? AND processed_revision < ?",
+                (revision, task_id, revision),
+            )
+
+    def create_task_attempt(self, attempt: dict[str, Any]) -> dict[str, Any]:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT INTO task_attempts
+                (id, organization_id, task_id, attempt_number, status, payload,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    attempt["id"],
+                    attempt["organization_id"],
+                    attempt["task_id"],
+                    int(attempt["attempt_number"]),
+                    attempt["status"],
+                    _ser(attempt),
+                    attempt["created_at"],
+                    attempt["updated_at"],
+                ),
+            )
+        return attempt
+
+    def update_task_attempt(self, attempt: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE task_attempts SET status = ?, payload = ?, updated_at = ? WHERE id = ?",
+                (attempt["status"], _ser(attempt), attempt["updated_at"], attempt["id"]),
+            )
+
+    def list_task_attempts(self, task_id: str) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM task_attempts WHERE task_id = ?
+                ORDER BY attempt_number""",
+                (task_id,),
+            )
+            return [_de(row["payload"]) for row in cur.fetchall()]
+
+    def push_task_signal(self, signal: dict[str, Any]) -> dict[str, Any]:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT INTO task_signals
+                (id, organization_id, task_id, kind, message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    signal["id"],
+                    signal["organization_id"],
+                    signal["task_id"],
+                    signal["kind"],
+                    signal.get("message"),
+                    signal["created_at"],
+                ),
+            )
+        return signal
+
+    def pop_task_signal(self, task_id: str) -> dict[str, Any] | None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """SELECT id, kind, message, created_at FROM task_signals
+                WHERE task_id = ? ORDER BY created_at ASC LIMIT 1""",
+                (task_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cur.execute("DELETE FROM task_signals WHERE id = ?", (row["id"],))
+            return {
+                "id": row["id"],
+                "kind": row["kind"],
+                "message": row["message"],
+                "created_at": row["created_at"],
+            }
+
+    def find_root_task_for_session(self, session_id: str) -> dict[str, Any] | None:
+        """Return the Session's own active root Task, if any."""
+        terminal = ("completed", "failed", "cancelled")
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT {self._TASK_COLUMNS} FROM tasks
+                WHERE session_id = ? AND parent_task_id IS NULL
+                  AND state NOT IN (?, ?, ?)
+                ORDER BY
+                    CASE state
+                        WHEN 'queued' THEN 0
+                        WHEN 'running' THEN 1
+                        ELSE 2
+                    END,
+                    updated_at DESC
+                LIMIT 1""",
+                (session_id, *terminal),
+            )
+            row = cur.fetchone()
+            return self._task_row(row) if row else None
+
+    def append_task_turn(self, turn: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO task_turns
+                (id, organization_id, task_id, turn_number, payload, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)""",
                 (
                     turn["id"],
                     turn["organization_id"],
-                    turn["run_id"],
+                    turn["task_id"],
                     turn["turn_number"],
                     _ser(turn),
                     turn["created_at"],
@@ -1712,13 +2193,13 @@ class BrainStore:
         with self.cursor() as cur:
             cur.execute(
                 """INSERT OR REPLACE INTO harness_tool_calls
-                (id, organization_id, run_id, tool_name, status, idempotency_key,
+                (id, organization_id, task_id, tool_name, status, idempotency_key,
                  payload, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     call["id"],
                     call["organization_id"],
-                    call["run_id"],
+                    call["task_id"],
                     call["tool_name"],
                     call["status"],
                     call["idempotency_key"],
@@ -1744,13 +2225,13 @@ class BrainStore:
         with self.cursor() as cur:
             cur.execute(
                 """INSERT OR REPLACE INTO approvals
-                (id, organization_id, run_id, tool_call_id, status, payload,
+                (id, organization_id, task_id, tool_call_id, status, payload,
                  created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     approval["id"],
                     approval["organization_id"],
-                    approval["run_id"],
+                    approval["task_id"],
                     approval["tool_call_id"],
                     approval["status"],
                     _ser(approval),
@@ -1805,14 +2286,14 @@ class BrainStore:
     def insert_intervention(self, intervention: dict[str, Any]) -> None:
         with self.cursor() as cur:
             cur.execute(
-                """INSERT OR REPLACE INTO agent_interventions
-                (id, organization_id, conversation_key, run_id, payload, created_at)
+                """INSERT OR REPLACE INTO task_interventions
+                (id, organization_id, conversation_key, task_id, payload, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)""",
                 (
                     intervention["id"],
                     intervention["organization_id"],
                     intervention["conversation_key"],
-                    intervention["run_id"],
+                    intervention["task_id"],
                     _ser(intervention),
                     intervention["created_at"],
                 ),
@@ -1827,7 +2308,7 @@ class BrainStore:
     ) -> dict[str, Any] | None:
         with self.cursor() as cur:
             cur.execute(
-                """SELECT payload FROM agent_interventions
+                """SELECT payload FROM task_interventions
                 WHERE organization_id = ? AND conversation_key = ? AND created_at >= ?
                 ORDER BY created_at DESC LIMIT 1""",
                 (organization_id, conversation_key, since),
@@ -1865,16 +2346,16 @@ class BrainStore:
                           'docket' AS author,
                           COALESCE(
                               json_extract(d.payload, '$.text'),
-                              json_extract(r.payload, '$.final_answer')
+                              json_extract(t.payload, '$.final_answer')
                           ) AS text,
                           'assistant' AS role
                 FROM deliveries d
-                JOIN agent_runs r ON r.id = d.run_id
+                JOIN tasks t ON t.id = d.task_id
                 WHERE d.organization_id = ?
                   AND d.status IN ('completed', 'dry_run')
                   AND d.idempotency_key LIKE 'slack.%'
-                  AND json_extract(r.payload, '$.metadata.slack.workspace_id') = ?
-                  AND json_extract(r.payload, '$.envelope.destination.id') = ?
+                  AND json_extract(t.payload, '$.metadata.slack.workspace_id') = ?
+                  AND json_extract(t.payload, '$.envelope.destination.id') = ?
                 ORDER BY d.created_at DESC LIMIT ?""",
                 (organization_id, workspace_id, channel_id, fetch_limit),
             )
@@ -1891,13 +2372,13 @@ class BrainStore:
         with self.cursor() as cur:
             cur.execute(
                 """INSERT OR REPLACE INTO deliveries
-                (id, organization_id, run_id, status, idempotency_key, payload,
+                (id, organization_id, task_id, status, idempotency_key, payload,
                  created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     delivery["id"],
                     delivery["organization_id"],
-                    delivery.get("run_id"),
+                    delivery.get("task_id"),
                     delivery["status"],
                     delivery["idempotency_key"],
                     _ser(delivery),
@@ -1905,6 +2386,18 @@ class BrainStore:
                     delivery["updated_at"],
                 ),
             )
+
+    def delivery_by_idempotency_key(
+        self, organization_id: str, idempotency_key: str
+    ) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM deliveries
+                WHERE organization_id = ? AND idempotency_key = ?""",
+                (organization_id, idempotency_key),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
 
     def upsert_simple_harness_record(
         self, table: str, record: dict[str, Any]
@@ -1947,6 +2440,18 @@ class BrainStore:
                 _ser(record),
                 record.get("updated_at") or now,
             )
+        elif table == "roles":
+            sql = """INSERT OR REPLACE INTO roles
+                (id, organization_id, status, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)"""
+            values = (
+                record["id"],
+                record["organization_id"],
+                record.get("status") or "active",
+                _ser(record),
+                record.get("created_at") or now,
+                record.get("updated_at") or now,
+            )
         else:
             raise ValueError(f"no simple upsert mapping for {table}")
         with self.cursor() as cur:
@@ -1955,11 +2460,11 @@ class BrainStore:
     def upsert_harness_projection(
         self, table: str, record: dict[str, Any]
     ) -> None:
-        """Persist common run/workspace/capability projections safely."""
+        """Persist common Task/workspace/capability projections safely."""
         allowed = {
-            "skill_packages", "capabilities", "run_skill_refs",
-            "run_capability_refs", "workspaces", "plans", "specialist_tasks",
-            "handoffs", "automation_watermarks", "run_pattern_signals",
+            "skill_packages", "capabilities", "task_skill_refs",
+            "task_capability_refs", "workspaces", "plans", "automation_watermarks",
+            "task_pattern_signals",
         }
         if table not in allowed:
             raise ValueError(f"unsupported harness projection table: {table}")
@@ -1967,13 +2472,13 @@ class BrainStore:
         with self.cursor() as cur:
             cur.execute(
                 f"""INSERT OR REPLACE INTO {table}
-                (id, organization_id, status, run_id, payload, created_at, updated_at)
+                (id, organization_id, status, task_id, payload, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record["id"],
                     record["organization_id"],
                     record.get("status", "active"),
-                    record.get("run_id"),
+                    record.get("task_id"),
                     _ser(record),
                     record.get("created_at", now),
                     record.get("updated_at", now),
@@ -1982,9 +2487,9 @@ class BrainStore:
 
     def delete_harness_projection(self, table: str, record_id: str) -> None:
         allowed = {
-            "skill_packages", "capabilities", "run_skill_refs",
-            "run_capability_refs", "workspaces", "plans", "specialist_tasks",
-            "handoffs", "automation_watermarks", "run_pattern_signals",
+            "skill_packages", "capabilities", "task_skill_refs",
+            "task_capability_refs", "workspaces", "plans", "automation_watermarks",
+            "task_pattern_signals",
         }
         if table not in allowed:
             raise ValueError(f"unsupported harness projection table: {table}")
@@ -2163,7 +2668,6 @@ class BrainStore:
     ) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc)
         now_s = now.isoformat()
-        expiry = (now + timedelta(seconds=lease_seconds)).isoformat()
         # Selection and claiming are one atomic writer transaction across
         # threads and gateway processes. A competitor waits, then re-runs the
         # query after these rows are no longer eligible.
@@ -2188,6 +2692,12 @@ class BrainStore:
             leased: list[dict[str, Any]] = []
             for row in rows:
                 job = _de(row["payload"])
+                # A job can carry its own lease_seconds override (set at
+                # enqueue time for kinds that drive a full agent loop and can
+                # legitimately outlive the default lease) -- fall back to the
+                # batch-wide default otherwise.
+                row_lease_seconds = int(job.get("lease_seconds") or lease_seconds)
+                expiry = (now + timedelta(seconds=row_lease_seconds)).isoformat()
                 job["status"] = "leased"
                 job["lease_owner"] = worker_id
                 job["lease_expires_at"] = expiry

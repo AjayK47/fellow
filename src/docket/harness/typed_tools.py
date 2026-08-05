@@ -51,9 +51,9 @@ class ArtifactToolBase:
         if (
             scope_id not in allowed
             and not bool((scope or {}).get("is_public"))
-            and artifact.get("run_id") != runtime.get("run_id")
+            and artifact.get("task_id") != runtime.get("task_id")
         ):
-            raise PermissionError("artifact is outside this run's allowed scopes")
+            raise PermissionError("artifact is outside this Task's allowed scopes")
         return artifact
 
     def _bytes(self, artifact_id: str, runtime: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
@@ -94,17 +94,70 @@ class ArtifactToolBase:
             title=title,
             content=content,
             scope_id=self._scope(runtime),
-            run_id=runtime.get("run_id"),
+            task_id=runtime.get("task_id"),
             created_by=(runtime.get("envelope") or {}).get("principal_id"),
             metadata=metadata or {},
         )
-        return {
+        result = {
             "status": "completed",
             "artifact_id": artifact["id"],
             "artifact_type": artifact_type,
             "title": title,
             "version": artifact.get("version", 1),
         }
+        if artifact.get("download_url"):
+            result["download_url"] = artifact["download_url"]
+        return result
+
+
+_NO_ARTIFACT_ID_REQUIRED = {"pdf_create", "docx_create", "xlsx_create", "pptx_create", "html_create"}
+
+# The generic "Typed artifact-only X operation" description said nothing
+# about *when* to reach for one format over another, so the model had no
+# signal beyond the tool name -- it would pick arbitrarily. These five are
+# the ones a request in plain English actually has to choose between.
+_CREATE_DESCRIPTIONS = {
+    "pdf_create": (
+        "Create a PDF artifact from plain text. This is the default, "
+        "preferred format for a finished report, summary, or brief when "
+        "the user hasn't named a specific file format -- prefer this over "
+        "docx_create unless they explicitly ask for something editable. "
+        "The result includes a `download_url` when a public URL is "
+        "configured -- share that exact link verbatim; never construct or "
+        "guess a download URL yourself."
+    ),
+    "docx_create": (
+        "Create an editable Word (.docx) document artifact. Use only when "
+        "the user explicitly asks for Word, DOCX, or an editable document "
+        "-- not the default for an ordinary report (prefer pdf_create for "
+        "that). The result includes a `download_url` when a public URL is "
+        "configured -- share that exact link verbatim; never construct or "
+        "guess a download URL yourself."
+    ),
+    "xlsx_create": (
+        "Create an Excel (.xlsx) spreadsheet artifact from tabular rows. "
+        "Use for structured/tabular data, or when the user explicitly asks "
+        "for Excel or a spreadsheet. The result includes a `download_url` "
+        "when a public URL is configured -- share that exact link "
+        "verbatim; never construct or guess a download URL yourself."
+    ),
+    "pptx_create": (
+        "Create a PowerPoint (.pptx) slide deck artifact. Use only when "
+        "the user explicitly asks for slides, a deck, PowerPoint, or PPT. "
+        "The result includes a `download_url` when a public URL is "
+        "configured -- share that exact link verbatim; never construct or "
+        "guess a download URL yourself."
+    ),
+    "html_create": (
+        "Create a rendered HTML page artifact. Use this when the user "
+        "wants something visually rich (charts, styling, layout) but "
+        "hasn't asked for a specific downloadable file format -- it opens "
+        "directly in the browser from its `download_url`, so present it "
+        "as a link to view, not a file to download. Never construct or "
+        "guess this URL yourself; only ever share the exact `download_url` "
+        "field the tool result returns."
+    ),
+}
 
 
 class DocumentTools(ArtifactToolBase):
@@ -135,6 +188,7 @@ class DocumentTools(ArtifactToolBase):
         "pptx_edit": "pptx",
         "pptx_render": "libreoffice",
         "ocr_extract": "pytesseract",
+        "html_create": "builtins",
     }
 
     def dependency_ready(self, name: str) -> tuple[bool, list[str]]:
@@ -170,22 +224,26 @@ class DocumentTools(ArtifactToolBase):
         for name in all_names:
             ready, missing = self.dependency_ready(name)
             read_only = name.endswith(("_read", "_inspect", "_extract", "_render", "_validate"))
-            required = ["artifact_id"] if name not in {"pdf_create", "docx_create", "xlsx_create", "pptx_create"} else []
+            required = [] if name in _NO_ARTIFACT_ID_REQUIRED else ["artifact_id"]
             if name in {"pdf_merge", "pdf_split"}:
                 required = ["artifact_ids"] if name == "pdf_merge" else ["artifact_id"]
             definitions.append(
                 ToolDefinition(
                     name=name,
-                    description=f"Typed artifact-only {name.replace('_', ' ')} operation.",
+                    description=_CREATE_DESCRIPTIONS.get(name)
+                    or f"Typed artifact-only {name.replace('_', ' ')} operation.",
                     input_schema=_schema(common, required),
                     # A disabled optional runtime cannot execute anything. It
                     # is represented as read/setup-needed in the registry so
                     # policy scanners do not treat an unavailable operation as
                     # an active write surface; readiness flips this to write
-                    # when the dependency is installed.
+                    # when the dependency is installed. Approval gating is no
+                    # longer decided here -- these tools go through the same
+                    # single ToolExecutor.execute() gate (risk tier + the
+                    # ActionReviewer front door) as everything else, instead
+                    # of an independent always-on gate that could (and did)
+                    # silently drift out of sync with the rest of the system.
                     risk="read" if read_only or not ready else "write",
-                    approval_required=not read_only and ready,
-                    approval_mode="on_write" if not read_only and ready else "never",
                     capability_id=self._capability(name),
                     runtime_ready=ready,
                     setup_needed=missing,
@@ -243,6 +301,8 @@ class DocumentTools(ArtifactToolBase):
             return self._pptx_create(arguments, runtime)
         if name == "ocr_extract":
             return self._ocr_extract(arguments, runtime)
+        if name == "html_create":
+            return self._html_create(arguments, runtime)
         # The remaining operations are intentionally typed and can be enabled
         # independently; their handlers return an explicit contract until the
         # optional renderer/editor is installed.
@@ -457,6 +517,18 @@ class DocumentTools(ArtifactToolBase):
         presentation.save(output)
         return self._create(runtime=runtime, artifact_type="document.pptx", title=str(arguments.get("title") or "Generated PowerPoint"), content={"base64": base64.b64encode(output.getvalue()).decode("ascii"), "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}, metadata={"operation": "pptx_create"})
 
+    def _html_create(self, arguments: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        # Plain text content, not base64 -- the download route serves
+        # text/html inline, so the link itself IS the deliverable (opens
+        # as a page in the browser) rather than something to download.
+        return self._create(
+            runtime=runtime,
+            artifact_type="document.html",
+            title=str(arguments.get("title") or "Generated HTML"),
+            content={"text": str(arguments.get("text") or ""), "mime_type": "text/html"},
+            metadata={"operation": "html_create"},
+        )
+
     def _ocr_extract(self, arguments: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
         artifact, payload = self._bytes(arguments["artifact_id"], runtime)
         from PIL import Image  # type: ignore
@@ -500,8 +572,6 @@ class BrowserTools:
                         ["url"] if operation == "navigate" else [],
                     ),
                     risk="write" if write and self._runtime_ready else "read",
-                    approval_required=write and self._runtime_ready,
-                    approval_mode="on_write" if write and self._runtime_ready else "never",
                     capability_id=f"browser.{operation}",
                     runtime_ready=self._runtime_ready,
                     setup_needed=[] if self._runtime_ready else ["playwright", "browser_runtime"],
@@ -516,7 +586,7 @@ class BrowserTools:
         if not self.allowed_domains:
             return {"status": "setup_needed", "required_capabilities": ["browser.allowed_domains"]}
         operation = str(runtime.get("tool_name") or "").removeprefix("browser_")
-        session_id = str(arguments.get("session_id") or runtime.get("run_id") or "")
+        session_id = str(arguments.get("session_id") or runtime.get("task_id") or "")
         try:
             page = self._page(session_id)
         except Exception as exc:
@@ -600,7 +670,7 @@ class BrowserTools:
             title=title,
             content={"base64": base64.b64encode(payload).decode("ascii"), "mime_type": mime_type},
             scope_id=scope_id,
-            run_id=runtime.get("run_id"),
+            task_id=runtime.get("task_id"),
             created_by=envelope["principal_id"],
         )
         return {"status": "completed", "artifact_id": artifact["id"], "mime_type": mime_type}
@@ -629,7 +699,6 @@ class VisionMediaTools(ArtifactToolBase):
                 description="Generate an image artifact with recorded model/prompt provenance.",
                 input_schema=_schema({"prompt": {"type": "string"}, "title": {"type": "string"}}, ["prompt"]),
                 risk="write" if self.image_generation_enabled else "read",
-                approval_required=self.image_generation_enabled,
                 capability_id="image.generate",
                 runtime_ready=self.image_generation_enabled,
                 setup_needed=[] if self.image_generation_enabled else ["image_provider"],

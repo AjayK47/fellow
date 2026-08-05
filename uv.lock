@@ -145,9 +145,16 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "itsdangerous" },
+    { name = "openpyxl" },
+    { name = "pillow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "pymupdf" },
+    { name = "pypdf" },
+    { name = "python-docx" },
+    { name = "python-pptx" },
     { name = "pyyaml" },
+    { name = "reportlab" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
 ]
@@ -160,38 +167,29 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
-documents = [
-    { name = "openpyxl" },
-    { name = "pillow" },
-    { name = "pymupdf" },
-    { name = "pypdf" },
-    { name = "python-docx" },
-    { name = "python-pptx" },
-    { name = "reportlab" },
-]
 
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
-    { name = "openpyxl", marker = "extra == 'documents'", specifier = ">=3.1.0" },
-    { name = "pillow", marker = "extra == 'documents'", specifier = ">=10.0.0" },
+    { name = "openpyxl", specifier = ">=3.1.0" },
+    { name = "pillow", specifier = ">=10.0.0" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.50.0" },
     { name = "pydantic", specifier = ">=2.9.0" },
     { name = "pydantic-settings", specifier = ">=2.6.0" },
-    { name = "pymupdf", marker = "extra == 'documents'", specifier = ">=1.24.0" },
-    { name = "pypdf", marker = "extra == 'documents'", specifier = ">=5.0.0" },
+    { name = "pymupdf", specifier = ">=1.24.0" },
+    { name = "pypdf", specifier = ">=5.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
-    { name = "python-docx", marker = "extra == 'documents'", specifier = ">=1.1.0" },
-    { name = "python-pptx", marker = "extra == 'documents'", specifier = ">=1.0.0" },
+    { name = "python-docx", specifier = ">=1.1.0" },
+    { name = "python-pptx", specifier = ">=1.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "reportlab", marker = "extra == 'documents'", specifier = ">=4.0.0" },
+    { name = "reportlab", specifier = ">=4.0.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
     { name = "websockets", specifier = ">=15.0" },
 ]
-provides-extras = ["dev", "documents", "browser"]
+provides-extras = ["dev", "browser"]
 
 [[package]]
 name = "et-xmlfile"

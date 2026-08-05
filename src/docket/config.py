@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     # Falls back to chat_model (a separate call, not a shared context) when unset.
     tool_output_summary_model: str | None = None
     model_base_url: str = "https://openrouter.ai/api/v1"
-    model_timeout_seconds: float = 90.0
+    model_timeout_seconds: float = 600.0
     # General web research. Search is opt-in because Brave uses a metered API;
     # fetching public pages needs no provider key and remains read-only.
     brave_search_api_key: str | None = Field(
@@ -75,14 +75,38 @@ class Settings(BaseSettings):
     # it runs, and callbacks are restricted to a read-only allow-list
     # re-verified on every call — on by default under those guarantees.
     run_code_enabled: bool = True
-    run_code_timeout_seconds: int = 60
-    run_code_max_tool_calls: int = 20
+    run_code_timeout_seconds: int = 900
+    run_code_max_tool_calls: int = 100
+    # Phase D: full-trust `pi` coding child-worker subprocess. Unlike run_code
+    # this has real network access and no approval gate (see PiTaskExecutor's
+    # hardline floor), so it defaults off and must be explicitly enabled.
+    pi_coding_enabled: bool = False
+    # Phase 5: durable worker_type=pi Task runtime (pi_task_executor.py).
+    # No total wall-clock timeout -- only heartbeat staleness (crash/hang
+    # detection) and the checkpoint interval (periodic Manager judgment
+    # call on a still-running attempt, plan §10.3.1) bound it.
+    pi_checkpoint_interval_seconds: int = 3600
+    pi_stale_heartbeat_seconds: int = 1800
+    pi_poll_interval_seconds: int = 10
+    pi_cancel_grace_seconds: int = 20
     agent_max_iterations: int = 100
     agent_max_tool_calls: int = 150
     agent_context_token_budget: int = 200_000
     agent_max_total_tokens: int = 2_000_000
-    specialist_max_parallel: int = 3
-    specialist_max_depth: int = 1
+    # Output budget for a single model completion in the loop -- distinct
+    # from the input-side context_token_budget above. Too small and a
+    # turn producing several parallel tool calls, or one tool call
+    # embedding a large text argument (e.g. a full document/report body),
+    # gets cut off mid-JSON: unparseable tool arguments, a failed run, and
+    # no way to tell from the error alone whether the model just did too
+    # much in one turn.
+    agent_completion_max_tokens: int = 40_000
+    child_task_max_parallel: int = 3
+    child_task_max_depth: int = 1
+    # A Manager lease is a renewable ownership window, not a runtime limit.
+    # Every reasoning iteration extends it by another hour.
+    session_manager_lease_seconds: int = 3600
+    task_execution_lease_seconds: int = 3600
     browser_enabled: bool = False
     browser_allowed_domains: str = ""
     vision_enabled: bool = False
@@ -148,6 +172,8 @@ class Settings(BaseSettings):
     attention_minimum_confidence: float = 0.72
     proactive_cooldown_seconds: int = 900
     episode_quiet_seconds: int = 300
+    # How often the worker loop ticks scheduled automations.
+    dispatcher_tick_interval_seconds: float = 30.0
 
     @property
     def db_path(self) -> Path:

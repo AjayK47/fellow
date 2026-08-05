@@ -1,4 +1,4 @@
-import { api, Json, ORG, fmt } from "../api";
+import { api, Json, ORG, PRINCIPAL, fmt } from "../api";
 import { useAsync } from "../components";
 import { PageHeader, Section, Card, Empty, Pill } from "../components";
 import { useState } from "react";
@@ -13,14 +13,18 @@ export default function Approvals() {
     [status, tick]
   );
   async function decide(id: string, approved: boolean) {
-    await api.post(`/v1/approvals/${id}:decide`, { approved, decided_by: "console" });
+    // decided_by must be a principal actually in the approval's own
+    // allowed_approver_ids (server checks this and 403s otherwise) --
+    // the literal string "console" never is, so every dashboard decision
+    // used to fail closed regardless of who was signed in.
+    await api.post(`/v1/approvals/${id}:decide`, { approved, decided_by: PRINCIPAL });
     setTick((t) => t + 1);
   }
   return (
     <>
       <PageHeader
         title="Approvals"
-        subtitle="Write actions that paused for human approval. Decide here; the run resumes with the exact (or edited) arguments."
+        subtitle="Write actions that paused for human approval. Decide here; the Task resumes with the exact (or edited) arguments."
         actions={
           <select className="select" value={status} onChange={(e) => setStatus(e.target.value)}>
             <option value="">all</option>
@@ -40,7 +44,7 @@ export default function Approvals() {
               <thead>
                 <tr>
                   <th className="whitespace-nowrap">id</th>
-                  <th className="whitespace-nowrap">run</th>
+                  <th className="whitespace-nowrap">task</th>
                   <th className="whitespace-nowrap">tool</th>
                   <th className="w-full">preview</th>
                   <th className="whitespace-nowrap">status</th>
@@ -54,7 +58,7 @@ export default function Approvals() {
                   return (
                     <tr key={String(ap.id)}>
                       <td>{String(ap.id)}</td>
-                      <td>{String(ap.run_id)}</td>
+                      <td>{String(ap.task_id)}</td>
                       <td>{String(preview.action)}</td>
                       <td>{fmt(preview.description, 100)}</td>
                       <td>

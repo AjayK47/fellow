@@ -31,7 +31,7 @@ def test_readiness_reports_missing_capabilities():
 
 
 def test_empty_database_can_materialize_packages_without_company_data(empty_brain):
-    active = empty_brain.skills.resolve_for_run(
+    active = empty_brain.skills.resolve_for_task(
         organization_id="org_acme",
         task="write a Slack response",
         destination={"type": "dm", "id": "D1", "is_private": True},

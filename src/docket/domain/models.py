@@ -41,7 +41,6 @@ class EntityType(str, Enum):
     ISSUE = "issue"
     DECISION = "decision"
     COMMITMENT = "commitment"
-    AGENT_RUN = "agent_run"
 
 
 class MemoryType(str, Enum):
@@ -118,14 +117,6 @@ class SkillStatus(str, Enum):
     DEPRECATED = "deprecated"
 
 
-class RunStatus(str, Enum):
-    STARTED = "started"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
 class SignalType(str, Enum):
     VERIFIED_MISSING_ANSWER = "verified_missing_answer"
     VERIFIED_CORRECTION = "verified_correction"
@@ -163,6 +154,7 @@ class Organization(BaseModel):
     id: str
     name: str
     region: str = "us-east-1"
+    about: str = ""
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -328,22 +320,6 @@ class Skill(BaseModel):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
-class TaskRun(BaseModel):
-    id: str = Field(default_factory=lambda: new_id("run"))
-    organization_id: str
-    task: str
-    acting_principal_id: str
-    harness_id: str
-    skill_id: str | None = None
-    target_entity_ids: list[str] = Field(default_factory=list)
-    status: RunStatus = RunStatus.STARTED
-    summary: str | None = None
-    outcome: str | None = None
-    started_at: datetime = Field(default_factory=utcnow)
-    completed_at: datetime | None = None
-    events: list[dict[str, Any]] = Field(default_factory=list)
-
-
 class Signal(BaseModel):
     id: str = Field(default_factory=lambda: new_id("sig"))
     organization_id: str
@@ -394,6 +370,7 @@ class ContextPackage(BaseModel):
     request_id: str = Field(default_factory=lambda: new_id("ctx"))
     permission_decision_id: str
     viewer: dict[str, Any] = Field(default_factory=dict)
+    organization_about: str = ""
     destination: dict[str, Any] = Field(default_factory=dict)
     task: dict[str, Any] = Field(default_factory=dict)
     summary: str = ""

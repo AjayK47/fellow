@@ -2,13 +2,13 @@
 
 Docket is a company-wide agent harness: one accountable main agent can
 observe organizational events, retrieve permission-safe company context,
-reason with tools, create bounded specialist workers, request approval for
+reason with tools, create bounded child Tasks, request approval for
 writes, and preserve what happened as durable organizational memory.
 
 It is not a collection of permanent autonomous agents. Slack, connectors,
 automations, and direct API requests all enter the same tenant-aware runtime.
-The main agent owns the response; specialist workers are ephemeral,
-read-only, and return evidence to their parent.
+The Session Manager owns the response; child Tasks are durable, independently
+leased workers that return evidence to their parent Task.
 
 SQLite is the definitive database for this implementation. Relational state,
 graph nodes and edges, FTS5 indexes, embedding vectors, temporal facts, cases,
@@ -42,15 +42,15 @@ flowchart LR
 
     subgraph Harness["Agent harness"]
         Attention["Retrieval-first attention"]
-        Main["Main agent model-tool loop"]
-        Specialists["Bounded specialist workers"]
+        Main["Session Manager model-tool loop"]
+        ChildTasks["General and Pi child Tasks"]
         Policy["Policies, approvals, preconditions"]
         Delivery["Permission-checked delivery"]
     end
 
     subgraph Durable["Durable execution"]
-        Runs["Runs, turns, messages, checkpoints"]
-        Signals["Atomically-claimed run signals"]
+        Tasks["Sessions, Tasks, turns, messages, checkpoints"]
+        Signals["Atomically-claimed Task signals"]
         Jobs["Leased background jobs"]
         Artifacts["Reports and worker artifacts"]
         Audit["Audit and evaluation"]
@@ -60,10 +60,10 @@ flowchart LR
         Console["Docket Console — React SPA"]
     end
 
-    Console -->|same /v1 API as any client| Runs
+    Console -->|same /v1 API as any client| Tasks
     Console --> Policy
     Console --> Jobs
-    Runs --> Signals
+    Tasks --> Signals
 
     Slack --> Verify
     Composio --> Verify
@@ -82,14 +82,14 @@ flowchart LR
     Cases --> Attention
     Judgment --> Attention
     Attention --> Main
-    Main <--> Specialists
+    Main <--> ChildTasks
     Main <--> Policy
     Main --> Delivery
-    Main --> Runs
-    Specialists --> Artifacts
+    Main --> Tasks
+    ChildTasks --> Artifacts
     Jobs --> Evidence
     Jobs --> Judgment
-    Runs --> Audit
+    Tasks --> Audit
     Delivery --> Audit
 ```
 
@@ -99,21 +99,21 @@ flowchart LR
 |---|---|---|
 | Gateways | Slack Events API, Socket Mode, Composio webhooks, direct events | `harness/slack.py`, `slack_socket.py`, `harness/composio.py`, `api/routes.py` |
 | Authorization | Principal, destination, membership, and scope resolution | `services/authorization.py` |
-| Agent runtime | Bounded model → tool → observation loop and resumable states | `harness/runtime.py`, `harness/run_store.py`, `harness/prompts.py` |
+| Agent runtime | Resumable Session Manager and Task model → tool → observation loop | `harness/runtime.py`, `harness/task_run_store.py`, `harness/prompts.py` |
 | Tools and actions | Capability-aware schemas, readiness, policy checks, previews, approvals, idempotency | `harness/tools.py`, `harness/typed_tools.py`, `services/policy.py` |
-| Skill packages | Immutable file-backed `SKILL.md` procedures, provenance, readiness, and run-level pinning | `services/skill_packages.py`, `builtin_skills/`, `services/skills.py` |
-| Specialists | Parallel read-only child runs with inherited scopes, durable task/handoff records, and budgets | `harness/specialists.py`, `services/workspaces.py` |
-| Retrieval | Permission-filtered lexical, FTS5, vector, graph, fact, case, and run context | `services/retrieval.py`, `services/context.py` |
+| Skill packages | Immutable file-backed `SKILL.md` procedures, provenance, readiness, and Task-level pinning | `services/skill_packages.py`, `builtin_skills/`, `services/skills.py` |
+| Child Tasks | Parallel general or Pi Tasks with inherited scopes and durable attempts | `harness/child_tasks.py`, `harness/child_task_executor.py`, `services/workspaces.py` |
+| Retrieval | Permission-filtered lexical, FTS5, vector, graph, fact, case, and Task context | `services/retrieval.py`, `services/context.py` |
 | Reality | Connector objects, identity resolution, temporal facts, conflicts, and cases | `services/reality.py` |
 | Memory | Atomic memories, temporal revisions, relations, profiles, and extraction | `services/memory.py`, `harness/extraction.py`, `harness/memory_capture.py` |
 | Proactivity | Retrieval-first attention followed by deterministic delivery policy | `harness/attention.py`, `services/proactive.py` |
 | Durability | SQLite state, leased jobs, retries, artifacts, traces, and audit | `storage/db.py`, `harness/jobs.py`, `harness/worker.py`, `services/artifacts.py` |
-| Console | Operator-facing React SPA: dashboard, run/approval/job inspection, per-tool policy, skill draft approval, automation authoring, and a force-directed graph explorer | `web/src/` |
+| Console | Operator-facing React SPA: dashboard, Session/Task/approval/job inspection, per-tool policy, skill draft approval, automation authoring, and a force-directed graph explorer | `web/src/` |
 
 Built-in and connector procedures are not database-only rows. The authoritative
 content lives in validated `src/docket/builtin_skills/**/SKILL.md` packages.
 SQLite materializes a tenant-aware index so company skills can be reset or
-versioned independently. Each run resolves mandatory destination skills and
+versioned independently. Each Task resolves mandatory destination skills and
 relevant optional skills, checks declared capabilities, and pins the package
 hash and instructions into its trace. Use `GET /v1/skills/catalog` to inspect
 the package inventory and readiness; the Skills console shows the same view.
@@ -130,20 +130,18 @@ same schema-validated, policy-checked, audit-logged call as any other client.
 
 Pages are organized by what they let an operator do, not by data source:
 
-- **Dashboard** — active runs, pending approvals, and a permission-scoped
+- **Dashboard** — active Tasks, pending approvals, and a permission-scoped
   activity feed, refreshed on a short poll rather than a push channel.
 - **Sessions / Session detail** — the primary way to browse conversations. A
   session is one conversation key (a Slack DM, channel, or thread) — there is
   no user-facing "start a new session" action, since a session begins
   implicitly the first time someone messages Docket there and every
   subsequent message in that same place reuses it. Session detail shows the
-  full cross-run transcript plus the list of runs it contains, since one
-  session commonly spans several runs over time. `GET /v1/sessions` and
+  full transcript plus the list of Tasks it contains, since one
+  session commonly spans several Tasks over time. `GET /v1/sessions` and
   `GET /v1/sessions/{id}` back this view.
-- **Runs / Run detail** — still reachable (`/runs/:runId`, linked from session
-  detail), for inspecting a single run's turns (model request/response with
-  tool calls and token usage), resolved skills and capabilities, workspace,
-  artifacts, and specialist handoffs.
+- **Tasks / Task detail** — inspect a single Task's turns, tool calls, token
+  usage, resolved skills, workspace, artifacts, attempts, and child Tasks.
 - **Approvals / Tools** — decide pending write approvals; set each tool's
   organization policy to allow, always ask for approval, or forbid outright.
   Write-risk tools always require approval regardless of this setting — the
@@ -176,10 +174,10 @@ Pages are organized by what they let an operator do, not by data source:
    retrieval-based attention and proactive policy.
 6. Retrieval is authorized before search and again before delivery.
 7. The main agent may query memory, use connected tools, or delegate distinct
-   read-only investigations to up to three specialists.
+   independent investigations to up to three child Tasks.
 8. Writes require schema validation, policy permission, an approval preview,
    and optional external-state revalidation immediately before execution.
-9. Runs, tool results, judgments, artifacts, and post-run memories are
+9. Sessions, Tasks, tool results, judgments, artifacts, and post-Task memories are
    persisted for later retrieval.
 
 ### Memory and company reality
@@ -208,7 +206,7 @@ The harness deliberately keeps several related representations:
   unrelated duplicates, and guidance is ranked by semantic and lexical
   relevance to the current task plus recency — not returned in a flat,
   insertion-ordered list.
-- **Artifacts** preserve durable reports and specialist results.
+- **Artifacts** preserve durable reports and child Task results.
 
 Every representation retains organization and scope boundaries. Retrieval is
 always performed for an acting principal and destination.
@@ -225,24 +223,24 @@ always performed for an acting principal and destination.
   checkpoints, resumable human waits, and token/tool/time budgets.
   Abort/steer interrupts are claimed from a dedicated table with the same
   atomic immediate-transaction pattern used for job leasing, so a signal sent
-  mid-iteration can't be silently overwritten by the run's own checkpoint
+  mid-iteration can't be silently overwritten by the Task's own checkpoint
   write. Exact-duplicate `(tool, arguments)` calls within a single model turn
   are dropped before execution — a model occasionally requests the identical
   call twice, which otherwise burns real tool-call budget for zero new
   information (ported from Hermes's `_deduplicate_tool_calls`)
-- A self-improvement pass after every reactive/proactive run: goals are
-  compared by embedding similarity against other recently completed runs —
-  something no single run's own in-task reasoning has visibility into, since
+- A self-improvement pass after every reactive/proactive Task: prompts are
+  compared by embedding similarity against other recently completed Tasks —
+  something no single Task's own reasoning has visibility into, since
   it only ever sees itself. Detection is pure embedding comparison, no LLM
   call, so it doesn't add to the tool/model call volume it exists to reduce;
   once a pattern repeats often enough to not be a coincidence, it's drafted
   as a skill for human review, never auto-approved
-- A React/Vite/Tailwind operator console served by the same process: run and
+- A React/Vite/Tailwind operator console served by the same process: Task and
   approval inspection, per-tool allow/ask-approval/forbid policy, skill draft
   approval, cron or interval automation authoring, live setup forms for the
   model provider/web tools/Slack, and a force-directed graph explorer — all
   calling the same policy-checked, audit-logged API as any other client
-- Dynamic specialist workers with inherited scopes, maximum depth one,
+- Dynamic general and Pi child Tasks with inherited scopes, maximum depth one,
   parallelism limits, and durable result artifacts. A worker's tool set is
   whatever the delegating task explicitly named — including write tools —
   not forced read-only; a write call still pauses for the same approval it
@@ -254,18 +252,18 @@ always performed for an acting principal and destination.
 - 44 immutable Hermes-adapted skill packages with YAML frontmatter, provenance,
   readiness checks, progressive body loading, Slack response validation, and
   company-skill draft/approval workflows
-- Root-confined per-run workspace list/search/read/write/patch/diff tools,
-  session search, durable run plans, explicit Slack actions, and approval-gated
+- Root-confined per-Task workspace list/search/read/write/patch/diff tools,
+  session search, durable Task plans, explicit Slack actions, and approval-gated
   automation management
-- Capability registry and per-run capability/tool references; typed PDF,
+- Capability registry and per-Task capability/tool references; typed PDF,
   DOCX, XLSX, PPTX, OCR, browser, vision, and image contracts report
   `setup_needed` when optional runtimes are absent instead of accepting
   arbitrary paths or shell commands
 - Immutable package security scanning, package indexes, workspace expiry and
-  scope ownership, specialist handoff review, and a run inspector exposing
-  skills, capabilities, workspaces, plans, specialists, and artifacts
+  scope ownership, and a Task inspector exposing skills, capabilities,
+  workspaces, plans, child Tasks, and artifacts
 - Permission-filtered hybrid retrieval across evidence, memories, FTS5,
-  embeddings, graph relationships, temporal facts, cases, profiles, and runs
+  embeddings, graph relationships, temporal facts, cases, profiles, and Tasks
 - Canonical versioned connector objects, per-stream sync cursors, cross-tool
   identifiers, temporal facts, contradiction handling, case correlation, and
   judgment memory. Entity resolution is tiered rather than one flat fuzzy
@@ -413,8 +411,8 @@ DOCKET_AGENT_MAX_TOOL_CALLS=24
 DOCKET_AGENT_CONTEXT_TOKEN_BUDGET=12000
 DOCKET_AGENT_MAX_TOTAL_TOKENS=100000
 
-DOCKET_SPECIALIST_MAX_PARALLEL=3
-DOCKET_SPECIALIST_MAX_DEPTH=1
+DOCKET_CHILD_TASK_MAX_PARALLEL=3
+DOCKET_CHILD_TASK_MAX_DEPTH=1
 
 DOCKET_WORKER_ENABLED=true
 DOCKET_WORKER_POLL_INTERVAL_SECONDS=0.5
@@ -425,20 +423,16 @@ DOCKET_PROACTIVE_COOLDOWN_SECONDS=900
 DOCKET_EPISODE_QUIET_SECONDS=300
 ```
 
-Specialists are additionally capped per task by iterations, tool calls, token
+Child Tasks are additionally capped per Task by iterations, tool calls, token
 budget, and deadline, and can never delegate further regardless of what a
 direct or malformed model call requests — delegation depth is capped at one
 independently of tool access. A worker can be granted a write tool by the
 delegating task, but that write still requires the same human approval any
 main-agent write would need.
 
-**Known limitation:** approving a write that a specialist is waiting on does
-not currently resume that specialist run — nothing re-invokes it after the
-approval is decided, so the worker stays parked in
-`waiting_for_approval` and its result artifact says so explicitly rather
-than silently returning an empty finding. Treat specialist write access as
-useful for actions a human is watching and will approve promptly, not yet
-for unattended multi-step specialist work.
+Approving a write wakes the waiting Task, revalidates its external preconditions,
+and executes it once. If a precondition is stale, the Task remains parked with
+an explicit failure rather than silently applying an outdated write.
 
 ## Slack setup
 
@@ -597,10 +591,10 @@ Authentication is intentionally outside the current implementation. Until an
 identity layer is added, expose these administrative APIs only on a trusted
 network.
 
-## Invoke the agent
+## Invoke a Session Manager Task
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/agent/invoke \
+curl -s http://127.0.0.1:8080/v1/tasks/invoke \
   -H 'content-type: application/json' \
   -d '{
     "organization_id": "org_acme",
@@ -611,7 +605,7 @@ curl -s http://127.0.0.1:8080/v1/agent/invoke \
       "id": "demo",
       "is_private": true
     },
-    "goal": "Who owns the export worker, what happened recently, and what should we do next?",
+    "prompt": "Who owns the export worker, what happened recently, and what should we do next?",
     "run_now": true
   }'
 ```
@@ -619,7 +613,7 @@ curl -s http://127.0.0.1:8080/v1/agent/invoke \
 Inspect the resulting execution with:
 
 ```text
-GET /v1/agent/runs/{run_id}
+GET /v1/tasks/{task_id}?organization_id=org_acme
 GET /v1/approvals
 GET /v1/harness/jobs
 GET /v1/audit/events

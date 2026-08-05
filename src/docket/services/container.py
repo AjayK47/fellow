@@ -6,6 +6,7 @@ from pathlib import Path
 import json
 
 from docket.config import settings
+from docket.domain.models import new_id
 from docket.services.audit import AuditService
 from docket.services.authorization import AuthorizationService
 from docket.services.context import ContextService
@@ -20,7 +21,6 @@ from docket.services.profiles import ProfilesService
 from docket.services.retrieval import RetrievalService
 from docket.services.retention import RetentionService
 from docket.services.web_tools import WebTools
-from docket.services.runs import RunsService
 from docket.services.skills import SkillsService
 from docket.services.skill_packages import SkillPackageCatalog
 from docket.services.workspaces import WorkspaceService
@@ -40,15 +40,20 @@ from docket.harness.jobs import JobQueue
 from docket.harness.memory_capture import HarnessMemoryCapture
 from docket.harness.model_client import build_model_clients
 from docket.harness.router import EventRouter
-from docket.harness.run_store import AgentRunStore
 from docket.harness.runtime import CompanyAgent
 from docket.harness.slack import SlackGateway, SlackSender
 from docket.harness.skill_validation import SkillResponseValidator
 from docket.harness.tool_output_summary import ToolOutputSummarizer
+from docket.harness.action_review import ActionReviewer
 from docket.harness.tools import ToolExecutor, ToolDefinition, build_tool_registry
 from docket.harness.typed_tools import BrowserTools, DocumentTools, VisionMediaTools
 from docket.harness.worker import HarnessWorker
-from docket.harness.specialists import SpecialistWorkerService
+from docket.harness.child_tasks import ChildTaskService
+from docket.harness.child_task_executor import ChildTaskExecutor
+from docket.harness.pi_task_executor import PiTaskExecutor
+from docket.harness.session_manager import SessionManagerScheduler
+from docket.harness.sessions import SessionService
+from docket.harness.task_run_store import TaskRunStore
 
 
 class DocketApp:
@@ -93,7 +98,6 @@ class DocketApp:
             self.audit,
             package_catalog=self.skill_packages,
         )
-        self.runs = RunsService(self.store, self.graph, self.audit)
         self.signals = SignalsService(self.store, self.graph, self.audit)
         self.proactive = ProactiveService(
             self.store, self.authz, self.retrieval, self.graph, self.audit, self.signals
@@ -110,7 +114,6 @@ class DocketApp:
         self.harness_jobs = JobQueue(
             self.store, lease_seconds=runtime_settings.worker_lease_seconds
         )
-        self.agent_runs = AgentRunStore(self.store)
         self.composio = ComposioClient(
             api_key=runtime_settings.composio_api_key,
             base_url=runtime_settings.composio_base_url,
@@ -168,10 +171,15 @@ class DocketApp:
             document_tools=self.document_tools,
             browser_tools=self.browser_tools,
             vision_tools=self.vision_tools,
+            audit=self.audit,
         )
         self.tool_output_summarizer = ToolOutputSummarizer(
             model=self.tool_output_summary_model
         )
+        # Reuses the same small/cheap model client as tool-output
+        # summarization rather than provisioning a new one -- both are
+        # low-stakes, structured, single-purpose auxiliary calls.
+        self.action_reviewer = ActionReviewer(model=self.tool_output_summary_model)
         self.tool_executor = ToolExecutor(
             self.store,
             self.tool_registry,
@@ -180,66 +188,118 @@ class DocketApp:
             reality=self.reality,
             artifacts=self.artifacts,
             output_summarizer=self.tool_output_summarizer,
+            action_reviewer=self.action_reviewer,
         )
         self.history_compactor = HistoryCompactor(model=self.extraction_model)
         self.skill_response_validator = SkillResponseValidator(
             model=self.extraction_model
         )
-        self.company_agent = CompanyAgent(
-            runs=self.agent_runs,
-            context_service=self.context,
-            model=self.main_model,
-            tools=self.tool_executor,
-            skills=self.skills,
-            skill_validator=self.skill_response_validator,
-            audit=self.audit,
-            enqueue_job=self.harness_jobs.enqueue,
-            graph=self.graph,
-            history_compactor=self.history_compactor,
-            workspaces=self.workspaces,
-            max_iterations=runtime_settings.agent_max_iterations,
-            max_tool_calls=runtime_settings.agent_max_tool_calls,
-            context_token_budget=runtime_settings.agent_context_token_budget,
-            max_total_tokens=runtime_settings.agent_max_total_tokens,
+        # Every executor gets a fresh TaskRunStore bound to its own lease
+        # owner. The public agent is only a dependency bundle; Session Manager
+        # and child execution create their own bound instance below.
+        def _task_agent_factory(runs: TaskRunStore) -> CompanyAgent:
+            return CompanyAgent(
+                runs=runs,
+                context_service=self.context,
+                model=getattr(getattr(self, "company_agent", None), "model", self.main_model),
+                tools=self.tool_executor,
+                skills=self.skills,
+                skill_validator=self.skill_response_validator,
+                audit=self.audit,
+                enqueue_job=self.harness_jobs.enqueue,
+                graph=self.graph,
+                history_compactor=self.history_compactor,
+                workspaces=self.workspaces,
+                max_iterations=runtime_settings.agent_max_iterations,
+                max_tool_calls=runtime_settings.agent_max_tool_calls,
+                context_token_budget=runtime_settings.agent_context_token_budget,
+                max_total_tokens=runtime_settings.agent_max_total_tokens,
+                completion_max_tokens=runtime_settings.agent_completion_max_tokens,
+            )
+
+        self.company_agent = _task_agent_factory(
+            TaskRunStore(
+                self.store,
+                owner=new_id("agent"),
+                lease_seconds=runtime_settings.worker_lease_seconds,
+            )
         )
-        self.specialists = SpecialistWorkerService(
-            agent=self.company_agent,
+
+        self.sessions = SessionService(
+            store=self.store, audit=self.audit, queue=self.harness_jobs
+        )
+        self.session_manager = SessionManagerScheduler(
+            store=self.store,
+            authz=self.authz,
+            sessions=self.sessions,
+            agent_factory=_task_agent_factory,
+            lease_seconds=runtime_settings.session_manager_lease_seconds,
+            task_lease_seconds=runtime_settings.task_execution_lease_seconds,
+        )
+        self.child_tasks = ChildTaskService(
+            store=self.store,
+            queue=self.harness_jobs,
+            audit=self.audit,
+            max_parallel=runtime_settings.child_task_max_parallel,
+            max_depth=runtime_settings.child_task_max_depth,
+        )
+        self.tool_registry.register(
+            self.child_tasks.tool_definition(), self.child_tasks.execute
+        )
+        self.tool_registry.register(
+            self.child_tasks.tool_definition_manage(), self.child_tasks.manage
+        )
+        self.tool_registry.register(
+            self.child_tasks.tool_definition_wait(), self.child_tasks.wait
+        )
+        self.tool_registry.register(
+            self.child_tasks.tool_definition_start_root(), self.child_tasks.start_root
+        )
+        self.pi_task_executor = PiTaskExecutor(
+            store=self.store,
+            sessions=self.sessions,
+            workspaces=self.workspaces,
             artifacts=self.artifacts,
             audit=self.audit,
-            max_parallel=runtime_settings.specialist_max_parallel,
-            max_depth=runtime_settings.specialist_max_depth,
+            checkpoint_interval_seconds=runtime_settings.pi_checkpoint_interval_seconds,
+            stale_heartbeat_seconds=runtime_settings.pi_stale_heartbeat_seconds,
+            poll_interval_seconds=runtime_settings.pi_poll_interval_seconds,
+            cancel_grace_seconds=runtime_settings.pi_cancel_grace_seconds,
         )
-        self.tool_registry.register(
-            self.specialists.tool_definition(), self.specialists.execute
+        self.child_task_executor = ChildTaskExecutor(
+            store=self.store,
+            queue=self.harness_jobs,
+            sessions=self.sessions,
+            agent_factory=_task_agent_factory,
+            # Only wire Pi when the actual `pi` CLI is expected to be present.
+            # worker_type="pi" children fail closed with a clear error
+            # otherwise (ChildTaskExecutor.run), never silently no-op.
+            pi_executor=self.pi_task_executor if runtime_settings.pi_coding_enabled else None,
         )
-        self.tool_registry.register(
-            self.specialists.tool_definition().model_copy(
-                update={
-                    "name": "delegate_task",
-                    "description": "Delegate bounded specialist tasks with explicit scopes, capabilities, budgets, and handoff contracts.",
-                }
-            ),
-            self.specialists.execute,
-        )
+        # Back-references for code built before pi_task_executor existed --
+        # same circular-ish ordering already worked around for
+        # company_agent/child tasks above.
+        self.sessions.pi_executor = self.child_task_executor.pi_executor
+        self.child_tasks.pi_executor = self.child_task_executor.pi_executor
+
         self.attention = AttentionPipeline(
             store=self.store,
             retrieval=self.retrieval,
             model=self.attention_model,
-            agent=self.company_agent,
             queue=self.harness_jobs,
             audit=self.audit,
             config=runtime_settings,
+            sessions=self.sessions,
         )
         self.event_router = EventRouter(
             store=self.store,
             ingestion=self.ingestion,
-            retrieval=self.retrieval,
-            agent=self.company_agent,
             attention=self.attention,
             queue=self.harness_jobs,
             audit=self.audit,
             graph=self.graph,
             config=runtime_settings,
+            sessions=self.sessions,
         )
         self.slack_gateway = SlackGateway(
             store=self.store,
@@ -247,6 +307,7 @@ class DocketApp:
             graph=self.graph,
             config=runtime_settings,
             audit=self.audit,
+            sessions=self.sessions,
         )
         self.model_memory_extractor = ModelMemoryExtractor(
             model=self.extraction_model,
@@ -272,18 +333,22 @@ class DocketApp:
             queue=self.harness_jobs,
             router=self.event_router,
             attention=self.attention,
-            agent=self.company_agent,
             memory_capture=self.harness_memory,
             delivery=self.delivery,
             indexing=self.indexing,
             profiles=self.profiles,
             batch_size=runtime_settings.worker_batch_size,
             concurrency=runtime_settings.worker_concurrency,
+            store=self.store,
+            task_agent_factory=_task_agent_factory,
+            session_manager=self.session_manager,
+            sessions=self.sessions,
         )
+        self.harness_worker.register("task.run_child", self.child_task_executor.run)
+        self.harness_worker.register("task.pi_poll", self.child_task_executor.poll_pi)
         self.automations = AutomationService(
             store=self.store,
-            authz=self.authz,
-            agent=self.company_agent,
+            sessions=self.sessions,
             queue=self.harness_jobs,
             audit=self.audit,
         )
@@ -305,7 +370,7 @@ class DocketApp:
         self.tool_registry.register(
             ToolDefinition(
                 name="automation_create",
-                description="Create a durable scheduled agent run after approval.",
+                description="Create a durable scheduled Task after approval.",
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -358,6 +423,7 @@ class DocketApp:
                 _automation_owned(args["automation_id"], runtime["organization_id"])["id"]
             ),
         )
+
         self.harness_worker.register(
             "automations.tick",
             lambda payload: self.automations.tick(payload.get("organization_id")),

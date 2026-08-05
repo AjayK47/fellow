@@ -34,6 +34,32 @@ def test_prepare_context_structured_and_budgeted(brain):
     assert data["summary"]
 
 
+def test_prepare_context_surfaces_the_org_about_field(brain):
+    org = brain.store.get_organization("org_acme")
+    org["about"] = "Acme builds export tooling for logistics companies."
+    brain.store.put_organization(org)
+
+    pkg = brain.context.prepare_context(
+        organization_id="org_acme",
+        task="anything",
+        acting_principal_id="person_ajay",
+        destination={"type": "internal_agent_session", "id": "session_1", "is_private": True},
+        purpose="reactive_agent",
+    )
+    assert pkg.organization_about == "Acme builds export tooling for logistics companies."
+
+
+def test_prepare_context_org_about_defaults_to_empty_string(brain):
+    pkg = brain.context.prepare_context(
+        organization_id="org_acme",
+        task="anything",
+        acting_principal_id="person_ajay",
+        destination={"type": "internal_agent_session", "id": "session_1", "is_private": True},
+        purpose="reactive_agent",
+    )
+    assert pkg.organization_about == ""
+
+
 def test_resolve_owner_includes_evidence(brain):
     result = brain.context.resolve_owner(
         organization_id="org_acme",

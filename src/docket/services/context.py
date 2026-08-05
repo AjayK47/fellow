@@ -207,12 +207,12 @@ class ContextService:
                 )
         relevant_skills.sort(key=lambda skill: skill["score"], reverse=True)
 
-        active_runs: list[dict[str, Any]] = []
+        active_tasks: list[dict[str, Any]] = []
         session_id = (conversation or {}).get("session_id")
         if session_id:
-            active = self.store.active_run_for_session(session_id)
+            active = self.store.find_root_task_for_session(session_id)
             if active:
-                active_runs.append(
+                active_tasks.append(
                     {
                         "id": active["id"],
                         "state": active["state"],
@@ -275,12 +275,14 @@ class ContextService:
                 if key in {"current_facts", "issues", "decisions"} and item.get("content"):
                     summary_bits.append(str(item["content"])[:120])
 
+        organization = self.store.get_organization(organization_id)
         package = ContextPackage(
             permission_decision_id=decision_id,
             viewer={
                 "person_id": acting_principal_id,
                 "organization_id": organization_id,
             },
+            organization_about=(organization or {}).get("about") or "",
             destination=(
                 destination.model_dump(mode="json")
                 if isinstance(destination, Destination)
@@ -303,7 +305,7 @@ class ContextService:
             skills=budgeted["skills"][:10],
             recent_events=budgeted["related_messages"][:8],
             related_messages=budgeted["related_messages"][:12],
-            active_runs=active_runs,
+            active_tasks=active_tasks,
             active_cases=active_cases[:10],
             judgment_guidance=judgment_guidance[:10],
             warnings=[],

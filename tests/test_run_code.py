@@ -214,7 +214,7 @@ def test_run_code_end_to_end_calls_back_into_a_real_read_tool(brain):
         "principal_id": "person_ajay",
         "destination": {"type": "internal_agent_session", "id": "test", "is_private": True},
         "purpose": "reactive_agent",
-        "run_id": "arun_test_run_code",
+        "task_id": "task_test_run_code",
     }
     script = (
         "import docket_tools\n"

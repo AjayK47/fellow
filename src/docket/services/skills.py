@@ -199,7 +199,7 @@ class SkillsService:
             raise RuntimeError("The mandatory Slack communication skill is not approved")
         return materialized
 
-    def resolve_for_run(
+    def resolve_for_task(
         self,
         *,
         organization_id: str,

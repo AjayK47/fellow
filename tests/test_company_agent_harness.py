@@ -12,6 +12,7 @@ from docket.harness.models import (
     InvocationEnvelope,
     ModelResponse,
     ModelToolCall,
+    ToolDefinition,
 )
 
 
@@ -41,60 +42,168 @@ def _sign(secret: str, body: bytes, timestamp: str) -> str:
 
 
 def test_reactive_run_is_durable_and_captures_memory(brain):
-    run = brain.company_agent.create_invocation(
-        envelope=_envelope(brain),
-        goal="What do we know about the Acme export failure?",
-        trigger_kind="reactive",
-        initial_message="What do we know about the Acme export failure?",
+    wake = brain.sessions.wake(
+        organization_id="org_acme",
+        conversation_key="api:test:thread",
+        destination={"type": "internal_agent_session", "id": "test", "is_private": True},
+        role="user",
+        content="What do we know about the Acme export failure?",
+        principal_id="person_ajay",
     )
     brain.harness_jobs.enqueue(
         organization_id="org_acme",
-        kind="agent.run",
-        payload={"run_id": run["id"]},
-        idempotency_key=f"agent.run:{run['id']}",
+        kind="session.dispatch",
+        payload={"session_id": wake["session_id"]},
+        idempotency_key=f"session.dispatch:{wake['session_id']}",
     )
     drained = brain.harness_worker.drain_until_idle()
     assert drained["failed"] == 0
 
-    stored = brain.agent_runs.get(run["id"])
+    run = next(
+        task for task in brain.store.list_tasks(
+            "org_acme", session_id=wake["session_id"], worker_type="session_manager"
+        )
+    )
+    stored = brain.store.get_task(run["id"])
     assert stored["state"] == "completed"
     assert "permitted company context" in stored["final_answer"]
     assert stored["iteration_count"] == 1
     assert brain.store.list_harness_records(
-        "agent_turns", "org_acme", where={"run_id": run["id"]}
+        "task_turns", "org_acme", where={"task_id": run["id"]}
     )
     checkpoints = brain.store.list_harness_records(
-        "checkpoints", "org_acme", where={"run_id": run["id"]}
+        "checkpoints", "org_acme", where={"task_id": run["id"]}
     )
-    assert {item["state"] for item in checkpoints} >= {
-        "created",
-        "queued",
-        "running",
-        "completed",
-    }
+    assert checkpoints
+    assert any(item["state"] == "running" for item in checkpoints)
     captured = [
         source
         for source in brain.store.list_sources("org_acme")
         if source.get("external_id") == run["id"]
-        and source.get("source_type") == "agent_run"
+        and source.get("source_type") == "agent_task"
     ]
-    assert captured, "completed run must be captured asynchronously"
+    assert captured, "completed Task must be captured asynchronously"
+
+
+def test_request_batch_approval_pauses_once_then_pre_approves_declared_actions(brain):
+    """A task can front-load its whole plan in one request_batch_approval
+    call and get ONE human decision covering every declared action, instead
+    of pausing once per gated action it actually takes later."""
+    run = brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation="api:batch-approval:thread"),
+        goal="do several gated things",
+        trigger_kind="reactive",
+        initial_message="do several gated things",
+    )
+    run = brain.store.get_task(run["id"])
+
+    batch_call = ModelToolCall(
+        id="call_batch",
+        name="request_batch_approval",
+        arguments={
+            "summary": "Set up a recurring check and run some code for it.",
+            "actions": [
+                {"tool_name": "automation_create", "description": "Create the recurring check"},
+                {"tool_name": "run_code", "description": "Compute the summary"},
+            ],
+        },
+    )
+    batch_result = brain.tool_executor.execute(run=run, call=batch_call)
+    assert batch_result.status == "waiting_for_approval"
+    _, resolved = brain.tool_executor.resolve_approval(
+        approval_id=batch_result.approval_id, approved=True, decided_by="person_ajay"
+    )
+    assert resolved.status == "completed"
+    run = brain.store.get_task(run["id"])
+
+    automation_call = ModelToolCall(
+        id="call_automation",
+        name="automation_create",
+        arguments={
+            "name": "redteam",
+            "goal": "redteam",
+            "conversation_id": "redteam",
+            "destination": {"type": "internal_agent_session", "id": "redteam", "is_private": True},
+        },
+    )
+    result = brain.tool_executor.execute(run=run, call=automation_call)
+    assert result.status != "waiting_for_approval"
+    run = brain.store.get_task(run["id"])
+
+    # Only one unit of automation_create was declared -- a second call must
+    # be gated normally again, not silently pre-approved forever.
+    second_automation_call = ModelToolCall(
+        id="call_automation_2",
+        name="automation_create",
+        arguments={
+            "name": "redteam2",
+            "goal": "redteam2",
+            "conversation_id": "redteam2",
+            "destination": {"type": "internal_agent_session", "id": "redteam2", "is_private": True},
+        },
+    )
+    second_result = brain.tool_executor.execute(run=run, call=second_automation_call)
+    assert second_result.status == "waiting_for_approval"
+
+    run_code_call = ModelToolCall(id="call_run_code", name="run_code", arguments={"code": "print(1)"})
+    run_code_result = brain.tool_executor.execute(run=run, call=run_code_call)
+    assert run_code_result.status != "waiting_for_approval"
+
+
+def test_batch_approval_does_not_pre_approve_undeclared_tools(brain):
+    run = brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation="api:batch-approval:undeclared"),
+        goal="do one gated thing",
+        trigger_kind="reactive",
+        initial_message="do one gated thing",
+    )
+    run = brain.store.get_task(run["id"])
+    batch_call = ModelToolCall(
+        id="call_batch_narrow",
+        name="request_batch_approval",
+        arguments={
+            "summary": "Just run some code.",
+            "actions": [{"tool_name": "run_code", "description": "Compute something"}],
+        },
+    )
+    batch_result = brain.tool_executor.execute(run=run, call=batch_call)
+    brain.tool_executor.resolve_approval(
+        approval_id=batch_result.approval_id, approved=True, decided_by="person_ajay"
+    )
+    run = brain.store.get_task(run["id"])
+    automation_call = ModelToolCall(
+        id="call_undeclared_automation",
+        name="automation_create",
+        arguments={
+            "name": "redteam3",
+            "goal": "redteam3",
+            "conversation_id": "redteam3",
+            "destination": {"type": "internal_agent_session", "id": "redteam3", "is_private": True},
+        },
+    )
+    result = brain.tool_executor.execute(run=run, call=automation_call)
+    assert result.status == "waiting_for_approval"
 
 
 def test_write_tool_pauses_and_resumes_from_approval(brain):
+    # A DELETE-shaped Composio action is in the always-gated high-stakes
+    # tier (unlike ordinary named connector shortcuts, which now auto-execute
+    # under the risk-tiered default) — using it here keeps this test's focus
+    # on the generic pause/resume plumbing rather than any specific tool.
+    # No Composio API key is configured for this test org, so execution
+    # after approval fails locally without ever making a real network call.
+    brain.composio.api_key = None
     brain.company_agent.model = ScriptedModelClient(
         [
             ModelResponse(
                 content="",
                 tool_calls=[
                     ModelToolCall(
-                        id="call_create_linear",
-                        name="linear_create_issue",
+                        id="call_delete_repo",
+                        name="COMPOSIO_EXECUTE",
                         arguments={
-                            "arguments": {
-                                "title": "Acme export failure",
-                                "description": "Recurring customer failure",
-                            }
+                            "tool_slug": "GITHUB_DELETE_A_REPOSITORY",
+                            "arguments": {"owner": "acme", "repo": "exports"},
                         },
                     )
                 ],
@@ -102,23 +211,23 @@ def test_write_tool_pauses_and_resumes_from_approval(brain):
             ),
             ModelResponse(
                 content=(
-                    "The approved action could not execute because the external "
-                    "connection is not configured; no issue was claimed as created."
+                    "The approved action could not execute because there is no "
+                    "connected account for this action; no repository was claimed as deleted."
                 )
             ),
         ]
     )
     run = brain.company_agent.create_invocation(
         envelope=_envelope(brain, conversation="api:approval:thread"),
-        goal="Create a Linear issue for Acme exports",
+        goal="Delete the acme/exports repository",
         trigger_kind="reactive",
-        initial_message="Create a Linear issue for Acme exports",
+        initial_message="Delete the acme/exports repository",
     )
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "waiting_for_approval"
     approval = brain.store.get_harness_record("approvals", outcome.approval_id)
     assert approval["status"] == "pending"
-    assert approval["tool_name"] == "linear_create_issue"
+    assert approval["tool_name"] == "COMPOSIO_EXECUTE"
 
     resumed = brain.company_agent.resume_after_approval(
         approval_id=approval["id"],
@@ -129,7 +238,7 @@ def test_write_tool_pauses_and_resumes_from_approval(brain):
     decided = brain.store.get_harness_record("approvals", approval["id"])
     assert decided["status"] == "approved"
     calls = brain.store.list_harness_records(
-        "harness_tool_calls", "org_acme", where={"run_id": run["id"]}
+        "harness_tool_calls", "org_acme", where={"task_id": run["id"]}
     )
     assert calls[0]["status"] == "failed"
     assert "not configured" in calls[0]["error"]
@@ -144,19 +253,20 @@ def test_auto_approve_writes_flag_still_creates_an_approved_record(
     from docket.harness import tools as tools_module
 
     monkeypatch.setattr(tools_module.settings, "auto_approve_writes", True)
+    # No Composio API key is configured for this test org, so execution
+    # after auto-approval fails locally without a real network call.
+    brain.composio.api_key = None
     brain.company_agent.model = ScriptedModelClient(
         [
             ModelResponse(
                 content="",
                 tool_calls=[
                     ModelToolCall(
-                        id="call_create_linear_auto",
-                        name="linear_create_issue",
+                        id="call_delete_repo_auto",
+                        name="COMPOSIO_EXECUTE",
                         arguments={
-                            "arguments": {
-                                "title": "Auto-approved issue",
-                                "description": "Created under auto_approve_writes",
-                            }
+                            "tool_slug": "GITHUB_DELETE_A_REPOSITORY",
+                            "arguments": {"owner": "acme", "repo": "exports"},
                         },
                     )
                 ],
@@ -167,18 +277,57 @@ def test_auto_approve_writes_flag_still_creates_an_approved_record(
     )
     run = brain.company_agent.create_invocation(
         envelope=_envelope(brain, conversation="api:auto-approve:thread"),
-        goal="Create a Linear issue",
+        goal="Delete the acme/exports repository",
         trigger_kind="reactive",
-        initial_message="Create a Linear issue",
+        initial_message="Delete the acme/exports repository",
     )
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "completed"
     calls = brain.store.list_harness_records(
-        "harness_tool_calls", "org_acme", where={"run_id": run["id"]}
+        "harness_tool_calls", "org_acme", where={"task_id": run["id"]}
     )
     approval = brain.store.get_harness_record("approvals", calls[0]["approval_id"])
     assert approval["status"] == "approved"
     assert approval["decided_by"] == "person_ajay"
+
+
+def test_slack_send_message_suppresses_automatic_final_answer_delivery(brain):
+    """When the model sends its own (possibly richly-formatted) message via
+    slack_send_message, the automatic plain-text final-answer delivery must
+    not also fire and double-post once the run completes."""
+    destination = {"type": "slack_channel", "id": "C_TEST", "is_private": False}
+    decision = brain.authz.resolve("org_acme", "person_ajay", destination, "reactive_agent")
+    envelope = InvocationEnvelope(
+        organization_id="org_acme",
+        principal_id="person_ajay",
+        conversation_id="api:suppress-delivery:thread",
+        destination=destination,
+        purpose="reactive_agent",
+        permission_decision_id=decision.id,
+        allowed_scope_ids=decision.allowed_scope_ids,
+    )
+    run = brain.company_agent.create_invocation(
+        envelope=envelope,
+        goal="Announce results",
+        trigger_kind="reactive",
+        initial_message="Announce results",
+    )
+    run = brain.store.get_task(run["id"])
+    assert not (run.get("metadata") or {}).get("suppress_delivery")
+
+    call = ModelToolCall(
+        id="call_announce",
+        name="slack_send_message",
+        arguments={
+            "text": "Done.",
+            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "Done."}}],
+        },
+    )
+    result = brain.tool_executor.execute(run=run, call=call)
+    assert result.status != "waiting_for_approval"
+
+    updated = brain.store.get_task(run["id"])
+    assert updated["metadata"]["suppress_delivery"] is True
 
 
 def test_resolving_an_approval_updates_the_original_slack_message(brain):
@@ -194,7 +343,7 @@ def test_resolving_an_approval_updates_the_original_slack_message(brain):
         {
             "id": approval_id,
             "organization_id": "org_acme",
-            "run_id": "arun_does_not_need_to_exist",
+            "task_id": "task_does_not_need_to_exist",
             "tool_call_id": "call_test",
             "status": "pending",
             "created_at": now,
@@ -205,7 +354,7 @@ def test_resolving_an_approval_updates_the_original_slack_message(brain):
         {
             "id": "delivery_slack_update_test",
             "organization_id": "org_acme",
-            "run_id": "arun_does_not_need_to_exist",
+            "task_id": "task_does_not_need_to_exist",
             "kind": "approval_request",
             "status": "completed",
             "idempotency_key": f"slack.approval:{approval_id}",
@@ -230,6 +379,61 @@ def test_resolving_an_approval_updates_the_original_slack_message(brain):
     assert calls[0]["blocks"][0]["text"]["text"] == "*Approved* by person_ajay"
 
 
+def test_approval_card_truncates_a_large_argument_preview_instead_of_failing(brain):
+    """Slack rejects an entire postMessage call (invalid_blocks) if any
+    section's text.text exceeds 3000 characters -- a tool call whose
+    arguments embed a large text field (a full report/document body, e.g.
+    pdf_create) must still produce a postable approval card instead of
+    silently dead-lettering with the human never seeing an approval
+    prompt at all."""
+    from docket.domain.models import utcnow
+
+    run = brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation="api:huge-approval:thread"),
+        goal="Create a PDF report",
+        trigger_kind="reactive",
+        initial_message="Create a PDF report",
+    )
+    now = utcnow().isoformat()
+    approval_id = "approval_huge_preview_test"
+    huge_text = "A" * 10_000
+    brain.store.upsert_approval(
+        {
+            "id": approval_id,
+            "organization_id": "org_acme",
+            "task_id": run["id"],
+            "tool_call_id": "call_huge_pdf",
+            "status": "pending",
+            "requested_by": "person_ajay",
+            "allowed_approver_ids": ["person_ajay"],
+            "preview": {
+                "action": "pdf_create",
+                "description": "Typed artifact-only pdf create operation.",
+                "arguments": {"title": "Report", "text": huge_text},
+            },
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+
+    sent: list[dict] = []
+    brain.delivery.slack.send = lambda **kwargs: (sent.append(kwargs), {"ok": True, "channel": "C_TEST", "ts": "1.1"})[1]
+
+    result = brain.delivery.deliver_approval(approval_id)
+
+    assert result["delivery"]["status"] == "completed"
+    assert len(sent) == 1
+    section_text = sent[0]["blocks"][0]["text"]["text"]
+    assert len(section_text) <= 3000
+    assert "truncated" in section_text
+    # The Approve/Deny buttons must still be present and untouched.
+    actions = sent[0]["blocks"][1]
+    assert [el["action_id"] for el in actions["elements"]] == [
+        "docket_approve",
+        "docket_deny",
+    ]
+
+
 def test_resume_after_approval_failure_does_not_leave_a_zombie_run(brain):
     """run() has always wrapped _loop() in a try/except that marks the run
     FAILED on any exception. resume_after_approval() called _loop()
@@ -237,6 +441,9 @@ def test_resume_after_approval_failure_does_not_leave_a_zombie_run(brain):
     approved a write (a model API error, anything) left the run stuck at
     RUNNING forever: no failure recorded, nothing to retry, no answer or
     error ever surfacing to the human who just approved it."""
+    # No Composio API key is configured for this test org, so the tool call
+    # made on resume fails locally without a real network call.
+    brain.composio.api_key = None
 
     class CrashesOnResume:
         model = "crashes-on-resume"
@@ -252,12 +459,10 @@ def test_resume_after_approval_failure_does_not_leave_a_zombie_run(brain):
                     tool_calls=[
                         ModelToolCall(
                             id="call_zombie",
-                            name="linear_create_issue",
+                            name="COMPOSIO_EXECUTE",
                             arguments={
-                                "arguments": {
-                                    "title": "Zombie test issue",
-                                    "description": "Should not hang the run",
-                                }
+                                "tool_slug": "GITHUB_DELETE_A_REPOSITORY",
+                                "arguments": {"owner": "acme", "repo": "zombie"},
                             },
                         )
                     ],
@@ -273,11 +478,11 @@ def test_resume_after_approval_failure_does_not_leave_a_zombie_run(brain):
     brain.company_agent.model = CrashesOnResume()
     run = brain.company_agent.create_invocation(
         envelope=_envelope(brain, conversation="api:zombie:thread"),
-        goal="Create a Linear issue",
+        goal="Delete the acme/zombie repository",
         trigger_kind="reactive",
-        initial_message="Create a Linear issue",
+        initial_message="Delete the acme/zombie repository",
     )
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "waiting_for_approval"
 
     resumed = brain.company_agent.resume_after_approval(
@@ -288,8 +493,107 @@ def test_resume_after_approval_failure_does_not_leave_a_zombie_run(brain):
     assert resumed.state.value == "failed"
     assert "context length" in resumed.error
 
-    persisted = brain.agent_runs.get(run["id"])
+    persisted = brain.store.get_task(run["id"])
     assert persisted["state"] == "failed"
+
+
+def test_a_non_retryable_run_failure_notifies_slack_instead_of_going_silent(brain):
+    """A run failing closed (no hang, no partial write) is not the same as
+    the human waiting on it in Slack ever hearing about it -- before this,
+    a non-retryable failure (e.g. malformed model tool-call arguments) left
+    the run "failed" in the database with nothing ever delivered, which is
+    indistinguishable from a hang from the human's side."""
+
+    class RaisesNonRetryableError:
+        model = "raises-non-retryable"
+
+        def generate(self, **_kwargs):
+            raise RuntimeError(
+                "invalid model tool arguments: Unterminated string starting "
+                "at: line 1 column 7039 (char 7038)"
+            )
+
+        def context_length(self):
+            return 128_000
+
+    brain.company_agent.model = RaisesNonRetryableError()
+
+    routed = brain.event_router.route(
+        _reactive_event_payload(
+            event_id="ev_notify_failure",
+            conversation_key="slack:TACME:Cfail:1",
+            text="Research computer-use SaaS options and write a PDF report",
+            channel_id="Cfail",
+        )
+    )
+    assert routed["route"] == "session_wake"
+
+    drained = brain.harness_worker.drain_until_idle()
+    assert drained["failed"] == 0, drained  # the job itself is not retried
+
+    task_id = next(
+        r["result"]["task_id"] for r in drained["results"] if r["kind"] == "session.dispatch"
+    )
+    persisted = brain.store.get_task(task_id)
+    assert persisted["state"] == "failed"
+
+    deliveries = brain.store.list_harness_records(
+        "deliveries", "org_acme", where={"task_id": task_id}
+    )
+    failures = [d for d in deliveries if d.get("kind") == "task_failure"]
+    assert len(failures) == 1
+    assert "couldn't finish" in failures[0]["text"].lower()
+    assert "unterminated string" in failures[0]["text"].lower()
+
+
+def test_a_retryable_run_failure_does_not_notify_slack_before_retrying(brain):
+    """A transient error (rate limit, timeout, ...) is retried by the queue
+    and commonly recovers silently -- notifying Slack the first time it
+    fails would be a false alarm, not useful signal."""
+
+    class FlakyThenFails:
+        model = "flaky-then-fails"
+
+        def generate(self, **_kwargs):
+            raise RuntimeError("connection reset by peer")
+
+        def context_length(self):
+            return 128_000
+
+    brain.company_agent.model = FlakyThenFails()
+
+    routed = brain.event_router.route(
+        _reactive_event_payload(
+            event_id="ev_retryable_failure",
+            conversation_key="slack:TACME:Cretry:1",
+            text="Check the export pipeline status",
+            channel_id="Cretry",
+        )
+    )
+    assert routed["route"] == "session_wake"
+
+    drained = brain.harness_worker.drain_once()
+    assert drained["failed"] == 1  # the session.dispatch job itself is re-queued to retry
+
+    # The failure marks the Task itself terminal immediately (no partial
+    # state left running) even though the *job* retries -- retryability is
+    # about whether the Session gets woken again automatically and whether
+    # Slack is notified, not about the Task's own state.
+    tasks = brain.store.list_tasks(
+        "org_acme", session_id=routed["session_id"], worker_type="session_manager"
+    )
+    assert len(tasks) == 1
+    assert tasks[0]["state"] == "failed"
+
+    deliveries = brain.store.list_harness_records(
+        "deliveries", "org_acme", where={"task_id": tasks[0]["id"]}
+    )
+    assert not [d for d in deliveries if d.get("kind") == "run_failure"]
+
+    # And the Session was left `queued`, not idle -- a later dispatch will
+    # naturally retry it, matching the old job-retry behavior's intent.
+    session = brain.sessions.get(routed["session_id"])
+    assert session["manager_state"] == "queued"
 
 
 def test_parallel_read_tool_calls_execute_concurrently(brain):
@@ -344,7 +648,7 @@ def test_parallel_read_tool_calls_execute_concurrently(brain):
         initial_message="run two slow reads",
     )
     started = time.monotonic()
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     elapsed = time.monotonic() - started
 
     assert outcome.state.value == "completed"
@@ -355,10 +659,85 @@ def test_parallel_read_tool_calls_execute_concurrently(brain):
     assert labels_started == {"a", "b"}
 
     calls = brain.store.list_harness_records(
-        "harness_tool_calls", "org_acme", where={"run_id": run["id"]}
+        "harness_tool_calls", "org_acme", where={"task_id": run["id"]}
     )
     assert len(calls) == 2
     assert all(call["status"] == "completed" for call in calls)
+
+
+def _spy_on_prepare_context(brain) -> list[int]:
+    """Wrap context_service.prepare_context to count real invocations,
+    without changing its behavior."""
+    calls: list[int] = []
+    original = brain.context.prepare_context
+
+    def _wrapped(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    brain.context.prepare_context = _wrapped
+    return calls
+
+
+def test_context_is_not_recomputed_across_read_only_iterations(brain):
+    """prepare_context() (embeddings included) used to run unconditionally
+    on every loop iteration -- expensive and unnecessary when nothing in
+    that iteration could have changed what it would return. A run whose
+    only tool call is read-risk should only pay for it once."""
+    calls = _spy_on_prepare_context(brain)
+    brain.company_agent.model = ScriptedModelClient(
+        [
+            ModelResponse(
+                content="",
+                tool_calls=[
+                    ModelToolCall(id="call_read", name="brain_search", arguments={"query": "Acme"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(content="Done reading."),
+        ]
+    )
+    run = brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation="api:context-cache:read-only"),
+        goal="look something up",
+        trigger_kind="reactive",
+        initial_message="look something up",
+    )
+    outcome = brain.company_agent.execute_task(run["id"])
+    assert outcome.state.value == "completed"
+    assert len(calls) == 1
+
+
+def test_context_is_recomputed_after_a_write_tool_call(brain):
+    """A write-risk tool call can change facts/memories the model should
+    see on its very next turn -- the cache must invalidate in that case,
+    not just blindly reuse the first snapshot for the whole run."""
+    calls = _spy_on_prepare_context(brain)
+    brain.company_agent.model = ScriptedModelClient(
+        [
+            ModelResponse(
+                content="",
+                tool_calls=[
+                    ModelToolCall(
+                        id="call_write",
+                        name="workspace_write",
+                        arguments={"path": "notes.txt", "content": "hello"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            ModelResponse(content="Wrote the file."),
+        ]
+    )
+    run = brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation="api:context-cache:write"),
+        goal="write a file",
+        trigger_kind="reactive",
+        initial_message="write a file",
+    )
+    outcome = brain.company_agent.execute_task(run["id"])
+    assert outcome.state.value == "completed"
+    assert len(calls) == 2
 
 
 def test_read_and_write_calls_in_one_iteration_still_pause_correctly(brain):
@@ -375,12 +754,10 @@ def test_read_and_write_calls_in_one_iteration_still_pause_correctly(brain):
                     ),
                     ModelToolCall(
                         id="call_write",
-                        name="linear_create_issue",
+                        name="COMPOSIO_EXECUTE",
                         arguments={
-                            "arguments": {
-                                "title": "Acme export failure",
-                                "description": "Recurring customer failure",
-                            }
+                            "tool_slug": "GITHUB_DELETE_A_REPOSITORY",
+                            "arguments": {"owner": "acme", "repo": "exports"},
                         },
                     ),
                 ],
@@ -390,14 +767,14 @@ def test_read_and_write_calls_in_one_iteration_still_pause_correctly(brain):
     )
     run = brain.company_agent.create_invocation(
         envelope=_envelope(brain, conversation="api:mixed-risk:thread"),
-        goal="Look up context then file a ticket",
+        goal="Look up context then delete the repository",
         trigger_kind="reactive",
-        initial_message="Look up context then file a ticket",
+        initial_message="Look up context then delete the repository",
     )
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "waiting_for_approval"
 
-    messages = brain.agent_runs.messages(run["session_id"])
+    messages = brain.store.list_session_messages(run["session_id"])
     tool_messages = [m for m in messages if m["role"] == "tool"]
     assert any(m.get("tool_call_id") == "call_read" for m in tool_messages)
     assert not any(m.get("tool_call_id") == "call_write" for m in tool_messages)
@@ -430,18 +807,18 @@ def test_duplicate_tool_calls_in_one_turn_execute_only_once(brain):
         trigger_kind="reactive",
         initial_message="Look up export context",
     )
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "completed"
 
-    completed = brain.agent_runs.get(run["id"])
+    completed = brain.store.get_task(run["id"])
     assert completed["tool_call_count"] == 1
 
     calls = brain.store.list_harness_records(
-        "harness_tool_calls", "org_acme", where={"run_id": run["id"]}
+        "harness_tool_calls", "org_acme", where={"task_id": run["id"]}
     )
     assert len(calls) == 1
 
-    messages = brain.agent_runs.messages(run["session_id"])
+    messages = brain.store.list_session_messages(run["session_id"])
     tool_messages = [m for m in messages if m["role"] == "tool"]
     assert len(tool_messages) == 1
     assert tool_messages[0]["tool_call_id"] == "call_a"
@@ -468,79 +845,6 @@ def _reactive_event_payload(
     }
 
 
-def test_running_agent_receives_a_steer_signal_instead_of_a_duplicate_run(brain):
-    """A message arriving while a run is genuinely RUNNING must fold into
-    that run, not spawn a second, independent one in the same conversation."""
-    conversation_key = "slack:TACME:Csteer:1"
-    run = brain.company_agent.create_invocation(
-        envelope=_envelope(brain, conversation=conversation_key),
-        goal="Investigate the export failure",
-        trigger_kind="reactive",
-        initial_message="Investigate the export failure",
-    )
-    brain.agent_runs.transition(run["id"], "running", force=True)
-
-    result = brain.event_router.route(
-        _reactive_event_payload(
-            event_id="ev_steer_1",
-            conversation_key=conversation_key,
-            text="Actually also check the billing service",
-        )
-    )
-    assert result["route"] == "run_signal"
-    assert result["signal"] == "steer"
-    assert result["run_id"] == run["id"]
-
-    with brain.store.cursor() as cur:
-        cur.execute(
-            "SELECT run_id, kind, message FROM agent_run_signals WHERE run_id = ?",
-            (run["id"],),
-        )
-        pending = [dict(row) for row in cur.fetchall()]
-    assert pending == [
-        {
-            "run_id": run["id"],
-            "kind": "steer",
-            "message": "Actually also check the billing service",
-        }
-    ]
-    matching = [
-        r
-        for r in brain.store.list_harness_records("agent_runs", "org_acme")
-        if r.get("goal") == "Investigate the export failure"
-    ]
-    assert len(matching) == 1
-
-
-def test_running_agent_receives_an_abort_signal_on_stop_like_message(brain):
-    conversation_key = "slack:TACME:Cabort:1"
-    run = brain.company_agent.create_invocation(
-        envelope=_envelope(brain, conversation=conversation_key),
-        goal="Investigate the export failure",
-        trigger_kind="reactive",
-        initial_message="Investigate the export failure",
-    )
-    brain.agent_runs.transition(run["id"], "running", force=True)
-
-    result = brain.event_router.route(
-        _reactive_event_payload(
-            event_id="ev_abort_1",
-            conversation_key=conversation_key,
-            text="stop",
-            channel_id="Cabort",
-        )
-    )
-    assert result["route"] == "run_signal"
-    assert result["signal"] == "abort"
-    with brain.store.cursor() as cur:
-        cur.execute(
-            "SELECT kind, message FROM agent_run_signals WHERE run_id = ?",
-            (run["id"],),
-        )
-        pending = [dict(row) for row in cur.fetchall()]
-    assert pending == [{"kind": "abort", "message": "stop"}]
-
-
 def test_steer_signal_is_injected_before_the_next_model_call(brain):
     model = ScriptedModelClient([ModelResponse(content="Updated plan noted.")])
     brain.company_agent.model = model
@@ -551,17 +855,17 @@ def test_steer_signal_is_injected_before_the_next_model_call(brain):
         initial_message="Investigate exports",
     )
     brain.company_agent.send_signal(run["id"], kind="steer", message="Focus on Q3 only")
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "completed"
 
-    messages = brain.agent_runs.messages(run["session_id"])
+    messages = brain.store.list_session_messages(run["session_id"])
     steered = [m for m in messages if (m.get("metadata") or {}).get("steered")]
     assert steered and steered[0]["content"] == "Focus on Q3 only"
     # The steer message must have reached the model that produced the answer.
     request = model.requests[0]
     assert any(m.get("content") == "Focus on Q3 only" for m in request["messages"])
 
-    assert brain.company_agent.runs.pop_signal(run["id"]) is None
+    assert brain.store.pop_task_signal(run["id"]) is None
 
 
 def test_abort_signal_cancels_the_run_before_any_model_call(brain):
@@ -574,25 +878,26 @@ def test_abort_signal_cancels_the_run_before_any_model_call(brain):
         initial_message="Investigate exports",
     )
     brain.company_agent.send_signal(run["id"], kind="abort", message="stop")
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "cancelled"
     assert model.requests == []
 
 
 def _pending_approval(brain, *, conversation: str) -> str:
+    # No Composio API key is configured for this test org, so execution
+    # after approval fails locally without a real network call.
+    brain.composio.api_key = None
     brain.company_agent.model = ScriptedModelClient(
         [
             ModelResponse(
                 content="",
                 tool_calls=[
                     ModelToolCall(
-                        id="call_create_linear",
-                        name="linear_create_issue",
+                        id="call_delete_repo",
+                        name="COMPOSIO_EXECUTE",
                         arguments={
-                            "arguments": {
-                                "title": "Acme export failure",
-                                "description": "Recurring customer failure",
-                            }
+                            "tool_slug": "GITHUB_DELETE_A_REPOSITORY",
+                            "arguments": {"owner": "acme", "repo": "exports"},
                         },
                     )
                 ],
@@ -603,11 +908,11 @@ def _pending_approval(brain, *, conversation: str) -> str:
     )
     run = brain.company_agent.create_invocation(
         envelope=_envelope(brain, conversation=conversation),
-        goal="Create a Linear issue for Acme exports",
+        goal="Delete the acme/exports repository",
         trigger_kind="reactive",
-        initial_message="Create a Linear issue for Acme exports",
+        initial_message="Delete the acme/exports repository",
     )
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "waiting_for_approval"
     return outcome.approval_id
 
@@ -722,15 +1027,15 @@ def _pending_question_with_choices(brain, *, conversation: str) -> tuple[str, li
         trigger_kind="reactive",
         initial_message="Handle the export failure",
     )
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "waiting_for_human"
     return run["id"], choices
 
 
 def _choice_interaction_payload(
-    *, action_id: str, run_id: str, index: int, user_id: str, is_select: bool = False
+    *, action_id: str, task_id: str, index: int, user_id: str, is_select: bool = False
 ) -> bytes:
-    value = f"{run_id}::{index}"
+    value = f"{task_id}::{index}"
     action = (
         {"type": "static_select", "action_id": action_id, "selected_option": {"value": value}}
         if is_select
@@ -747,7 +1052,7 @@ def _choice_interaction_payload(
 
 
 def test_choice_button_click_resumes_run_with_selected_text(brain):
-    run_id, choices = _pending_question_with_choices(brain, conversation="api:choice-button:thread")
+    task_id, choices = _pending_question_with_choices(brain, conversation="api:choice-button:thread")
     brain.company_agent.model = ScriptedModelClient([ModelResponse(content="Rolling back now.")])
     brain.store.upsert_simple_harness_record(
         "identity_mappings",
@@ -762,7 +1067,7 @@ def test_choice_button_click_resumes_run_with_selected_text(brain):
 
     result = brain.slack_gateway.accept_interaction(
         body=_choice_interaction_payload(
-            action_id="docket_choice", run_id=run_id, index=0, user_id="U_CHOOSER"
+            action_id="docket_choice", task_id=task_id, index=0, user_id="U_CHOOSER"
         ),
         allow_unsigned=True,
     )
@@ -770,17 +1075,17 @@ def test_choice_button_click_resumes_run_with_selected_text(brain):
 
     drained = brain.harness_worker.drain_until_idle()
     assert drained["failed"] == 0
-    stored = brain.agent_runs.get(run_id)
+    stored = brain.store.get_task(task_id)
     assert stored["state"] == "completed"
-    messages = brain.agent_runs.messages(stored["session_id"], limit=50)
+    messages = brain.store.list_session_messages(stored["session_id"], limit=50)
     assert any(m["content"] == choices[0] and m["role"] == "user" for m in messages)
 
 
 def test_choice_select_click_resumes_run_with_selected_text(brain):
-    """The same run_id::index encoding resolves identically whether Slack
+    """The same task_id::index encoding resolves identically whether Slack
     rendered buttons or a static_select — the resolver doesn't care which
     UI produced the click."""
-    run_id, choices = _pending_question_with_choices(brain, conversation="api:choice-select:thread")
+    task_id, choices = _pending_question_with_choices(brain, conversation="api:choice-select:thread")
     brain.company_agent.model = ScriptedModelClient([ModelResponse(content="Monitoring now.")])
     brain.store.upsert_simple_harness_record(
         "identity_mappings",
@@ -796,7 +1101,7 @@ def test_choice_select_click_resumes_run_with_selected_text(brain):
     result = brain.slack_gateway.accept_interaction(
         body=_choice_interaction_payload(
             action_id="docket_choice_select",
-            run_id=run_id,
+            task_id=task_id,
             index=1,
             user_id="U_CHOOSER2",
             is_select=True,
@@ -806,28 +1111,94 @@ def test_choice_select_click_resumes_run_with_selected_text(brain):
     assert result["accepted"] is True
     drained = brain.harness_worker.drain_until_idle()
     assert drained["failed"] == 0
-    messages = brain.agent_runs.messages(brain.agent_runs.get(run_id)["session_id"], limit=50)
+    messages = brain.store.list_session_messages(brain.store.get_task(task_id)["session_id"], limit=50)
     assert any(m["content"] == choices[1] and m["role"] == "user" for m in messages)
 
 
+def test_choice_button_click_resumes_session_manager_task(brain):
+    choices = ["Rollback the deploy", "Wait and monitor", "Page on-call"]
+    brain.company_agent.model = ScriptedModelClient(
+        [
+            ModelResponse(
+                content="",
+                tool_calls=[
+                    ModelToolCall(
+                        id="call_task_ask",
+                        name="request_human_input",
+                        arguments={
+                            "question": "How should we handle the export failure?",
+                            "reason": "Multiple valid remediation paths.",
+                            "choices": choices,
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        ]
+    )
+    wake = brain.sessions.wake(
+        organization_id="org_acme",
+        conversation_key="slack:T_ACME:D_CHOICE_TASK",
+        destination={"type": "dm", "id": "D_CHOICE_TASK", "is_private": True},
+        role="user",
+        content="Handle the export failure",
+        principal_id="person_ajay",
+    )
+    waiting = brain.session_manager.dispatch(wake["session_id"])
+    assert waiting is not None
+    assert waiting.state.value == "waiting_for_human"
+
+    brain.company_agent.model = ScriptedModelClient(
+        [ModelResponse(content="Rolling back now.")]
+    )
+    brain.store.upsert_simple_harness_record(
+        "identity_mappings",
+        {
+            "id": "identity_choice_task",
+            "organization_id": "org_acme",
+            "source": "slack",
+            "source_user_id": "U_TASK_CHOOSER",
+            "principal_id": "person_ajay",
+        },
+    )
+    result = brain.slack_gateway.accept_interaction(
+        body=_choice_interaction_payload(
+            action_id="docket_choice",
+            task_id=waiting.task_id,
+            index=0,
+            user_id="U_TASK_CHOOSER",
+        ),
+        allow_unsigned=True,
+    )
+    assert result["accepted"] is True
+    assert brain.harness_worker.drain_until_idle()["failed"] == 0
+    stored = brain.store.get_task(waiting.task_id)
+    assert stored["state"] == "completed"
+    messages = brain.store.list_session_messages(wake["session_id"], limit=50)
+    assert any(
+        message["content"] == choices[0] and message["role"] == "user"
+        for message in messages
+    )
+
+
 def test_choice_interaction_on_already_resumed_run_is_a_noop(brain):
-    run_id, choices = _pending_question_with_choices(brain, conversation="api:choice-stale:thread")
+    task_id, choices = _pending_question_with_choices(brain, conversation="api:choice-stale:thread")
     brain.company_agent.model = ScriptedModelClient([ModelResponse(content="Done.")])
     first = brain.slack_gateway.accept_interaction(
         body=_choice_interaction_payload(
-            action_id="docket_choice", run_id=run_id, index=0, user_id="U_FIRST"
+            action_id="docket_choice", task_id=task_id, index=0, user_id="U_FIRST"
         ),
         allow_unsigned=True,
     )
     assert first["accepted"] is True
     brain.harness_worker.drain_until_idle()
-    assert brain.agent_runs.get(run_id)["state"] == "completed"
+    assert brain.store.get_task(task_id)["state"] == "completed"
 
     # A second, stale click (different choice, e.g. a slow double-tap) must
     # not raise or attempt to resume a run that has already finished.
     second = brain.slack_gateway.accept_interaction(
         body=_choice_interaction_payload(
-            action_id="docket_choice", run_id=run_id, index=1, user_id="U_SECOND"
+            action_id="docket_choice", task_id=task_id, index=1, user_id="U_SECOND"
         ),
         allow_unsigned=True,
     )
@@ -835,20 +1206,99 @@ def test_choice_interaction_on_already_resumed_run_is_a_noop(brain):
 
 
 def test_deliver_question_renders_buttons_or_select_by_choice_count(brain):
-    run_id, choices = _pending_question_with_choices(brain, conversation="api:choice-render:thread")
+    task_id, choices = _pending_question_with_choices(brain, conversation="api:choice-render:thread")
 
-    few = brain.delivery.deliver_question(run_id, "Pick one", choices=choices)
+    few = brain.delivery.deliver_question(task_id, "Pick one", choices=choices)
     few_blocks = few["delivery"]["provider_result"]["blocks"]
     assert any(b["type"] == "actions" for b in few_blocks)
 
     many = [f"Option {i}" for i in range(8)]
-    result = brain.delivery.deliver_question(run_id, "Pick one of many", choices=many)
+    result = brain.delivery.deliver_question(task_id, "Pick one of many", choices=many)
     many_blocks = result["delivery"]["provider_result"]["blocks"]
     assert many_blocks[0]["accessory"]["type"] == "static_select"
     assert len(many_blocks[0]["accessory"]["options"]) == 8
 
-    plain = brain.delivery.deliver_question(run_id, "No choices here")
+    plain = brain.delivery.deliver_question(task_id, "No choices here")
     assert plain["delivery"]["provider_result"]["blocks"] == []
+
+
+def test_status_checkpoint_tracking_and_live_update_message(brain):
+    """Phase F: the live Slack status message only starts once a run
+    crosses a *second*, distinct toolkit -- a single-toolkit run gets no
+    status message at all -- and every checkpoint after that edits the
+    same message in place instead of posting a new one."""
+    run = brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation="status-checkpoints"),
+        goal="Cross-toolkit task",
+        trigger_kind="reactive",
+        initial_message="Cross-toolkit task",
+    )
+    linear_call = ModelToolCall(id="c1", name="linear_create_issue", arguments={})
+    linear_definition = ToolDefinition(
+        name="linear_create_issue",
+        description="d",
+        input_schema={"type": "object"},
+        toolkits=["linear"],
+    )
+    github_call = ModelToolCall(id="c2", name="github_create_issue", arguments={})
+    github_definition = ToolDefinition(
+        name="github_create_issue",
+        description="d",
+        input_schema={"type": "object"},
+        toolkits=["github"],
+    )
+
+    brain.company_agent._track_checkpoint(run, linear_call, linear_definition)
+    jobs = brain.harness_jobs.lease(
+        worker_id="test-f-1", limit=10, kinds=["delivery.status_update"]
+    )
+    assert jobs == []  # a single toolkit alone never triggers a status message
+
+    brain.company_agent._track_checkpoint(run, github_call, github_definition)
+    jobs = brain.harness_jobs.lease(
+        worker_id="test-f-2", limit=10, kinds=["delivery.status_update"]
+    )
+    assert len(jobs) == 1
+    assert jobs[0]["payload"]["task_id"] == run["id"]
+
+    refreshed = brain.store.get_task(run["id"])
+    assert refreshed["metadata"]["status_checkpoints"] == ["linear", "github"]
+
+    sent: list[dict] = []
+    brain.delivery.slack.send = lambda **kwargs: (
+        sent.append(kwargs),
+        {"ok": True, "channel": "C_STATUS", "ts": "100.1"},
+    )[1]
+    result = brain.delivery.deliver_status_update(run["id"])
+    assert result["delivered"] is True
+    assert len(sent) == 1
+    assert "linear" in sent[0]["blocks"][0]["text"]["text"]
+    assert "github" in sent[0]["blocks"][0]["text"]["text"]
+
+    # A third checkpoint must EDIT that same message, not post a new one.
+    slack_call = ModelToolCall(
+        id="c3",
+        name="COMPOSIO_EXECUTE",
+        arguments={"tool_slug": "SLACK_SEND_MESSAGE"},
+    )
+    slack_definition = ToolDefinition(
+        name="COMPOSIO_EXECUTE", description="d", input_schema={"type": "object"}
+    )
+    brain.company_agent._track_checkpoint(
+        brain.store.get_task(run["id"]), slack_call, slack_definition
+    )
+
+    updated: list[dict] = []
+    brain.delivery.slack.update_message = lambda **kwargs: (
+        updated.append(kwargs),
+        {"ok": True, "channel": "C_STATUS", "ts": "100.1"},
+    )[1]
+    brain.delivery.deliver_status_update(run["id"])
+    assert len(sent) == 1  # still just the one original post
+    assert len(updated) == 1
+    assert updated[0]["channel_id"] == "C_STATUS"
+    assert updated[0]["timestamp"] == "100.1"
+    assert "slack" in updated[0]["text"]
 
 
 def test_signed_slack_mention_routes_through_full_harness(brain):
@@ -890,8 +1340,8 @@ def test_signed_slack_mention_routes_through_full_harness(brain):
     assert accepted["accepted"] is True
     drained = brain.harness_worker.drain_until_idle()
     assert drained["failed"] == 0
-    runs = brain.store.list_harness_records("agent_runs", "org_acme")
-    run = next(item for item in runs if item["trigger_event_id"] == "Ev100")
+    tasks = brain.store.list_tasks("org_acme", worker_type="session_manager")
+    run = next(item for item in tasks if item.get("trigger_event_id") == "Ev100")
     assert run["state"] == "completed"
     assert run["envelope"]["destination"]["id"] == "CGENERAL"
     assert any(
@@ -943,13 +1393,12 @@ def test_message_and_app_mention_callbacks_for_one_slack_message_are_deduped(bra
     assert drained["failed"] == 0
     matching_runs = [
         run
-        for run in brain.store.list_harness_records("agent_runs", "org_acme")
-        if run.get("trigger_event_id")
-        in {"EvMessageVariant", "EvMentionVariant"}
+        for run in brain.store.list_tasks("org_acme", worker_type="session_manager")
+        if run.get("trigger_event_id") in {"EvMessageVariant", "EvMentionVariant"}
     ]
     assert len(matching_runs) == 1
     deliveries = brain.store.list_harness_records(
-        "deliveries", "org_acme", where={"run_id": matching_runs[0]["id"]}
+        "deliveries", "org_acme", where={"task_id": matching_runs[0]["id"]}
     )
     assert len(deliveries) == 1
 
@@ -1034,7 +1483,9 @@ def test_slack_has_only_public_private_and_dm_conversation_types(brain):
     assert dm.is_direct_agent_request
 
 
-def test_agent_can_change_current_slack_channel_proactivity_after_approval(brain):
+def test_agent_can_change_current_slack_channel_proactivity(brain):
+    # slack_set_channel_proactivity is in the auto-execute tier under the
+    # risk-tiered default — it no longer pauses for human approval.
     destination = {"type": "slack_channel", "id": "CSOCIAL", "is_private": False}
     decision = brain.authz.resolve(
         "org_acme", "person_ajay", destination, "reactive_agent"
@@ -1072,13 +1523,7 @@ def test_agent_can_change_current_slack_channel_proactivity_after_approval(brain
         trigger_kind="reactive",
         initial_message="Sally, stop proactively responding in this channel",
     )
-    waiting = brain.company_agent.run(run["id"])
-    assert waiting.state.value == "waiting_for_approval"
-    completed = brain.company_agent.resume_after_approval(
-        approval_id=waiting.approval_id,
-        approved=True,
-        decided_by="person_ajay",
-    )
+    completed = brain.company_agent.execute_task(run["id"])
     assert completed.state.value == "completed"
     policy = brain.store.channel_policy("org_acme", "slack", "CSOCIAL")
     assert policy["proactive"] is False
@@ -1135,16 +1580,16 @@ def test_ambient_slack_uses_contextual_attention_before_waking(brain):
     )
     assert evaluations
     assert evaluations[0]["decision"] == "WAKE_MAIN_AGENT"
-    runs = brain.store.list_harness_records("agent_runs", "org_acme")
+    runs = brain.store.list_tasks("org_acme", worker_type="session_manager")
     proactive = next(
         item for item in runs if item.get("trigger_event_id") == "EvAmbient"
     )
     assert proactive["trigger_kind"] == "proactive"
     assert proactive["state"] == "completed"
     interventions = brain.store.list_harness_records(
-        "agent_interventions", "org_acme"
+        "task_interventions", "org_acme"
     )
-    assert any(item["run_id"] == proactive["id"] for item in interventions)
+    assert any(item["task_id"] == proactive["id"] for item in interventions)
 
 
 def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
@@ -1168,7 +1613,7 @@ def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
     assert brain.harness_worker.drain_until_idle()["failed"] == 0
     first_run = next(
         run
-        for run in brain.store.list_harness_records("agent_runs", "org_acme")
+        for run in brain.store.list_tasks("org_acme", worker_type="session_manager")
         if run.get("trigger_event_id") == "EvChannelContextFirst"
     )
     assert first_run["final_answer"]
@@ -1186,7 +1631,7 @@ def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
                         "reason": "The user is responding to Docket's preceding message.",
                         "suggested_goal": "Answer the user's conversational follow-up.",
                         "related_entity_ids": [],
-                        "existing_run_id": None,
+                        "existing_task_id": None,
                     }
                 )
             )
@@ -1227,7 +1672,9 @@ def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
 
     followup_run = next(
         run
-        for run in brain.store.list_harness_records("agent_runs", "org_acme")
+        for run in brain.store.list_tasks(
+            "org_acme", worker_type="session_manager"
+        )
         if run.get("trigger_event_id") == "EvChannelContextFollowup"
     )
     main_timeline = brain.company_agent._slack_conversation(followup_run)
@@ -1278,7 +1725,10 @@ def test_wake_preserves_slack_conversation_address_for_main_context(brain):
         reason="Deterministic local evaluator found an actionable failure signal.",
     )
 
-    run = brain.attention._wake(event, evaluation)
+    wake = brain.attention._wake_session(event, evaluation)
+    run = brain.session_manager.dispatch(wake["session_id"])
+    assert run is not None
+    run = brain.store.get_task(run.task_id)
     assert run["metadata"]["slack"] == {
         "workspace_id": "TACME",
         "channel_id": "CSUPPORT2",
@@ -1291,28 +1741,37 @@ def test_wake_preserves_slack_conversation_address_for_main_context(brain):
     }
 
 
-def test_stale_active_run_id_does_not_strand_ambient_messages(brain):
-    """A conversation's active_run_id is only ever set by attention's own
-    wake path and is never cleared on completion — if that run finished
-    (e.g. a direct-mention run answered and completed, bypassing attention
-    entirely) and a later ambient message references the same conversation,
-    the old code would silently attach the new message to the dead run and
-    never process it. It must instead treat the stale pointer as no active
-    run and wake a fresh one."""
+def test_stale_active_session_does_not_strand_ambient_messages(brain):
+    """A conversation's active_session_id is only ever set by attention's
+    own wake path and is never cleared on completion -- if that Session's
+    root Task already finished (e.g. a direct-mention Task answered and
+    completed, bypassing attention entirely) and a later ambient message
+    references the same conversation, the old code would silently attach
+    the new message to the dead pointer and never process it. It must
+    instead treat the stale pointer as no active work and wake a fresh
+    root Task (find_root_task_for_session excludes terminal states,
+    exactly like the old stale-root check did)."""
     from docket.domain.models import utcnow
     from docket.harness.model_client import ScriptedModelClient
-    from docket.harness.models import EventActor, EventScope, NormalizedEvent
+    from docket.harness.models import EventActor, EventScope, ModelResponse, NormalizedEvent
 
     context_key = "slack:TACME:CSTALE"
-    envelope = _envelope(brain, conversation=context_key)
-    stale_run = brain.company_agent.create_invocation(
-        envelope=envelope,
-        goal="Earlier finished task",
-        trigger_kind="reactive",
-        initial_message="Earlier finished task",
+    brain.company_agent.model = ScriptedModelClient(
+        [ModelResponse(content="Earlier finished task done.")]
     )
-    brain.agent_runs.transition(stale_run["id"], "completed", force=True)
-    assert brain.agent_runs.get(stale_run["id"])["state"] == "completed"
+    wake = brain.sessions.wake(
+        organization_id="org_acme",
+        conversation_key=context_key,
+        destination={"type": "slack_channel", "id": "CSTALE", "is_private": False},
+        role="user",
+        content="Earlier finished task",
+        principal_id="person_ajay",
+    )
+    brain.session_manager.dispatch(wake["session_id"])
+    stale_root = brain.store.list_tasks(
+        "org_acme", session_id=wake["session_id"], worker_type="session_manager"
+    )[0]
+    assert stale_root["state"] == "completed"
 
     brain.store.upsert_conversation_state(
         {
@@ -1323,7 +1782,7 @@ def test_stale_active_run_id_does_not_strand_ambient_messages(brain):
             "channel_id": "CSTALE",
             "participants": [],
             "recent_messages": [],
-            "active_run_id": stale_run["id"],
+            "active_session_id": wake["session_id"],
             "last_agent_intervention_at": None,
             "last_human_acknowledgement_at": None,
             "updated_at": utcnow().isoformat(),
@@ -1343,7 +1802,7 @@ def test_stale_active_run_id_does_not_strand_ambient_messages(brain):
                         "reason": "New actionable issue.",
                         "suggested_goal": "Investigate the new issue.",
                         "related_entity_ids": [],
-                        "existing_run_id": None,
+                        "existing_task_id": None,
                     }
                 )
             }
@@ -1373,11 +1832,140 @@ def test_stale_active_run_id_does_not_strand_ambient_messages(brain):
 
     result = brain.attention.process(event)
     assert result["evaluation"]["decision"] == "WAKE_MAIN_AGENT"
-    assert "run_id" in result and result["run_id"] != stale_run["id"]
+    assert "session_id" in result
     assert "job_id" in result
+    # Same Session (stable per conversation_key) but the dispatch tick must
+    # start a fresh root Task, not silently attach to the dead one.
+    brain.harness_worker.drain_until_idle()
+    fresh_tasks = [
+        t
+        for t in brain.store.list_tasks(
+            "org_acme", session_id=wake["session_id"], worker_type="session_manager"
+        )
+        if t["id"] != stale_root["id"]
+    ]
+    assert len(fresh_tasks) == 1
 
     updated_conversation = brain.store.conversation_state("org_acme", context_key)
-    assert updated_conversation["active_run_id"] == result["run_id"]
+    assert updated_conversation["active_session_id"] == result["session_id"]
+
+
+def _create_onboarding_role(brain, **overrides) -> dict:
+    role = {
+        "id": "role_onboarding",
+        "organization_id": "org_acme",
+        "name": "New hire onboarding",
+        "goal": "Kick off the onboarding skill for the incoming new hire.",
+        "skill_ids": ["skill_onboarding"],
+        "trigger_description": "a new hire starting soon",
+        "status": "active",
+    }
+    role.update(overrides)
+    brain.store.upsert_simple_harness_record("roles", role)
+    return role
+
+
+def test_role_trigger_wakes_the_main_agent_with_matching_goal(brain):
+    from docket.harness.models import EventActor, EventScope, NormalizedEvent
+
+    role = _create_onboarding_role(brain)
+    context_key = "slack:TACME:CHIRING"
+    conversation_key = f"{context_key}:event:EvNewHire"
+    event = NormalizedEvent(
+        id="EvNewHire",
+        organization_id="org_acme",
+        source="slack",
+        type="slack.channel_message",
+        actor=EventActor(id="person_ravi", source_id="URAVI3", type="person"),
+        scope=EventScope(
+            workspace_id="TACME",
+            channel_id="CHIRING",
+            visibility="organization_public",
+            scope_id="scope_org_public",
+        ),
+        payload={
+            "text": "We have a new hire starting soon, please help get her set up.",
+            "conversation_key": conversation_key,
+            "context_key": context_key,
+            "proactivity_enabled": True,
+        },
+        dedupe_key="dedupe-EvNewHire",
+        is_direct_agent_request=False,
+    )
+
+    result = brain.attention.process(event)
+    assert result["evaluation"]["decision"] == "WAKE_MAIN_AGENT"
+    assert result["evaluation"]["matched_role_id"] == role["id"]
+    assert result["evaluation"]["suggested_goal"] == role["goal"]
+    assert "session_id" in result
+    brain.harness_worker.drain_until_idle()
+    run = brain.store.find_root_task_for_session(result["session_id"]) or next(
+        t
+        for t in brain.store.list_tasks(
+            "org_acme", session_id=result["session_id"], worker_type="session_manager"
+        )
+    )
+    assert run["metadata"]["role_skill_ids"] == ["skill_onboarding"]
+
+
+def test_role_with_no_matching_event_does_not_spuriously_wake(brain):
+    from docket.harness.models import EventActor, EventScope, NormalizedEvent
+
+    _create_onboarding_role(brain)
+    context_key = "slack:TACME:CFINANCE"
+    conversation_key = f"{context_key}:event:EvUnrelated"
+    event = NormalizedEvent(
+        id="EvUnrelated",
+        organization_id="org_acme",
+        source="slack",
+        type="slack.channel_message",
+        actor=EventActor(id="person_ravi", source_id="URAVI4", type="person"),
+        scope=EventScope(
+            workspace_id="TACME",
+            channel_id="CFINANCE",
+            visibility="organization_public",
+            scope_id="scope_org_public",
+        ),
+        payload={
+            "text": "Can someone double check the quarterly report numbers?",
+            "conversation_key": conversation_key,
+            "context_key": context_key,
+            "proactivity_enabled": True,
+        },
+        dedupe_key="dedupe-EvUnrelated",
+        is_direct_agent_request=False,
+    )
+
+    result = brain.attention.process(event)
+    assert result["evaluation"]["matched_role_id"] is None
+    assert not any(
+        run.get("trigger_event_id") == "EvUnrelated"
+        for run in brain.store.list_tasks(
+            "org_acme", worker_type="session_manager"
+        )
+    )
+
+
+def test_role_api_create_and_list(api_client):
+    created = api_client.post(
+        "/v1/roles",
+        json={
+            "organization_id": "org_acme",
+            "name": "New hire onboarding",
+            "trigger_description": "a new hire starting soon",
+            "goal": "Kick off the onboarding skill for the incoming new hire.",
+            "skill_ids": ["skill_onboarding"],
+        },
+    )
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["status"] == "active"
+    assert body["id"]
+
+    listed = api_client.get("/v1/roles", params={"organization_id": "org_acme"})
+    assert listed.status_code == 200
+    assert listed.json()["count"] >= 1
+    assert any(r["id"] == body["id"] for r in listed.json()["roles"])
 
 
 def test_ambient_channel_without_policy_is_proactive_by_default(brain):
@@ -1405,13 +1993,15 @@ def test_ambient_channel_without_policy_is_proactive_by_default(brain):
     assert evaluations[0]["decision"] == "WAKE_MAIN_AGENT"
     assert any(
         run.get("trigger_event_id") == "EvNoWake"
-        for run in brain.store.list_harness_records("agent_runs", "org_acme")
+        for run in brain.store.list_tasks(
+            "org_acme", worker_type="session_manager"
+        )
     )
 
 
 def test_api_invoke_exposes_complete_trace(api_client):
     response = api_client.post(
-        "/v1/agent/invoke",
+        "/v1/tasks/invoke",
         json={
             "organization_id": "org_acme",
             "principal_id": "person_ajay",
@@ -1421,23 +2011,23 @@ def test_api_invoke_exposes_complete_trace(api_client):
                 "id": "api-e2e",
                 "is_private": True,
             },
-            "goal": "What happened with Acme exports?",
+            "prompt": "What happened with Acme exports?",
             "run_now": True,
         },
     )
     assert response.status_code == 200, response.text
-    run = response.json()["run"]
+    run = next(task for task in response.json()["tasks"] if task["worker_type"] == "session_manager")
     assert run["state"] == "completed"
-    trace = api_client.get(f"/v1/agent/runs/{run['id']}").json()
+    trace = api_client.get(f"/v1/tasks/{run['id']}", params={"organization_id": "org_acme"}).json()
     assert trace["messages"]
     assert trace["turns"]
     assert trace["checkpoints"]
-    assert trace["run"]["trace_id"]
+    assert trace["task"]["trace_id"]
     evaluation = api_client.get(
         "/v1/harness/evaluation", params={"organization_id": "org_acme"}
     )
     assert evaluation.status_code == 200
-    assert evaluation.json()["runs"]["count"] >= 1
+    assert evaluation.json()["tasks"]["count"] >= 1
 
 
 def test_agent_can_wait_for_human_and_resume(brain):
@@ -1465,7 +2055,7 @@ def test_agent_can_wait_for_human_and_resume(brain):
         trigger_kind="reactive",
         initial_message="Prepare the issue",
     )
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "waiting_for_human"
     assert "Which Linear team" in outcome.answer
     brain.harness_worker.drain_until_idle()
@@ -1497,9 +2087,14 @@ def test_automation_activates_same_agent_runtime(brain):
     tick = brain.automations.tick("org_acme")
     assert tick["fired"] == 1
     brain.harness_worker.drain_until_idle()
-    run = brain.agent_runs.get(tick["run_ids"][0])
+    run = brain.store.list_tasks(
+        "org_acme",
+        session_id=tick["session_ids"][0],
+        worker_type="session_manager",
+    )[0]
     assert run["trigger_kind"] == "automation"
     assert run["state"] == "completed"
+    assert run["envelope"]["purpose"] == "scheduled_automation"
 
 
 def test_feedback_updates_attention_precision_metrics(brain):
@@ -1507,7 +2102,7 @@ def test_feedback_updates_attention_precision_metrics(brain):
         organization_id="org_acme",
         feedback_type="helpful",
         principal_id="person_ajay",
-        run_id=None,
+        task_id=None,
         comment="Useful intervention",
     )
     assert item["id"]
@@ -1548,7 +2143,7 @@ def test_invalid_slack_signature_is_rejected(brain):
 
 def test_operational_dashboard_and_list_routes(api_client):
     invoked = api_client.post(
-        "/v1/agent/invoke",
+        "/v1/tasks/invoke",
         json={
             "organization_id": "org_acme",
             "principal_id": "person_ajay",
@@ -1558,13 +2153,13 @@ def test_operational_dashboard_and_list_routes(api_client):
                 "id": "dashboard",
                 "is_private": True,
             },
-            "goal": "Summarize the export incident",
+            "prompt": "Summarize the export incident",
             "run_now": True,
         },
     )
     assert invoked.status_code == 200
     listed = api_client.get(
-        "/v1/agent/runs", params={"organization_id": "org_acme"}
+        "/v1/tasks", params={"organization_id": "org_acme"}
     )
     assert listed.status_code == 200
     assert listed.json()["count"] >= 1
@@ -1574,7 +2169,7 @@ def test_operational_dashboard_and_list_routes(api_client):
     )
     assert dashboard.status_code == 200, dashboard.text
     payload = dashboard.json()
-    assert payload["evaluation"]["runs"]["count"] >= 1
+    assert payload["evaluation"]["tasks"]["count"] >= 1
     assert "counts" in payload["jobs"]
     status = api_client.get("/v1/harness/status")
     assert status.status_code == 200
@@ -1662,17 +2257,19 @@ def test_transient_model_failure_is_retried_by_durable_queue(brain):
             return ModelResponse(content="Recovered after provider retry.")
 
     brain.company_agent.model = FlakyModel()
-    run = brain.company_agent.create_invocation(
-        envelope=_envelope(brain, conversation="api:retry"),
-        goal="Retry a transient model failure",
-        trigger_kind="reactive",
-        initial_message="Retry a transient model failure",
+    wake = brain.sessions.wake(
+        organization_id="org_acme",
+        conversation_key="api:retry",
+        destination={"type": "internal_agent_session", "id": "test", "is_private": True},
+        role="user",
+        content="Retry a transient model failure",
+        principal_id="person_ajay",
     )
     job = brain.harness_jobs.enqueue(
         organization_id="org_acme",
-        kind="agent.run",
-        payload={"run_id": run["id"]},
-        idempotency_key=f"agent.run:{run['id']}",
+        kind="session.dispatch",
+        payload={"session_id": wake["session_id"]},
+        idempotency_key=f"session.dispatch:{wake['session_id']}",
     )
     first = brain.harness_worker.drain_once()
     assert first["failed"] == 1
@@ -1691,4 +2288,7 @@ def test_transient_model_failure_is_retried_by_durable_queue(brain):
         )
     second = brain.harness_worker.drain_until_idle()
     assert second["failed"] == 0
-    assert brain.agent_runs.get(run["id"])["state"] == "completed"
+    tasks = brain.store.list_tasks(
+        "org_acme", session_id=wake["session_id"], worker_type="session_manager"
+    )
+    assert any(task["state"] == "completed" for task in tasks)

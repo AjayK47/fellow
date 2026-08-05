@@ -1,4 +1,4 @@
-"""Durable scheduled automations that activate the same CompanyAgent runtime.
+"""Durable scheduled automations that wake a configured Session Manager.
 
 Supports fixed intervals (unchanged, backward compatible) and real cron
 schedules with timezone awareness, quiet hours, and explicit misfire/overlap
@@ -14,9 +14,6 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from docket.domain.models import new_id, utcnow
-from docket.harness.models import InvocationEnvelope, TriggerKind
-
-_TERMINAL_RUN_STATES = {"completed", "failed", "cancelled"}
 _DEFAULT_MISFIRE_GRACE_SECONDS = 300
 
 
@@ -126,14 +123,12 @@ class AutomationService:
         self,
         *,
         store: Any,
-        authz: Any,
-        agent: Any,
+        sessions: Any,
         queue: Any,
         audit: Any,
     ) -> None:
         self.store = store
-        self.authz = authz
-        self.agent = agent
+        self.sessions = sessions
         self.queue = queue
         self.audit = audit
 
@@ -185,7 +180,7 @@ class AutomationService:
             "overlap_policy": overlap_policy,
             "status": "enabled" if enabled else "disabled",
             "next_run_at": None,
-            "last_run_id": None,
+            "last_session_id": None,
             "created_at": now.isoformat(),
             "updated_at": now.isoformat(),
         }
@@ -218,7 +213,7 @@ class AutomationService:
                     (now_iso,),
                 )
             due = [json.loads(row["payload"]) for row in cur.fetchall()]
-        runs: list[dict[str, Any]] = []
+        activations: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         for automation in due:
             due_at = datetime.fromisoformat(automation["next_run_at"])
@@ -239,13 +234,17 @@ class AutomationService:
                 )
                 continue
 
+            session = self.sessions.resolve(
+                organization_id=automation["organization_id"],
+                conversation_key=automation["conversation_id"],
+                destination=automation["destination"],
+                participants=[automation["principal_id"]],
+                metadata={"automation_id": automation["id"]},
+            )
             if automation.get("overlap_policy", "skip_if_running") == "skip_if_running":
-                last_run = (
-                    self.store.get_harness_record("agent_runs", automation["last_run_id"])
-                    if automation.get("last_run_id")
-                    else None
-                )
-                if last_run and last_run.get("state") not in _TERMINAL_RUN_STATES:
+                active_task = self.store.find_root_task_for_session(session["id"])
+                manager_busy = session.get("manager_state") in {"queued", "running"}
+                if active_task or manager_busy:
                     automation["next_run_at"] = compute_next_run_at(automation, after=now)
                     automation["updated_at"] = now.isoformat()
                     self._upsert(automation)
@@ -253,58 +252,60 @@ class AutomationService:
                     self.audit.record(
                         automation["organization_id"],
                         "automation.overlap_skipped",
-                        {"automation_id": automation["id"], "running_run_id": last_run["id"]},
+                        {
+                            "automation_id": automation["id"],
+                            "session_id": session["id"],
+                            "active_task_id": (active_task or {}).get("id"),
+                        },
                         principal_id=automation["principal_id"],
                     )
                     continue
 
-            decision = self.authz.resolve(
+            wake = self.sessions.wake(
                 organization_id=automation["organization_id"],
-                acting_principal_id=automation["principal_id"],
+                conversation_key=automation["conversation_id"],
                 destination=automation["destination"],
-                purpose="scheduled_automation",
-            )
-            envelope = InvocationEnvelope(
-                organization_id=automation["organization_id"],
                 principal_id=automation["principal_id"],
-                application_id="docket_scheduler",
-                conversation_id=automation["conversation_id"],
-                destination=automation["destination"],
-                purpose="scheduled_automation",
-                permission_decision_id=decision.id,
-                allowed_scope_ids=decision.allowed_scope_ids,
-            )
-            run = self.agent.create_invocation(
-                envelope=envelope,
-                goal=automation["goal"],
-                trigger_kind=TriggerKind.AUTOMATION,
-                initial_message=(
+                participants=[automation["principal_id"]],
+                role="user",
+                content=(
                     f"Scheduled automation '{automation['name']}': "
                     f"{automation['goal']}"
                 ),
                 metadata={"automation_id": automation["id"]},
+                message_metadata={"automation_id": automation["id"]},
+                trigger_kind="automation",
+                purpose="scheduled_automation",
             )
-            self.queue.enqueue(
+            job = self.queue.enqueue(
                 organization_id=automation["organization_id"],
-                kind="agent.run",
-                payload={"run_id": run["id"]},
-                idempotency_key=f"automation.run:{automation['id']}:{automation['next_run_at']}",
+                kind="session.dispatch",
+                payload={"session_id": wake["session_id"]},
+                idempotency_key=(
+                    f"automation.dispatch:{automation['id']}:"
+                    f"{automation['next_run_at']}"
+                ),
             )
-            automation["last_run_id"] = run["id"]
+            automation["last_session_id"] = wake["session_id"]
             automation["next_run_at"] = compute_next_run_at(automation, after=now)
             automation["updated_at"] = now.isoformat()
             self._upsert(automation)
-            runs.append(run)
+            activation = {
+                "session_id": wake["session_id"],
+                "revision": wake["revision"],
+                "job_id": job["id"],
+            }
+            activations.append(activation)
             self.audit.record(
                 automation["organization_id"],
                 "automation.fired",
-                {"automation_id": automation["id"], "run_id": run["id"]},
+                {"automation_id": automation["id"], **activation},
                 principal_id=automation["principal_id"],
-                trace_id=run["trace_id"],
             )
         return {
-            "fired": len(runs),
-            "run_ids": [run["id"] for run in runs],
+            "fired": len(activations),
+            "session_ids": [item["session_id"] for item in activations],
+            "activations": activations,
             "skipped": skipped,
         }
 

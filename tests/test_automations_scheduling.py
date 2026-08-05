@@ -11,7 +11,6 @@ from docket.harness.automations import (
     compute_next_run_at,
     next_cron_fire,
 )
-from docket.harness.models import InvocationEnvelope
 from docket.harness.prompts import AUTOMATION_TRIGGER_GUIDANCE, build_agent_messages
 
 
@@ -154,28 +153,19 @@ def test_overlap_skip_if_running_does_not_double_fire_while_previous_run_active(
         overlap_policy="skip_if_running",
     )
     automation["next_run_at"] = "2000-01-01T00:00:00+00:00"
-    # Simulate a still-running previous run rather than draining the queue,
-    # so overlap detection is exercised in isolation from job draining.
-    fake_run = brain.agent_runs.create_run(
-        session_id=brain.agent_runs.get_or_create_session(
-            organization_id="org_acme",
-            conversation_key="automation:overlap-skip:fake",
-            destination=_destination(),
-        )["id"],
-        envelope=InvocationEnvelope(
-            organization_id="org_acme",
-            principal_id="person_ajay",
-            conversation_id="automation:overlap-skip:fake",
-            destination=_destination(),
-            purpose="scheduled_automation",
-            permission_decision_id="authz_fake",
-            allowed_scope_ids=["scope_org_public"],
-        ),
-        goal="still running",
+    # A queued Session dispatch is already active work even before its root
+    # Task is created, so overlap detection must suppress another fire.
+    wake = brain.sessions.wake(
+        organization_id="org_acme",
+        conversation_key="automation:overlap-skip",
+        destination=_destination(),
+        role="user",
+        content="Previous scheduled activation",
+        principal_id="person_ajay",
         trigger_kind="automation",
+        purpose="scheduled_automation",
     )
-    brain.agent_runs.transition(fake_run["id"], "running", force=True)
-    automation["last_run_id"] = fake_run["id"]
+    automation["last_session_id"] = wake["session_id"]
     brain.automations._upsert(automation)
 
     tick = brain.automations.tick("org_acme")

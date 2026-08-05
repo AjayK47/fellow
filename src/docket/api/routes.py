@@ -6,12 +6,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+import base64
 import json
+import mimetypes
 import secrets
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -22,8 +24,7 @@ from docket.adapters import (
 )
 from docket.services.container import DocketApp
 from docket.config import Settings
-from docket.domain.models import utcnow
-from docket.harness.models import InvocationEnvelope, TriggerKind
+from docket.domain.models import new_id, utcnow
 from docket.harness.slack import UnauthorizedApprover, resolve_slack_principal
 from docket.harness.tools import refresh_composio_tool_schemas
 from docket.services.gateway_setup import GatewaySetupService, SLACK_MANIFEST
@@ -176,31 +177,6 @@ class SkillSearchRequest(BaseModel):
     limit: int = 20
 
 
-class RunStartRequest(BaseModel):
-    organization_id: str
-    task: str
-    acting_principal_id: str
-    harness_id: str
-    skill_id: str | None = None
-    target_entity_ids: list[str] = Field(default_factory=list)
-
-
-class RunEventRequest(BaseModel):
-    event_type: str
-    agent_id: str | None = None
-    action: str | None = None
-    target_entity_id: str | None = None
-    result: str | None = None
-    evidence_source_ids: list[str] = Field(default_factory=list)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class RunCompleteRequest(BaseModel):
-    outcome: str
-    summary: str | None = None
-    evidence_source_ids: list[str] = Field(default_factory=list)
-
-
 class ProactiveRequest(BaseModel):
     organization_id: str
     trigger: dict[str, Any]
@@ -233,12 +209,12 @@ class MembershipRequest(BaseModel):
     scope_id: str
 
 
-class AgentInvokeRequest(BaseModel):
+class TaskInvokeRequest(BaseModel):
     organization_id: str
     principal_id: str
     conversation_id: str
     destination: dict[str, Any]
-    goal: str
+    prompt: str
     purpose: str = "reactive_agent"
     application_id: str = "docket_api"
     trigger_kind: str = "reactive"
@@ -270,6 +246,16 @@ class IdentityMappingRequest(BaseModel):
     source: str = "slack"
     source_user_id: str
     principal_id: str
+
+
+class RoleRequest(BaseModel):
+    organization_id: str
+    name: str
+    trigger_description: str
+    goal: str | None = None
+    skill_ids: list[str] = Field(default_factory=list)
+    scope_id: str | None = None
+    enabled: bool = True
 
 
 class AutomationRequest(BaseModel):
@@ -334,6 +320,18 @@ class ComposioConnectStartRequest(BaseModel):
     toolkit: str
 
 
+class ComposioCredentialConnectRequest(BaseModel):
+    organization_id: str
+    toolkit: str
+    auth_scheme: str
+    credentials: dict[str, str]
+    composio_user_id: str | None = None
+    principal_id: str | None = None
+    scope_id: str = "scope_org_public"
+    visibility: str = "organization_public"
+    proactivity_enabled: bool = True
+
+
 class ComposioTriggerRequest(BaseModel):
     organization_id: str
     connected_account_id: str
@@ -350,7 +348,7 @@ class HarnessFeedbackRequest(BaseModel):
     organization_id: str
     feedback_type: str
     principal_id: str
-    run_id: str | None = None
+    task_id: str | None = None
     attention_evaluation_id: str | None = None
     comment: str | None = None
 
@@ -469,7 +467,7 @@ class ArtifactRequest(BaseModel):
     title: str
     content: Any
     scope_id: str = "scope_org_public"
-    run_id: str | None = None
+    task_id: str | None = None
     created_by: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -583,6 +581,28 @@ def list_organizations(request: Request) -> dict[str, Any]:
     return {"organizations": organizations, "count": len(organizations)}
 
 
+class OrganizationUpdateRequest(BaseModel):
+    name: str | None = None
+    about: str | None = None
+
+
+@router.patch("/v1/organizations/{organization_id}")
+def update_organization(
+    organization_id: str, body: OrganizationUpdateRequest, request: Request
+) -> dict[str, Any]:
+    brain = _app(request)
+    organization = brain.store.get_organization(organization_id)
+    if not organization:
+        raise HTTPException(404, "organization not found")
+    updates = body.model_dump(exclude_none=True)
+    organization.update(updates)
+    brain.store.put_organization(organization)
+    brain.audit.record(
+        organization_id, "organization.updated", {"organization_id": organization_id, **updates}
+    )
+    return organization
+
+
 @router.get("/v1/metrics")
 def metrics(request: Request, organization_id: str | None = None) -> dict[str, Any]:
     brain = _app(request)
@@ -596,10 +616,8 @@ def metrics(request: Request, organization_id: str | None = None) -> dict[str, A
         "sources": len(brain.store.list_sources(org, include_revoked=True)),
         "memories": len(brain.store.list_memories(org, latest_only=False)),
         "signals": len(brain.store.list_signals(org)),
-        "runs": len(brain.store.list_runs(org)),
-        "agent_runs": len(
-            brain.store.list_harness_records("agent_runs", org)
-        ),
+        "sessions": len(brain.store.list_sessions(org, limit=100_000)),
+        "tasks": len(brain.store.list_tasks(org, limit=100_000)),
         "harness_jobs": brain.store.harness_job_counts(org),
         "connector_objects": len(
             brain.reality.list_connector_objects(org, latest_only=True)
@@ -616,110 +634,182 @@ def metrics(request: Request, organization_id: str | None = None) -> dict[str, A
 # ---- managed company agent harness ----
 
 
-@router.post("/v1/agent/invoke")
-def invoke_agent(body: AgentInvokeRequest, request: Request) -> dict[str, Any]:
+@router.post("/v1/tasks/invoke")
+def invoke_task(body: TaskInvokeRequest, request: Request) -> dict[str, Any]:
+    """Wake the one Session Manager responsible for this conversation."""
     brain = _app(request)
-    decision = brain.authz.resolve(
+    wake = brain.sessions.wake(
         organization_id=body.organization_id,
-        acting_principal_id=body.principal_id,
+        conversation_key=body.conversation_id,
         destination=body.destination,
-        purpose=body.purpose,
-    )
-    envelope = InvocationEnvelope(
-        organization_id=body.organization_id,
+        role="user",
+        content=body.prompt,
         principal_id=body.principal_id,
-        application_id=body.application_id,
-        conversation_id=body.conversation_id,
-        destination=body.destination,
-        purpose=body.purpose,
-        permission_decision_id=decision.id,
-        allowed_scope_ids=decision.allowed_scope_ids,
-    )
-    run = brain.company_agent.create_invocation(
-        envelope=envelope,
-        goal=body.goal,
-        trigger_kind=body.trigger_kind,
-        initial_message=body.goal,
         metadata=body.metadata,
+        message_metadata={"application_id": body.application_id},
+        trigger_kind=body.trigger_kind,
+        purpose=body.purpose,
     )
     job = brain.harness_jobs.enqueue(
         organization_id=body.organization_id,
-        kind="agent.run",
-        payload={"run_id": run["id"]},
-        idempotency_key=f"agent.run:{run['id']}",
+        kind="session.dispatch",
+        payload={"session_id": wake["session_id"]},
+        idempotency_key=f"session.dispatch:{wake['session_id']}:{wake['revision']}",
     )
-    response: dict[str, Any] = {"run": run, "job": job}
+    response: dict[str, Any] = {
+        "session": brain.sessions.get(wake["session_id"]),
+        "wake": wake,
+        "job": job,
+    }
     if body.run_now:
         response["worker"] = brain.harness_worker.drain_until_idle()
-        response["run"] = brain.agent_runs.get(run["id"])
+        response["tasks"] = brain.store.list_tasks(
+            body.organization_id, session_id=wake["session_id"]
+        )
+        response["session"] = brain.sessions.get(wake["session_id"])
     return response
 
 
-@router.get("/v1/agent/runs")
-def list_agent_runs(
+def _task_detail(brain: DocketApp, task: dict[str, Any]) -> dict[str, Any]:
+    task_id = task["id"]
+    organization_id = task["organization_id"]
+
+    def task_records(table: str, *, limit: int = 1000) -> list[dict[str, Any]]:
+        """Return Task-scoped auxiliary rows in their native schema."""
+        rows = brain.store.list_harness_records(
+            table, organization_id, where={"task_id": task_id}, limit=limit
+        )
+        return rows
+
+    artifacts = brain.artifacts.list(organization_id, task_id=task_id)
+    return {
+        "task": task,
+        "session": brain.sessions.get(task["session_id"]),
+        "messages": brain.store.list_session_messages(task["session_id"], limit=1000),
+        "children": brain.store.list_tasks(
+            organization_id, parent_task_id=task_id, limit=500
+        ),
+        "attempts": brain.store.list_task_attempts(task_id),
+        "turns": task_records("task_turns"),
+        "tool_calls": task_records("harness_tool_calls"),
+        "approvals": task_records("approvals"),
+        "checkpoints": task_records("checkpoints"),
+        "skill_refs": task_records("task_skill_refs"),
+        "capability_refs": task_records("task_capability_refs"),
+        "plan": brain.store.get_harness_record("plans", f"plan:{task_id}"),
+        "artifacts": artifacts,
+        "workspace": brain.workspaces.get_for_task(organization_id, task),
+    }
+
+
+@router.get("/v1/tasks")
+def list_tasks(
     request: Request,
     organization_id: str,
+    session_id: str | None = None,
+    parent_task_id: str | None = None,
+    root_task_id: str | None = None,
     state: str | None = None,
+    worker_type: str | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
-    records = _app(request).store.list_harness_records(
-        "agent_runs",
+    records = _app(request).store.list_tasks(
         organization_id,
-        where={"state": state} if state else None,
-        descending=True,
+        session_id=session_id,
+        parent_task_id=parent_task_id,
+        root_task_id=root_task_id,
+        state=state,
+        worker_type=worker_type,
         limit=min(limit, 500),
     )
-    return {"runs": records, "count": len(records)}
+    return {"tasks": records, "count": len(records)}
 
 
-@router.get("/v1/agent/runs/{run_id}")
-def get_agent_run(run_id: str, request: Request) -> dict[str, Any]:
+@router.get("/v1/tasks/{task_id}")
+def get_task(task_id: str, request: Request, organization_id: str) -> dict[str, Any]:
     brain = _app(request)
-    run = brain.agent_runs.get(run_id)
-    if not run:
-        raise HTTPException(404, "agent run not found")
-    edges = brain.graph.neighbors(run["organization_id"], run_id)
-    related_ids = {run_id}
-    for edge in edges:
-        related_ids.add(edge["from_id"])
-        related_ids.add(edge["to_id"])
-    nodes = [brain.store.get_entity(node_id) for node_id in related_ids]
-    nodes = [node for node in nodes if node]
-    return {
-        "run": run,
-        "nodes": nodes,
-        "edges": edges,
-        "messages": brain.agent_runs.messages(run["session_id"]),
-        "turns": brain.store.list_harness_records(
-            "agent_turns", run["organization_id"], where={"run_id": run_id}
-        ),
-        "tool_calls": brain.store.list_harness_records(
-            "harness_tool_calls",
-            run["organization_id"],
-            where={"run_id": run_id},
-        ),
-        "approvals": brain.store.list_harness_records(
-            "approvals", run["organization_id"], where={"run_id": run_id}
-        ),
-        "checkpoints": brain.store.list_harness_records(
-            "checkpoints", run["organization_id"], where={"run_id": run_id}
-        ),
-        "skill_refs": brain.store.list_harness_records(
-            "run_skill_refs", run["organization_id"], where={"run_id": run_id}
-        ),
-        "capability_refs": brain.store.list_harness_records(
-            "run_capability_refs", run["organization_id"], where={"run_id": run_id}
-        ),
-        "workspace": brain.workspaces.get_for_run(run["organization_id"], run_id),
-        "plan": brain.store.get_harness_record("plans", f"plan:{run_id}"),
-        "specialist_tasks": brain.store.list_harness_records(
-            "specialist_tasks", run["organization_id"], where={"run_id": run_id}
-        ),
-        "handoffs": brain.store.list_harness_records(
-            "handoffs", run["organization_id"], where={"run_id": run_id}
-        ),
-        "artifacts": brain.artifacts.list(run["organization_id"], run_id=run_id),
-    }
+    task = brain.store.get_task(task_id)
+    if not task or task["organization_id"] != organization_id:
+        raise HTTPException(404, "task not found")
+    return _task_detail(brain, task)
+
+
+@router.get("/v1/tasks/{task_id}/attempts")
+def list_task_attempts(
+    task_id: str, request: Request, organization_id: str
+) -> dict[str, Any]:
+    brain = _app(request)
+    task = brain.store.get_task(task_id)
+    if not task or task["organization_id"] != organization_id:
+        raise HTTPException(404, "task not found")
+    attempts = brain.store.list_task_attempts(task_id)
+    return {"attempts": attempts, "count": len(attempts)}
+
+
+@router.get("/v1/tasks/{task_id}/children")
+def list_task_children(
+    task_id: str, request: Request, organization_id: str
+) -> dict[str, Any]:
+    brain = _app(request)
+    task = brain.store.get_task(task_id)
+    if not task or task["organization_id"] != organization_id:
+        raise HTTPException(404, "task not found")
+    children = brain.store.list_tasks(
+        organization_id, parent_task_id=task_id, limit=500
+    )
+    return {"children": children, "count": len(children)}
+
+
+@router.get("/v1/tasks/{task_id}/artifacts")
+def list_task_artifacts(
+    task_id: str, request: Request, organization_id: str
+) -> dict[str, Any]:
+    brain = _app(request)
+    task = brain.store.get_task(task_id)
+    if not task or task["organization_id"] != organization_id:
+        raise HTTPException(404, "task not found")
+    artifacts = brain.artifacts.list(organization_id, task_id=task_id)
+    return {"artifacts": artifacts, "count": len(artifacts)}
+
+
+@router.post("/v1/tasks/{task_id}:cancel")
+def cancel_task(task_id: str, request: Request, organization_id: str) -> dict[str, Any]:
+    brain = _app(request)
+    task = brain.store.get_task(task_id)
+    if not task or task["organization_id"] != organization_id:
+        raise HTTPException(404, "task not found")
+    if task.get("worker_type") == "pi" and brain.child_task_executor.pi_executor:
+        brain.child_task_executor.pi_executor.cancel(task_id, reason="operator cancel")
+    changed = brain.store.cancel_task(task_id)
+    if task.get("parent_task_id") is None:
+        brain.sessions.notify(task["session_id"], reason="task.cancelled")
+    return {"task": brain.store.get_task(task_id), "cancelled": changed}
+
+
+@router.post("/v1/tasks/{task_id}:retry")
+def retry_task(task_id: str, request: Request, organization_id: str) -> dict[str, Any]:
+    brain = _app(request)
+    task = brain.store.get_task(task_id)
+    if not task or task["organization_id"] != organization_id:
+        raise HTTPException(404, "task not found")
+    if not brain.store.retry_task(task_id):
+        raise HTTPException(409, "only failed or cancelled tasks can be retried")
+    if task.get("parent_task_id") is None:
+        wake = brain.sessions.notify(task["session_id"], reason="task.retried")
+        job = brain.harness_jobs.enqueue(
+            organization_id=organization_id,
+            kind="session.dispatch",
+            payload={"session_id": task["session_id"]},
+            idempotency_key=f"task.retry:{task_id}:{wake}",
+        )
+    else:
+        job = brain.harness_jobs.enqueue(
+            organization_id=organization_id,
+            kind="task.run_child",
+            payload={"task_id": task_id},
+            idempotency_key=f"task.retry:{task_id}:{utcnow().isoformat()}",
+        )
+    return {"task": brain.store.get_task(task_id), "job": job}
 
 
 @router.get("/v1/sessions")
@@ -728,34 +818,21 @@ def list_sessions(
     organization_id: str,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Sessions, not runs, are the primary unit of conversation: one Slack
-    thread/DM/channel key maps to one session, and every run inside it
-    shares that session's messages. Each listed session carries a light
-    preview (its most recent run's goal, if any) and counts so the console
-    can render a list without a detail fetch per row."""
+    """List the durable Session Manager conversations and their Task preview."""
     brain = _app(request)
-    sessions = brain.store.list_harness_records(
-        "agent_sessions",
-        organization_id,
-        descending=True,
-        limit=min(limit, 500),
-    )
+    sessions = brain.store.list_sessions(organization_id, limit=min(limit, 500))
     results = []
     for session in sessions:
-        runs = brain.store.list_harness_records(
-            "agent_runs",
-            organization_id,
-            where={"session_id": session["id"]},
-            order_by="created_at",
-            descending=True,
+        tasks = brain.store.list_tasks(
+            organization_id, session_id=session["id"], limit=500
         )
-        latest_run = runs[0] if runs else None
+        latest_task = tasks[-1] if tasks else None
         messages = brain.store.session_messages(session["id"], limit=1)
         results.append(
             {
                 "session": session,
-                "run_count": len(runs),
-                "latest_run": latest_run,
+                "task_count": len(tasks),
+                "latest_task": latest_task,
                 "message_count": len(
                     brain.store.session_messages(session["id"], limit=10_000)
                 ),
@@ -768,33 +845,35 @@ def list_sessions(
 @router.get("/v1/sessions/{session_id}")
 def get_session(session_id: str, request: Request) -> dict[str, Any]:
     brain = _app(request)
-    session = brain.store.get_harness_record("agent_sessions", session_id)
+    session = brain.store.get_session(session_id)
     if not session:
         raise HTTPException(404, "session not found")
-    runs = brain.store.list_harness_records(
-        "agent_runs",
-        session["organization_id"],
-        where={"session_id": session_id},
-        order_by="created_at",
-        descending=False,
+    tasks = brain.store.list_tasks(
+        session["organization_id"], session_id=session_id, limit=1000
     )
     return {
         "session": session,
-        "runs": runs,
+        "tasks": tasks,
         "messages": brain.store.session_messages(session_id, limit=1000),
     }
 
 
-@router.post("/v1/agent/runs/{run_id}:cancel")
-def cancel_agent_run(
-    run_id: str, request: Request, cancelled_by: str
+@router.get("/v1/sessions/{session_id}/tasks")
+def list_session_tasks(
+    session_id: str,
+    request: Request,
+    organization_id: str,
+    state: str | None = None,
+    limit: int = 500,
 ) -> dict[str, Any]:
-    try:
-        return _app(request).company_agent.cancel(
-            run_id, cancelled_by=cancelled_by
-        )
-    except KeyError as exc:
-        raise HTTPException(404, "agent run not found") from exc
+    brain = _app(request)
+    session = brain.store.get_session(session_id)
+    if not session or session["organization_id"] != organization_id:
+        raise HTTPException(404, "session not found")
+    tasks = brain.store.list_tasks(
+        organization_id, session_id=session_id, state=state, limit=min(limit, 1000)
+    )
+    return {"tasks": tasks, "count": len(tasks)}
 
 
 @router.post("/v1/approvals/{approval_id}:decide")
@@ -899,21 +978,19 @@ def harness_dashboard(
     request: Request, organization_id: str
 ) -> dict[str, Any]:
     brain = _app(request)
+    tasks = brain.store.list_tasks(organization_id, limit=50)
+    approvals = brain.store.list_harness_records(
+        "approvals",
+        organization_id,
+        descending=True,
+        limit=50,
+    )
     return {
         "organization_id": organization_id,
         "evaluation": brain.harness_evaluation.metrics(organization_id),
-        "runs": brain.store.list_harness_records(
-            "agent_runs",
-            organization_id,
-            descending=True,
-            limit=50,
-        ),
-        "approvals": brain.store.list_harness_records(
-            "approvals",
-            organization_id,
-            descending=True,
-            limit=50,
-        ),
+        "sessions": brain.store.list_sessions(organization_id, limit=50),
+        "tasks": tasks,
+        "approvals": approvals,
         "attention": brain.store.list_harness_records(
             "attention_evaluations",
             organization_id,
@@ -921,7 +998,7 @@ def harness_dashboard(
             limit=50,
         ),
         "interventions": brain.store.list_harness_records(
-            "agent_interventions",
+            "task_interventions",
             organization_id,
             descending=True,
             limit=50,
@@ -980,10 +1057,10 @@ def harness_status(request: Request) -> dict[str, Any]:
             "concurrency": config.worker_concurrency,
             "batch_size": config.worker_batch_size,
         },
-        "specialists": {
+        "child_tasks": {
             "enabled": True,
-            "max_parallel": config.specialist_max_parallel,
-            "max_depth": config.specialist_max_depth,
+            "max_parallel": config.child_task_max_parallel,
+            "max_depth": config.child_task_max_depth,
             "write_tools_allowed": False,
         },
         "capabilities": {
@@ -1097,6 +1174,26 @@ def list_channel_policies(
         "channel_policies", organization_id, order_by="updated_at"
     )
     return {"channel_policies": records, "count": len(records)}
+
+
+@router.post("/v1/roles")
+def create_role(body: RoleRequest, request: Request) -> dict[str, Any]:
+    data = body.model_dump()
+    now = datetime.now(timezone.utc).isoformat()
+    data["id"] = new_id("role")
+    data["status"] = "active" if body.enabled else "disabled"
+    data["created_at"] = now
+    data["updated_at"] = now
+    _app(request).store.upsert_simple_harness_record("roles", data)
+    return data
+
+
+@router.get("/v1/roles")
+def list_roles(request: Request, organization_id: str) -> dict[str, Any]:
+    records = _app(request).store.list_harness_records(
+        "roles", organization_id, order_by="updated_at"
+    )
+    return {"roles": records, "count": len(records)}
 
 
 @router.post("/v1/slack/installations")
@@ -1326,6 +1423,95 @@ def list_composio_auth_configs(
         raise HTTPException(502, f"Composio auth-config listing failed: {exc}") from exc
 
 
+@router.get("/v1/composio/toolkits")
+def list_composio_toolkits(
+    request: Request,
+    search: str | None = None,
+    category: str | None = None,
+    cursor: str | None = None,
+    limit: int = 8,
+) -> dict[str, Any]:
+    """Browse Composio's full toolkit catalog (1000+ entries), not just the
+    console's curated shortlist — search/category-filtered and cursor-
+    paginated so the page never has to fetch or render all of them."""
+    brain = _app(request)
+    if not brain.composio.configured:
+        raise HTTPException(503, "Composio API key is not configured")
+    try:
+        response = brain.composio.list_toolkits(
+            search=search, category=category, cursor=cursor, limit=limit
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"Composio toolkit listing failed: {exc}") from exc
+    items = [
+        {
+            "slug": item.get("slug"),
+            "name": item.get("name"),
+            "description": (item.get("meta") or {}).get("description"),
+            "logo": (item.get("meta") or {}).get("logo"),
+            "auth_schemes": item.get("auth_schemes")
+            or item.get("composio_managed_auth_schemes")
+            or [],
+            "no_auth": bool(item.get("no_auth")),
+            "categories": [
+                c.get("name") for c in (item.get("meta") or {}).get("categories") or []
+            ],
+        }
+        for item in response.get("items") or []
+    ]
+    return {
+        "items": items,
+        "next_cursor": response.get("next_cursor"),
+        "total_items": response.get("total_items"),
+    }
+
+
+@router.get("/v1/composio/toolkits/categories")
+def list_composio_toolkit_categories(request: Request) -> dict[str, Any]:
+    brain = _app(request)
+    if not brain.composio.configured:
+        raise HTTPException(503, "Composio API key is not configured")
+    try:
+        return brain.composio.list_toolkit_categories()
+    except Exception as exc:
+        raise HTTPException(502, f"Composio category listing failed: {exc}") from exc
+
+
+@router.get("/v1/composio/toolkits/{slug}")
+def describe_composio_toolkit(slug: str, request: Request) -> dict[str, Any]:
+    """Toolkit detail for building a connect UI: every supported auth
+    scheme and, for each, the exact fields needed to open a connection
+    under it (name/displayName/description/is_secret) — this is what lets
+    the console render a correct credentials form instead of a single
+    generic "API key" box that only happens to fit some toolkits."""
+    brain = _app(request)
+    if not brain.composio.configured:
+        raise HTTPException(503, "Composio API key is not configured")
+    try:
+        detail = brain.composio.describe_toolkit(slug)
+    except Exception as exc:
+        raise HTTPException(502, f"Composio toolkit lookup failed: {exc}") from exc
+    schemes = []
+    for config in detail.get("auth_config_details") or []:
+        fields = (config.get("fields") or {}).get("connected_account_initiation") or {}
+        schemes.append(
+            {
+                "mode": config.get("mode"),
+                "name": config.get("name"),
+                "required_fields": fields.get("required") or [],
+                "optional_fields": fields.get("optional") or [],
+            }
+        )
+    return {
+        "slug": detail.get("slug"),
+        "name": detail.get("name"),
+        "logo": (detail.get("meta") or {}).get("logo"),
+        "description": (detail.get("meta") or {}).get("description"),
+        "no_auth": bool(detail.get("no_auth")),
+        "auth_schemes": schemes,
+    }
+
+
 @router.post("/v1/composio/connect")
 def start_composio_connect(
     body: ComposioConnectStartRequest, request: Request
@@ -1364,6 +1550,81 @@ def start_composio_connect(
         "auth_config_id": auth_config_id,
         "redirect_url": link.get("redirect_url"),
         "connected_account_id": link.get("connected_account_id"),
+    }
+
+
+@router.post("/v1/composio/connections:credentials")
+def connect_composio_with_credentials(
+    body: ComposioCredentialConnectRequest, request: Request
+) -> dict[str, Any]:
+    """Non-OAuth connect: API key, bearer token, basic auth, etc. Unlike
+    the OAuth path there is no redirect to wait on — a correctly-formed
+    request activates the connection synchronously, so the caller gets
+    back an already-saved connector account instead of a link to poll.
+    """
+    brain = _app(request)
+    if not brain.composio.configured:
+        raise HTTPException(503, "Composio API key is not configured")
+    if not brain.store.get_organization(body.organization_id):
+        raise HTTPException(404, "Organization not found")
+    toolkit = body.toolkit.strip().lower()
+    auth_scheme = body.auth_scheme.strip().upper()
+    user_id = body.composio_user_id or f"docket:{body.organization_id}"
+    scope = brain.store.get_scope(body.scope_id)
+    if not scope or scope["organization_id"] != body.organization_id:
+        raise HTTPException(400, "Connector scope does not belong to organization")
+    try:
+        existing = brain.composio.list_auth_configs(toolkit=toolkit)
+        auth_config_id = next(
+            (
+                item["id"]
+                for item in existing.get("items") or []
+                if str(item.get("auth_scheme") or "").upper() == auth_scheme
+            ),
+            None,
+        )
+        if not auth_config_id:
+            created = brain.composio.create_auth_config(
+                toolkit=toolkit, auth_scheme=auth_scheme
+            )
+            auth_config_id = created.get("id") or created.get("auth_config_id")
+        if not auth_config_id:
+            raise RuntimeError("Composio did not return an auth config id")
+        remote = brain.composio.create_connected_account(
+            auth_config_id=auth_config_id,
+            user_id=user_id,
+            auth_scheme=auth_scheme,
+            val={"status": "ACTIVE", **body.credentials},
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Composio credential connect failed: {exc}") from exc
+    account_id = remote.get("id")
+    if not account_id:
+        raise HTTPException(502, "Composio did not return a connected account id")
+    account = ConnectorAccountRequest(
+        id=f"connector:{body.organization_id}:{account_id}",
+        organization_id=body.organization_id,
+        toolkit=toolkit,
+        connected_account_id=str(account_id),
+        status=(
+            "active"
+            if str(remote.get("status") or "ACTIVE").upper() == "ACTIVE"
+            else str(remote.get("status") or "inactive").lower()
+        ),
+        composio_user_id=user_id,
+        principal_id=body.principal_id,
+        scope_id=body.scope_id,
+        visibility=body.visibility,
+        proactivity_enabled=body.proactivity_enabled,
+    )
+    saved = upsert_connector_account(account, request)
+    return {
+        "organization_id": body.organization_id,
+        "toolkit": toolkit,
+        "auth_config_id": auth_config_id,
+        "account": saved,
     }
 
 
@@ -2276,7 +2537,7 @@ def list_artifacts(
     organization_id: str,
     acting_principal_id: str,
     artifact_type: str | None = None,
-    run_id: str | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     brain = _app(request)
     decision = brain.authz.resolve(
@@ -2288,7 +2549,7 @@ def list_artifacts(
         organization_id,
         scope_ids=decision.allowed_scope_ids,
         artifact_type=artifact_type,
-        run_id=run_id,
+        task_id=task_id,
     )
     return {
         "artifacts": values,
@@ -2318,6 +2579,56 @@ def get_artifact(
         "artifact": artifact,
         "permission_decision_id": decision.id,
     }
+
+
+# The id itself is the unguessable capability (new_id()'s 16 hex chars) --
+# same trust model as a Slack file link or "anyone with the link" sharing.
+# No separate auth check here: this route exists specifically so a link
+# posted into an already-permission-checked Slack channel actually works
+# when clicked, which an authenticated-only JSON endpoint cannot do.
+_INLINE_MIME_TYPES = {"text/html", "application/pdf", "image/png", "image/jpeg"}
+_EXTENSION_BY_MIME = {
+    "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "text/html": ".html",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "application/json": ".json",
+    "text/plain": ".txt",
+}
+
+
+@router.get("/v1/artifacts/{artifact_id}/download")
+def download_artifact(artifact_id: str, request: Request) -> Response:
+    brain = _app(request)
+    artifact = brain.artifacts.get(artifact_id)
+    if not artifact:
+        raise HTTPException(404, "artifact not found")
+    content = artifact.get("content")
+    if isinstance(content, dict) and isinstance(content.get("base64"), str):
+        body = base64.b64decode(content["base64"])
+        mime_type = str(content.get("mime_type") or "application/octet-stream")
+    elif isinstance(content, dict) and isinstance(content.get("text"), str):
+        body = content["text"].encode("utf-8")
+        mime_type = str(content.get("mime_type") or "text/plain")
+    elif isinstance(content, str):
+        body = content.encode("utf-8")
+        mime_type = "text/plain"
+    else:
+        body = json.dumps(content, indent=2, default=str).encode("utf-8")
+        mime_type = "application/json"
+    safe_title = "".join(
+        c if c.isalnum() or c in " ._-" else "_" for c in str(artifact.get("title") or artifact_id)
+    ).strip() or artifact_id
+    extension = _EXTENSION_BY_MIME.get(mime_type) or mimetypes.guess_extension(mime_type) or ""
+    disposition = "inline" if mime_type in _INLINE_MIME_TYPES else "attachment"
+    return Response(
+        content=body,
+        media_type=mime_type,
+        headers={"Content-Disposition": f'{disposition}; filename="{safe_title}{extension}"'},
+    )
 
 
 # ---- ingestion ----
@@ -2964,14 +3275,9 @@ def deprecate_company_skill(skill_id: str, request: Request) -> dict[str, Any]:
     return deprecate_skill(skill_id, request)
 
 
-# ---- runs ----
-
-
 @router.get("/v1/workspaces")
-def list_workspaces(
-    request: Request, organization_id: str, run_id: str | None = None
-) -> dict[str, Any]:
-    records = _app(request).workspaces.list(organization_id, run_id=run_id)
+def list_workspaces(request: Request, organization_id: str) -> dict[str, Any]:
+    records = _app(request).workspaces.list(organization_id)
     return {"workspaces": records, "count": len(records)}
 
 
@@ -2989,162 +3295,6 @@ def expire_workspace(workspace_id: str, request: Request, organization_id: str) 
     if not record:
         raise HTTPException(404, "workspace not found")
     return record
-
-
-@router.get("/v1/plans/{run_id}")
-def get_run_plan(run_id: str, request: Request, organization_id: str) -> dict[str, Any]:
-    plan = _app(request).store.get_harness_record("plans", f"plan:{run_id}")
-    if not plan or plan.get("organization_id") != organization_id:
-        raise HTTPException(404, "plan not found")
-    return plan
-
-
-@router.post("/v1/plans/{run_id}")
-def create_run_plan(run_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
-    brain = _app(request)
-    run = brain.agent_runs.get(run_id)
-    if not run:
-        raise HTTPException(404, "run not found")
-    now = utcnow().isoformat()
-    plan = {
-        "id": f"plan:{run_id}",
-        "organization_id": run["organization_id"],
-        "run_id": run_id,
-        "title": str(body.get("title") or run.get("goal") or "Plan"),
-        "items": body.get("items") or [],
-        "status": "active",
-        "created_at": now,
-        "updated_at": now,
-    }
-    brain.store.upsert_harness_projection("plans", plan)
-    run["plan"] = plan
-    brain.agent_runs.update(run)
-    return plan
-
-
-@router.patch("/v1/plans/{run_id}")
-def update_run_plan(run_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
-    brain = _app(request)
-    plan = brain.store.get_harness_record("plans", f"plan:{run_id}")
-    if not plan:
-        raise HTTPException(404, "plan not found")
-    if "title" in body:
-        plan["title"] = body["title"]
-    if "items" in body:
-        plan["items"] = body["items"]
-    if "status" in body and body["status"] in {"active", "blocked", "completed", "cancelled"}:
-        plan["status"] = body["status"]
-    plan["updated_at"] = utcnow().isoformat()
-    brain.store.upsert_harness_projection("plans", plan)
-    run = brain.agent_runs.get(run_id)
-    if run:
-        run["plan"] = plan
-        brain.agent_runs.update(run)
-    return plan
-
-
-@router.get("/v1/specialist-tasks")
-def list_specialist_tasks(
-    request: Request, organization_id: str, run_id: str | None = None
-) -> dict[str, Any]:
-    where = {"run_id": run_id} if run_id else None
-    records = _app(request).store.list_harness_records(
-        "specialist_tasks", organization_id, where=where, order_by="updated_at", descending=True
-    )
-    return {"tasks": records, "count": len(records)}
-
-
-@router.get("/v1/specialist-tasks/{task_id}")
-def get_specialist_task(task_id: str, request: Request, organization_id: str) -> dict[str, Any]:
-    record = _app(request).store.get_harness_record("specialist_tasks", task_id)
-    if not record or record.get("organization_id") != organization_id:
-        raise HTTPException(404, "specialist task not found")
-    return record
-
-
-@router.get("/v1/handoffs")
-def list_handoffs(
-    request: Request, organization_id: str, run_id: str | None = None
-) -> dict[str, Any]:
-    where = {"run_id": run_id} if run_id else None
-    records = _app(request).store.list_harness_records(
-        "handoffs", organization_id, where=where, order_by="updated_at", descending=True
-    )
-    return {"handoffs": records, "count": len(records)}
-
-
-@router.post("/v1/handoffs/{handoff_id}:review")
-def review_handoff(handoff_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
-    brain = _app(request)
-    handoff = brain.store.get_harness_record("handoffs", handoff_id)
-    if not handoff:
-        raise HTTPException(404, "handoff not found")
-    decision = str(body.get("decision") or "").lower()
-    if decision not in {"accepted", "rejected", "needs_revision"}:
-        raise HTTPException(400, "decision must be accepted, rejected, or needs_revision")
-    handoff["status"] = decision
-    handoff["reviewed_by"] = body.get("reviewed_by") or "admin"
-    handoff["review_notes"] = str(body.get("notes") or "")[:4000]
-    handoff["updated_at"] = utcnow().isoformat()
-    brain.store.upsert_harness_projection("handoffs", handoff)
-    task_id = handoff.get("specialist_task_id")
-    if task_id:
-        task = brain.store.get_harness_record("specialist_tasks", task_id)
-        if task:
-            task["status"] = "completed" if decision == "accepted" else decision
-            task["updated_at"] = handoff["updated_at"]
-            brain.store.upsert_harness_projection("specialist_tasks", task)
-    return handoff
-
-
-@router.post("/v1/runs")
-def start_run(body: RunStartRequest, request: Request) -> dict[str, Any]:
-    return _app(request).runs.start(**body.model_dump())
-
-
-@router.post("/v1/runs/{run_id}/events")
-def run_event(run_id: str, body: RunEventRequest, request: Request) -> dict[str, Any]:
-    run = _app(request).runs.add_event(run_id, body.model_dump())
-    if not run:
-        raise HTTPException(404, "run not found")
-    return run
-
-
-@router.post("/v1/runs/{run_id}:complete")
-def complete_run(run_id: str, body: RunCompleteRequest, request: Request) -> dict[str, Any]:
-    run = _app(request).runs.complete(
-        run_id,
-        outcome=body.outcome,
-        summary=body.summary,
-        evidence_source_ids=body.evidence_source_ids,
-    )
-    if not run:
-        raise HTTPException(404, "run not found")
-    return run
-
-
-@router.get("/v1/runs/{run_id}")
-def get_run(run_id: str, request: Request) -> dict[str, Any]:
-    run = _app(request).runs.get(run_id)
-    if not run:
-        raise HTTPException(404, "run not found")
-    return run
-
-
-@router.get("/v1/runs/{run_id}/graph")
-def run_graph(run_id: str, request: Request) -> dict[str, Any]:
-    view = _app(request).runs.execution_graph_view(run_id)
-    if not view:
-        raise HTTPException(404, "run not found")
-    return view
-
-
-@router.post("/v1/runs/{run_id}:evaluate")
-def evaluate_run(run_id: str, request: Request) -> dict[str, Any]:
-    result = _app(request).runs.evaluate(run_id)
-    if not result:
-        raise HTTPException(404, "run not found")
-    return result
 
 
 # ---- proactive ----

@@ -1,6 +1,11 @@
 """slack_send_artifact only ever shares content the acting principal and
 destination are actually authorized to see, and behaves safely with no
-Slack bot token configured (the default in tests — see conftest.py)."""
+Slack bot token configured (the default in tests — see conftest.py).
+
+slack_send_artifact auto-executes under the risk-tiered default (it is not
+in the always-gated tier), so these assert directly on execute()'s result
+rather than going through the approval flow.
+"""
 
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ def _run(brain, destination: dict):
         trigger_kind="reactive",
         initial_message="share artifact probe",
     )
-    return brain.agent_runs.get(created["id"])
+    return brain.store.get_task(created["id"])
 
 
 def test_slack_send_artifact_dry_runs_with_no_bot_token_configured(brain):
@@ -47,12 +52,8 @@ def test_slack_send_artifact_dry_runs_with_no_bot_token_configured(brain):
         arguments={"artifact_id": artifact["id"]},
     )
     result = brain.tool_executor.execute(run=run, call=call)
-    assert result.status == "waiting_for_approval"
-    _, resolved = brain.tool_executor.resolve_approval(
-        approval_id=result.approval_id, approved=True, decided_by="person_ajay"
-    )
-    assert resolved.status == "completed"
-    upload_result = resolved.output["upload_result"]
+    assert result.status == "completed"
+    upload_result = result.output["upload_result"]
     assert upload_result["dry_run"] is True
     assert upload_result["ok"] is False
     assert upload_result["filename"] == "Export Failure Report.txt"
@@ -78,16 +79,10 @@ def test_slack_send_artifact_respects_scope_even_after_tool_call_is_approved(bra
         arguments={"artifact_id": private_artifact["id"]},
     )
     result = brain.tool_executor.execute(run=run, call=call)
-    assert result.status == "waiting_for_approval"
-    # Approving the *tool call* is not the same as the artifact actually
-    # being in scope — the handler still re-checks scope at execution time
-    # and fails closed. ToolExecutor.execute() catches handler exceptions
-    # and reports them on the ToolResult rather than raising.
-    _, resolved = brain.tool_executor.resolve_approval(
-        approval_id=result.approval_id, approved=True, decided_by="person_ajay"
-    )
-    assert resolved.status == "failed"
-    assert "scope" in (resolved.error or "").lower()
+    # The handler still re-checks scope at execution time and fails closed,
+    # even though the tool call itself never paused for approval.
+    assert result.status == "failed"
+    assert "scope" in (result.error or "").lower()
 
 
 def test_slack_send_artifact_rejects_unknown_artifact_id(brain):
@@ -99,8 +94,5 @@ def test_slack_send_artifact_rejects_unknown_artifact_id(brain):
         arguments={"artifact_id": "artifact_does_not_exist"},
     )
     result = brain.tool_executor.execute(run=run, call=call)
-    _, resolved = brain.tool_executor.resolve_approval(
-        approval_id=result.approval_id, approved=True, decided_by="person_ajay"
-    )
-    assert resolved.status == "failed"
-    assert "not found" in (resolved.error or "").lower()
+    assert result.status == "failed"
+    assert "not found" in (result.error or "").lower()

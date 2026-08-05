@@ -35,7 +35,8 @@ import {
 } from "../components";
 
 type Dashboard = {
-  runs: Json[];
+  tasks: Json[];
+  sessions: Json[];
   approvals: Json[];
   attention: Json[];
   interventions: Json[];
@@ -55,7 +56,7 @@ function dayKey(iso: unknown): string {
   return d.toISOString().slice(0, 10);
 }
 
-function buildSeries(runs: Record<string, unknown>[], approvals: Record<string, unknown>[]) {
+function buildSeries(tasks: Record<string, unknown>[], approvals: Record<string, unknown>[]) {
   const days: { key: string; label: string }[] = [];
   const today = new Date();
   for (let i = DAYS - 1; i >= 0; i--) {
@@ -64,14 +65,14 @@ function buildSeries(runs: Record<string, unknown>[], approvals: Record<string, 
     const key = d.toISOString().slice(0, 10);
     days.push({ key, label: d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) });
   }
-  const runCounts = new Map<string, number>();
-  for (const r of runs) runCounts.set(dayKey(r.created_at), (runCounts.get(dayKey(r.created_at)) ?? 0) + 1);
+  const taskCounts = new Map<string, number>();
+  for (const task of tasks) taskCounts.set(dayKey(task.created_at), (taskCounts.get(dayKey(task.created_at)) ?? 0) + 1);
   const approvalCounts = new Map<string, number>();
   for (const a of approvals)
     approvalCounts.set(dayKey(a.created_at), (approvalCounts.get(dayKey(a.created_at)) ?? 0) + 1);
   return days.map((d) => ({
     label: d.label,
-    runs: runCounts.get(d.key) ?? 0,
+    tasks: taskCounts.get(d.key) ?? 0,
     approvals: approvalCounts.get(d.key) ?? 0,
   }));
 }
@@ -120,8 +121,8 @@ export default function Overview() {
     setTick((t) => t + 1);
   }
 
-  const runs = (data?.runs ?? []) as Record<string, unknown>[];
-  const activeRuns = runs.filter((r) => !TERMINAL_STATES.has(String(r.state)));
+  const tasks = (data?.tasks ?? []) as Record<string, unknown>[];
+  const activeTasks = tasks.filter((task) => !TERMINAL_STATES.has(String(task.state)));
   const approvalsAll = (data?.approvals ?? []) as Record<string, unknown>[];
   const pendingApprovals = approvalsAll.filter((a) => a.status === "pending");
   const deadLetters = (data?.jobs.dead_letters ?? []) as Record<string, unknown>[];
@@ -130,7 +131,7 @@ export default function Overview() {
   const recentAudit = ((audit?.events ?? []) as Record<string, unknown>[])
     .filter((e) => !dismissed.has(String(e.id)))
     .slice(0, 8);
-  const series = useMemo(() => buildSeries(runs, approvalsAll), [runs, approvalsAll]);
+  const series = useMemo(() => buildSeries(tasks, approvalsAll), [tasks, approvalsAll]);
   const activeConnections = (connectors?.accounts ?? []).filter(
     (a) => (a as Record<string, unknown>).status === "active"
   ).length;
@@ -139,7 +140,7 @@ export default function Overview() {
     <>
       <PageHeader
         title="Dashboard"
-        subtitle="What Docket is doing right now — active runs, pending approvals, and recent activity."
+        subtitle="What Docket is doing right now — active Tasks, pending approvals, and recent activity."
         actions={
           <span className="text-[11px] font-medium text-muted">
             Refreshed {reltime(lastRefreshed.toISOString())}
@@ -181,8 +182,8 @@ export default function Overview() {
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
           <StatCard
             icon={<Activity size={17} />}
-            label="Active runs"
-            value={activeRuns.length}
+            label="Active tasks"
+            value={activeTasks.length}
             delta="in flight right now"
             deltaTone="muted"
           />
@@ -216,8 +217,8 @@ export default function Overview() {
         <div className="grid gap-5">
           <Card title="Activity overview" meta={`last ${DAYS} days`}>
             <div className="flex items-center gap-4 border-b border-line px-5 py-3 text-[11px] font-medium text-muted">
-              <span className="flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full bg-brand" /> Runs started
+                  <span className="flex items-center gap-1.5">
+                <span className="h-2 w-2 rounded-full bg-brand" /> Tasks started
               </span>
               <span className="flex items-center gap-1.5">
                 <span className="h-2 w-2 rounded-full bg-acid" /> Approvals requested
@@ -248,7 +249,7 @@ export default function Overview() {
                       boxShadow: "0 8px 24px -8px rgba(20,26,21,0.2)",
                     }}
                   />
-                  <Bar dataKey="runs" name="Runs" fill="#1c7a4d" radius={[6, 6, 0, 0]} barSize={22} />
+                  <Bar dataKey="tasks" name="Tasks" fill="#1c7a4d" radius={[6, 6, 0, 0]} barSize={22} />
                   <Line
                     type="monotone"
                     dataKey="approvals"
@@ -262,26 +263,26 @@ export default function Overview() {
             </div>
           </Card>
 
-          <Card title="Active runs" meta={String(activeRuns.length)}>
+          <Card title="Active tasks" meta={String(activeTasks.length)}>
             {loading && !data && <Empty>loading…</Empty>}
-            {data && activeRuns.length === 0 && <Empty>nothing in flight</Empty>}
-            {activeRuns.length > 0 && (
+            {data && activeTasks.length === 0 && <Empty>nothing in flight</Empty>}
+            {activeTasks.length > 0 && (
               <table className="table">
                 <thead>
-                  <tr><th>run</th><th>goal</th><th>trigger</th><th>state</th><th>updated</th></tr>
+                  <tr><th>task</th><th>prompt</th><th>worker</th><th>state</th><th>updated</th></tr>
                 </thead>
                 <tbody>
-                  {activeRuns.slice(0, 10).map((r) => (
-                    <tr key={String(r.id)}>
+                  {activeTasks.slice(0, 10).map((task) => (
+                    <tr key={String(task.id)}>
                       <td>
-                        <Link to={`/runs/${r.id}`} className="font-medium text-ink hover:text-brand hover:underline">
-                          {String(r.id)}
+                        <Link to={`/tasks/${task.id}`} className="font-medium text-ink hover:text-brand hover:underline">
+                          {String(task.id)}
                         </Link>
                       </td>
-                      <td>{fmt(r.goal, 90)}</td>
-                      <td>{String(r.trigger_kind)}</td>
-                      <td><StatePill state={String(r.state)} /></td>
-                      <td className="text-muted">{reltime(String(r.updated_at))}</td>
+                      <td>{fmt(task.prompt || task.goal, 90)}</td>
+                      <td>{String(task.worker_type || "session_manager")}</td>
+                      <td><StatePill state={String(task.state)} /></td>
+                      <td className="text-muted">{reltime(String(task.updated_at))}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -293,7 +294,7 @@ export default function Overview() {
             <Card title="Pending approvals" meta={String(pendingApprovals.length)}>
               <table className="table">
                 <thead>
-                  <tr><th>run</th><th>tool</th><th>preview</th><th>action</th></tr>
+                  <tr><th>task</th><th>tool</th><th>preview</th><th>action</th></tr>
                 </thead>
                 <tbody>
                   {pendingApprovals.slice(0, 10).map((a) => {
@@ -301,8 +302,8 @@ export default function Overview() {
                     return (
                       <tr key={String(a.id)}>
                         <td>
-                          <Link to={`/runs/${a.run_id}`} className="font-medium text-ink hover:text-brand hover:underline">
-                            {String(a.run_id)}
+                          <Link to={`/tasks/${a.task_id}`} className="font-medium text-ink hover:text-brand hover:underline">
+                            {String(a.task_id)}
                           </Link>
                         </td>
                         <td>{String(preview.action)}</td>

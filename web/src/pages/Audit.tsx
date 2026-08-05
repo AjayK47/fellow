@@ -15,16 +15,16 @@ export default function Audit() {
     <>
       <PageHeader
         title="Audit"
-        subtitle="Append-only event log: every route, attention decision, run, tool call, delivery, and admin action."
+        subtitle="Append-only event log: every route, attention decision, Task, tool call, delivery, and admin action."
         actions={
           <select className="select" value={type} onChange={(e) => setType(e.target.value)}>
             <option value="">all types</option>
             <option value="event.routed">event.routed</option>
             <option value="attention.evaluated">attention.evaluated</option>
-            <option value="agent.run.completed">agent.run.completed</option>
-            <option value="agent.run.failed">agent.run.failed</option>
-            <option value="agent.delivery">agent.delivery</option>
-            <option value="agent.specialist.completed">agent.specialist.completed</option>
+            <option value="task.completed">task.completed</option>
+            <option value="task.failed">task.failed</option>
+            <option value="task.delivery">task.delivery</option>
+            <option value="task.child.completed">task.child.completed</option>
             <option value="slack.event.accepted">slack.event.accepted</option>
           </select>
         }

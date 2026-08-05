@@ -32,7 +32,7 @@ def _slack_envelope(brain, *, conversation: str) -> InvocationEnvelope:
 
 
 def test_resolver_separates_destination_mandatory_and_task_optional_skills(brain):
-    resolved = brain.skills.resolve_for_run(
+    resolved = brain.skills.resolve_for_task(
         organization_id="org_acme",
         task="Investigate the export failure before fixing it",
         destination={
@@ -55,14 +55,14 @@ def test_resolver_separates_destination_mandatory_and_task_optional_skills(brain
     assert investigation["activation_reason"] == "task_relevant"
 
 
-def test_active_skill_versions_are_pinned_to_the_run(brain):
-    run = brain.company_agent.create_invocation(
+def test_active_skill_versions_are_pinned_to_the_task(brain):
+    task = brain.company_agent.create_invocation(
         envelope=_slack_envelope(brain, conversation="slack:T:channel_eng:event:pin"),
         goal="Investigate the export failure before fixing it",
         trigger_kind="reactive",
         initial_message="Investigate the export failure before fixing it",
     )
-    first = brain.company_agent._active_skills(run)
+    first = brain.company_agent._active_skills(task)
     pinned_procedure = next(
         skill for skill in first if skill["name"] == "Handle Export Failure"
     )
@@ -72,7 +72,7 @@ def test_active_skill_versions_are_pinned_to_the_run(brain):
     assert proposal
     brain.skills.approve(pinned_procedure["id"], proposal["version"])
 
-    persisted = brain.agent_runs.get(run["id"])
+    persisted = brain.store.get_task(task["id"])
     pinned = brain.company_agent._active_skills(persisted)
     pinned_again = next(
         skill for skill in pinned if skill["name"] == "Handle Export Failure"
@@ -113,7 +113,7 @@ def test_slack_skill_is_injected_and_validates_the_final_response(brain):
     brain.company_agent.skill_validator = SkillResponseValidator(
         model=validation_model
     )
-    run = brain.company_agent.create_invocation(
+    task = brain.company_agent.create_invocation(
         envelope=_slack_envelope(
             brain, conversation="slack:T:channel_eng:event:validation"
         ),
@@ -125,7 +125,7 @@ def test_slack_skill_is_injected_and_validates_the_final_response(brain):
         },
     )
 
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(task["id"])
 
     assert outcome.answer == (
         "Spain won the *2026 FIFA World Cup*. "
@@ -145,7 +145,7 @@ def test_slack_skill_is_injected_and_validates_the_final_response(brain):
     assert validation_input["active_skill_contracts"][0]["name"] == (
         "Write for Slack"
     )
-    completed = brain.agent_runs.get(run["id"])
+    completed = brain.store.get_task(task["id"])
     assert completed["metadata"]["last_skill_validation"]["valid"] is False
     audit = brain.store.list_audit(
         "org_acme", event_type="agent.response.skill_validated"
@@ -156,7 +156,7 @@ def test_slack_skill_is_injected_and_validates_the_final_response(brain):
 def test_platform_skills_are_visible_without_memory_public_scope(brain):
     # A fresh/reset tenant may not have materialized its organization-public
     # memory scope yet. Destination skills must still be active.
-    active = brain.skills.resolve_for_run(
+    active = brain.skills.resolve_for_task(
         organization_id="org_acme",
         task="read and summarize a PDF",
         destination={"type": "dm", "id": "D1", "is_private": True},
@@ -166,6 +166,40 @@ def test_platform_skills_are_visible_without_memory_public_scope(brain):
     )
     names = {skill["name"] for skill in active}
     assert "Write for Slack" in names
+    assert "PDF and Document Handling" in names
+
+
+def test_document_skills_activate_with_real_run_scoped_capabilities(brain):
+    """H-31: the builtin document skills (pdf-documents, docx, xlsx,
+    powerpoint, ocr-documents, nano-pdf) declare required_capabilities in
+    terms of coarse `documents.read`/`documents.write` markers, not the
+    granular `document.<family>.<op>` capability_ids typed_tools.py actually
+    emits. resolve_for_task's own `ready()` gate only lets an optional skill
+    through when it can't prove a required capability is missing -- passing
+    `available_capabilities=None` (as the sibling test above does) skips
+    that check entirely. This test passes the *real* Task-scoped capability
+    set (`ToolExecutor.available_capabilities()`, exactly what
+    CompanyAgent._active_skills() passes in production) so a regression in
+    that capability-marker wiring actually fails a test instead of silently
+    leaving every document skill permanently inert."""
+    task = brain.company_agent.create_invocation(
+        envelope=_slack_envelope(brain, conversation="skills:documents:real-capabilities"),
+        goal="Create a PDF report",
+        trigger_kind="reactive",
+        initial_message="Create a PDF report",
+    )
+    task = brain.store.get_task(task["id"])
+    resolved = brain.skills.resolve_for_task(
+        organization_id="org_acme",
+        task="Create a PDF document report artifact",
+        destination={"type": "slack_channel", "id": "channel_eng", "is_private": False},
+        trigger_kind="reactive",
+        purpose="reactive_agent",
+        allowed_scope_ids=["scope_channel_eng"],
+        optional_limit=20,
+        available_capabilities=brain.tool_executor.available_capabilities(task),
+    )
+    names = {skill["name"] for skill in resolved}
     assert "PDF and Document Handling" in names
 
 

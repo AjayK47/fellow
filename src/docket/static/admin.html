@@ -105,7 +105,7 @@
       <header>
         <div>
           <div class="eyebrow">Operational intelligence / live</div>
-          <h1>Agent<br>control room.</h1>
+          <h1>Task<br>control room.</h1>
           <div class="statusline"><span class="dot" id="health-dot"></span><span id="status">Connecting to harness…</span></div>
         </div>
         <div class="controls">
@@ -114,15 +114,15 @@
         </div>
       </header>
       <section class="metrics">
-        <div class="metric acid"><small>Agent runs</small><b id="m-runs">—</b></div>
+        <div class="metric acid"><small>Tasks</small><b id="m-tasks">—</b></div>
         <div class="metric"><small>Completed</small><b id="m-completed">—</b></div>
         <div class="metric"><small>Attention wakes</small><b id="m-wakes">—</b></div>
         <div class="metric"><small>Queued work</small><b id="m-jobs">—</b></div>
       </section>
       <section class="grid">
         <div class="panel">
-          <div class="panel-head"><h2>Durable agent runs</h2><span>click for full record</span></div>
-          <table><thead><tr><th style="width:24%">State</th><th>Goal</th><th style="width:18%">Trigger</th><th style="width:17%">Turns</th></tr></thead><tbody id="runs"></tbody></table>
+          <div class="panel-head"><h2>Durable Tasks</h2><span>click for full record</span></div>
+          <table><thead><tr><th style="width:24%">State</th><th>Prompt</th><th style="width:18%">Trigger</th><th style="width:17%">Turns</th></tr></thead><tbody id="tasks"></tbody></table>
         </div>
         <div class="panel">
           <div class="panel-head"><h2>Attention stream</h2><span>policy decisions</span></div>
@@ -154,12 +154,12 @@
         const data = await response.json(), evaluation = data.evaluation;
         $("health-dot").classList.add("live");
         $("status").textContent = `Live · ${org} · ${new Date().toLocaleTimeString()}`;
-        $("m-runs").textContent = evaluation.runs.count;
-        $("m-completed").textContent = evaluation.runs.states.completed || 0;
+        $("m-tasks").textContent = evaluation.tasks.count;
+        $("m-completed").textContent = evaluation.tasks.states.completed || 0;
         $("m-wakes").textContent = evaluation.attention.wake_count || 0;
         $("m-jobs").textContent = data.jobs.counts.queued || 0;
-        $("runs").innerHTML = data.runs.length ? data.runs.map((r, i) => `<tr data-id="${i}"><td>${badge(r.state)}</td><td title="${safe(r.goal)}">${safe(r.goal)}</td><td>${safe(r.trigger_kind)}</td><td>${safe(r.iteration_count || 0)}</td></tr>`).join("") : `<tr><td colspan="4" class="empty">No runs yet.</td></tr>`;
-        [...$("runs").querySelectorAll("tr[data-id]")].forEach(row => row.onclick = () => show(data.runs[Number(row.dataset.id)]));
+        $("tasks").innerHTML = data.tasks.length ? data.tasks.map((task, i) => `<tr data-id="${i}"><td>${badge(task.state)}</td><td title="${safe(task.prompt || task.goal)}">${safe(task.prompt || task.goal)}</td><td>${safe(task.trigger_kind)}</td><td>${safe(task.iteration_count || 0)}</td></tr>`).join("") : `<tr><td colspan="4" class="empty">No Tasks yet.</td></tr>`;
+        [...$("tasks").querySelectorAll("tr[data-id]")].forEach(row => row.onclick = () => show(data.tasks[Number(row.dataset.id)]));
         $("approvals").innerHTML = data.approvals.length ? data.approvals.map((a, i) => `<tr data-id="${i}"><td>${badge(a.status)}</td><td>${safe(a.tool_name)}</td><td>${safe(a.requested_by)}</td></tr>`).join("") : `<tr><td colspan="3" class="empty">No approval requests.</td></tr>`;
         [...$("approvals").querySelectorAll("tr[data-id]")].forEach(row => row.onclick = () => show(data.approvals[Number(row.dataset.id)]));
         $("attention").innerHTML = data.attention.length ? data.attention.slice(0, 12).map(a => `<div class="feed-item"><time>${safe((a.created_at || "").slice(11,19))}</time><p>${badge(a.decision)}<br>${safe(a.reason || a.event_id)}</p></div>`).join("") : `<div class="empty">No ambient decisions yet.</div>`;

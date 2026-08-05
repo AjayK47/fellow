@@ -1,4 +1,4 @@
-"""Asynchronous post-run capture and ambient episode consolidation."""
+"""Asynchronous post-Task capture and ambient episode consolidation."""
 
 from __future__ import annotations
 
@@ -38,48 +38,50 @@ class HarnessMemoryCapture:
         self.embeddings = embeddings
         self.skills = skills
 
-    def capture_run(self, run_id: str) -> dict[str, Any]:
-        run = self.store.get_harness_record("agent_runs", run_id)
-        if not run:
-            raise KeyError(run_id)
-        messages = self.store.session_messages(run["session_id"], limit=200)
+    def capture_task(self, task_id: str) -> dict[str, Any]:
+        task = self.store.get_task(task_id)
+        if not task:
+            raise KeyError(task_id)
+        # Task transcripts are scoped to the owning Session and carry the
+        # Task identity on each message.
+        messages = self.store.list_session_messages(task["session_id"], limit=200)
+        own_messages = [m for m in messages if m.get("task_id") == task_id]
         transcript = "\n".join(
             f"{message['role'].upper()}: {message.get('content') or ''}"
-            for message in messages
-            if message.get("run_id") == run_id
+            for message in own_messages
         )
         if not transcript.strip():
-            return {"run_id": run_id, "captured": False, "reason": "empty_transcript"}
-        envelope = run["envelope"]
+            return {"task_id": task_id, "captured": False, "reason": "empty_transcript"}
+        envelope = task["envelope"]
         use_model = bool(self.model_extractor and self.model_extractor.live)
-        # H-12: capture writes to the scope of the conversation this run
+        # H-12: capture writes to the scope of the conversation this Task
         # actually happened in, not an arbitrary pick from the authorization
         # decision's allowed_scope_ids (which can legitimately span more
         # than one room and was never a statement of provenance).
         write_scope_id = resolve_scope(
             store=self.store,
-            organization_id=run["organization_id"],
+            organization_id=task["organization_id"],
             principal_id=envelope["principal_id"],
             destination=envelope["destination"],
         ).write_scope_id
         result = self.ingestion.ingest(
-            organization_id=run["organization_id"],
+            organization_id=task["organization_id"],
             source_system="docket_agent",
-            source_type="agent_run",
-            external_id=run_id,
+            source_type="agent_task",
+            external_id=task_id,
             content=(
-                f"Goal: {run['goal']}\nStatus: {run['state']}\n"
-                f"Final answer: {run.get('final_answer') or ''}\n\n{transcript}"
+                f"Goal: {task['goal']}\nStatus: {task['state']}\n"
+                f"Final answer: {task.get('final_answer') or ''}\n\n{transcript}"
             ),
             scope_id=write_scope_id,
             author_entity_id=envelope["principal_id"],
             channel_id=envelope["destination"].get("id"),
             is_private_channel=bool(envelope["destination"].get("is_private")),
-            entity_ids=list(run.get("metadata", {}).get("entity_ids") or []),
+            entity_ids=list(task.get("metadata", {}).get("entity_ids") or []),
             metadata={
-                "run_id": run_id,
-                "trace_id": run["trace_id"],
-                "trigger_kind": run["trigger_kind"],
+                "task_id": task_id,
+                "trace_id": task["trace_id"],
+                "trigger_kind": task["trigger_kind"],
                 "conversation_id": envelope["conversation_id"],
             },
             learn=not use_model,
@@ -96,19 +98,19 @@ class HarnessMemoryCapture:
                     result["source"], memories
                 )
         self.audit.record(
-            run["organization_id"],
-            "memory.run_captured",
+            task["organization_id"],
+            "memory.task_captured",
             {
-                "run_id": run_id,
+                "task_id": task_id,
                 "source_id": result["source"]["id"],
                 "memory_count": len(memories),
             },
             principal_id=envelope["principal_id"],
-            trace_id=run["trace_id"],
+            trace_id=task["trace_id"],
         )
-        pattern_signal = self._track_pattern_and_maybe_propose(run)
+        pattern_signal = self._track_pattern_and_maybe_propose(task)
         return {
-            "run_id": run_id,
+            "task_id": task_id,
             "captured": True,
             "source_id": result["source"]["id"],
             "memory_ids": [memory["id"] for memory in memories],
@@ -116,14 +118,14 @@ class HarnessMemoryCapture:
         }
 
     def _track_pattern_and_maybe_propose(
-        self, run: dict[str, Any]
+        self, task: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Notice when a run's goal semantically repeats a recent one, and
+        """Notice when a Task's goal semantically repeats a recent one, and
         once it has repeated enough to be a real pattern (not a coincidence),
         draft a skill for a human to review.
 
-        This is the "bigger picture" pass a single run's own model call can
-        never have: it compares THIS run's goal against other SEPARATE runs
+        This is the "bigger picture" pass a single Task's own model call can
+        never have: it compares THIS Task's goal against other completed Tasks
         completed earlier, something no in-task reasoning has visibility
         into. Detection is a pure embedding-similarity comparison — no LLM
         call — so this stays cheap and doesn't add to the very tool/model
@@ -133,19 +135,19 @@ class HarnessMemoryCapture:
         """
         if not self.embeddings or not self.skills:
             return None
-        if run.get("trigger_kind") not in _PATTERN_TRACKED_TRIGGER_KINDS:
+        if task.get("trigger_kind") not in _PATTERN_TRACKED_TRIGGER_KINDS:
             return None
-        if (run.get("metadata") or {}).get("specialist_worker"):
+        if (task.get("worker_type") or (task.get("metadata") or {}).get("worker_type")) in {"general", "pi"}:
             return None
-        goal = (run.get("goal") or "").strip()
+        goal = (task.get("goal") or "").strip()
         if len(goal) < 12:
             return None
 
-        org = run["organization_id"]
+        org = task["organization_id"]
         vector = self.embeddings.embed([goal])[0]
         now = utcnow().isoformat()
         existing = self.store.list_harness_records(
-            "run_pattern_signals", org, where={"status": "open"}
+            "task_pattern_signals", org, where={"status": "open"}
         )
         best: tuple[float, dict[str, Any]] | None = None
         for candidate in existing:
@@ -160,36 +162,36 @@ class HarnessMemoryCapture:
                 "id": new_id("pattern"),
                 "organization_id": org,
                 "status": "open",
-                "run_id": run["id"],
+                "task_id": task["id"],
                 "sample_goal": goal,
                 "embedding": vector,
                 "occurrence_count": 1,
-                "run_ids": [run["id"]],
+                "task_ids": [task["id"]],
                 "created_at": now,
                 "updated_at": now,
             }
-            self.store.upsert_harness_projection("run_pattern_signals", signal)
+            self.store.upsert_harness_projection("task_pattern_signals", signal)
             return signal
 
         signal = best[1]
         signal["occurrence_count"] = int(signal.get("occurrence_count", 1)) + 1
-        signal["run_ids"] = (list(signal.get("run_ids") or []) + [run["id"]])[-10:]
+        signal["task_ids"] = (list(signal.get("task_ids") or []) + [task["id"]])[-10:]
         signal["updated_at"] = now
         if signal["occurrence_count"] >= _PATTERN_PROPOSAL_THRESHOLD:
             self._propose_skill_from_pattern(signal)
         else:
-            self.store.upsert_harness_projection("run_pattern_signals", signal)
+            self.store.upsert_harness_projection("task_pattern_signals", signal)
         return signal
 
     def _propose_skill_from_pattern(self, signal: dict[str, Any]) -> None:
-        run_ids = signal.get("run_ids") or []
+        task_ids = signal.get("task_ids") or []
         skill = self.skills.create(
             organization_id=signal["organization_id"],
             name=f"Recurring request: {signal['sample_goal'][:60]}",
             description=(
                 f"Auto-detected: {signal['occurrence_count']} separate requests "
                 f"since {signal.get('created_at', '')[:10]} looked like the same "
-                f"underlying ask (runs: {', '.join(run_ids[-5:])}). Drafted for "
+                f"underlying ask (Tasks: {', '.join(task_ids[-5:])}). Drafted for "
                 "review — steps are not filled in yet."
             ),
             goal=signal["sample_goal"],
@@ -197,7 +199,7 @@ class HarnessMemoryCapture:
             inputs=[],
             preconditions=[],
             warnings=[
-                "Auto-drafted from a recurring pattern across separate runs, "
+                "Auto-drafted from a recurring pattern across separate Tasks, "
                 "not authored by a human or reviewed in context. Verify the "
                 "steps before approving.",
             ],
@@ -206,14 +208,14 @@ class HarnessMemoryCapture:
         )
         signal["status"] = "proposed"
         signal["proposed_skill_id"] = skill["id"]
-        self.store.upsert_harness_projection("run_pattern_signals", signal)
+        self.store.upsert_harness_projection("task_pattern_signals", signal)
         self.audit.record(
             signal["organization_id"],
             "skill.pattern_detected",
             {
                 "pattern_signal_id": signal["id"],
                 "occurrence_count": signal["occurrence_count"],
-                "run_ids": run_ids,
+                "task_ids": task_ids,
                 "proposed_skill_id": skill["id"],
             },
         )

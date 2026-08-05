@@ -30,6 +30,85 @@ def test_superseded_edge_stops_being_current_but_stays_queryable_historically(br
     assert closed["valid_until"] and closed["system_to"]
 
 
+def test_paths_between_finds_a_direct_and_a_multi_hop_path(brain):
+    """paths_between() is a recursive SQL CTE scoped to the actual query,
+    not a Python BFS over every edge in the org -- these tests are the
+    correctness baseline for that rewrite (no prior tests existed)."""
+    org = "org_acme"
+    brain.graph.add_edge(org, "OWNS", "person_a", "service_x")
+    brain.graph.add_edge(org, "OWNS", "person_b", "service_y")
+    brain.graph.add_edge(org, "DEPENDS_ON", "service_x", "service_y")
+
+    direct = brain.graph.paths_between(org, "person_a", "service_x", max_depth=3)
+    assert len(direct) == 1
+    assert [e["id"] for e in direct[0]] == [
+        e["id"]
+        for e in brain.graph.list_edges(org, edge_type="OWNS", from_id="person_a")
+    ]
+
+    multi_hop = brain.graph.paths_between(org, "person_a", "person_b", max_depth=3)
+    assert len(multi_hop) == 1
+    path = multi_hop[0]
+    assert len(path) == 3
+    # person_a -[OWNS]-> service_x -[DEPENDS_ON]-> service_y <-[OWNS]- person_b
+    assert path[0]["from_id"] == "person_a" and path[0]["to_id"] == "service_x"
+    assert path[1]["from_id"] == "service_x" and path[1]["to_id"] == "service_y"
+    # The third edge is stored as person_b -> service_y but traversed
+    # backward -- must come back normalized to service_y -> person_b with
+    # _reversed set, matching the original BFS's undirected semantics.
+    assert path[2]["from_id"] == "service_y" and path[2]["to_id"] == "person_b"
+    assert path[2]["_reversed"] is True
+
+
+def test_paths_between_respects_max_depth(brain):
+    org = "org_acme"
+    brain.graph.add_edge(org, "DEPENDS_ON", "svc_a", "svc_b")
+    brain.graph.add_edge(org, "DEPENDS_ON", "svc_b", "svc_c")
+    brain.graph.add_edge(org, "DEPENDS_ON", "svc_c", "svc_d")
+
+    assert brain.graph.paths_between(org, "svc_a", "svc_d", max_depth=2) == []
+    found = brain.graph.paths_between(org, "svc_a", "svc_d", max_depth=3)
+    assert len(found) == 1
+    assert len(found[0]) == 3
+
+
+def test_paths_between_filters_by_edge_type(brain):
+    org = "org_acme"
+    brain.graph.add_edge(org, "OWNS", "person_a", "service_x")
+    brain.graph.add_edge(org, "DEPENDS_ON", "service_x", "service_y")
+
+    all_types = brain.graph.paths_between(org, "person_a", "service_y", max_depth=3)
+    assert len(all_types) == 1
+
+    filtered = brain.graph.paths_between(
+        org, "person_a", "service_y", max_depth=3, edge_types=["DEPENDS_ON"]
+    )
+    assert filtered == []  # the only path requires the OWNS edge first, filtered out
+
+
+def test_paths_between_terminates_and_stays_bounded_with_a_cycle(brain):
+    """A cycle in the (undirected) graph must not cause infinite recursion,
+    and every returned path must still respect max_depth and never revisit
+    a node."""
+    org = "org_acme"
+    brain.graph.add_edge(org, "DEPENDS_ON", "svc_a", "svc_b")
+    brain.graph.add_edge(org, "DEPENDS_ON", "svc_b", "svc_c")
+    brain.graph.add_edge(org, "DEPENDS_ON", "svc_c", "svc_a")  # closes the cycle
+
+    found = brain.graph.paths_between(org, "svc_a", "svc_c", max_depth=3)
+    assert found  # at least one path exists (directly, and via svc_b)
+    for path in found:
+        assert len(path) <= 3
+        nodes = [path[0]["from_id"]] + [e["to_id"] for e in path]
+        assert len(nodes) == len(set(nodes))  # no node visited twice
+
+
+def test_paths_between_returns_empty_when_unreachable(brain):
+    org = "org_acme"
+    brain.graph.add_edge(org, "OWNS", "person_a", "service_x")
+    assert brain.graph.paths_between(org, "person_a", "service_never_connected") == []
+
+
 def test_supersede_edge_endpoint_closes_without_replacement(api_client):
     api_client.post(
         "/v1/entities",

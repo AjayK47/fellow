@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 
+from docket.domain.models import new_id, utcnow
 from docket.harness.history_compaction import (
     COMPACTION_SCHEMA,
     SUMMARY_PREFIX,
@@ -223,24 +224,34 @@ def test_compaction_is_incremental_across_two_runs_on_the_same_conversation(brai
         initial_message="Investigate the export failure",
     )
     session_id = run_a["session_id"]
+    def append_message(task_id: str, role: str, content: str) -> None:
+        brain.store.append_session_message(
+            {
+                "id": new_id("smsg"),
+                "organization_id": "org_acme",
+                "session_id": session_id,
+                "task_id": task_id,
+                "role": role,
+                "content": content,
+                "created_at": utcnow().isoformat(),
+            }
+        )
     # Seed 55 plain messages directly so the token threshold is already
     # crossed before the first run() call, without needing dozens of real
     # tool-call iterations.
     for i in range(55):
-        brain.agent_runs.add_message(
-            organization_id="org_acme",
-            session_id=session_id,
-            run_id=run_a["id"],
-            role="user" if i % 2 == 0 else "assistant",
-            content=f"seed message {i}",
+        append_message(
+            run_a["id"],
+            "user" if i % 2 == 0 else "assistant",
+            f"seed message {i}",
         )
-    outcome_a = brain.company_agent.run(run_a["id"])
+    outcome_a = brain.company_agent.execute_task(run_a["id"])
     assert outcome_a.state.value == "completed"
     assert len(spy.calls) == 1
     first_call_size = len(spy.calls[0])
     assert first_call_size > 0
 
-    session_after_a = brain.agent_runs.store.get_harness_record("agent_sessions", session_id)
+    session_after_a = brain.store.get_session(session_id)
     assert session_after_a["summary"]
     summarized_through = session_after_a["summary_through_message_id"]
 
@@ -255,14 +266,8 @@ def test_compaction_is_incremental_across_two_runs_on_the_same_conversation(brai
     )
     assert run_b["session_id"] == session_id
     for i in range(5):
-        brain.agent_runs.add_message(
-            organization_id="org_acme",
-            session_id=session_id,
-            run_id=run_b["id"],
-            role="user",
-            content=f"extra message {i}",
-        )
-    outcome_b = brain.company_agent.run(run_b["id"])
+        append_message(run_b["id"], "user", f"extra message {i}")
+    outcome_b = brain.company_agent.execute_task(run_b["id"])
     assert outcome_b.state.value == "completed"
     assert len(spy.calls) == 2
     second_call = spy.calls[1]

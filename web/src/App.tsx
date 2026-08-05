@@ -8,6 +8,7 @@ import {
   Clock,
   Database,
   ExternalLink,
+  Kanban,
   ListChecks,
   LogOut,
   MessageSquare,
@@ -23,8 +24,6 @@ import {
 import Overview from "./pages/Overview";
 import Sessions from "./pages/Sessions";
 import SessionDetail from "./pages/SessionDetail";
-import Runs from "./pages/Runs";
-import RunDetail from "./pages/RunDetail";
 import Approvals from "./pages/Approvals";
 import Policies from "./pages/Policies";
 import Tools from "./pages/Tools";
@@ -33,6 +32,8 @@ import Setup from "./pages/Setup";
 import Connections from "./pages/Connections";
 import Channels from "./pages/Channels";
 import Automations from "./pages/Automations";
+import Tasks from "./pages/Tasks";
+import TaskDetail from "./pages/TaskDetail";
 import Graph from "./pages/Graph";
 import Reality from "./pages/Reality";
 import Jobs from "./pages/Jobs";
@@ -68,6 +69,7 @@ const GROUPS: NavGroup[] = [
       { to: "/connections", label: "Integrations", icon: Plug },
       { to: "/channels", label: "Channels", icon: MessageSquare },
       { to: "/automations", label: "Automations", icon: Clock },
+      { to: "/tasks", label: "Tasks", icon: Kanban },
     ],
   },
   {
@@ -219,7 +221,7 @@ function NavSearch() {
       <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
       <input
         className="input w-full pl-9"
-        placeholder="Search pages, runs, or tools…"
+        placeholder="Search pages, tasks, or tools…"
         value={query}
         onChange={(e) => {
           setQuery(e.target.value);
@@ -336,8 +338,6 @@ export default function App() {
             <Routes>
               <Route path="/sessions" element={<Sessions />} />
               <Route path="/sessions/:sessionId" element={<SessionDetail />} />
-              <Route path="/runs" element={<Runs />} />
-              <Route path="/runs/:runId" element={<RunDetail />} />
               <Route path="/approvals" element={<Approvals />} />
               <Route path="/policies" element={<Policies />} />
               <Route path="/tools" element={<Tools />} />
@@ -346,6 +346,8 @@ export default function App() {
               <Route path="/connections" element={<Connections />} />
               <Route path="/channels" element={<Channels />} />
               <Route path="/automations" element={<Automations />} />
+              <Route path="/tasks" element={<Tasks />} />
+              <Route path="/tasks/:taskId" element={<TaskDetail />} />
               <Route path="/graph" element={<Graph />} />
               <Route path="/reality" element={<Reality />} />
               <Route path="/jobs" element={<Jobs />} />

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import time
 
 from docket.config import settings
 from docket.services.container import DocketApp
@@ -17,9 +18,15 @@ async def run_worker() -> None:
     for name in ("SIGINT", "SIGTERM"):
         if hasattr(signal, name):
             loop.add_signal_handler(getattr(signal, name), stopping.set)
+    last_dispatcher_tick = 0.0
     try:
         while not stopping.is_set():
-            brain.automations.tick()
+            if (
+                time.monotonic() - last_dispatcher_tick
+                >= settings.dispatcher_tick_interval_seconds
+            ):
+                brain.automations.tick()
+                last_dispatcher_tick = time.monotonic()
             result = await asyncio.to_thread(brain.harness_worker.drain_once)
             if not result["leased"]:
                 try:

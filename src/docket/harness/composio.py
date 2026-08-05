@@ -210,19 +210,94 @@ class ComposioClient:
         return self._request("GET", "auth_configs", params=params)
 
     def create_auth_config(
-        self, *, toolkit: str, name: str | None = None
+        self,
+        *,
+        toolkit: str,
+        name: str | None = None,
+        auth_scheme: str | None = None,
     ) -> dict[str, Any]:
-        """Create a Composio-managed auth config for a toolkit (no custom OAuth app needed)."""
+        """Create an auth config for a toolkit.
+
+        OAuth2 (the default, auth_scheme=None or "OAUTH2") uses Composio's
+        own managed auth — no custom OAuth app needed. Every other scheme
+        (API_KEY, BEARER_TOKEN, BASIC, ...) requires "use_custom_auth"
+        instead; confirmed against Composio's v3 OpenAPI schema that
+        "use_composio_managed_auth" only ever declares OAUTH2 as a valid
+        mode. No credentials are needed at this step even for API_KEY —
+        the toolkit's own auth_config_details (see describe_toolkit) show
+        connected_account_initiation, not auth_config_creation, as where
+        the actual secret is collected, per-connected-account.
+        """
+        if auth_scheme and auth_scheme != "OAUTH2":
+            auth_config: dict[str, Any] = {
+                "type": "use_custom_auth",
+                "authScheme": auth_scheme,
+                "name": name or toolkit,
+            }
+        else:
+            auth_config = {
+                "type": "use_composio_managed_auth",
+                "name": name or toolkit,
+            }
         return self._request(
             "POST",
             "auth_configs",
+            body={"toolkit": {"slug": toolkit}, "auth_config": auth_config},
+        )
+
+    def list_toolkits(
+        self,
+        *,
+        search: str | None = None,
+        category: str | None = None,
+        cursor: str | None = None,
+        limit: int = 8,
+    ) -> dict[str, Any]:
+        """Browse Composio's full toolkit catalog (1000+ entries) rather
+        than a hardcoded shortlist — cursor-paginated per Composio's own
+        `/toolkits` contract (a `total_pages` field is present but not
+        usable for page-number access; `next_cursor` is the real cursor)."""
+        params: dict[str, Any] = {"limit": limit}
+        if search:
+            params["search"] = search
+        if category:
+            params["category"] = category
+        if cursor:
+            params["cursor"] = cursor
+        return self._request("GET", "toolkits", params=params)
+
+    def list_toolkit_categories(self) -> dict[str, Any]:
+        return self._request("GET", "toolkits/categories", params={"limit": 100})
+
+    def describe_toolkit(self, slug: str) -> dict[str, Any]:
+        """Full toolkit detail, including auth_config_details — each
+        supported auth scheme (OAUTH2, API_KEY, BEARER_TOKEN, ...) plus the
+        exact fields (name, displayName, description, is_secret) needed to
+        initiate a connected account under that scheme. This is what lets
+        the console render a correct credentials form per toolkit instead
+        of guessing a single generic "API key" field."""
+        return self._request("GET", f"toolkits/{slug}")
+
+    def create_connected_account(
+        self,
+        *,
+        auth_config_id: str,
+        user_id: str,
+        auth_scheme: str,
+        val: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create a connected account directly from caller-supplied
+        credentials (API key, bearer token, basic auth, ...) — the
+        non-OAuth counterpart to create_connect_link. No redirect: a
+        correctly-formed request activates the connection synchronously."""
+        return self._request(
+            "POST",
+            "connected_accounts",
             body={
-                "toolkit": {"slug": toolkit},
-                "auth_config": {
-                    "type": "use_composio_managed_auth",
-                    "name": name or toolkit,
-                },
+                "auth_config": {"id": auth_config_id},
+                "connection": {"user_id": user_id, "state": {"authScheme": auth_scheme, "val": val}},
             },
+            v3=True,
         )
 
     def list_webhook_subscriptions(self) -> dict[str, Any]:

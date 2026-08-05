@@ -6,7 +6,7 @@ import { useParams, Link } from "react-router-dom";
 
 type SessionDetailResponse = {
   session: Record<string, unknown>;
-  runs: Record<string, unknown>[];
+  tasks: Record<string, unknown>[];
   messages: Record<string, unknown>[];
 };
 
@@ -31,9 +31,9 @@ function Transcript({ messages }: { messages: Record<string, unknown>[] }) {
             <div className="flex items-center gap-2 text-[11px] text-muted">
               <Pill tone={role === "assistant" ? "good" : role === "tool" ? "orange" : "muted"}>{role}</Pill>
               {m.name ? <span className="font-mono">{String(m.name)}</span> : null}
-              {m.run_id ? (
-                <Link to={`/runs/${m.run_id}`} className="font-mono text-brand hover:underline">
-                  {fmt(m.run_id, 20)}
+              {m.task_id ? (
+                <Link to={`/tasks/${m.task_id}`} className="font-mono text-brand hover:underline">
+                  {fmt(m.task_id, 20)}
                 </Link>
               ) : null}
               <span className="ml-auto">{reltime(String(m.created_at))}</span>
@@ -68,7 +68,7 @@ export default function SessionDetail() {
   );
   const session = (data?.session || {}) as Record<string, any>;
   const destination = session.destination || {};
-  const runs = (data?.runs ?? []) as Record<string, unknown>[];
+  const tasks = (data?.tasks ?? []) as Record<string, unknown>[];
   const messages = (data?.messages ?? []) as Record<string, unknown>[];
   const participants = (session.participants as string[]) || [];
 
@@ -85,38 +85,38 @@ export default function SessionDetail() {
         <>
           <Section>
             <div className="card grid grid-cols-2 sm:grid-cols-3">
-              <Field label="state"><StatePill state={String(session.state)} /></Field>
+              <Field label="manager"><StatePill state={String(session.manager_state)} /></Field>
               <Field label="destination">{`${destination.type ?? "—"} · ${fmt(destination.id, 30)}`}</Field>
               <Field label="participants">{participants.length > 0 ? participants.join(", ") : "—"}</Field>
-              <Field label="runs">{runs.length}</Field>
+              <Field label="tasks">{tasks.length}</Field>
               <Field label="created">{fmt(session.created_at, 22)}</Field>
               <Field label="updated">{fmt(session.updated_at, 22)}</Field>
             </div>
           </Section>
 
           <Section>
-            <Card title="Runs in this session" meta={String(runs.length)}>
-              {runs.length === 0 && <Empty>no runs yet</Empty>}
-              {runs.length > 0 && (
+            <Card title="Tasks in this session" meta={String(tasks.length)}>
+              {tasks.length === 0 && <Empty>no Tasks yet</Empty>}
+              {tasks.length > 0 && (
                 <table className="table">
                   <thead>
                     <tr>
-                      <th className="w-full">goal</th>
+                      <th className="w-full">prompt</th>
                       <th className="whitespace-nowrap">state</th>
-                      <th className="whitespace-nowrap">trigger</th>
+                      <th className="whitespace-nowrap">worker</th>
                       <th className="whitespace-nowrap">created</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {runs.map((r) => (
+                    {tasks.map((r) => (
                       <tr key={String(r.id)}>
-                        <td title={String(r.goal)}>
-                          <Link to={`/runs/${r.id}`} className="text-ink hover:underline">
-                            {fmt(r.goal, 90)}
+                        <td title={String(r.prompt)}>
+                          <Link to={`/tasks/${r.id}`} className="text-ink hover:underline">
+                            {fmt(r.prompt, 90)}
                           </Link>
                         </td>
                         <td><StatePill state={String(r.state)} /></td>
-                        <td>{String(r.trigger_kind)}</td>
+                        <td>{String(r.worker_type)}</td>
                         <td>{fmt(r.created_at, 22)}</td>
                       </tr>
                     ))}

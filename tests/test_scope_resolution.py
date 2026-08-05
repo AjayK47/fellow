@@ -97,9 +97,9 @@ def test_removing_membership_immediately_removes_dm_based_access(brain):
     assert "scope_priv_e" not in after.read_scope_ids
 
 
-def test_capture_run_writes_to_the_conversations_own_scope(brain):
-    """H-12: the memory captured from a run must be scoped to the room the
-    run actually happened in, not an arbitrary entry from allowed_scope_ids."""
+def test_capture_task_writes_to_the_conversations_own_scope(brain):
+    """H-12: memory captured from a Task is scoped to its destination room,
+    not an arbitrary entry from allowed_scope_ids."""
     _make_channel_scope(brain, scope_id="scope_priv_f", channel_id="Cprivf", is_public=False)
     brain.store.add_membership("org_acme", "person_ajay", "scope_priv_f")
 
@@ -123,19 +123,19 @@ def test_capture_run_writes_to_the_conversations_own_scope(brain):
         trigger_kind="reactive",
         initial_message="Summarize the private rollout plan",
     )
-    outcome = brain.company_agent.run(run["id"])
+    outcome = brain.company_agent.execute_task(run["id"])
     assert outcome.state.value == "completed"
 
-    captured = brain.harness_memory.capture_run(run["id"])
+    captured = brain.harness_memory.capture_task(run["id"])
     assert captured["captured"]
     source = brain.store.get_source(captured["source_id"])
     assert source["scope_id"] == "scope_priv_f"
 
 
-def test_recurring_run_goal_gets_proposed_as_a_skill_draft(brain):
+def test_recurring_task_prompt_gets_proposed_as_a_skill_draft(brain):
     """Self-improvement layer: the same underlying ask across three SEPARATE
-    runs gets flagged as a pattern and drafted as a skill for review -- a
-    single run's own in-task reasoning has no visibility into runs other
+    Tasks gets flagged as a pattern and drafted as a skill for review -- a
+    single Task's own reasoning has no visibility into Tasks other
     than itself, so nothing inside one run could ever notice this."""
     goal = "Check the export worker queue for backlog and report anything stuck"
     destination = {"type": "internal_agent_session", "id": "pattern-test", "is_private": True}
@@ -156,12 +156,12 @@ def test_recurring_run_goal_gets_proposed_as_a_skill_draft(brain):
             trigger_kind="reactive",
             initial_message=goal,
         )
-        outcome = brain.company_agent.run(run["id"])
+        outcome = brain.company_agent.execute_task(run["id"])
         assert outcome.state.value == "completed"
-        brain.harness_memory.capture_run(run["id"])
+        brain.harness_memory.capture_task(run["id"])
 
     signals = brain.store.list_harness_records(
-        "run_pattern_signals", "org_acme", where={"status": "proposed"}
+        "task_pattern_signals", "org_acme", where={"status": "proposed"}
     )
     assert len(signals) == 1
     signal = signals[0]

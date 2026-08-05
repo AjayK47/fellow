@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import time
+import uuid
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -134,12 +135,14 @@ class SlackGateway:
         graph: Any,
         config: Settings,
         audit: Any,
+        sessions: Any,
     ) -> None:
         self.store = store
         self.queue = queue
         self.graph = graph
         self.config = config
         self.audit = audit
+        self.sessions = sessions
         self._user_profile_cache: dict[str, dict[str, Any]] = {}
 
     def accept(
@@ -292,10 +295,10 @@ class SlackGateway:
     ) -> dict[str, Any]:
         """Resolve a request_human_input(choices=...) button/select click.
 
-        The interactive element's value only ever carries `run_id::index` —
+        The interactive element's value only ever carries `task_id::index` —
         Slack caps option/button values at 75 chars, far shorter than a
         choice's actual text could be — so the real choice text is looked up
-        from the run's own pending_question_choices, set when the question
+        from the Task's own pending_question_choices, set when the question
         was asked (harness/runtime.py), rather than round-tripped through
         Slack.
         """
@@ -305,33 +308,43 @@ class SlackGateway:
             value = action.get("value")
         if not value or "::" not in value:
             raise ValueError("Malformed choice interaction")
-        run_id, _, index_str = value.partition("::")
-        run = self.store.get_harness_record("agent_runs", run_id)
-        if not run:
-            raise KeyError("run not found")
-        if run.get("state") != "waiting_for_human":
-            return {"accepted": False, "reason": "run is no longer waiting for a response"}
-        choices = run.get("pending_question_choices") or []
+        task_id, _, index_str = value.partition("::")
+        task = self.store.get_task(task_id)
+        if not task:
+            raise KeyError("task not found")
+        if task.get("state") != "waiting_for_human":
+            return {"accepted": False, "reason": "Task is no longer waiting for a response"}
+        choices = task.get("pending_question_choices") or []
         try:
             choice_text = choices[int(index_str)]
         except (ValueError, IndexError):
             raise ValueError("Choice index out of range")
         user_id = str((payload.get("user") or {}).get("id") or "unknown")
-        mapping = self.store.identity_mapping(run["organization_id"], "slack", user_id)
+        mapping = self.store.identity_mapping(task["organization_id"], "slack", user_id)
         principal_id = mapping["principal_id"] if mapping else f"slack:{user_id}"
-        job = self.queue.enqueue(
-            organization_id=run["organization_id"],
-            kind="agent.human_resume",
-            payload={
-                "run_id": run_id,
-                "message": choice_text,
-                "principal_id": principal_id,
-            },
-            idempotency_key=(
-                f"human_resume.slack_choice:{run_id}:{run.get('iteration_count')}"
-            ),
+        self.store.append_session_message(
+            {
+                "id": new_id("smsg"),
+                "organization_id": task["organization_id"],
+                "session_id": task["session_id"],
+                "task_id": task_id,
+                "role": "user",
+                "content": choice_text,
+                "tool_call_id": None,
+                "metadata": {"principal_id": principal_id, "continuation": True},
+                "created_at": utcnow().isoformat(),
+            }
         )
-        return {"accepted": True, "job_id": job["id"]}
+        # Appending the continuation is also a Session wake. Without the
+        # revision bump below, the durable dispatch job can claim an idle
+        # Session but the Manager has no new revision to process, leaving the
+        # Task stuck in waiting_for_human.
+        # notify() both advances the durable Session revision and enqueues its
+        # one dispatch job. Enqueuing a second key here let two queue workers
+        # race the same Manager; the loser correctly reported it busy, but
+        # made an otherwise successful choice interaction look failed.
+        self.sessions.notify(task["session_id"], reason="slack_choice")
+        return {"accepted": True}
 
     def normalize(self, payload: dict[str, Any]) -> NormalizedEvent:
         inner = payload.get("event") or {}
@@ -361,7 +374,7 @@ class SlackGateway:
         # while addressed channel messages can run independently.
         context_key = f"slack:{workspace_id}:{channel_id}"
         conversation_key = context_key
-        existing_session = self.store.session_by_conversation(
+        existing_session = self.store.find_session_by_conversation(
             organization_id, conversation_key
         )
         free_response = channel_id in self._csv_set(
@@ -615,6 +628,7 @@ class SlackSender:
         text: str,
         blocks: list[dict[str, Any]] | None = None,
         workspace_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         token = self._token_for(workspace_id)
         if not token:
@@ -626,6 +640,12 @@ class SlackSender:
                 "blocks": blocks or [],
             }
         body: dict[str, Any] = {"channel": channel_id, "text": text}
+        if idempotency_key:
+            # Slack deduplicates chat.postMessage retries by client_msg_id.
+            # UUID5 makes the same durable delivery key stable across crashes.
+            body["client_msg_id"] = str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"docket:{idempotency_key}")
+            )
         if blocks:
             body["blocks"] = blocks
         response = httpx.post(

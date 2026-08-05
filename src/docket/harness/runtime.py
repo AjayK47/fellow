@@ -8,17 +8,19 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
-from docket.domain.models import new_id, utcnow
+from docket.domain.models import ContextPackage, new_id, utcnow
 from docket.harness.model_client import _DEFAULT_CONTEXT_LENGTH, ModelClient
+from docket.harness.context_budget import request_budget
 from docket.harness.models import (
     AgentOutcome,
     AgentRunState,
     InvocationEnvelope,
     ModelToolCall,
+    ToolResult,
     TriggerKind,
 )
 from docket.harness.prompts import build_agent_messages, frame_untrusted_tool_result
-from docket.harness.run_store import AgentRunStore
+from docket.harness.task_run_store import TaskRunStore
 from docket.harness.tools import ToolExecutor
 from docket.services.scope_resolution import resolve_scope
 
@@ -52,20 +54,17 @@ def _model_context_length(model: Any) -> int:
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
-    """Cheap, provider-agnostic token estimate for a compaction trigger —
-    doesn't need to be exact, just proportional. A real tokenizer would be
-    per-model-family anyway; this is the same class of approximation
-    Hermes itself falls back to when a model's exact tokenizer isn't
-    available."""
-    total_chars = sum(len(json.dumps(message)) for message in messages)
-    return total_chars // _CHARS_PER_TOKEN_ESTIMATE
+    """Compatibility wrapper for callers that only need history estimates."""
+    from docket.harness.context_budget import estimate_tokens
+
+    return estimate_tokens(messages)
 
 
 class CompanyAgent:
     def __init__(
         self,
         *,
-        runs: AgentRunStore,
+        runs: TaskRunStore,
         context_service: Any,
         model: ModelClient,
         tools: ToolExecutor,
@@ -80,6 +79,7 @@ class CompanyAgent:
         max_tool_calls: int = 24,
         context_token_budget: int = 12_000,
         max_total_tokens: int = 100_000,
+        completion_max_tokens: int = 40_000,
     ) -> None:
         self.runs = runs
         self.context_service = context_service
@@ -96,6 +96,7 @@ class CompanyAgent:
         self.max_tool_calls = max_tool_calls
         self.context_token_budget = context_token_budget
         self.max_total_tokens = max_total_tokens
+        self.completion_max_tokens = completion_max_tokens
 
     def create_invocation(
         self,
@@ -115,7 +116,7 @@ class CompanyAgent:
             participants=[envelope.principal_id],
             metadata=metadata,
         )
-        active = self.runs.store.active_run_for_session(session["id"])
+        active = self.runs.store.find_root_task_for_session(session["id"])
         if active and active["state"] in {
             AgentRunState.WAITING_FOR_HUMAN.value,
             AgentRunState.WAITING_FOR_APPROVAL.value,
@@ -126,7 +127,7 @@ class CompanyAgent:
                 self.runs.add_message(
                     organization_id=envelope.organization_id,
                     session_id=session["id"],
-                    run_id=run["id"],
+                task_id=run["id"],
                     role="user",
                     content=initial_message,
                     metadata={"trigger_event_id": trigger_event_id},
@@ -144,9 +145,8 @@ class CompanyAgent:
             metadata=metadata,
         )
         if self.workspaces:
-            workspace = self.workspaces.create(
+            workspace = self.workspaces.get_or_create(
                 organization_id=envelope.organization_id,
-                run_id=run["id"],
                 owner_id=envelope.principal_id,
                 scope_id=resolve_scope(
                     store=self.runs.store,
@@ -154,6 +154,9 @@ class CompanyAgent:
                     principal_id=envelope.principal_id,
                     destination=envelope.destination.model_dump(mode="json"),
                 ).write_scope_id,
+                slack_workspace_id=((run.get("metadata") or {}).get("slack") or {}).get(
+                    "workspace_id"
+                ),
             )
             run_metadata = dict(run.get("metadata") or {})
             run_metadata["workspace_id"] = workspace["id"]
@@ -163,7 +166,7 @@ class CompanyAgent:
             self.runs.add_message(
                 organization_id=envelope.organization_id,
                 session_id=session["id"],
-                run_id=run["id"],
+                    task_id=run["id"],
                 role="user",
                 content=initial_message or goal,
                 metadata={"trigger_event_id": trigger_event_id},
@@ -173,8 +176,8 @@ class CompanyAgent:
                 {
                     "id": run["id"],
                     "organization_id": envelope.organization_id,
-                    "entity_type": "agent_run",
-                    "name": f"Agent run: {goal[:80]}",
+                    "entity_type": "task",
+                    "name": f"Task: {goal[:80]}",
                     "aliases": [],
                     "attributes": {
                         "state": run["state"],
@@ -198,13 +201,13 @@ class CompanyAgent:
                 )
         return self.runs.transition(run["id"], AgentRunState.QUEUED)
 
-    def run(self, run_id: str) -> AgentOutcome:
+    def execute_task(self, run_id: str) -> AgentOutcome:
         run = self.runs.get(run_id)
         if not run:
             raise KeyError(f"run not found: {run_id}")
         if run["state"] == AgentRunState.COMPLETED.value:
             return AgentOutcome(
-                run_id=run_id,
+                task_id=run_id,
                 state=AgentRunState.COMPLETED,
                 answer=run.get("final_answer"),
                 trace_id=run["trace_id"],
@@ -212,9 +215,10 @@ class CompanyAgent:
         if run["state"] in {
             AgentRunState.WAITING_FOR_APPROVAL.value,
             AgentRunState.WAITING_FOR_HUMAN.value,
+            AgentRunState.WAITING_FOR_CHILDREN.value,
         }:
             return AgentOutcome(
-                run_id=run_id,
+                task_id=run_id,
                 state=AgentRunState(run["state"]),
                 approval_id=run.get("pending_approval_id"),
                 trace_id=run["trace_id"],
@@ -222,7 +226,7 @@ class CompanyAgent:
         if run["state"] == AgentRunState.FAILED.value:
             run = self.runs.transition(run_id, AgentRunState.QUEUED)
         log.info(
-            "Agent run starting: run_id=%s goal=%r trigger=%s principal=%s",
+            "Task starting: task_id=%s goal=%r trigger=%s principal=%s",
             run_id,
             (run.get("goal") or "")[:120],
             run.get("trigger_kind"),
@@ -251,29 +255,47 @@ class CompanyAgent:
             failed = self.runs.fail(run_id, str(exc))
             self.audit.record(
                 failed["organization_id"],
-                "agent.run.failed",
-                {"run_id": run_id, "error": str(exc)},
+                "task.failed",
+                {"task_id": run_id, "error": str(exc)},
                 principal_id=failed["envelope"]["principal_id"],
                 trace_id=failed["trace_id"],
             )
+            # Whether this failure is worth telling a human about depends on
+            # whether the queue is about to retry it (transient errors like
+            # a rate limit or timeout resolve themselves silently and
+            # shouldn't produce a false alarm) — that policy lives with the
+            # job handlers in worker.py, not here. See _run_agent,
+            # _human_resume, and _resolve_approval for where the
+            # delivery.failure job actually gets enqueued.
             return AgentOutcome(
-                run_id=run_id,
+                task_id=run_id,
                 state=AgentRunState.FAILED,
                 error=str(exc),
                 trace_id=failed["trace_id"],
             )
 
     def _loop(self, run: dict[str, Any]) -> AgentOutcome:
+        # prepare_context() (embeddings included) used to run unconditionally
+        # on every iteration -- real cost, and most iterations don't need a
+        # fresh fetch. Cache it across iterations, but invalidate whenever
+        # the just-completed iteration executed a write-risk tool call, so
+        # the model still sees facts/memories it just wrote itself. A fresh
+        # `_loop()` call (initial run, or any resume) always starts dirty.
+        cached_context: dict[str, Any] | None = None
+        context_dirty = True
         while int(run.get("iteration_count", 0)) < int(run["max_iterations"]):
             persisted = self.runs.get(run["id"])
             if persisted and persisted["state"] == AgentRunState.CANCELLED.value:
                 return AgentOutcome(
-                    run_id=run["id"],
+                    task_id=run["id"],
                     state=AgentRunState.CANCELLED,
                     trace_id=run["trace_id"],
                 )
             if persisted:
                 run = persisted
+            # Both the Task executor lease and, for a root Task, the owning
+            # Session Manager lease are extended at every durable iteration.
+            self.runs.renew(run["id"])
             signal = self.runs.pop_signal(run["id"])
             if signal:
                 if signal.get("kind") == "abort":
@@ -286,15 +308,30 @@ class CompanyAgent:
                         },
                     )
                     return AgentOutcome(
-                        run_id=run["id"],
+                        task_id=run["id"],
                         state=AgentRunState.CANCELLED,
                         trace_id=cancelled["trace_id"],
                     )
+                if signal.get("kind") == "reauthorize":
+                    paused = self.runs.transition(
+                        run["id"],
+                        AgentRunState.WAITING_FOR_HUMAN,
+                        event_payload={"reason": "current_actor_changed"},
+                    )
+                    return AgentOutcome(
+                        task_id=run["id"],
+                        state=AgentRunState.WAITING_FOR_HUMAN,
+                        trace_id=paused["trace_id"],
+                    )
+                # SessionService already persisted ordinary steering in the
+                # Session transcript and therefore sends an empty signal.
+                # Direct send_signal callers still provide message content,
+                # which must become a durable steered turn here.
                 if signal.get("kind") == "steer" and signal.get("message"):
                     self.runs.add_message(
                         organization_id=run["organization_id"],
                         session_id=run["session_id"],
-                        run_id=run["id"],
+                        task_id=run["id"],
                         role="user",
                         content=signal["message"],
                         metadata={"steered": True},
@@ -307,31 +344,50 @@ class CompanyAgent:
                 raise RuntimeError("model_token_budget")
             if run.get("deadline_at") and utcnow().isoformat() >= run["deadline_at"]:
                 raise RuntimeError("worker_deadline_exceeded")
-            context = self.context_service.prepare_context(
-                organization_id=run["organization_id"],
-                task=run["goal"],
-                acting_principal_id=run["envelope"]["principal_id"],
-                destination=run["envelope"]["destination"],
-                purpose=run["envelope"]["purpose"],
-                token_budget=self.context_token_budget,
-                agent_id="company_agent",
-                conversation={"session_id": run["session_id"]},
-            ).model_dump(mode="json")
             active_skills = self._active_skills(run)
-            full_history = self.runs.messages(run["session_id"], limit=200)
+            is_child = bool(run.get("parent_task_id"))
+            full_history = self.runs.messages(
+                run["session_id"],
+                limit=200,
+                task_id=run["id"] if is_child else None,
+            )
             summary = ""
             history = full_history
             context_length = _model_context_length(self.model)
+            model_name = getattr(self.model, "model", None)
+            prior_budget = (run.get("metadata") or {}).get("request_budget") or {}
+            prior_estimate = float(prior_budget.get("estimated_input_tokens") or 0)
+            measured_prompt = float(
+                (run.get("metadata") or {}).get("last_prompt_tokens") or 0
+            )
+            # Provider prompt usage includes wrappers that local preflight
+            # cannot see. Carry forward only an upward calibration, capped so
+            # a single anomalous response cannot starve retrieval forever.
+            calibration_factor = 1.0
+            if prior_estimate > 0 and measured_prompt > prior_estimate:
+                calibration_factor = min(2.0, measured_prompt / prior_estimate)
+            allowed = self.tools.allowed_definitions(run)
+            schemas = [definition.openai_schema() for definition in allowed]
+            # The output cap is a reservation, not an expected duration. It
+            # must be subtracted before allocating input/context space.
+            provisional_budget = request_budget(
+                context_window=context_length,
+                output_tokens=self.completion_max_tokens,
+                messages=[],
+                tools=schemas,
+                model=model_name,
+                calibration_factor=calibration_factor,
+            )
             threshold_percent = (
                 _SMALL_CTX_THRESHOLD_PERCENT
                 if context_length < _SMALL_CTX_WINDOW_LIMIT
                 else _DEFAULT_THRESHOLD_PERCENT
             )
-            threshold_tokens = int(context_length * threshold_percent)
+            threshold_tokens = int(
+                provisional_budget.effective_input_window * threshold_percent
+            )
             if len(full_history) > 30 and _estimate_tokens(full_history) > threshold_tokens:
-                session = self.runs.store.get_harness_record(
-                    "agent_sessions", run["session_id"]
-                )
+                session = self.runs.store.get_session(run["session_id"])
                 older = full_history[:-30]
                 history = full_history[-30:]
                 previous_summary = (session or {}).get("summary") or ""
@@ -359,12 +415,63 @@ class CompanyAgent:
                     session["summary"] = summary
                     session["summary_through_message_id"] = older[-1]["id"]
                     session["updated_at"] = utcnow().isoformat()
-                    self.runs.store.upsert_agent_session(session)
+                    self.runs.store.update_session(session)
             else:
-                session = self.runs.store.get_harness_record(
-                    "agent_sessions", run["session_id"]
-                )
+                session = self.runs.store.get_session(run["session_id"])
                 summary = (session or {}).get("summary") or ""
+
+            # Build once without company context to determine how much room is
+            # left for permission-filtered retrieval. Tool schemas are part of
+            # this estimate, so a large tool registry naturally shrinks the
+            # retrieval budget instead of overflowing the provider request.
+            preliminary_messages = build_agent_messages(
+                run=run,
+                context={},
+                history=history,
+                conversation_summary=summary,
+                slack_conversation=self._slack_conversation(run),
+                active_skills=active_skills,
+                available_skills=(run.get("metadata") or {}).get("skill_index") or [],
+            )
+            preliminary_budget = request_budget(
+                context_window=context_length,
+                output_tokens=self.completion_max_tokens,
+                messages=preliminary_messages,
+                tools=schemas,
+                model=model_name,
+                calibration_factor=calibration_factor,
+            )
+            dynamic_context_budget = min(
+                self.context_token_budget,
+                preliminary_budget.remaining_for_context,
+            )
+
+            if run.get("worker_type") in {"general", "pi"} or (run.get("metadata") or {}).get("worker_type") in {"general", "pi"}:
+                # Child Tasks already get an explicit prompt from the
+                # delegating call and do not inherit broad Session retrieval.
+                if cached_context is None:
+                    cached_context = ContextPackage(
+                        permission_decision_id=run["envelope"]["permission_decision_id"],
+                        summary=(
+                            "Child worker: context retrieval is skipped by "
+                            "design. Use brain_search/brain_query_facts directly "
+                            "if you genuinely need to look something up."
+                        ),
+                    ).model_dump(mode="json")
+            elif context_dirty or cached_context is None:
+                cached_context = self.context_service.prepare_context(
+                    organization_id=run["organization_id"],
+                    task=run["goal"],
+                    acting_principal_id=run["envelope"]["principal_id"],
+                    destination=run["envelope"]["destination"],
+                    purpose=run["envelope"]["purpose"],
+                    token_budget=dynamic_context_budget,
+                    agent_id="company_agent",
+                    conversation={"session_id": run["session_id"]},
+                ).model_dump(mode="json")
+                context_dirty = False
+            context = cached_context
+
             messages = build_agent_messages(
                 run=run,
                 context=context,
@@ -374,9 +481,92 @@ class CompanyAgent:
                 active_skills=active_skills,
                 available_skills=(run.get("metadata") or {}).get("skill_index") or [],
             )
-            allowed = self.tools.allowed_definitions(run)
-            schemas = [definition.openai_schema() for definition in allowed]
+            final_budget = request_budget(
+                context_window=context_length,
+                output_tokens=self.completion_max_tokens,
+                messages=messages,
+                tools=schemas,
+                model=model_name,
+                calibration_factor=calibration_factor,
+            )
+            if not final_budget.fits and not (run.get("metadata") or {}).get(
+                "worker_type"
+            ):
+                # Retrieval is the lowest-priority input. Rebuild it using the
+                # exact remaining space before throwing away conversation
+                # history, which keeps the active Task and latest user turn
+                # intact whenever possible.
+                retry_context_budget = max(0, preliminary_budget.remaining_for_context)
+                cached_context = self.context_service.prepare_context(
+                    organization_id=run["organization_id"],
+                    task=run["goal"],
+                    acting_principal_id=run["envelope"]["principal_id"],
+                    destination=run["envelope"]["destination"],
+                    purpose=run["envelope"]["purpose"],
+                    token_budget=min(self.context_token_budget, retry_context_budget),
+                    agent_id="company_agent",
+                    conversation={"session_id": run["session_id"]},
+                ).model_dump(mode="json")
+                context = cached_context
+                messages = build_agent_messages(
+                    run=run,
+                    context=context,
+                    history=history,
+                    conversation_summary=summary,
+                    slack_conversation=self._slack_conversation(run),
+                    active_skills=active_skills,
+                    available_skills=(run.get("metadata") or {}).get("skill_index") or [],
+                )
+                final_budget = request_budget(
+                    context_window=context_length,
+                    output_tokens=self.completion_max_tokens,
+                    messages=messages,
+                    tools=schemas,
+                    model=model_name,
+                    calibration_factor=calibration_factor,
+                )
+            if not final_budget.fits:
+                # Keep the newest conversation evidence and the active prompt;
+                # the incremental summary carries the aged-out middle.
+                history = history[-8:]
+                messages = build_agent_messages(
+                    run=run,
+                    context=context,
+                    history=history,
+                    conversation_summary=summary,
+                    slack_conversation=self._slack_conversation(run),
+                    active_skills=active_skills,
+                    available_skills=(run.get("metadata") or {}).get("skill_index") or [],
+                )
+                final_budget = request_budget(
+                    context_window=context_length,
+                    output_tokens=self.completion_max_tokens,
+                    messages=messages,
+                    tools=schemas,
+                    model=model_name,
+                    calibration_factor=calibration_factor,
+                )
+            # Tiny synthetic windows used by local compaction tests are not
+            # provider-realistic. For real model windows, never send a request
+            # that the preflight calculation says cannot fit.
+            if not final_budget.fits and context_length >= 4096:
+                raise RuntimeError(
+                    "context_window_exceeded: "
+                    f"estimated={final_budget.estimated_input_tokens} "
+                    f"effective={final_budget.effective_input_window}"
+                )
             run_metadata = dict(run.get("metadata") or {})
+            run_metadata["request_budget"] = {
+                "context_window": final_budget.context_window,
+                "output_reservation": final_budget.output_reservation,
+                "safety_margin": final_budget.safety_margin,
+                "effective_input_window": final_budget.effective_input_window,
+                "estimated_input_tokens": final_budget.estimated_input_tokens,
+                "remaining_for_context": final_budget.remaining_for_context,
+                "context_token_budget": dynamic_context_budget,
+                "model": model_name,
+                "calibration_factor": calibration_factor,
+            }
             run_metadata["tool_refs"] = [
                 {
                     "name": definition.name,
@@ -392,11 +582,11 @@ class CompanyAgent:
             for ref in run_metadata["tool_refs"]:
                 now = utcnow().isoformat()
                 self.runs.store.upsert_harness_projection(
-                    "run_capability_refs",
+                    "task_capability_refs",
                     {
                         "id": f"{run['id']}:{ref['name']}",
                         "organization_id": run["organization_id"],
-                        "run_id": run["id"],
+                        "task_id": run["id"],
                         "status": "active",
                         **ref,
                         "created_at": now,
@@ -418,7 +608,7 @@ class CompanyAgent:
                 messages=messages,
                 tools=schemas,
                 temperature=0.1,
-                max_tokens=1800,
+                max_tokens=self.completion_max_tokens,
             )
             if response.tool_calls:
                 response.tool_calls = self._deduplicate_tool_calls(
@@ -440,6 +630,16 @@ class CompanyAgent:
                     continue
             usage["model_calls"] = int(usage.get("model_calls", 0)) + 1
             run["usage"] = usage
+            # Preserve the provider's real prompt measurement alongside the
+            # cumulative usage. This is the calibration signal for later
+            # preflight estimates and remains inspectable in Task detail.
+            run_metadata = dict(run.get("metadata") or {})
+            run_metadata["last_prompt_tokens"] = response_usage.get("prompt_tokens")
+            run_metadata["last_completion_tokens"] = response_usage.get(
+                "completion_tokens"
+            )
+            run_metadata["last_total_tokens"] = response_usage.get("total_tokens")
+            run["metadata"] = run_metadata
             self.runs.update(run)
             answer: str | None = None
             skill_validation: dict[str, Any] | None = None
@@ -495,7 +695,7 @@ class CompanyAgent:
             self.runs.add_message(
                 organization_id=run["organization_id"],
                 session_id=run["session_id"],
-                run_id=run["id"],
+                task_id=run["id"],
                 role="assistant",
                 content=assistant_content,
                 tool_calls=[
@@ -513,7 +713,7 @@ class CompanyAgent:
             if not response.tool_calls:
                 assert answer is not None
                 log.info(
-                    "Agent run completed: run_id=%s iterations=%s tool_calls=%s answer_len=%s",
+                    "Task completed: task_id=%s iterations=%s tool_calls=%s answer_len=%s",
                     run["id"],
                     run["iteration_count"],
                     run.get("tool_call_count", 0),
@@ -525,8 +725,8 @@ class CompanyAgent:
                         {
                             "id": completed["id"],
                             "organization_id": completed["organization_id"],
-                            "entity_type": "agent_run",
-                            "name": f"Agent run: {completed['goal'][:80]}",
+                            "entity_type": "task",
+                            "name": f"Task: {completed['goal'][:80]}",
                             "aliases": [],
                             "attributes": {
                                 "state": completed["state"],
@@ -539,9 +739,9 @@ class CompanyAgent:
                 self._enqueue_post_run_jobs(completed)
                 self.audit.record(
                     run["organization_id"],
-                    "agent.run.completed",
+                    "task.completed",
                     {
-                        "run_id": run["id"],
+                        "task_id": run["id"],
                         "iterations": completed["iteration_count"],
                         "tool_calls": completed["tool_call_count"],
                     },
@@ -549,7 +749,7 @@ class CompanyAgent:
                     trace_id=run["trace_id"],
                 )
                 return AgentOutcome(
-                    run_id=run["id"],
+                    task_id=run["id"],
                     state=AgentRunState.COMPLETED,
                     answer=answer,
                     trace_id=run["trace_id"],
@@ -563,7 +763,18 @@ class CompanyAgent:
             allowed_by_name = {definition.name: definition for definition in allowed}
 
             def _is_read_safe(call: ModelToolCall) -> bool:
-                if call.name == "request_human_input":
+                # Delegation can pause the Task and therefore stays serialized.
+                # risk="read" (a child worker's own write tools still
+                # gate normally), but the call itself can come back
+                # status="waiting_for_child_approval"/"waiting_for_children"
+                # when a child pauses or is dispatched -- that must go
+                # through the serialized other_calls path below, not the
+                # concurrent read path, which never checks status.
+                if call.name in {
+                    "request_human_input",
+                    "delegate_tasks",
+                    "wait_for_children",
+                }:
                     return False
                 definition = allowed_by_name.get(call.name)
                 return bool(definition and definition.risk == "read")
@@ -606,6 +817,7 @@ class CompanyAgent:
                 # so the transcript stays deterministic regardless of timing.
                 for call in read_calls:
                     self._append_tool_result(run, results_by_call_id[call.id])
+                    self._track_checkpoint(run, call, allowed_by_name.get(call.name))
 
             for call in other_calls:
                 run["tool_call_count"] = int(run.get("tool_call_count", 0)) + 1
@@ -616,6 +828,13 @@ class CompanyAgent:
                     call.name,
                     call.id,
                 )
+                definition = allowed_by_name.get(call.name)
+                if (
+                    call.name != "request_human_input"
+                    and definition is not None
+                    and definition.risk != "read"
+                ):
+                    context_dirty = True
                 result = self.tools.execute(run=run, call=call)
                 if (
                     call.name == "request_human_input"
@@ -642,18 +861,32 @@ class CompanyAgent:
                             "choices": result.output.get("choices"),
                         },
                     )
-                    self.enqueue_job(
-                        organization_id=run["organization_id"],
-                        kind="delivery.question",
-                        payload={
-                            "run_id": run["id"],
-                            "question": result.output.get("question"),
-                            "choices": result.output.get("choices"),
-                        },
-                        idempotency_key=f"delivery.question:{run['id']}:{call.id}",
-                    )
+                    if run.get("parent_task_id"):
+                        revision = self.runs.store.bump_session_revision(
+                            run["session_id"]
+                        )
+                        self.enqueue_job(
+                            organization_id=run["organization_id"],
+                            kind="session.dispatch",
+                            payload={"session_id": run["session_id"]},
+                            idempotency_key=(
+                                f"session.dispatch:child_question:{run['id']}:"
+                                f"{revision}"
+                            ),
+                        )
+                    else:
+                        self.enqueue_job(
+                            organization_id=run["organization_id"],
+                            kind="delivery.question",
+                            payload={
+                                "task_id": run["id"],
+                                "question": result.output.get("question"),
+                                "choices": result.output.get("choices"),
+                            },
+                            idempotency_key=f"delivery.question:{run['id']}:{call.id}",
+                        )
                     return AgentOutcome(
-                        run_id=run["id"],
+                        task_id=run["id"],
                         state=AgentRunState.WAITING_FOR_HUMAN,
                         answer=result.output.get("question"),
                         trace_id=run["trace_id"],
@@ -661,6 +894,7 @@ class CompanyAgent:
                 if result.status == "waiting_for_approval":
                     run["pending_approval_id"] = result.approval_id
                     run["pending_tool_call_id"] = call.id
+                    run["pending_tool_name"] = call.name
                     self.runs.update(run)
                     self.runs.transition(
                         run["id"],
@@ -671,12 +905,39 @@ class CompanyAgent:
                         },
                     )
                     return AgentOutcome(
-                        run_id=run["id"],
+                        task_id=run["id"],
                         state=AgentRunState.WAITING_FOR_APPROVAL,
                         approval_id=result.approval_id,
                         trace_id=run["trace_id"],
                     )
+                if result.status == "waiting_for_children":
+                    # delegate_tasks already created and enqueued the child
+                    # Tasks (child_tasks.py) -- pause here without blocking a
+                    # thread on them. resume_for_children() is what wakes
+                    # this Task back up, called by the Session Manager
+                    # scheduler once a child's terminal transition notifies
+                    # the Session.
+                    run["pending_child_task_ids"] = result.output.get(
+                        "child_task_ids"
+                    ) or []
+                    run["pending_tool_call_id"] = call.id
+                    run["pending_tool_name"] = call.name
+                    self.runs.update(run)
+                    self.runs.transition(
+                        run["id"],
+                        AgentRunState.WAITING_FOR_CHILDREN,
+                        event_payload={
+                            "child_task_ids": run["pending_child_task_ids"],
+                            "tool_name": call.name,
+                        },
+                    )
+                    return AgentOutcome(
+                        task_id=run["id"],
+                        state=AgentRunState.WAITING_FOR_CHILDREN,
+                        trace_id=run["trace_id"],
+                    )
                 self._append_tool_result(run, result)
+                self._track_checkpoint(run, call, definition)
             run = self.runs.get(run["id"]) or run
         raise RuntimeError("iteration_limit")
 
@@ -688,39 +949,120 @@ class CompanyAgent:
         decided_by: str,
         edited_arguments: dict[str, Any] | None = None,
     ) -> AgentOutcome:
+        approval_record = self.runs.store.get_harness_record(
+            "approvals", approval_id
+        )
+        if not approval_record:
+            raise KeyError(approval_id)
+        run = self.runs.get(approval_record["task_id"])
+        if not run:
+            raise KeyError(approval_record["task_id"])
+        self.runs.transition(run["id"], AgentRunState.RUNNING)
         approval, result = self.tools.resolve_approval(
             approval_id=approval_id,
             approved=approved,
             decided_by=decided_by,
             edited_arguments=edited_arguments,
         )
-        run = self.runs.get(approval["run_id"])
+        run = self.runs.get(approval["task_id"])
         if not run:
-            raise KeyError(approval["run_id"])
+            raise KeyError(approval["task_id"])
         run.pop("pending_approval_id", None)
         run.pop("pending_tool_call_id", None)
+        run.pop("pending_tool_name", None)
         self.runs.update(run)
         if result:
             self._append_tool_result(run, result)
-        self.runs.transition(run["id"], AgentRunState.RUNNING)
-        return self._run_loop_protected(self.runs.get(run["id"]) or run)
+        outcome = self._run_loop_protected(self.runs.get(run["id"]) or run)
+        return outcome
 
     def resume_with_human_message(
-        self, run_id: str, *, message: str, principal_id: str
+        self,
+        run_id: str,
+        *,
+        message: str,
+        principal_id: str,
+        persist_message: bool = True,
     ) -> AgentOutcome:
         run = self.runs.get(run_id)
         if not run:
             raise KeyError(run_id)
-        self.runs.add_message(
-            organization_id=run["organization_id"],
-            session_id=run["session_id"],
-            run_id=run_id,
-            role="user",
-            content=message,
-            metadata={"principal_id": principal_id, "continuation": True},
-        )
+        if persist_message:
+            self.runs.add_message(
+                organization_id=run["organization_id"],
+                session_id=run["session_id"],
+                task_id=run_id,
+                role="user",
+                content=message,
+                metadata={"principal_id": principal_id, "continuation": True},
+            )
         self.runs.transition(run_id, AgentRunState.RUNNING)
         return self._run_loop_protected(self.runs.get(run_id) or run)
+
+    def resume_for_children(self, run_id: str) -> AgentOutcome:
+        """Wake a delegate_tasks parent paused at WAITING_FOR_CHILDREN.
+
+        Called whenever the Session Manager scheduler sees the root (or any
+        ancestor) Task in that state -- typically because a child's terminal
+        transition notified the Session, but also safe to call speculatively
+        (e.g. a checkpoint tick): each child's CURRENT state/result is
+        reported, and _loop() is free to decide "still waiting" is the right
+        outcome and pause again on the same or a fresh delegate_tasks call.
+        """
+        run = self.runs.get(run_id)
+        if not run:
+            raise KeyError(run_id)
+        child_task_ids = run.get("pending_child_task_ids") or []
+        children = [
+            child
+            for child in (self.runs.store.get_task(cid) for cid in child_task_ids)
+            if child
+        ]
+        summaries = [
+            {
+                "task_id": child["id"],
+                "worker_type": child.get("worker_type"),
+                "prompt": child.get("prompt") or child.get("goal"),
+                "state": child["state"],
+                "answer": child.get("final_answer"),
+                "error": child.get("error"),
+                "wake_revision": child.get("wake_revision", 0),
+            }
+            for child in children
+        ]
+        tool_call_id = run.get("pending_tool_call_id")
+        tool_name = run.get("pending_tool_name") or "delegate_tasks"
+        unfinished = [
+            child["id"]
+            for child in children
+            if child["state"] not in {
+                AgentRunState.COMPLETED.value,
+                AgentRunState.FAILED.value,
+                AgentRunState.CANCELLED.value,
+            }
+        ]
+        self.runs.transition(run["id"], AgentRunState.RUNNING)
+        run = self.runs.get(run["id"]) or run
+        if unfinished:
+            run["pending_child_task_ids"] = child_task_ids
+        else:
+            run.pop("pending_child_task_ids", None)
+        run.pop("pending_tool_call_id", None)
+        run.pop("pending_tool_name", None)
+        self.runs.update(run)
+        if tool_call_id:
+            tool_result = ToolResult(
+                call_id=tool_call_id,
+                tool_name=tool_name,
+                status="completed",
+                output={
+                    "children": summaries,
+                    "unfinished_child_task_ids": unfinished,
+                    "all_children_terminal": not unfinished,
+                },
+            )
+            self._append_tool_result(run, tool_result)
+        return self._run_loop_protected(self.runs.get(run["id"]) or run)
 
     def cancel(self, run_id: str, *, cancelled_by: str) -> dict[str, Any]:
         run = self.runs.get(run_id)
@@ -741,16 +1083,16 @@ class CompanyAgent:
     def send_signal(
         self, run_id: str, *, kind: str, message: str | None = None
     ) -> dict[str, Any]:
-        """Interrupt a run that is genuinely in flight (RUNNING) instead of
-        letting a new message spawn a second, independent run.
+        """Interrupt a Task that is genuinely in flight instead of letting a
+        new message spawn a second, independent Task.
 
-        `kind="abort"` cancels the run at its next iteration boundary;
-        `kind="steer"` injects `message` as a new user turn the run picks up
+        `kind="abort"` cancels the Task at its next iteration boundary;
+        `kind="steer"` injects `message` as a new user turn the Task picks up
         on its next iteration, without pausing it.
 
-        Signals live in their own `agent_run_signals` table, claimed with
+        Signals live in their own `task_signals` table, claimed with
         the same atomic immediate-transaction pop used for job leasing
-        (`pop_agent_run_signal`) — not on the run record's own JSON blob.
+        (`pop_task_signal`) — not on the Task record's own JSON blob.
         That means a signal sent concurrently with `_loop()`'s per-iteration
         `AgentRunStore.update()` can never be silently overwritten before
         it's read: the two writes touch different rows.
@@ -772,7 +1114,7 @@ class CompanyAgent:
         self.runs.add_message(
             organization_id=run["organization_id"],
             session_id=run["session_id"],
-            run_id=run["id"],
+            task_id=run["id"],
             role="tool",
             content=content,
             tool_call_id=result.call_id,
@@ -780,21 +1122,69 @@ class CompanyAgent:
             metadata={"status": result.status, "approval_id": result.approval_id},
         )
 
+    def _toolkit_label(self, definition: Any, call: ModelToolCall) -> str | None:
+        if definition and definition.toolkits:
+            return definition.toolkits[0]
+        if call.name == "COMPOSIO_EXECUTE":
+            # The curated linear_*/github_* shortcuts declare a static
+            # toolkit on their ToolDefinition; COMPOSIO_EXECUTE covers every
+            # other toolkit dynamically via tool_slug, which Composio always
+            # names "{TOOLKIT}_{ACTION}" -- good enough for a friendly
+            # progress label without an extra composio.describe() round trip.
+            slug = str(call.arguments.get("tool_slug") or "")
+            if "_" in slug:
+                return slug.split("_", 1)[0].lower()
+        return None
+
+    def _track_checkpoint(
+        self, run: dict[str, Any], call: ModelToolCall, definition: Any
+    ) -> None:
+        """Phase F: the live Slack status message only updates on a toolkit
+        *transition* (e.g. Linear -> GitHub), not on every tool call --
+        editing it per call would blow through Slack's rate limits for
+        nothing anyone reads. It also only starts firing from the second
+        transition onward: a run that never leaves its first toolkit gets
+        no status message at all, same as a single-turn no-tool-call reply.
+        """
+        if (run.get("metadata") or {}).get("suppress_delivery"):
+            return
+        toolkit = self._toolkit_label(definition, call)
+        if not toolkit:
+            return
+        metadata = dict(run.get("metadata") or {})
+        checkpoints = list(metadata.get("status_checkpoints") or [])
+        if checkpoints and checkpoints[-1] == toolkit:
+            return
+        checkpoints.append(toolkit)
+        metadata["status_checkpoints"] = checkpoints
+        run["metadata"] = metadata
+        self.runs.update(run)
+        if len(checkpoints) < 2:
+            return
+        self.enqueue_job(
+            organization_id=run["organization_id"],
+            kind="delivery.status_update",
+            payload={"task_id": run["id"]},
+            idempotency_key=f"delivery.status_update:{run['id']}:{len(checkpoints)}",
+        )
+
     def _enqueue_post_run_jobs(self, run: dict[str, Any]) -> None:
-        kinds = ["memory.capture_run"]
-        if not (run.get("metadata") or {}).get("suppress_delivery"):
-            kinds.append("delivery.send")
+        # Children are private specialist evidence. Only a synthesized root
+        # conclusion is captured as durable memory or delivered to Slack.
+        if run.get("parent_task_id"):
+            return
+        kinds = ["memory.capture_task", "delivery.send"]
         for kind in kinds:
             self.enqueue_job(
                 organization_id=run["organization_id"],
                 kind=kind,
-                payload={"run_id": run["id"]},
+                payload={"task_id": run["id"]},
                 idempotency_key=f"{kind}:{run['id']}",
             )
 
     def _slack_conversation(self, run: dict[str, Any]) -> list[dict[str, Any]]:
         """Load previous messages from the exact Slack channel or DM."""
-        if (run.get("metadata") or {}).get("specialist_worker"):
+        if run.get("worker_type") in {"general", "pi"} or (run.get("metadata") or {}).get("worker_type") in {"general", "pi"}:
             return []
         slack = (run.get("metadata") or {}).get("slack") or {}
         workspace_id = str(slack.get("workspace_id") or "")
@@ -824,13 +1214,13 @@ class CompanyAgent:
         if metadata.get("skills_resolved"):
             return list(metadata.get("active_skills") or [])
         destination = dict(run["envelope"]["destination"])
-        if metadata.get("specialist_worker"):
+        if metadata.get("worker_type") in {"general", "pi"}:
             destination = {
                 "type": "internal_agent_session",
                 "id": run["id"],
                 "is_private": True,
             }
-        active = self.skills.resolve_for_run(
+        active = self.skills.resolve_for_task(
             organization_id=run["organization_id"],
             task=run["goal"],
             destination=destination,
@@ -857,11 +1247,11 @@ class CompanyAgent:
         for ref in metadata["skill_refs"]:
             now = utcnow().isoformat()
             self.runs.store.upsert_harness_projection(
-                "run_skill_refs",
+                "task_skill_refs",
                 {
                     "id": f"{run['id']}:{ref['id']}:{ref['version']}",
                     "organization_id": run["organization_id"],
-                    "run_id": run["id"],
+                    "task_id": run["id"],
                     "status": "active",
                     **ref,
                     "created_at": now,
@@ -882,7 +1272,7 @@ class CompanyAgent:
         self.audit.record(
             run["organization_id"],
             "agent.skills.resolved",
-            {"run_id": run["id"], "skills": metadata["skill_refs"]},
+            {"task_id": run["id"], "skills": metadata["skill_refs"]},
             principal_id=run["envelope"]["principal_id"],
             trace_id=run["trace_id"],
         )
@@ -932,7 +1322,7 @@ class CompanyAgent:
                 run["organization_id"],
                 "agent.response.skill_validated",
                 {
-                    "run_id": run["id"],
+                    "task_id": run["id"],
                     "valid": validation["valid"],
                     "violations": validation["violations"],
                     "skill_refs": validation["skill_refs"],

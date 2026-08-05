@@ -17,7 +17,6 @@ const TYPE_COLORS: Record<string, string> = {
   customer: "#cb5b79",
   channel: "#3b6fb0",
   task: "#767d72",
-  agent_run: "#c8f24c",
   service_account: "#2e8272",
   organization: "#141a15",
 };

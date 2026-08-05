@@ -102,8 +102,8 @@ def mcp_tool_specs() -> list[dict[str, Any]]:
         },
         {
             "name": "brain_record_task_event",
-            "description": "Record structured execution telemetry for an existing run",
-            "input_schema": {"type": "object", "required": ["run_id", "event_type"], "properties": {"run_id": {"type": "string"}, "event_type": {"type": "string"}, "action": {"type": "string"}, "result": {"type": "string"}}},
+            "description": "Record structured execution telemetry for an existing Task",
+            "input_schema": {"type": "object", "required": ["task_id", "event_type"], "properties": {"task_id": {"type": "string"}, "event_type": {"type": "string"}, "action": {"type": "string"}, "result": {"type": "string"}}},
         },
         {
             "name": "brain_evaluate_intervention",
@@ -171,11 +171,13 @@ def bind_mcp_handlers(brain: DocketApp) -> dict[str, Callable[..., Any]]:
         return result
 
     def record_task_event(**kwargs: Any) -> dict[str, Any]:
-        event = {key: value for key, value in kwargs.items() if key != "run_id"}
-        result = brain.runs.add_event(kwargs["run_id"], event)
-        if not result:
-            raise KeyError("run not found")
-        return result
+        task = brain.store.get_task(kwargs["task_id"])
+        if not task:
+            raise KeyError("task not found")
+        event = {key: value for key, value in kwargs.items() if key != "task_id"}
+        task.setdefault("events", []).append(event)
+        brain.store.update_task(task)
+        return task
 
     def evaluate_intervention(**kwargs: Any) -> dict[str, Any]:
         return brain.proactive.evaluate(

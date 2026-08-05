@@ -8,6 +8,27 @@ from typing import Any
 from docket.domain.models import new_id, utcnow
 from docket.storage.db import BrainStore
 
+# Session and child Task execution can drive CompanyAgent._loop() to completion -- potentially
+# several iterations, each with a model round-trip plus tool calls -- and can
+# legitimately run past the default 60s lease. Without a longer lease, a
+# second worker process (the documented DOCKET_WORKER_ENABLED=false +
+# separate docket-worker topology) could see the lease as expired mid-run and
+# re-lease + re-execute the same run concurrently. A stale lease only matters
+# for actual crash recovery, so a generous static override is enough here --
+# true lease renewal isn't needed for jobs this infrequent.
+_LONG_RUNNING_LEASE_OVERRIDES = {
+    "session.dispatch": 3600,
+    "task.run_child": 3600,
+    "task.pi_poll": 1800,
+    "approval.resolve": 1800,
+}
+
+_MAX_ATTEMPT_OVERRIDES = {
+    # A dispatch that races the currently active Manager is deferred rather
+    # than discarded. One hundred exponential retries cover multi-hour work.
+    "session.dispatch": 100,
+}
+
 
 class JobQueue:
     def __init__(
@@ -42,11 +63,16 @@ class JobQueue:
             "lease_owner": None,
             "lease_expires_at": None,
             "attempts": 0,
-            "max_attempts": max_attempts or self.max_attempts,
+            "max_attempts": max_attempts
+            or _MAX_ATTEMPT_OVERRIDES.get(kind)
+            or self.max_attempts,
             "idempotency_key": idempotency_key,
             "created_at": now,
             "updated_at": now,
         }
+        lease_override = _LONG_RUNNING_LEASE_OVERRIDES.get(kind)
+        if lease_override:
+            job["lease_seconds"] = lease_override
         return self.store.enqueue_harness_job(job)
 
     def lease(

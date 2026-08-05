@@ -60,6 +60,57 @@ function SaveBanner({ result }: { result: { ok: boolean; message: string; restar
   );
 }
 
+function OrganizationRow({
+  org,
+  onSaved,
+}: {
+  org: Record<string, unknown>;
+  onSaved: () => void;
+}) {
+  const [about, setAbout] = useState(String(org.about || ""));
+  const [saving, setSaving] = useState(false);
+  const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
+
+  async function save() {
+    setSaving(true);
+    setResult(null);
+    try {
+      await api.patch(`/v1/organizations/${org.id}`, { about });
+      setResult({ ok: true, message: "Saved" });
+      onSaved();
+    } catch (e) {
+      setResult({ ok: false, message: e instanceof ApiError ? e.message : String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <tr>
+      <td className="font-mono text-[12px] align-top">{String(org.id)}</td>
+      <td className="font-medium align-top">{fmt(org.name, 60)}</td>
+      <td className="align-top">
+        <textarea
+          className="input min-h-[60px] w-full"
+          placeholder="What this company does — briefly, for the agent's own grounding."
+          value={about}
+          onChange={(e) => setAbout(e.target.value)}
+        />
+        <div className="mt-1.5 flex items-center gap-2">
+          <button className="btn-ghost" onClick={save} disabled={saving}>
+            {saving ? "Saving…" : "Save"}
+          </button>
+          {result && (
+            <span className={`text-[11px] ${result.ok ? "text-good" : "text-bad"}`}>
+              {result.message}
+            </span>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
 function ConfigSection({
   label,
   children,
@@ -392,13 +443,14 @@ export default function Setup() {
             <Section>
               <Card title="Organizations" meta={String(organizations.length)}>
                 <table className="table">
-                  <thead><tr><th>id</th><th>name</th></tr></thead>
+                  <thead><tr><th>id</th><th>name</th><th className="w-full">about</th></tr></thead>
                   <tbody>
                     {organizations.map((org) => (
-                      <tr key={String(org.id)}>
-                        <td className="font-mono text-[12px]">{String(org.id)}</td>
-                        <td className="font-medium">{fmt(org.name, 60)}</td>
-                      </tr>
+                      <OrganizationRow
+                        key={String(org.id)}
+                        org={org}
+                        onSaved={() => setTick((t) => t + 1)}
+                      />
                     ))}
                   </tbody>
                 </table>

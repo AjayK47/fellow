@@ -12,13 +12,12 @@ from docket.domain.models import new_id, utcnow
 
 
 class AgentRunState(str, Enum):
-    CREATED = "created"
     QUEUED = "queued"
     RUNNING = "running"
     WAITING_FOR_TOOL = "waiting_for_tool"
     WAITING_FOR_APPROVAL = "waiting_for_approval"
     WAITING_FOR_HUMAN = "waiting_for_human"
-    SCHEDULED = "scheduled"
+    WAITING_FOR_CHILDREN = "waiting_for_children"
     PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -40,11 +39,11 @@ class AttentionDecision(str, Enum):
     IGNORE = "IGNORE"
     OBSERVE = "OBSERVE"
     UPDATE_WORKING_STATE = "UPDATE_WORKING_STATE"
-    ATTACH_TO_EXISTING_RUN = "ATTACH_TO_EXISTING_RUN"
+    ATTACH_TO_EXISTING_TASK = "ATTACH_TO_EXISTING_TASK"
     ADD_TO_DIGEST = "ADD_TO_DIGEST"
     WAKE_MAIN_AGENT = "WAKE_MAIN_AGENT"
     DM_OWNER = "DM_OWNER"
-    ESCALATE_EXISTING_RUN = "ESCALATE_EXISTING_RUN"
+    ESCALATE_EXISTING_TASK = "ESCALATE_EXISTING_TASK"
 
 
 class DestinationEnvelope(BaseModel):
@@ -127,7 +126,7 @@ class ToolDefinition(BaseModel):
     allowed_destination_types: list[str] = Field(default_factory=list)
     allowed_trigger_types: list[str] = Field(default_factory=list)
     main_agent_visible: bool = True
-    specialist_only: bool = False
+    child_worker_only: bool = False
     connector_readiness: dict[str, Any] = Field(default_factory=dict)
     runtime_ready: bool = True
     setup_needed: list[str] = Field(default_factory=list)
@@ -152,7 +151,13 @@ class ToolResult(BaseModel):
     call_id: str
     tool_name: str
     status: Literal[
-        "completed", "failed", "waiting_for_approval", "denied", "disabled"
+        "completed",
+        "failed",
+        "waiting_for_approval",
+        "waiting_for_child_approval",
+        "waiting_for_children",
+        "denied",
+        "disabled",
     ]
     output: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
@@ -169,11 +174,12 @@ class AttentionEvaluation(BaseModel):
     reason: str
     suggested_goal: str | None = None
     related_entity_ids: list[str] = Field(default_factory=list)
-    existing_run_id: str | None = None
+    existing_task_id: str | None = None
+    matched_role_id: str | None = None
 
 
 class AgentOutcome(BaseModel):
-    run_id: str
+    task_id: str
     state: AgentRunState
     answer: str | None = None
     approval_id: str | None = None

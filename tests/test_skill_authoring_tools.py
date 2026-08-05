@@ -33,7 +33,7 @@ def _run(brain, conversation: str):
         trigger_kind="reactive",
         initial_message="skill authoring probe",
     )
-    return brain.agent_runs.get(created["id"])
+    return brain.store.get_task(created["id"])
 
 
 def test_skill_propose_create_pauses_for_approval_and_lands_as_draft(brain):

@@ -55,11 +55,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     worker_task: asyncio.Task[None] | None = None
     if settings.worker_enabled:
         async def _worker_loop() -> None:
-            last_automation_tick = 0.0
+            last_dispatcher_tick = 0.0
             while True:
-                if time.monotonic() - last_automation_tick >= 30:
+                if (
+                    time.monotonic() - last_dispatcher_tick
+                    >= settings.dispatcher_tick_interval_seconds
+                ):
                     await asyncio.to_thread(brain.automations.tick)
-                    last_automation_tick = time.monotonic()
+                    last_dispatcher_tick = time.monotonic()
                 result = await asyncio.to_thread(brain.harness_worker.drain_once)
                 if result["leased"] == 0:
                     await asyncio.sleep(settings.worker_poll_interval_seconds)

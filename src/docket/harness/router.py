@@ -7,11 +7,7 @@ import logging
 from datetime import timedelta
 from typing import Any
 
-from docket.harness.models import (
-    InvocationEnvelope,
-    NormalizedEvent,
-    TriggerKind,
-)
+from docket.harness.models import NormalizedEvent
 
 log = logging.getLogger("docket.router")
 
@@ -47,23 +43,21 @@ class EventRouter:
         *,
         store: Any,
         ingestion: Any,
-        retrieval: Any,
-        agent: Any,
         attention: Any,
         queue: Any,
         audit: Any,
         graph: Any,
         config: Any,
+        sessions: Any,
     ) -> None:
         self.store = store
         self.ingestion = ingestion
-        self.retrieval = retrieval
-        self.agent = agent
         self.attention = attention
         self.queue = queue
         self.audit = audit
         self.graph = graph
         self.config = config
+        self.sessions = sessions
 
     def route(self, event_payload: dict[str, Any]) -> dict[str, Any]:
         event = NormalizedEvent(**event_payload)
@@ -106,6 +100,12 @@ class EventRouter:
         }
 
     def _route_reactive(self, event: NormalizedEvent) -> dict[str, Any]:
+        """Direct events (DMs, explicit mentions, interactive answers) wake
+        the relevant Session Manager directly (plan §7.1). sessions.wake()
+        already handles message coalescing, revision bumping, and steering
+        (folding a message into whatever Task tree is already active, or
+        cancelling it outright on an explicit stop -- plan §9); this only
+        needs to resolve the destination and schedule the dispatch tick."""
         destination = {
             "type": "dm"
             if event.type == "slack.dm"
@@ -115,102 +115,48 @@ class EventRouter:
             "id": event.scope.channel_id or "",
             "is_private": event.scope.visibility != "organization_public",
         }
-        authz = self.retrieval.authorize(
-            event.organization_id,
-            event.actor.id,
-            destination,
-            "reactive_agent",
-        )
-        envelope = InvocationEnvelope(
-            organization_id=event.organization_id,
-            principal_id=event.actor.id,
-            application_id="slack_docket",
-            conversation_id=event.payload["conversation_key"],
-            destination=destination,
-            purpose="reactive_agent",
-            permission_decision_id=authz.id,
-            allowed_scope_ids=authz.allowed_scope_ids,
-        )
-        existing_session = self.store.session_by_conversation(
-            event.organization_id, event.payload["conversation_key"]
-        )
-        active = (
-            self.store.active_run_for_session(existing_session["id"])
-            if existing_session
-            else None
-        )
         text = event.payload.get("text") or ""
-        if active and active["state"] == "waiting_for_human":
-            job = self.queue.enqueue(
-                organization_id=event.organization_id,
-                kind="agent.human_resume",
-                payload={
-                    "run_id": active["id"],
-                    "message": text,
-                    "principal_id": event.actor.id,
-                },
-                idempotency_key=f"human.resume:{active['id']}:{event.id}",
-            )
-            return {
-                "route": "human_continuation",
-                "run_id": active["id"],
-                "job_id": job["id"],
-            }
-        # A run that's genuinely in flight (not paused/waiting) must not get
-        # a second, independent invocation spawned alongside it just because
-        # a new message arrived — fold the message into the run that's
-        # already working instead. create_invocation() already correctly
-        # reuses waiting_for_approval/paused runs on its own; this covers
-        # the states it doesn't (created/queued/running/waiting_for_tool).
-        if active and active["state"] in {
-            "created",
-            "queued",
-            "running",
-            "waiting_for_tool",
-            "scheduled",
-        }:
-            kind = "abort" if _looks_like_stop(text) else "steer"
-            self.agent.send_signal(active["id"], kind=kind, message=text)
-            log.info(
-                "Run signal sent: event_id=%s run_id=%s signal=%s",
-                event.id,
-                active["id"],
-                kind,
-            )
-            return {"route": "run_signal", "run_id": active["id"], "signal": kind}
-        run = self.agent.create_invocation(
-            envelope=envelope,
-            goal=text,
-            trigger_kind=TriggerKind.REACTIVE,
-            trigger_event_id=event.id,
-            initial_message=text,
-            metadata={
-                "slack": {
-                    "workspace_id": event.scope.workspace_id,
-                    "channel_id": event.scope.channel_id,
-                    "context_key": event.payload.get("context_key"),
-                    "actor_profile": event.payload.get("actor_profile") or {
-                        "principal_id": event.actor.id,
-                        "source_user_id": event.actor.source_id,
-                        "display_name": event.actor.id,
-                    },
-                }
+        slack_metadata = {
+            "workspace_id": event.scope.workspace_id,
+            "channel_id": event.scope.channel_id,
+            "context_key": event.payload.get("context_key"),
+            "actor_profile": event.payload.get("actor_profile") or {
+                "principal_id": event.actor.id,
+                "source_user_id": event.actor.source_id,
+                "display_name": event.actor.id,
             },
+        }
+        wake = self.sessions.wake(
+            organization_id=event.organization_id,
+            conversation_key=event.payload["conversation_key"],
+            destination=destination,
+            role="user",
+            content=text,
+            principal_id=event.actor.id,
+            metadata={"slack": slack_metadata},
+            message_metadata={"trigger_event_id": event.id},
         )
         job = self.queue.enqueue(
             organization_id=event.organization_id,
-            kind="agent.run",
-            payload={"run_id": run["id"]},
-            idempotency_key=f"agent.run:{run['id']}",
+            kind="session.dispatch",
+            payload={"session_id": wake["session_id"]},
+            idempotency_key=f"session.dispatch:{wake['session_id']}:{wake['revision']}",
         )
         log.info(
-            "Reactive agent invocation created: event_id=%s run_id=%s channel=%s job_id=%s",
+            "Session woken: event_id=%s session_id=%s revision=%s signal=%s job_id=%s",
             event.id,
-            run["id"],
-            event.scope.channel_id,
+            wake["session_id"],
+            wake["revision"],
+            wake.get("steer_signal"),
             job["id"],
         )
-        return {"route": "reactive", "run_id": run["id"], "job_id": job["id"]}
+        return {
+            "route": "session_wake",
+            "session_id": wake["session_id"],
+            "revision": wake["revision"],
+            "steer_signal": wake.get("steer_signal"),
+            "job_id": job["id"],
+        }
 
     def _store_raw_evidence(self, event: NormalizedEvent) -> dict[str, Any]:
         learn = bool(event.payload.get("learn", event.source != "slack"))

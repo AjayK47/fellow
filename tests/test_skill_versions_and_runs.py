@@ -35,13 +35,3 @@ def test_proposed_update_stays_hidden_until_approved(brain):
     hits = brain.skills.search("org_acme", "deploy freeze")
     assert len(hits) == 1
     assert hits[0]["description"] == "Original"
-
-
-def test_run_evaluation_requires_human_skill_governance(brain):
-    skill = brain.skills.create(organization_id="org_acme", name="Recover", description="Recover", goal="Restore", steps=[])
-    run = brain.runs.start(organization_id="org_acme", task="Recover export", acting_principal_id="person_ajay", harness_id="h", skill_id=skill["id"])
-    brain.runs.add_event(run["id"], {"event_type": "action.completed", "action": "rollback", "result": "failed", "evidence_source_ids": ["src_x"]})
-    brain.runs.complete(run["id"], outcome="failed")
-    evaluation = brain.runs.evaluate(run["id"])
-    assert evaluation and evaluation["skill_update_candidate"]["recommended"] is True
-    assert evaluation["evidence_source_ids"] == ["src_x"]

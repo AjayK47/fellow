@@ -22,7 +22,7 @@ class HarnessEvaluationService:
         organization_id: str,
         feedback_type: str,
         principal_id: str,
-        run_id: str | None = None,
+        task_id: str | None = None,
         attention_evaluation_id: str | None = None,
         comment: str | None = None,
     ) -> dict[str, Any]:
@@ -41,7 +41,7 @@ class HarnessEvaluationService:
         item = {
             "id": new_id("feedback"),
             "organization_id": organization_id,
-            "run_id": run_id,
+            "task_id": task_id,
             "attention_evaluation_id": attention_evaluation_id,
             "feedback_type": feedback_type,
             "principal_id": principal_id,
@@ -51,13 +51,13 @@ class HarnessEvaluationService:
         with self.store.cursor() as cur:
             cur.execute(
                 """INSERT INTO agent_feedback
-                (id, organization_id, run_id, attention_evaluation_id,
+                (id, organization_id, task_id, attention_evaluation_id,
                  feedback_type, payload, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item["id"],
                     organization_id,
-                    run_id,
+                    task_id,
                     attention_evaluation_id,
                     feedback_type,
                     __import__("json").dumps(item),
@@ -76,7 +76,7 @@ class HarnessEvaluationService:
                 judgment_type="agent_feedback",
                 principal_id=principal_id,
                 subject={
-                    "run_id": run_id,
+                    "task_id": task_id,
                     "attention_evaluation_id": attention_evaluation_id,
                 },
                 decision=feedback_type,
@@ -88,7 +88,7 @@ class HarnessEvaluationService:
         attentions = self.store.list_harness_records(
             "attention_evaluations", organization_id
         )
-        runs = self.store.list_harness_records("agent_runs", organization_id)
+        tasks = self.store.list_tasks(organization_id, limit=100_000)
         calls = self.store.list_harness_records(
             "harness_tool_calls", organization_id
         )
@@ -96,15 +96,15 @@ class HarnessEvaluationService:
             "agent_feedback", organization_id
         )
         decisions = Counter(item["decision"] for item in attentions)
-        run_states = Counter(item["state"] for item in runs)
-        run_kinds = Counter(item["trigger_kind"] for item in runs)
+        task_states = Counter(item["state"] for item in tasks)
+        task_kinds = Counter(item["trigger_kind"] for item in tasks)
         tool_states = Counter(item["status"] for item in calls)
         feedback_counts = Counter(item["feedback_type"] for item in feedback)
         wake_count = decisions.get("WAKE_MAIN_AGENT", 0) + decisions.get(
             "DM_OWNER", 0
         )
-        attaches = decisions.get("ATTACH_TO_EXISTING_RUN", 0) + decisions.get(
-            "ESCALATE_EXISTING_RUN", 0
+        attaches = decisions.get("ATTACH_TO_EXISTING_TASK", 0) + decisions.get(
+            "ESCALATE_EXISTING_TASK", 0
         )
         labeled_positive = feedback_counts.get("helpful", 0) + feedback_counts.get(
             "acknowledged", 0
@@ -113,8 +113,8 @@ class HarnessEvaluationService:
             "not_helpful", 0
         ) + feedback_counts.get("dismissed", 0)
         labeled_total = labeled_positive + labeled_negative
-        completed = run_states.get("completed", 0)
-        terminal = completed + run_states.get("failed", 0) + run_states.get(
+        completed = task_states.get("completed", 0)
+        terminal = completed + task_states.get("failed", 0) + task_states.get(
             "cancelled", 0
         )
         return {
@@ -131,16 +131,16 @@ class HarnessEvaluationService:
                     "missed_critical_event", 0
                 ),
             },
-            "runs": {
-                "count": len(runs),
-                "states": dict(run_states),
-                "trigger_kinds": dict(run_kinds),
+            "tasks": {
+                "count": len(tasks),
+                "states": dict(task_states),
+                "trigger_kinds": dict(task_kinds),
                 "terminal_task_completion_rate": (
                     completed / terminal if terminal else None
                 ),
                 "total_model_tokens": sum(
-                    int((run.get("usage") or {}).get("total_tokens", 0))
-                    for run in runs
+                    int((task.get("usage") or {}).get("total_tokens", 0))
+                    for task in tasks
                 ),
             },
             "tools": {

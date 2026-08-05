@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from docket.harness.models import InvocationEnvelope
 from docket.mcp_tools import bind_mcp_handlers, mcp_tool_specs
 
 
@@ -11,6 +12,23 @@ def test_mcp_tools_cover_core_brain_operations(brain):
     handlers = bind_mcp_handlers(brain)
     skills = handlers["brain_search_skills"](organization_id="org_acme", query="export")
     assert skills["results"]
-    run = brain.runs.start(organization_id="org_acme", task="Investigate", acting_principal_id="person_ajay", harness_id="mcp")
-    updated = handlers["brain_record_task_event"](run_id=run["id"], event_type="action.completed", action="inspect", result="success")
-    assert updated["status"] == "running"
+    destination = {"type": "internal_agent_session", "id": "mcp:task", "is_private": True}
+    decision = brain.authz.resolve("org_acme", "person_ajay", destination, "reactive_agent")
+    task = brain.company_agent.create_invocation(
+        envelope=InvocationEnvelope(
+            organization_id="org_acme",
+            principal_id="person_ajay",
+            conversation_id="mcp:task",
+            destination=destination,
+            purpose="reactive_agent",
+            permission_decision_id=decision.id,
+            allowed_scope_ids=decision.allowed_scope_ids,
+        ),
+        goal="Investigate",
+        trigger_kind="reactive",
+    )
+    updated = handlers["brain_record_task_event"](
+        task_id=task["id"], event_type="action.completed", action="inspect", result="success"
+    )
+    assert updated["id"] == task["id"]
+    assert updated["events"][-1]["event_type"] == "action.completed"

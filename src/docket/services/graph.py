@@ -157,33 +157,82 @@ class GraphService:
         max_depth: int = 3,
         edge_types: list[str] | None = None,
     ) -> list[list[dict[str, Any]]]:
-        """BFS multi-hop paths for relationship queries."""
-        edges = self.store.list_edges(organization_id)
-        adj: dict[str, list[dict[str, Any]]] = {}
-        for e in edges:
-            if edge_types and e["edge_type"] not in edge_types:
-                continue
-            adj.setdefault(e["from_id"], []).append(e)
-            # undirected for relationship exploration
-            adj.setdefault(e["to_id"], []).append(
-                {**e, "from_id": e["to_id"], "to_id": e["from_id"], "_reversed": True}
+        """Bounded-depth, undirected multi-hop paths for relationship
+        queries — same semantics as the original BFS (cycle-free by node,
+        undirected traversal, capped at 20 paths), but scoped to the actual
+        query via a recursive SQL CTE instead of loading every edge in the
+        organization into Python on every call. Only the edges that end up
+        on a found path are ever hydrated into full dicts.
+        """
+        edge_type_clause = ""
+        edge_type_params: list[Any] = []
+        if edge_types:
+            edge_type_clause = f"AND e.edge_type IN ({','.join('?' for _ in edge_types)})"
+            edge_type_params = list(edge_types)
+
+        sql = f"""
+            WITH RECURSIVE search(node, path_ids, path_dirs, visited, depth) AS (
+                SELECT ?, '', '', ',' || ? || ',', 0
+                UNION ALL
+                SELECT
+                    CASE WHEN e.from_id = search.node THEN e.to_id ELSE e.from_id END,
+                    search.path_ids || ',' || e.id,
+                    search.path_dirs || (CASE WHEN e.from_id = search.node THEN 'F' ELSE 'R' END),
+                    search.visited || (CASE WHEN e.from_id = search.node THEN e.to_id ELSE e.from_id END) || ',',
+                    search.depth + 1
+                FROM edges e
+                JOIN search ON (e.from_id = search.node OR e.to_id = search.node)
+                WHERE e.organization_id = ?
+                  AND e.valid_until IS NULL
+                  {edge_type_clause}
+                  AND search.depth < ?
+                  AND instr(
+                        search.visited,
+                        ',' || (CASE WHEN e.from_id = search.node THEN e.to_id ELSE e.from_id END) || ','
+                      ) = 0
             )
+            SELECT path_ids, path_dirs FROM search WHERE node = ? AND depth > 0
+            ORDER BY depth LIMIT 20
+        """
+        params = [
+            from_id, from_id,
+            organization_id, *edge_type_params, max_depth,
+            to_id,
+        ]
+        with self.store.cursor() as cur:
+            cur.execute(sql, params)
+            rows = [(r["path_ids"], r["path_dirs"]) for r in cur.fetchall()]
+
+        if not rows:
+            return []
+
+        all_edge_ids = {
+            edge_id
+            for path_ids, _ in rows
+            for edge_id in path_ids.strip(",").split(",")
+        }
+        edges_by_id = {
+            edge_id: edge
+            for edge_id in all_edge_ids
+            if (edge := self.store.get_json("edges", edge_id)) is not None
+        }
 
         paths: list[list[dict[str, Any]]] = []
-        queue: list[tuple[str, list[dict[str, Any]], set[str]]] = [(from_id, [], {from_id})]
-        while queue:
-            node, path, visited = queue.pop(0)
-            if len(path) > max_depth:
-                continue
-            if node == to_id and path:
-                paths.append(path)
-                continue
-            for e in adj.get(node, []):
-                nxt = e["to_id"]
-                if nxt in visited:
+        for path_ids, path_dirs in rows:
+            edge_ids = path_ids.strip(",").split(",")
+            path: list[dict[str, Any]] = []
+            for edge_id, direction in zip(edge_ids, path_dirs):
+                edge = edges_by_id.get(edge_id)
+                if edge is None:
                     continue
-                queue.append((nxt, path + [e], visited | {nxt}))
-        return paths[:20]
+                if direction == "R":
+                    path.append(
+                        {**edge, "from_id": edge["to_id"], "to_id": edge["from_id"], "_reversed": True}
+                    )
+                else:
+                    path.append(edge)
+            paths.append(path)
+        return paths
 
     # ---- memory graph ----
 

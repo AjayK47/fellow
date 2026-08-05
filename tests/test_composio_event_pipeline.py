@@ -121,7 +121,7 @@ def test_signed_trigger_becomes_retrievable_evidence_and_wakes_agent(
         "org_acme",
         where={"event_id": "msg_export_failure_1"},
     )
-    runs = brain.store.list_harness_records("agent_runs", "org_acme")
+    runs = brain.store.list_tasks("org_acme", worker_type="session_manager")
     assert any(
         run.get("trigger_event_id") == "msg_export_failure_1"
         for run in runs
@@ -220,7 +220,7 @@ def test_agent_catalog_is_scoped_to_organization_connections(
             "is_private": True,
         },
         "purpose": "test",
-        "run_id": "run_test",
+        "task_id": "task_test",
     }
     listing = brain.tool_registry.get(
         "composio_list_integrations"
@@ -240,9 +240,6 @@ def test_agent_catalog_is_scoped_to_organization_connections(
         {"query": "commits"}, other_tenant
     )
     assert isolated["tools"] == []
-    assert brain.tool_registry.get(
-        "COMPOSIO_EXECUTE"
-    ).definition.approval_required is True
 
 
 def test_connection_sync_link_and_trigger_creation_are_org_scoped(
@@ -331,3 +328,221 @@ def test_connection_sync_link_and_trigger_creation_are_org_scoped(
         },
     )
     assert wrong_org.status_code == 404
+
+
+def test_toolkit_browsing_is_not_limited_to_the_curated_four(api_client, monkeypatch):
+    """Item: the console's Integrations page must be able to browse any of
+    Composio's toolkits, not just the four hardcoded quick-connect tiles."""
+    brain = api_client.app.state.brain
+    brain.composio.api_key = "test-only"
+
+    list_args: dict = {}
+
+    def fake_list_toolkits(**kwargs):
+        list_args.update(kwargs)
+        return {
+            "items": [
+                {
+                    "slug": "stripe",
+                    "name": "Stripe",
+                    "auth_schemes": ["OAUTH2"],
+                    "no_auth": False,
+                    "meta": {
+                        "description": "Payments",
+                        "logo": "https://logos.composio.dev/api/stripe",
+                        "categories": [{"id": "payments", "name": "Payments"}],
+                    },
+                }
+            ],
+            "next_cursor": "cursor_2",
+            "total_items": 1070,
+        }
+
+    monkeypatch.setattr(brain.composio, "list_toolkits", fake_list_toolkits)
+    listed = api_client.get(
+        "/v1/composio/toolkits", params={"search": "stripe", "limit": 8}
+    )
+    assert listed.status_code == 200, listed.text
+    body = listed.json()
+    assert list_args == {"search": "stripe", "category": None, "cursor": None, "limit": 8}
+    assert body["total_items"] == 1070
+    assert body["next_cursor"] == "cursor_2"
+    assert body["items"] == [
+        {
+            "slug": "stripe",
+            "name": "Stripe",
+            "description": "Payments",
+            "logo": "https://logos.composio.dev/api/stripe",
+            "auth_schemes": ["OAUTH2"],
+            "no_auth": False,
+            "categories": ["Payments"],
+        }
+    ]
+
+    def fake_describe_toolkit(slug):
+        assert slug == "stripe"
+        return {
+            "slug": "stripe",
+            "name": "Stripe",
+            "no_auth": False,
+            "meta": {"description": "Payments", "logo": "https://logos.composio.dev/api/stripe"},
+            "auth_config_details": [
+                {
+                    "name": "stripe_oauth2",
+                    "mode": "OAUTH2",
+                    "fields": {"connected_account_initiation": {"required": [], "optional": []}},
+                },
+                {
+                    "name": "stripe_api_key",
+                    "mode": "API_KEY",
+                    "fields": {
+                        "connected_account_initiation": {
+                            "required": [
+                                {
+                                    "name": "generic_api_key",
+                                    "displayName": "API Key",
+                                    "type": "string",
+                                    "description": "Your Stripe secret key.",
+                                    "required": True,
+                                    "is_secret": True,
+                                }
+                            ],
+                            "optional": [],
+                        }
+                    },
+                },
+            ],
+        }
+
+    monkeypatch.setattr(brain.composio, "describe_toolkit", fake_describe_toolkit)
+    detail = api_client.get("/v1/composio/toolkits/stripe")
+    assert detail.status_code == 200, detail.text
+    detail_body = detail.json()
+    assert detail_body["no_auth"] is False
+    assert [s["mode"] for s in detail_body["auth_schemes"]] == ["OAUTH2", "API_KEY"]
+    api_key_scheme = detail_body["auth_schemes"][1]
+    assert api_key_scheme["required_fields"] == [
+        {
+            "name": "generic_api_key",
+            "displayName": "API Key",
+            "type": "string",
+            "description": "Your Stripe secret key.",
+            "required": True,
+            "is_secret": True,
+        }
+    ]
+
+
+def test_api_key_toolkit_connects_without_oauth_redirect(api_client, monkeypatch):
+    """Item: non-OAuth toolkits (API key, bearer token, ...) must be
+    connectable directly, without ever needing an OAuth redirect link."""
+    brain = api_client.app.state.brain
+    brain.composio.api_key = "test-only"
+
+    monkeypatch.setattr(
+        brain.composio, "list_auth_configs", lambda **_kwargs: {"items": []}
+    )
+
+    create_auth_config_args: dict = {}
+
+    def fake_create_auth_config(**kwargs):
+        create_auth_config_args.update(kwargs)
+        return {"id": "ac_stripe_api_key"}
+
+    monkeypatch.setattr(brain.composio, "create_auth_config", fake_create_auth_config)
+
+    create_account_args: dict = {}
+
+    def fake_create_connected_account(**kwargs):
+        create_account_args.update(kwargs)
+        return {"id": "ca_stripe_key", "status": "ACTIVE"}
+
+    monkeypatch.setattr(
+        brain.composio, "create_connected_account", fake_create_connected_account
+    )
+
+    response = api_client.post(
+        "/v1/composio/connections:credentials",
+        json={
+            "organization_id": "org_acme",
+            "toolkit": "stripe",
+            "auth_scheme": "api_key",
+            "credentials": {"generic_api_key": "sk_test_dummy"},
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["auth_config_id"] == "ac_stripe_api_key"
+    assert body["account"]["connected_account_id"] == "ca_stripe_key"
+    assert body["account"]["status"] == "active"
+    assert body["account"]["toolkit"] == "stripe"
+
+    assert create_auth_config_args == {"toolkit": "stripe", "auth_scheme": "API_KEY"}
+    assert create_account_args["auth_config_id"] == "ac_stripe_api_key"
+    assert create_account_args["auth_scheme"] == "API_KEY"
+    assert create_account_args["val"] == {
+        "status": "ACTIVE",
+        "generic_api_key": "sk_test_dummy",
+    }
+
+    stored = brain.store.get_harness_record(
+        "connector_accounts", "connector:org_acme:ca_stripe_key"
+    )
+    assert stored is not None and stored["status"] == "active"
+
+
+def test_api_key_connect_reuses_an_existing_matching_auth_config(api_client, monkeypatch):
+    """A toolkit that already has an API_KEY auth config (e.g. reconnecting,
+    or an OAuth2 auth config already exists for the same toolkit) must reuse
+    the one matching the requested scheme, not blindly grab the first result
+    or create a duplicate."""
+    brain = api_client.app.state.brain
+    brain.composio.api_key = "test-only"
+
+    monkeypatch.setattr(
+        brain.composio,
+        "list_auth_configs",
+        lambda **_kwargs: {
+            "items": [
+                {"id": "ac_stripe_oauth", "auth_scheme": "OAUTH2"},
+                {"id": "ac_stripe_api_key_existing", "auth_scheme": "API_KEY"},
+            ]
+        },
+    )
+
+    def fail_create_auth_config(**_kwargs):
+        raise AssertionError("should not create a new auth config when one already matches")
+
+    monkeypatch.setattr(brain.composio, "create_auth_config", fail_create_auth_config)
+    monkeypatch.setattr(
+        brain.composio,
+        "create_connected_account",
+        lambda **_kwargs: {"id": "ca_stripe_key_2", "status": "ACTIVE"},
+    )
+
+    response = api_client.post(
+        "/v1/composio/connections:credentials",
+        json={
+            "organization_id": "org_acme",
+            "toolkit": "stripe",
+            "auth_scheme": "API_KEY",
+            "credentials": {"generic_api_key": "sk_test_other"},
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["auth_config_id"] == "ac_stripe_api_key_existing"
+
+
+def test_credential_connect_rejects_an_unknown_organization(api_client, monkeypatch):
+    brain = api_client.app.state.brain
+    brain.composio.api_key = "test-only"
+    response = api_client.post(
+        "/v1/composio/connections:credentials",
+        json={
+            "organization_id": "org_does_not_exist",
+            "toolkit": "stripe",
+            "auth_scheme": "API_KEY",
+            "credentials": {"generic_api_key": "sk_test_dummy"},
+        },
+    )
+    assert response.status_code == 404
