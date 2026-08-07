@@ -25,9 +25,27 @@ _LONG_RUNNING_LEASE_OVERRIDES = {
 
 _MAX_ATTEMPT_OVERRIDES = {
     # A dispatch that races the currently active Manager is deferred rather
-    # than discarded. One hundred exponential retries cover multi-hour work.
+    # than discarded. Contention retries are cheap and constant-interval
+    # (see JobContention), so a high ceiling covers multi-hour work.
     "session.dispatch": 100,
 }
+
+# How soon to re-try a job that was deferred purely because something else
+# already owned the resource. This is NOT a failure and must not use the
+# exponential error backoff: a Session Manager being busy is the normal
+# case whenever a user sends a follow-up mid-run, and the retrying dispatch
+# job is the ONLY thing that picks the pending revision back up once the
+# Manager releases. Under exponential backoff those retries land at 1s, 2s,
+# 4s ... 300s, so a follow-up that arrived during a 60-second run could sit
+# unanswered for minutes AFTER the Manager was free -- a user-visible
+# "Docket ignored me" stall with nothing wrong in any log.
+_CONTENTION_RETRY_SECONDS = 1.0
+
+
+class JobContention(RuntimeError):
+    """Raised by a handler when a job cannot run right now because another
+    owner holds the resource. Retried on a short fixed interval instead of
+    the exponential backoff used for genuine failures."""
 
 
 class JobQueue:
@@ -103,7 +121,13 @@ class JobQueue:
             lease_owner=worker_id,
         )
 
-    def fail(self, job: dict[str, Any], error: str) -> dict[str, Any] | None:
+    def fail(
+        self,
+        job: dict[str, Any],
+        error: str,
+        *,
+        retry_in_seconds: float | None = None,
+    ) -> dict[str, Any] | None:
         attempts = int(job.get("attempts", 0))
         max_attempts = int(job.get("max_attempts", self.max_attempts))
         if attempts >= max_attempts:
@@ -113,9 +137,12 @@ class JobQueue:
                 error=error,
                 lease_owner=job.get("lease_owner"),
             )
-        retry_at = (
-            utcnow() + timedelta(seconds=min(2**attempts, 300))
-        ).isoformat()
+        delay = (
+            retry_in_seconds
+            if retry_in_seconds is not None
+            else min(2**attempts, 300)
+        )
+        retry_at = (utcnow() + timedelta(seconds=delay)).isoformat()
         return self.store.finish_harness_job(
             job["id"],
             status="queued",

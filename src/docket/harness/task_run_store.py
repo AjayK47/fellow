@@ -148,8 +148,8 @@ class TaskRunStore:
         trigger_kind: TriggerKind | str,
         trigger_event_id: str | None = None,
         parent_run_id: str | None = None,
-        max_iterations: int = 12,
-        max_tool_calls: int = 24,
+        max_iterations: int = 50,
+        max_tool_calls: int = 100,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = utcnow().isoformat()

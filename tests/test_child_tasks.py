@@ -138,6 +138,8 @@ def test_root_task_delegates_three_children_and_synthesizes_result(brain):
     assert all(child["parent_task_id"] == root_task["id"] for child in children)
     assert all(child["root_task_id"] == root_task["id"] for child in children)
     assert all(child["state"] == "queued" for child in children)
+    assert all(child["max_iterations"] == 200 for child in children)
+    assert all(child["max_tool_calls"] == 500 for child in children)
     assert sorted(child["worker_type"] for child in children) == [
         "general",
         "general",

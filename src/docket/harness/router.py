@@ -64,6 +64,20 @@ class EventRouter:
         if not event.payload.get("observe_enabled", True):
             return {"route": "discarded", "reason": "observation_disabled"}
         source = self._store_raw_evidence(event)
+        # The one inbound write into the conversation log. Every Slack
+        # message passes through here -- direct requests and ambient
+        # channel chatter alike -- so the log stays a complete, ordered
+        # record of the room rather than only the parts that woke Docket.
+        self.store.append_conversation_message(
+            organization_id=event.organization_id,
+            workspace_id=event.scope.workspace_id or "",
+            channel_id=event.scope.channel_id or "",
+            role="user",
+            text=str(event.payload.get("text") or ""),
+            author=event.actor.id,
+            message_id=event.id,
+            at=event.occurred_at.isoformat(),
+        )
         if event.is_approval_action:
             return {"route": "approval", "source_id": source["id"]}
         if event.is_direct_agent_request:
@@ -134,7 +148,15 @@ class EventRouter:
             content=text,
             principal_id=event.actor.id,
             metadata={"slack": slack_metadata},
-            message_metadata={"trigger_event_id": event.id},
+            message_metadata={
+                "trigger_event_id": event.id,
+                # A channel Session holds every participant's turns, so each
+                # one carries its speaker into the prompt transcript.
+                "author_name": (slack_metadata.get("actor_profile") or {}).get(
+                    "display_name"
+                )
+                or event.actor.id,
+            },
         )
         job = self.queue.enqueue(
             organization_id=event.organization_id,

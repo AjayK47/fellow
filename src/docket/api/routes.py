@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode
 
 import base64
@@ -274,11 +274,50 @@ class AutomationRequest(BaseModel):
     enabled: bool = True
 
 
+class AutomationUpdateRequest(BaseModel):
+    organization_id: str
+    name: str | None = None
+    goal: str | None = None
+    principal_id: str | None = None
+    conversation_id: str | None = None
+    destination: dict[str, Any] | None = None
+    interval_seconds: int | None = None
+    cron_expression: str | None = None
+    timezone: str | None = None
+    quiet_hours: dict[str, str] | None = None
+    misfire_policy: str | None = None
+    overlap_policy: str | None = None
+    enabled: bool | None = None
+
+
+class MCPServerRequest(BaseModel):
+    organization_id: str
+    name: str
+    transport: Literal["streamable_http", "sse", "stdio"] = "streamable_http"
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    auth_type: Literal["none", "api_key", "oauth"] = "none"
+    api_key_header: str = "Authorization"
+    api_key: str | None = None
+    oauth_scope: str | None = None
+    enabled: bool = True
+
+
+class OrganizationScopeRequest(BaseModel):
+    organization_id: str
+
+
 class ToolPolicyRequest(BaseModel):
     organization_id: str
     tool_name: str
-    enabled: bool = True
-    approval_required: bool | None = None
+    execution: Literal["inherit", "ai_review", "ask", "deny"] = "inherit"
+
+
+class ToolPolicyModeRequest(BaseModel):
+    organization_id: str
+    mode: Literal["supervised", "autonomous", "full_access", "restricted"]
 
 
 class ConnectorAccountRequest(BaseModel):
@@ -1240,6 +1279,20 @@ def upsert_tool_policy(
     return data
 
 
+@router.post("/v1/tool-policy-mode")
+def upsert_tool_policy_mode(
+    body: ToolPolicyModeRequest, request: Request
+) -> dict[str, Any]:
+    data = {
+        "id": f"tool_policy:{body.organization_id}:*",
+        "organization_id": body.organization_id,
+        "tool_name": "*",
+        "mode": body.mode,
+    }
+    _app(request).store.upsert_simple_harness_record("tool_policies", data)
+    return data
+
+
 @router.get("/v1/tools")
 def list_agent_tools(
     request: Request, organization_id: str
@@ -1247,22 +1300,25 @@ def list_agent_tools(
     brain = _app(request)
     definitions = []
     for definition in brain.tool_registry.definitions():
-        policies = brain.store.list_harness_records(
-            "tool_policies",
-            organization_id,
-            where={"tool_name": definition.name},
-            order_by="updated_at",
-            limit=1,
-        )
+        if (
+            definition.allowed_organization_ids
+            and organization_id not in definition.allowed_organization_ids
+        ):
+            continue
+        policy = brain.tool_executor.effective_policy(organization_id, definition)
         definitions.append(
             {
                 **definition.model_dump(mode="json"),
-                "policy": policies[0] if policies else {"enabled": True},
+                "policy": policy,
             }
         )
+    ready = sum(1 for definition in definitions if definition["runtime_ready"])
     return {
         "tools": definitions,
         "count": len(definitions),
+        "ready_count": ready,
+        "setup_needed_count": len(definitions) - ready,
+        "policy_mode": brain.tool_executor.organization_policy_mode(organization_id),
         "composio_configured": brain.composio.configured,
     }
 
@@ -1886,6 +1942,42 @@ def tick_automations(
     return _app(request).automations.tick(organization_id)
 
 
+@router.put("/v1/automations/{automation_id}")
+def update_automation(
+    automation_id: str, body: AutomationUpdateRequest, request: Request
+) -> dict[str, Any]:
+    try:
+        return _app(request).automations.update(
+            automation_id, **body.model_dump(exclude_none=True)
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "automation not found") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/v1/automations/{automation_id}:run")
+def run_automation_now(
+    automation_id: str, body: OrganizationScopeRequest, request: Request
+) -> dict[str, Any]:
+    try:
+        return _app(request).automations.run_now(
+            automation_id, body.organization_id
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "automation not found") from exc
+
+
+@router.delete("/v1/automations/{automation_id}")
+def delete_automation(
+    automation_id: str, request: Request, organization_id: str
+) -> dict[str, Any]:
+    automation = _app(request).store.get_harness_record("automations", automation_id)
+    if not automation or automation.get("organization_id") != organization_id:
+        raise HTTPException(404, "automation not found")
+    return _app(request).automations.delete(automation_id)
+
+
 @router.post("/v1/automations/{automation_id}:enable")
 def enable_automation(
     automation_id: str, request: Request
@@ -1904,6 +1996,102 @@ def disable_automation(
         return _app(request).automations.set_enabled(automation_id, False)
     except KeyError as exc:
         raise HTTPException(404, "automation not found") from exc
+
+
+@router.post("/v1/mcp/servers")
+def create_mcp_server(body: MCPServerRequest, request: Request) -> dict[str, Any]:
+    try:
+        return _app(request).mcp.create(**body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/v1/mcp/servers")
+def list_mcp_servers(request: Request, organization_id: str) -> dict[str, Any]:
+    servers = _app(request).mcp.list(organization_id)
+    return {"servers": servers, "count": len(servers)}
+
+
+@router.post("/v1/mcp/servers/{server_id}:test")
+def test_mcp_server(
+    server_id: str, body: OrganizationScopeRequest, request: Request
+) -> dict[str, Any]:
+    try:
+        return _app(request).mcp.test(server_id, body.organization_id)
+    except KeyError as exc:
+        raise HTTPException(404, "MCP server not found") from exc
+    except PermissionError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"MCP connection failed: {exc}") from exc
+
+
+@router.post("/v1/mcp/servers/{server_id}:enable")
+def enable_mcp_server(
+    server_id: str, body: OrganizationScopeRequest, request: Request
+) -> dict[str, Any]:
+    try:
+        return _app(request).mcp.set_enabled(server_id, body.organization_id, True)
+    except KeyError as exc:
+        raise HTTPException(404, "MCP server not found") from exc
+
+
+@router.post("/v1/mcp/servers/{server_id}:disable")
+def disable_mcp_server(
+    server_id: str, body: OrganizationScopeRequest, request: Request
+) -> dict[str, Any]:
+    try:
+        return _app(request).mcp.set_enabled(server_id, body.organization_id, False)
+    except KeyError as exc:
+        raise HTTPException(404, "MCP server not found") from exc
+
+
+@router.delete("/v1/mcp/servers/{server_id}")
+def delete_mcp_server(
+    server_id: str, request: Request, organization_id: str
+) -> dict[str, Any]:
+    try:
+        return _app(request).mcp.delete(server_id, organization_id)
+    except KeyError as exc:
+        raise HTTPException(404, "MCP server not found") from exc
+
+
+@router.post("/v1/mcp/servers/{server_id}:oauth-start")
+async def start_mcp_oauth(
+    server_id: str, body: OrganizationScopeRequest, request: Request
+) -> dict[str, Any]:
+    public_url = (Settings().public_url or str(request.base_url)).rstrip("/")
+    redirect_uri = f"{public_url}/v1/mcp/oauth/callback"
+    try:
+        return await _app(request).mcp.start_oauth(
+            server_id, body.organization_id, redirect_uri
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "MCP server not found") from exc
+    except (ValueError, TimeoutError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"OAuth setup failed: {exc}") from exc
+
+
+@router.get("/v1/mcp/oauth/callback", response_class=HTMLResponse)
+async def mcp_oauth_callback(
+    request: Request,
+    code: str,
+    state: str,
+    iss: str | None = None,
+) -> HTMLResponse:
+    try:
+        await _app(request).mcp.complete_oauth(state=state, code=code, iss=iss)
+    except KeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"OAuth callback failed: {exc}") from exc
+    return HTMLResponse(
+        """<!doctype html><meta charset=\"utf-8\"><title>MCP connected</title>
+        <body style=\"font-family:system-ui;padding:3rem\">MCP server connected. You can close this window.
+        <script>window.opener?.postMessage({type:'docket:mcp-oauth-complete'}, window.location.origin); window.close();</script></body>"""
+    )
 
 
 @router.post("/v1/slack/events")

@@ -1,3 +1,8 @@
+/* Hallmark · pre-emit critique: P5 H5 E4 S5 R4 V5
+ * Hallmark · macrostructure: balanced registry + full-height inspector · genre: modern-minimal
+ * theme: existing Docket console · anchor: brand green · slop: pass (component scope)
+ * contrast: pass (40–41) · responsive: pass (34, 49, 50–57) · icons: pass (30)
+ */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -89,5 +94,273 @@
   }
   .pill-orange {
     @apply bg-orange-soft text-orange;
+  }
+
+  .tool-mode-panel {
+    @apply grid grid-cols-[minmax(180px,1fr)_auto] items-center gap-x-5 gap-y-3 rounded-xl2 border border-line bg-panel px-5 py-4 shadow-card;
+  }
+  .tool-mode-options {
+    @apply flex flex-wrap items-center justify-end gap-1 rounded-lg bg-paper p-1;
+  }
+  .tool-mode-button {
+    @apply inline-flex min-h-9 cursor-pointer items-center gap-2 whitespace-nowrap rounded-md border-0 bg-transparent px-3 text-[11px] font-medium text-muted transition-colors;
+  }
+  .tool-mode-button:hover {
+    @apply bg-panel text-ink;
+  }
+  .tool-mode-button:active {
+    transform: translateY(1px);
+  }
+  .tool-mode-button:disabled {
+    @apply cursor-not-allowed opacity-50;
+  }
+  .tool-mode-button-active {
+    @apply bg-panel text-brand shadow-card;
+  }
+  .tool-mode-description {
+    @apply col-span-2 border-t border-line pt-3 text-[11px] text-muted;
+  }
+  .tool-summary {
+    @apply grid grid-cols-6 border-b border-line bg-paper/40;
+  }
+  .tool-summary > div {
+    @apply border-r border-line px-4 py-3 last:border-r-0;
+  }
+  .tool-summary strong {
+    @apply block font-mono text-[18px] font-medium tabular-nums text-ink;
+  }
+  .tool-summary span {
+    @apply mt-0.5 block text-[10px] uppercase tracking-wider text-muted;
+  }
+  .tool-filters {
+    @apply flex flex-wrap items-center gap-2 border-b border-line px-4 py-3;
+  }
+  .tool-search {
+    @apply relative min-w-[260px] flex-1;
+  }
+  .tool-clear {
+    @apply min-h-9 cursor-pointer whitespace-nowrap rounded-lg border-0 bg-transparent px-2 text-[11px] font-medium text-brand;
+  }
+  .tool-clear:hover {
+    @apply bg-brand-soft;
+  }
+  .tool-clear:active {
+    transform: translateY(1px);
+  }
+  .tool-result-line {
+    @apply flex items-center justify-between gap-4 border-b border-line px-4 py-2 text-[10px] text-muted;
+  }
+  .tool-registry {
+    @apply w-full;
+  }
+  .tool-registry-head,
+  .tool-registry-row {
+    grid-template-columns: minmax(190px, 0.8fr) minmax(260px, 1.25fr) minmax(360px, 1.2fr) 20px;
+  }
+  .tool-registry-head {
+    @apply grid items-center gap-5 border-b border-line bg-paper/60 px-4 py-2.5 font-mono text-[10px] font-medium uppercase tracking-wider text-muted;
+  }
+  .tool-registry-row {
+    @apply grid min-h-[70px] w-full cursor-pointer items-center gap-5 border-0 border-b border-line bg-panel px-4 py-3 text-left last:border-b-0;
+    transition: background-color 160ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .tool-registry-row:hover {
+    @apply bg-brand-soft/35;
+  }
+  .tool-registry-row:active {
+    @apply bg-brand-soft/60;
+  }
+  .tool-identity {
+    @apply grid min-w-0 grid-cols-[32px_minmax(0,1fr)] items-center gap-3;
+  }
+  .tool-identity-mark {
+    @apply flex h-8 w-8 items-center justify-center rounded-lg border border-line bg-paper text-muted;
+  }
+  .tool-purpose {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    @apply overflow-hidden text-[11px] leading-relaxed text-muted;
+  }
+  .tool-source {
+    @apply mt-1 font-mono text-[9px] uppercase tracking-wider text-muted/80;
+  }
+  .tool-governance {
+    @apply flex min-w-0 flex-wrap items-center gap-2;
+  }
+  .tool-governance-rule {
+    @apply mx-0.5 h-5 w-px bg-line;
+  }
+  .tool-status {
+    @apply inline-flex items-center gap-1.5 whitespace-nowrap text-[11px] font-medium;
+  }
+  .tool-status-ready {
+    @apply text-good;
+  }
+  .tool-status-setup {
+    @apply text-orange;
+  }
+  .tool-access {
+    @apply inline-flex items-center gap-1.5 whitespace-nowrap text-[11px] font-medium;
+  }
+  .tool-access::before {
+    content: "";
+    @apply h-1.5 w-1.5 rounded-full;
+  }
+  .tool-access-enabled {
+    @apply text-ink;
+  }
+  .tool-access-enabled::before {
+    @apply bg-good;
+  }
+  .tool-access-forbidden {
+    @apply text-bad;
+  }
+  .tool-access-forbidden::before {
+    @apply bg-bad;
+  }
+  .tool-policy-option {
+    @apply grid min-h-[58px] w-full cursor-pointer grid-cols-[32px_minmax(0,1fr)_auto] items-center gap-2 rounded-lg border border-line bg-panel px-3 py-2 transition-colors;
+  }
+  .tool-policy-option:hover {
+    @apply border-ink/20 bg-paper;
+  }
+  .tool-policy-option:active {
+    transform: translateY(1px);
+  }
+  .tool-policy-option:disabled {
+    @apply cursor-not-allowed opacity-50;
+  }
+  .tool-policy-option-active {
+    @apply border-brand/30 bg-brand-soft/60;
+  }
+  .tool-policy-option-icon {
+    @apply flex h-8 w-8 items-center justify-center rounded-full bg-paper text-muted;
+  }
+  .tool-policy-option-active .tool-policy-option-icon {
+    @apply bg-panel text-brand;
+  }
+  .tool-saving-dot {
+    @apply inline-block h-2 w-2 animate-pulse rounded-full bg-brand;
+  }
+  .tool-drawer-backdrop {
+    @apply fixed inset-0 z-50 bg-ink/45 backdrop-blur-[2px];
+  }
+  .tool-drawer {
+    @apply absolute inset-y-0 right-0 flex h-dvh w-full max-w-[760px] flex-col border-l border-line bg-panel shadow-popover;
+  }
+  .tool-drawer-head {
+    @apply flex flex-none items-center justify-between gap-4 border-b border-line px-6 py-5;
+  }
+  .tool-drawer-close {
+    @apply flex h-10 w-10 flex-none cursor-pointer items-center justify-center rounded-lg border border-line bg-panel text-muted;
+    transition: background-color 160ms cubic-bezier(0.16, 1, 0.3, 1), color 160ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .tool-drawer-close:hover {
+    @apply bg-paper text-ink;
+  }
+  .tool-drawer-close:active {
+    transform: translateY(1px);
+  }
+  .tool-drawer-body {
+    @apply grid min-h-0 flex-1 content-start gap-5 overflow-y-auto px-6 py-5;
+  }
+  .tool-drawer-intro {
+    @apply border-b border-line pb-5;
+  }
+  .tool-drawer-summary {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    @apply m-0 overflow-hidden max-w-[76ch] text-[13px] leading-relaxed text-muted;
+  }
+  .tool-drawer-facts {
+    @apply grid grid-cols-3 divide-x divide-line rounded-lg border border-line bg-paper/60;
+  }
+  .tool-drawer-facts > div {
+    @apply px-4 py-3;
+  }
+  .tool-policy-grid {
+    @apply grid grid-cols-2 gap-2;
+  }
+
+  @media (max-width: 900px) {
+    .tool-mode-panel {
+      @apply grid-cols-1;
+    }
+    .tool-mode-options {
+      @apply justify-start;
+    }
+    .tool-mode-description {
+      @apply col-span-1;
+    }
+    .tool-summary {
+      @apply grid-cols-3;
+    }
+    .tool-summary > div:nth-child(3) {
+      @apply border-r-0;
+    }
+    .tool-summary > div:nth-child(-n+3) {
+      @apply border-b;
+    }
+    .tool-registry-head {
+      @apply hidden;
+    }
+    .tool-registry-row {
+      grid-template-columns: minmax(0, 1fr) 20px;
+      @apply min-h-0 items-start gap-x-3 gap-y-2.5 py-4;
+    }
+    .tool-identity {
+      @apply col-start-1 row-start-1;
+    }
+    .tool-purpose {
+      @apply col-span-2 col-start-1 row-start-2;
+    }
+    .tool-governance {
+      @apply col-span-2 col-start-1 row-start-3;
+    }
+    .tool-registry-row > svg {
+      @apply col-start-2 row-start-1 mt-2;
+    }
+  }
+
+  @media (max-width: 560px) {
+    .tool-mode-options {
+      @apply grid grid-cols-2;
+    }
+    .tool-mode-button {
+      @apply justify-center px-2;
+    }
+    .tool-summary {
+      @apply grid-cols-2;
+    }
+    .tool-summary > div:nth-child(2n) {
+      @apply border-r-0;
+    }
+    .tool-summary > div:nth-child(3) {
+      @apply border-r;
+    }
+    .tool-summary > div:nth-child(-n+4) {
+      @apply border-b;
+    }
+    .tool-search {
+      @apply min-w-full;
+    }
+    .tool-filters .select {
+      @apply min-h-10 flex-1;
+    }
+    .tool-result-line {
+      @apply items-start;
+    }
+    .tool-drawer-head,
+    .tool-drawer-body {
+      @apply px-4;
+    }
+    .tool-policy-grid {
+      @apply grid-cols-1;
+    }
+    .tool-drawer-facts {
+      @apply grid-cols-1 divide-x-0 divide-y;
+    }
   }
 }

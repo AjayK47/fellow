@@ -194,11 +194,22 @@ class AutomationService:
             "automations", organization_id, order_by="updated_at"
         )
 
-    def tick(self, organization_id: str | None = None) -> dict[str, Any]:
+    def tick(
+        self,
+        organization_id: str | None = None,
+        automation_id: str | None = None,
+    ) -> dict[str, Any]:
         now = utcnow()
         now_iso = now.isoformat()
         with self.store.cursor() as cur:
-            if organization_id:
+            if automation_id:
+                cur.execute(
+                    """SELECT payload FROM automations
+                    WHERE id = ? AND organization_id = ? AND status = 'enabled'
+                    AND next_run_at <= ?""",
+                    (automation_id, organization_id, now_iso),
+                )
+            elif organization_id:
                 cur.execute(
                     """SELECT payload FROM automations
                     WHERE organization_id = ? AND status = 'enabled'
@@ -308,6 +319,83 @@ class AutomationService:
             "activations": activations,
             "skipped": skipped,
         }
+
+    def update(
+        self,
+        automation_id: str,
+        *,
+        organization_id: str,
+        name: str | None = None,
+        goal: str | None = None,
+        principal_id: str | None = None,
+        conversation_id: str | None = None,
+        destination: dict[str, Any] | None = None,
+        interval_seconds: int | None = None,
+        cron_expression: str | None = None,
+        timezone: str | None = None,
+        quiet_hours: dict[str, str] | None = None,
+        misfire_policy: str | None = None,
+        overlap_policy: str | None = None,
+        enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        automation = self.store.get_harness_record("automations", automation_id)
+        if not automation or automation.get("organization_id") != organization_id:
+            raise KeyError(automation_id)
+        if misfire_policy is not None and misfire_policy not in {"skip", "fire_once"}:
+            raise ValueError("misfire_policy must be 'skip' or 'fire_once'")
+        if overlap_policy is not None and overlap_policy not in {"skip_if_running", "queue"}:
+            raise ValueError("overlap_policy must be 'skip_if_running' or 'queue'")
+
+        for key, value in {
+            "name": name,
+            "goal": goal,
+            "principal_id": principal_id,
+            "conversation_id": conversation_id,
+            "destination": destination,
+            "timezone": timezone,
+            "quiet_hours": quiet_hours,
+            "misfire_policy": misfire_policy,
+            "overlap_policy": overlap_policy,
+        }.items():
+            if value is not None:
+                automation[key] = value
+        if cron_expression is not None:
+            next_cron_fire(cron_expression, str(automation.get("timezone") or "UTC"), utcnow())
+            automation["schedule_kind"] = "cron"
+            automation["cron_expression"] = cron_expression
+            automation["interval_seconds"] = None
+        elif interval_seconds is not None:
+            if interval_seconds < 60:
+                raise ValueError("automation interval must be at least 60 seconds")
+            automation["schedule_kind"] = "interval"
+            automation["interval_seconds"] = interval_seconds
+            automation["cron_expression"] = None
+        if enabled is not None:
+            automation["status"] = "enabled" if enabled else "disabled"
+        automation["next_run_at"] = (
+            compute_next_run_at(automation, after=utcnow())
+            if automation["status"] == "enabled"
+            else None
+        )
+        automation["updated_at"] = utcnow().isoformat()
+        self._upsert(automation)
+        self.audit.record(
+            organization_id,
+            "automation.updated",
+            {"automation_id": automation_id},
+            principal_id=automation.get("principal_id"),
+        )
+        return automation
+
+    def run_now(self, automation_id: str, organization_id: str) -> dict[str, Any]:
+        automation = self.store.get_harness_record("automations", automation_id)
+        if not automation or automation.get("organization_id") != organization_id:
+            raise KeyError(automation_id)
+        automation["next_run_at"] = utcnow().isoformat()
+        automation["status"] = "enabled"
+        automation["updated_at"] = utcnow().isoformat()
+        self._upsert(automation)
+        return self.tick(organization_id, automation_id)
 
     def set_enabled(self, automation_id: str, enabled: bool) -> dict[str, Any]:
         automation = self.store.get_harness_record("automations", automation_id)

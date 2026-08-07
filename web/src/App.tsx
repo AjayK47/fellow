@@ -11,15 +11,18 @@ import {
   Kanban,
   ListChecks,
   LogOut,
+  Menu,
   MessageSquare,
   Plug,
   ScrollText,
   Search,
+  Server,
   Settings2,
   Share2,
   ShieldCheck,
   Sparkles,
   Wrench,
+  X,
 } from "lucide-react";
 import Overview from "./pages/Overview";
 import Sessions from "./pages/Sessions";
@@ -32,6 +35,7 @@ import Setup from "./pages/Setup";
 import Connections from "./pages/Connections";
 import Channels from "./pages/Channels";
 import Automations from "./pages/Automations";
+import MCP from "./pages/MCP";
 import Tasks from "./pages/Tasks";
 import TaskDetail from "./pages/TaskDetail";
 import Graph from "./pages/Graph";
@@ -69,6 +73,7 @@ const GROUPS: NavGroup[] = [
       { to: "/connections", label: "Integrations", icon: Plug },
       { to: "/channels", label: "Channels", icon: MessageSquare },
       { to: "/automations", label: "Automations", icon: Clock },
+      { to: "/mcp", label: "MCP servers", icon: Server },
       { to: "/tasks", label: "Tasks", icon: Kanban },
     ],
   },
@@ -88,12 +93,13 @@ const OPERATIONS: NavItem[] = [
 
 const ALL_NAV = [...GROUPS.flatMap((g) => g.items), ...OPERATIONS];
 
-function NavRow({ item, badge }: { item: NavItem; badge?: number }) {
+function NavRow({ item, badge, onNavigate }: { item: NavItem; badge?: number; onNavigate?: () => void }) {
   const Icon = item.icon;
   return (
     <NavLink
       to={item.to}
       end={item.end}
+      onClick={onNavigate}
       className={({ isActive }) =>
         `group flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] font-medium no-underline transition-colors ${
           isActive ? "bg-brand-soft text-brand" : "text-ink/70 hover:bg-paper hover:text-ink"
@@ -120,11 +126,13 @@ function Sidebar({
   workspaceName,
   showSignOut,
   onSignOut,
+  onNavigate,
 }: {
   pendingApprovals: number;
   workspaceName?: string | null;
   showSignOut: boolean;
   onSignOut: () => void;
+  onNavigate?: () => void;
 }) {
   return (
     <aside className="flex h-screen flex-col overflow-y-auto border-r border-line bg-panel px-4 py-5">
@@ -142,7 +150,12 @@ function Sidebar({
               {g.title}
             </div>
             {g.items.map((it) => (
-              <NavRow key={it.to} item={it} badge={it.to === "/approvals" ? pendingApprovals : 0} />
+              <NavRow
+                key={it.to}
+                item={it}
+                badge={it.to === "/approvals" ? pendingApprovals : 0}
+                onNavigate={onNavigate}
+              />
             ))}
           </div>
         ))}
@@ -153,7 +166,7 @@ function Sidebar({
           Operations
         </div>
         {OPERATIONS.map((it) => (
-          <NavRow key={it.to} item={it} />
+          <NavRow key={it.to} item={it} onNavigate={onNavigate} />
         ))}
       </div>
 
@@ -254,9 +267,17 @@ function NavSearch() {
   );
 }
 
-function Topbar({ pendingApprovals }: { pendingApprovals: number }) {
+function Topbar({ pendingApprovals, onOpenNavigation }: { pendingApprovals: number; onOpenNavigation: () => void }) {
   return (
-    <div className="sticky top-0 z-30 flex items-center gap-4 border-b border-line bg-panel/90 px-8 py-3.5 backdrop-blur">
+    <div className="sticky top-0 z-30 flex items-center gap-3 border-b border-line bg-panel/90 px-4 py-3.5 backdrop-blur sm:px-6 lg:px-8">
+      <button
+        type="button"
+        className="flex h-9 w-9 flex-none items-center justify-center rounded-lg border border-line bg-panel text-ink/70 transition-colors hover:bg-paper hover:text-ink lg:hidden"
+        onClick={onOpenNavigation}
+        aria-label="Open navigation"
+      >
+        <Menu size={17} />
+      </button>
       <NavSearch />
       <div className="ml-auto flex items-center gap-2">
         <Link
@@ -285,6 +306,7 @@ export default function App() {
   const [pendingApprovals, setPendingApprovals] = useState(0);
   const [session, setSession] = useState<SessionState>("pending");
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -324,17 +346,48 @@ export default function App() {
   }
 
   return (
-    <div className="grid h-screen grid-cols-[256px_1fr] overflow-hidden bg-paper">
-      <Sidebar
-        pendingApprovals={pendingApprovals}
-        workspaceName={session.workspace_name}
-        showSignOut={!session.auth_disabled}
-        onSignOut={handleSignOut}
-      />
+    <div className="grid h-screen grid-cols-1 overflow-hidden bg-paper lg:grid-cols-[256px_1fr]">
+      <div className="hidden lg:block">
+        <Sidebar
+          pendingApprovals={pendingApprovals}
+          workspaceName={session.workspace_name}
+          showSignOut={!session.auth_disabled}
+          onSignOut={handleSignOut}
+        />
+      </div>
+
+      {mobileNavigationOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-ink/45 backdrop-blur-[2px] lg:hidden"
+          onClick={() => setMobileNavigationOpen(false)}
+        >
+          <div
+            className="relative h-full w-[min(320px,calc(100vw-32px))] bg-panel shadow-popover"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <Sidebar
+              pendingApprovals={pendingApprovals}
+              workspaceName={session.workspace_name}
+              showSignOut={!session.auth_disabled}
+              onSignOut={handleSignOut}
+              onNavigate={() => setMobileNavigationOpen(false)}
+            />
+            <button
+              type="button"
+              className="absolute right-3 top-3 flex h-10 w-10 items-center justify-center rounded-lg text-muted transition-colors hover:bg-paper hover:text-ink"
+              onClick={() => setMobileNavigationOpen(false)}
+              aria-label="Close navigation"
+            >
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="grid h-screen grid-rows-[auto_1fr] overflow-hidden">
-        <Topbar pendingApprovals={pendingApprovals} />
+        <Topbar pendingApprovals={pendingApprovals} onOpenNavigation={() => setMobileNavigationOpen(true)} />
         <main className="overflow-y-auto">
-          <div className="mx-auto w-full max-w-[1400px] p-8 pb-20">
+          <div className="mx-auto w-full max-w-[1400px] p-4 pb-20 sm:p-6 sm:pb-20 lg:p-8 lg:pb-20">
             <Routes>
               <Route path="/sessions" element={<Sessions />} />
               <Route path="/sessions/:sessionId" element={<SessionDetail />} />
@@ -346,6 +399,7 @@ export default function App() {
               <Route path="/connections" element={<Connections />} />
               <Route path="/channels" element={<Channels />} />
               <Route path="/automations" element={<Automations />} />
+              <Route path="/mcp" element={<MCP />} />
               <Route path="/tasks" element={<Tasks />} />
               <Route path="/tasks/:taskId" element={<TaskDetail />} />
               <Route path="/graph" element={<Graph />} />

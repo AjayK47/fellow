@@ -1,10 +1,8 @@
 """Typed document generation (pdf_create/docx_create/xlsx_create/pptx_create)
-actually produces valid files once its optional runtime dependencies
-(reportlab, python-docx, openpyxl, python-pptx) are installed -- not just
-that dependency_ready() reports true. These tools now auto-execute like
-every other ordinary write tool: TypedDocumentTools' own independent
-approval gate was retired in favor of the single unified gate in
-ToolExecutor.execute() (risk tier + ActionReviewer front door)."""
+actually produces valid files once its optional runtime dependencies are
+installed -- not just that dependency_ready() reports true. These tests call
+the handler through ToolExecutor with policy already resolved; organization
+mode/reviewer behavior is covered separately in test_tool_policy_modes.py."""
 
 from __future__ import annotations
 
@@ -60,10 +58,74 @@ def test_pdf_create_produces_a_real_pdf_artifact(brain):
         name="pdf_create",
         arguments={"title": "Computer-Use SaaS Comparison", "text": "Line one\nLine two"},
     )
-    result = brain.tool_executor.execute(run=run, call=call)
+    result = brain.tool_executor.execute(run=run, call=call, approved=True)
     assert result.status == "completed"
     data = _content_bytes(brain, result.output["artifact_id"])
     assert data.startswith(b"%PDF")
+
+
+def test_pdf_create_with_html_renders_real_multi_page_layout(brain):
+    """The designed-HTML path (WeasyPrint), not the plain-text fallback --
+    proves @page sizing and break-after pagination actually take effect,
+    not just that some PDF bytes come back."""
+    run = _run(brain)
+    html = """<!doctype html>
+<html><head><meta charset="utf-8"><style>
+  @page { size: letter; margin: 2cm; }
+  body { font-family: sans-serif; }
+  h1 { color: #1a1a1a; }
+  .page-break { break-after: page; }
+</style></head>
+<body>
+<h1>Page one</h1><p class="page-break">First page content.</p>
+<h1>Page two</h1><p>Second page content.</p>
+</body></html>"""
+    call = ModelToolCall(
+        id="call_pdf_html",
+        name="pdf_create",
+        arguments={"title": "Designed Report", "html": html},
+    )
+    result = brain.tool_executor.execute(run=run, call=call, approved=True)
+    assert result.status == "completed", result.error
+    data = _content_bytes(brain, result.output["artifact_id"])
+    assert data.startswith(b"%PDF")
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    assert len(reader.pages) == 2
+
+
+def test_html_create_with_text_argument_persists_the_content(brain):
+    run = _run(brain)
+    call = ModelToolCall(
+        id="call_html_text",
+        name="html_create",
+        arguments={"title": "A Page", "text": "<h1>Hello</h1>"},
+    )
+    result = brain.tool_executor.execute(run=run, call=call, approved=True)
+    assert result.status == "completed", result.error
+    artifact = brain.artifacts.get(result.output["artifact_id"])
+    assert artifact["content"]["text"] == "<h1>Hello</h1>"
+
+
+def test_html_create_with_html_argument_also_persists_the_content(brain):
+    """Regression test for a real production bug: pdf_create's schema adds
+    an `html` property to the *shared* DocumentTools properties dict (every
+    operation's input_schema is built from the same common dict), so a
+    model calling html_create with `html=` instead of the documented
+    `text=` argument silently produced an artifact with EMPTY content --
+    confirmed from an actual delivered link that rendered a blank page.
+    html_create must accept either key."""
+    run = _run(brain)
+    call = ModelToolCall(
+        id="call_html_html_key",
+        name="html_create",
+        arguments={"title": "A Page", "html": "<h1>Hello</h1>"},
+    )
+    result = brain.tool_executor.execute(run=run, call=call, approved=True)
+    assert result.status == "completed", result.error
+    artifact = brain.artifacts.get(result.output["artifact_id"])
+    assert artifact["content"]["text"] == "<h1>Hello</h1>"
 
 
 def test_docx_create_produces_a_real_docx_artifact(brain):
@@ -73,7 +135,7 @@ def test_docx_create_produces_a_real_docx_artifact(brain):
         name="docx_create",
         arguments={"title": "Report", "text": "Executive summary\nDetails follow."},
     )
-    result = brain.tool_executor.execute(run=run, call=call)
+    result = brain.tool_executor.execute(run=run, call=call, approved=True)
     assert result.status == "completed"
     data = _content_bytes(brain, result.output["artifact_id"])
     assert zipfile.is_zipfile(io.BytesIO(data))
@@ -88,7 +150,7 @@ def test_xlsx_create_produces_a_real_xlsx_artifact(brain):
         name="xlsx_create",
         arguments={"title": "Pricing", "rows": [["Product", "Price"], ["Coasty AI", "$99"]]},
     )
-    result = brain.tool_executor.execute(run=run, call=call)
+    result = brain.tool_executor.execute(run=run, call=call, approved=True)
     assert result.status == "completed"
     data = _content_bytes(brain, result.output["artifact_id"])
     assert zipfile.is_zipfile(io.BytesIO(data))
@@ -103,7 +165,7 @@ def test_pptx_create_produces_a_real_pptx_artifact(brain):
         name="pptx_create",
         arguments={"slides": [{"title": "Overview", "text": "Key findings"}]},
     )
-    result = brain.tool_executor.execute(run=run, call=call)
+    result = brain.tool_executor.execute(run=run, call=call, approved=True)
     assert result.status == "completed"
     data = _content_bytes(brain, result.output["artifact_id"])
     assert zipfile.is_zipfile(io.BytesIO(data))

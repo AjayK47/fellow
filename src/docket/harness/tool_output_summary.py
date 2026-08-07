@@ -12,9 +12,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-TOOL_OUTPUT_SUMMARY_SYSTEM_PROMPT = """You compress a single tool call's output for another agent that has a
-limited context budget. Produce a compact, faithful summary — never omit a fact that
-would change a decision, and never invent detail that is not present in the output."""
+from docket.harness.prompt_library import load
+
+TOOL_OUTPUT_SUMMARY_SYSTEM_PROMPT = load("tool_output_summary")
 
 TOOL_OUTPUT_SUMMARY_SCHEMA: dict[str, Any] = {
     "type": "object",

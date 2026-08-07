@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 from typing import Any
 import re
 
@@ -19,6 +20,65 @@ from docket.domain.models import (
 from docket.services.audit import AuditService
 from docket.storage.db import BrainStore
 from docket.services.skill_packages import SkillPackageCatalog
+
+# Generic conversational/request vocabulary that carries no topical signal
+# on its own ("can you look into...", "please make me..."). Without
+# filtering these, a message's incidental overlap with them can outscore a
+# skill's genuine, on-topic match -- this is exactly how "OCR and
+# Documents"/"YouTube Content" out-ranked "PDF and Document Handling" for
+# an economic-report request that never used any word specific to either.
+_SKILL_SEARCH_STOP_WORDS = {
+    "a", "an", "and", "as", "at", "before", "but", "by", "for", "from", "if",
+    "in", "into", "is", "it", "its", "of", "on", "or", "so", "that", "the",
+    "this", "to", "with", "without",
+    "i", "me", "my", "we", "us", "our", "you", "your", "yours", "he", "him",
+    "his", "she", "her", "they", "them", "their", "some", "any", "each",
+    "every", "all", "one", "ones",
+    "can", "could", "would", "should", "will", "shall", "do", "does", "did",
+    "have", "has", "had", "be", "am", "are", "was", "were", "been", "being",
+    "get", "got", "give", "gave", "make", "made", "look", "looking", "want",
+    "wanted", "need", "needed", "please", "thanks", "thank", "cool", "ok",
+    "okay", "just", "also", "like", "think", "know", "let", "lets", "help",
+    "new", "good", "great", "nice", "hey", "hi", "hello",
+}
+# Fuzzy (typo-tolerant) matching only kicks in for longer tokens -- a short
+# word like "war" or "you" is within edit-distance of plenty of unrelated
+# short words, so fuzzy-matching it would reintroduce the same noise the
+# stopword list just removed. A word long enough to need this ("rpeort",
+# "econmic") carries enough real signal for the comparison to be safe.
+_SKILL_SEARCH_FUZZY_MIN_TOKEN_LEN = 5
+_SKILL_SEARCH_FUZZY_THRESHOLD = 0.8
+
+
+def _skill_search_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _skill_query_tokens(query: str) -> list[str]:
+    return [
+        tok
+        for tok in re.findall(r"[a-z0-9]+", query.lower())
+        if tok not in _SKILL_SEARCH_STOP_WORDS and len(tok) > 2
+    ]
+
+
+def _skill_token_match_score(query_token: str, text_tokens: set[str]) -> float:
+    """1.0 for an exact match; a fuzzy ratio for a likely typo in a long
+    enough token; 0.0 otherwise (never a partial-credit substring match --
+    that's what let "an" inside "many" or "art" inside "start" through
+    before)."""
+    if query_token in text_tokens:
+        return 1.0
+    if len(query_token) < _SKILL_SEARCH_FUZZY_MIN_TOKEN_LEN:
+        return 0.0
+    best = 0.0
+    for candidate in text_tokens:
+        if abs(len(candidate) - len(query_token)) > 2:
+            continue
+        ratio = SequenceMatcher(None, query_token, candidate).ratio()
+        if ratio > best:
+            best = ratio
+    return best if best >= _SKILL_SEARCH_FUZZY_THRESHOLD else 0.0
 
 
 class SkillsService:
@@ -208,7 +268,7 @@ class SkillsService:
         trigger_kind: str,
         purpose: str,
         allowed_scope_ids: list[str],
-        optional_limit: int = 3,
+        optional_limit: int = 4,
         available_capabilities: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Resolve and pin approved mandatory and relevant optional skills."""
@@ -302,14 +362,38 @@ class SkillsService:
         task: str,
         allowed_scope_ids: list[str],
         available_capabilities: set[str] | None = None,
-        limit: int = 12,
+        limit: int = 60,
     ) -> list[dict[str, Any]]:
-        """Return compact metadata for progressive-disclosure prompting."""
+        """Return compact metadata (name/description only, not full
+        content) for progressive-disclosure prompting -- ported from
+        Hermes's build_skills_system_prompt(): show the *entire* compatible
+        skill catalog as a lightweight index and let the model itself
+        decide what's relevant and pull in the full content via
+        skill_view/skills_list, rather than a server-side keyword scorer
+        silently deciding what the model never even gets to see. A keyword
+        matcher can't tell "PDF and Document Handling" is the right skill
+        for a report request that never uses the word "PDF" and misspells
+        "report" -- the model reading a real description can. `task` is
+        unused now (kept for signature compatibility) since nothing here
+        pre-filters by relevance anymore; resolve_for_task's small
+        mandatory+optional auto-load selection still uses search() as a
+        genuine optimization (skip a manual skill_view round-trip for the
+        common case), it just isn't the only way a skill can be found."""
         self.ensure_platform_skills(organization_id)
         allowed = set(allowed_scope_ids)
         ready_caps = available_capabilities
         records: list[dict[str, Any]] = []
-        for skill in self.search(organization_id, task, limit=max(limit * 2, 20)):
+        catalog = sorted(
+            self.list(organization_id),
+            key=lambda s: (
+                0 if s.get("kind") == "company" else 1,
+                0 if s.get("immutable") else 1,
+                str(s.get("name") or ""),
+            ),
+        )
+        for skill in catalog:
+            if len(records) >= limit:
+                break
             if skill.get("status") != SkillStatus.APPROVED.value:
                 continue
             if not (
@@ -392,18 +476,33 @@ class SkillsService:
         admin console) to see other statuses.
         """
         allowed_status = include_status or {SkillStatus.APPROVED.value}
-        stop_words = {"a", "an", "and", "before", "for", "in", "is", "it", "of", "on", "or", "the", "to"}
-        q = query.lower()
         skills = [
             s for s in self.store.list_skills(organization_id)
             if s.get("status") in allowed_status
         ]
-        scored = []
-        for s in skills:
-            text = f"{s.get('name','')} {s.get('description','')} {s.get('goal','')}".lower()
-            score = sum(1 for tok in q.split() if tok not in stop_words and len(tok) > 1 and tok in text)
-            if score or not q.strip():
-                scored.append((score, s))
+        query_tokens = _skill_query_tokens(query)
+        if not query_tokens:
+            # No scoreable signal (empty query, or pure stopwords) --
+            # preserve "browse everything" rather than returning nothing.
+            scored = [(0.0, s) for s in skills]
+        else:
+            scored = []
+            for s in skills:
+                # name/description are the curated, authoritative relevance
+                # signal; goal is a longer free-text field weighted lower so
+                # it can't drown out a precise description match with
+                # incidental word overlap.
+                primary_tokens = _skill_search_tokens(
+                    f"{s.get('name','')} {s.get('description','')}"
+                )
+                secondary_tokens = _skill_search_tokens(s.get("goal", ""))
+                score = sum(
+                    2.0 * _skill_token_match_score(tok, primary_tokens)
+                    + 1.0 * _skill_token_match_score(tok, secondary_tokens)
+                    for tok in query_tokens
+                )
+                if score > 0:
+                    scored.append((score, s))
         scored.sort(
             key=lambda x: (
                 x[0],

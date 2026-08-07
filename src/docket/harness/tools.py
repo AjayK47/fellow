@@ -111,6 +111,9 @@ class ToolRegistry:
     def get(self, name: str) -> RegisteredTool | None:
         return self._tools.get(name)
 
+    def unregister(self, name: str) -> None:
+        self._tools.pop(name, None)
+
     def definitions(self) -> list[ToolDefinition]:
         return [registered.definition for registered in self._tools.values()]
 
@@ -242,6 +245,20 @@ _HIGH_STAKES_SLUG_KEYWORDS = (
     "PAYOUT",
 )
 _EXTERNAL_COMMS_TOOLKITS = {"gmail", "outlook", "zendesk", "intercom", "sendgrid", "twilio"}
+
+_TOOL_POLICY_MODES = {"supervised", "autonomous", "full_access", "restricted"}
+_TOOL_EXECUTIONS = {"inherit", "direct", "ai_review", "ask", "deny"}
+
+
+def _mode_default_execution(mode: str, risk: str) -> str:
+    """Resolve an organization's mode into a per-tool execution path."""
+    if mode == "full_access":
+        return "direct"
+    if mode == "restricted":
+        return "ask"
+    if risk == "read":
+        return "direct"
+    return "ask" if mode == "supervised" else "ai_review"
 _EXTERNAL_COMMS_KEYWORDS = ("SEND", "REPLY", "EMAIL")
 
 
@@ -268,6 +285,27 @@ def _requires_dynamic_high_stakes_approval(
         return False
     toolkit = slug.split("_", 1)[0].lower()
     return _is_high_stakes_slug(slug, toolkit)
+
+
+# Native-allow tools: they execute immediately in every policy mode, with no
+# ActionReviewer call and no human pause. Scheduling is Docket's own control
+# surface, not an external effect -- an automation only ever wakes this same
+# agent, every firing is itself subject to the full gate for whatever it then
+# tries to do, and the schedule is exactly as easy to stop (automation_delete/
+# automation_set_enabled) as it was to start. Gating it bought no safety and
+# put a human in the loop for "remind me every morning".
+#
+# An explicit per-tool execution override in tool_policies still wins, so an
+# organization that wants these gated can say so; only the mode default and
+# the approval_required floor are bypassed.
+NATIVE_ALLOW_TOOL_NAMES = frozenset(
+    {
+        "automation_create",
+        "automation_set_enabled",
+        "automation_run_now",
+        "automation_delete",
+    }
+)
 
 
 def build_tool_registry(
@@ -587,6 +625,11 @@ def build_tool_registry(
                 text=args["text"],
                 blocks=args.get("blocks"),
                 workspace_id=workspace_id,
+                # Without this the send is not recorded in the conversation
+                # log, and Docket cannot see its own tool-sent messages on
+                # any later turn -- the exact blind spot that log exists to
+                # close.
+                organization_id=runtime["organization_id"],
             )
             # The model chose to send its own (possibly richly-formatted)
             # message directly — don't also let the automatic plain-text
@@ -1975,6 +2018,11 @@ class ToolExecutor:
         definitions: list[ToolDefinition] = []
         is_child = bool(run.get("parent_task_id"))
         for definition in self.registry.definitions():
+            if (
+                definition.allowed_organization_ids
+                and org not in definition.allowed_organization_ids
+            ):
+                continue
             if is_child and definition.name in _CHILD_COORDINATOR_TOOLS:
                 continue
             # Child workers are not artificially read-only: all ordinary
@@ -1999,8 +2047,8 @@ class ToolExecutor:
                 continue
             if not definition.runtime_ready:
                 continue
-            policy = self._policy(org, definition.name)
-            if policy.get("enabled", True) and definition.risk != "destructive":
+            policy = self.effective_policy(org, definition)
+            if policy["access"] == "enabled":
                 definitions.append(definition)
         return definitions
 
@@ -2036,8 +2084,8 @@ class ToolExecutor:
         for definition in self.registry.definitions():
             if not definition.runtime_ready:
                 continue
-            policy = self._policy(organization_id, definition.name)
-            if not policy.get("enabled", True) or definition.risk == "destructive":
+            policy = self.effective_policy(organization_id, definition)
+            if policy["access"] != "enabled":
                 continue
             toolkit = str((definition.connector_readiness or {}).get("toolkit") or "")
             if toolkit and not any(
@@ -2077,8 +2125,8 @@ class ToolExecutor:
                 status="disabled",
                 error="Tool is outside this run's resolved capability envelope.",
             )
-        policy = self._policy(run["organization_id"], definition.name)
-        if not policy.get("enabled", True) or definition.risk == "destructive":
+        policy = self.effective_policy(run["organization_id"], definition)
+        if policy["access"] != "enabled":
             return ToolResult(
                 call_id=call.id,
                 tool_name=call.name,
@@ -2132,13 +2180,18 @@ class ToolExecutor:
             "updated_at": now,
         }
 
-        requires_approval = (
-            definition.approval_required
-            or _requires_dynamic_high_stakes_approval(call.name, call.arguments)
-            or definition.approval_mode in {"always", "conditional"}
-            or policy.get("approval_required", False)
-            or conditional.get("approval_required", False)
+        execution = str(policy["execution"])
+        dynamic_review = _requires_dynamic_high_stakes_approval(
+            call.name, call.arguments
         )
+        # Explicit conditional organization policy is a human gate. Dynamic
+        # high-stakes classification promotes an otherwise-direct call into
+        # AI review, where the reviewer can approve, deny, or escalate.
+        if conditional.get("approval_required", False):
+            execution = "ask"
+        elif dynamic_review and execution == "direct":
+            execution = "ai_review"
+        requires_approval = execution in {"ai_review", "ask"}
 
         # request_batch_approval lets a task front-load its whole plan and
         # get one combined human decision instead of one pause per action --
@@ -2165,7 +2218,7 @@ class ToolExecutor:
             # a non-interactive context, which Docket always is); ESCALATE
             # falls through to the existing human-approval flow unchanged.
             verdict = "escalate"
-            if self.action_reviewer:
+            if execution == "ai_review" and self.action_reviewer:
                 verdict = self.action_reviewer.review(
                     tool_name=definition.name,
                     description=definition.description,
@@ -2444,7 +2497,56 @@ class ToolExecutor:
             "task_metadata": run.get("metadata") or {},
         }
 
+    def organization_policy_mode(self, organization_id: str) -> str:
+        records = self.store.list_harness_records(
+            "tool_policies",
+            organization_id,
+            where={"tool_name": "*"},
+            order_by="updated_at",
+            limit=1,
+        )
+        mode = str((records[0] if records else {}).get("mode") or "autonomous")
+        return mode if mode in _TOOL_POLICY_MODES else "autonomous"
+
+    def effective_policy(
+        self, organization_id: str, definition: ToolDefinition
+    ) -> dict[str, Any]:
+        mode = self.organization_policy_mode(organization_id)
+        records = self.store.list_harness_records(
+            "tool_policies",
+            organization_id,
+            where={"tool_name": definition.name},
+            order_by="updated_at",
+            limit=1,
+        )
+        override = str((records[0] if records else {}).get("execution") or "inherit")
+        if override not in _TOOL_EXECUTIONS:
+            override = "inherit"
+        native_allow = definition.name in NATIVE_ALLOW_TOOL_NAMES
+        execution = (
+            ("direct" if native_allow else _mode_default_execution(mode, definition.risk))
+            if override == "inherit"
+            else override
+        )
+        # Tool authors may mark a capability as intrinsically governed. A
+        # direct organization default can relax ordinary writes, but not this
+        # explicit safety floor; it becomes AI review rather than a mandatory
+        # human pause. Native-allow tools sit below the floor by design.
+        if (
+            execution == "direct"
+            and not native_allow
+            and (definition.approval_required or definition.approval_mode == "always")
+        ):
+            execution = "ai_review"
+        return {
+            "override": override,
+            "access": "forbidden" if execution == "deny" else "enabled",
+            "execution": execution,
+            "source": "tool_override" if override != "inherit" else mode,
+        }
+
     def _policy(self, organization_id: str, tool_name: str) -> dict[str, Any]:
+        """Return the stored override record for low-level compatibility."""
         records = self.store.list_harness_records(
             "tool_policies",
             organization_id,
@@ -2452,7 +2554,7 @@ class ToolExecutor:
             order_by="updated_at",
             limit=1,
         )
-        return records[0] if records else {"enabled": True}
+        return records[0] if records else {"execution": "inherit"}
 
     def _create_approval(
         self,

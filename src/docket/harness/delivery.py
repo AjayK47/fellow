@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from datetime import timedelta
 from typing import Any
 
 from docket.domain.models import new_id, utcnow
@@ -24,6 +25,12 @@ _CITED_ID_PATTERN = re.compile(r"\b(?:src|mem)_[0-9a-f]{16}\b")
 # easily blow past that, so the arguments preview must be truncated with
 # real headroom, not dumped verbatim.
 _SLACK_SECTION_TEXT_LIMIT = 3000
+
+# How long a "sending" reservation may sit before another attempt may
+# reclaim it. Comfortably longer than SlackSender's own 30s HTTP timeout,
+# so this only ever fires for a genuinely abandoned claim (a crashed
+# process), never for a send that is merely slow.
+_STALE_RESERVATION_SECONDS = 300
 
 
 def _approval_preview_text(prefix: str, arguments: dict[str, Any]) -> str:
@@ -68,18 +75,34 @@ class DeliveryService:
                 "delivered": False,
                 "reason": "task_not_complete",
             }
-        envelope = task["envelope"]
-        self._recheck(task)
-        idempotency_key = f"slack.final:{task_id}"
-        existing = self.store.delivery_by_idempotency_key(
-            task["organization_id"], idempotency_key
-        )
-        if existing and existing.get("status") in {"completed", "dry_run"}:
+        if (task.get("metadata") or {}).get("suppress_delivery"):
+            # The model already sent its own message directly via
+            # slack_send_message (typed_tools.py sets this flag right when
+            # that happens, specifically to prevent this). Every OTHER
+            # delivery path already honors it (_maybe_notify_failure,
+            # deliver_status_update) -- this one didn't, which is exactly
+            # how a real production run ended up delivering both the
+            # model's direct send AND a redundant auto-delivered final
+            # answer as two separate Slack messages for one automation
+            # firing.
             return {
                 "task_id": task_id,
                 "delivered": False,
-                "reason": "already_delivered",
-                "delivery": existing,
+                "reason": "suppressed",
+            }
+        envelope = task["envelope"]
+        self._recheck(task)
+        idempotency_key = f"slack.final:{task_id}"
+        reservation = self._reserve(
+            task=task, kind="final_answer", idempotency_key=idempotency_key
+        )
+        if reservation is not None:
+            already_sent = reservation.get("status") in {"completed", "dry_run"}
+            return {
+                "task_id": task_id,
+                "delivered": False,
+                "reason": "already_delivered" if already_sent else "send_in_progress_elsewhere",
+                "delivery": reservation,
             }
         slack = (task.get("metadata") or {}).get("slack") or {}
         destination = envelope["destination"]
@@ -89,12 +112,22 @@ class DeliveryService:
             task_id,
             channel_id,
         )
-        result = self.slack.send(
-            channel_id=channel_id,
-            text=task["final_answer"],
-            workspace_id=slack.get("workspace_id"),
-            idempotency_key=idempotency_key,
-        )
+        try:
+            result = self.slack.send(
+                channel_id=channel_id,
+                text=task["final_answer"],
+                workspace_id=slack.get("workspace_id"),
+                organization_id=task["organization_id"],
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            # Hand the reservation back before propagating, so the job's
+            # own retry can actually re-send instead of being locked out by
+            # this attempt's abandoned claim.
+            self._release_reservation(
+                task=task, kind="final_answer", idempotency_key=idempotency_key
+            )
+            raise
         delivery = self._record(
             task=task,
             kind="final_answer",
@@ -138,6 +171,18 @@ class DeliveryService:
             return {"task_id": task_id, "delivered": False, "reason": "task_not_failed"}
         envelope = task["envelope"]
         self._recheck(task)
+        idempotency_key = f"slack.failure:{task_id}"
+        reservation = self._reserve(
+            task=task, kind="task_failure", idempotency_key=idempotency_key
+        )
+        if reservation is not None:
+            already_sent = reservation.get("status") in {"completed", "dry_run"}
+            return {
+                "task_id": task_id,
+                "delivered": False,
+                "reason": "already_delivered" if already_sent else "send_in_progress_elsewhere",
+                "delivery": reservation,
+            }
         slack = (task.get("metadata") or {}).get("slack") or {}
         destination = envelope["destination"]
         channel_id = slack.get("channel_id") or destination["id"]
@@ -153,17 +198,25 @@ class DeliveryService:
             task_id,
             channel_id,
         )
-        result = self.slack.send(
-            channel_id=channel_id,
-            text=text,
-            workspace_id=slack.get("workspace_id"),
-        )
+        try:
+            result = self.slack.send(
+                channel_id=channel_id,
+                text=text,
+                workspace_id=slack.get("workspace_id"),
+                organization_id=task["organization_id"],
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            self._release_reservation(
+                task=task, kind="task_failure", idempotency_key=idempotency_key
+            )
+            raise
         delivery = self._record(
             task=task,
             kind="task_failure",
             status="completed" if result.get("ok") else "dry_run",
             payload={"provider_result": result, "text": text},
-            idempotency_key=f"slack.failure:{task_id}",
+            idempotency_key=idempotency_key,
         )
         return {"task_id": task_id, "delivered": True, "delivery": delivery}
 
@@ -222,6 +275,7 @@ class DeliveryService:
                 text=text,
                 blocks=blocks,
                 workspace_id=slack.get("workspace_id"),
+                organization_id=task["organization_id"],
             )
             delivery = self._record(
                 task=task,
@@ -280,6 +334,7 @@ class DeliveryService:
             text=text,
             blocks=blocks,
             workspace_id=slack.get("workspace_id"),
+            organization_id=task["organization_id"],
         )
         delivery = self._record(
             task=task,
@@ -372,6 +427,7 @@ class DeliveryService:
             text=question,
             blocks=blocks,
             workspace_id=slack.get("workspace_id"),
+            organization_id=task["organization_id"],
         )
         delivery = self._record(
             task=task,
@@ -470,6 +526,58 @@ class DeliveryService:
                     f"Delivery blocked: cited evidence {cited_id} is outside "
                     "the current destination's allowed scopes"
                 )
+
+    def _reserve(
+        self, *, task: dict[str, Any], kind: str, idempotency_key: str
+    ) -> dict[str, Any] | None:
+        """Atomically claim this idempotency key BEFORE the real Slack
+        send -- a read-then-send check (look up an existing delivery,
+        then send if none found) leaves a real gap: two calls that both
+        read "not yet delivered" will both actually post to Slack, and
+        the later _record() call (upsert by the same UNIQUE constraint)
+        silently collapses them to one row, hiding that it happened.
+        Confirmed real: a live automation delivered its reminder text
+        twice in the channel with only one delivery row on record.
+        Returns None when this call won the reservation (safe to send);
+        returns the existing record otherwise (already completed, or a
+        concurrent/crashed attempt owns it -- either way this call must
+        not send)."""
+        now = utcnow()
+        placeholder = {
+            "id": new_id("delivery"),
+            "organization_id": task["organization_id"],
+            "task_id": task["id"],
+            "kind": kind,
+            "status": "sending",
+            "idempotency_key": idempotency_key,
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        return self.store.reserve_delivery(
+            placeholder,
+            reclaim_stale_before=(
+                now - timedelta(seconds=_STALE_RESERVATION_SECONDS)
+            ).isoformat(),
+        )
+
+    def _release_reservation(
+        self, *, task: dict[str, Any], kind: str, idempotency_key: str
+    ) -> None:
+        """Mark a reservation failed so a retry can claim it. Without this,
+        one transient Slack error would block that message forever."""
+        now = utcnow().isoformat()
+        self.store.upsert_delivery(
+            {
+                "id": new_id("delivery"),
+                "organization_id": task["organization_id"],
+                "task_id": task["id"],
+                "kind": kind,
+                "status": "failed",
+                "idempotency_key": idempotency_key,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
 
     def _record(
         self,

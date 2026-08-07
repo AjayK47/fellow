@@ -125,6 +125,7 @@ class ToolDefinition(BaseModel):
     allowed_roles: list[str] = Field(default_factory=list)
     allowed_destination_types: list[str] = Field(default_factory=list)
     allowed_trigger_types: list[str] = Field(default_factory=list)
+    allowed_organization_ids: list[str] = Field(default_factory=list)
     main_agent_visible: bool = True
     child_worker_only: bool = False
     connector_readiness: dict[str, Any] = Field(default_factory=dict)

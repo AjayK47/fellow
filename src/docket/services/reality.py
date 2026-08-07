@@ -780,6 +780,18 @@ class RealityEngine:
     def _candidate_entity(
         self, organization_id: str, identifier: dict[str, str]
     ) -> dict[str, Any] | None:
+        entity, _is_exact = self._match_entity(organization_id, identifier)
+        return entity
+
+    def _match_entity(
+        self, organization_id: str, identifier: dict[str, str]
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Same lookup _candidate_entity always did, but also reports
+        whether the match was exact -- resolve_source_entities doesn't
+        care (either way it has an entity to link to), but
+        propose_entity_mention does: an exact match is safe to auto-link,
+        a merely-similar one is not (it might be a different real entity
+        with a similar name) and must go through human review instead."""
         label = _normalize(identifier.get("label"))
         value = _normalize(identifier["value"])
         if identifier["namespace"] == "email":
@@ -792,14 +804,14 @@ class RealityEngine:
         for entity in entities:
             candidates = [entity.get("name") or "", *(entity.get("aliases") or [])]
             if any(_normalize(name) == label for name in candidates if name):
-                return entity
+                return entity, True
         if not _is_resolvable_label(label):
             # Too short/generic for a fuzzy ratio to mean anything — the
             # caller (resolve_source_entities) treats "no match" as reason
             # to create a new entity or queue a review candidate rather than
             # silently merging into whichever existing entity happens to
             # score highest on a near-meaningless comparison.
-            return None
+            return None, False
         best: tuple[float, dict[str, Any]] | None = None
         for entity in entities:
             candidates = [entity.get("name") or "", *(entity.get("aliases") or [])]
@@ -813,7 +825,93 @@ class RealityEngine:
             )
             if score >= 0.72 and (best is None or score > best[0]):
                 best = (score, entity)
-        return best[1] if best else None
+        return (best[1], False) if best else (None, False)
+
+    def propose_entity_mention(
+        self,
+        organization_id: str,
+        *,
+        name: str,
+        entity_type: str,
+        source_id: str,
+        aliases: list[str] | None = None,
+    ) -> tuple[str | None, str]:
+        """Resolve a plain-text entity MENTION -- a name the model found in
+        free-form conversation, as opposed to a structured connector
+        payload's identifier -- against the existing catalog.
+
+        This is the missing half of graph population: resolve_source_entities
+        only ever creates a business entity (team/project/customer/...) from
+        a "hard" identifier in a connector's structured data (an email, a
+        customer_id). An ordinary Slack conversation has no such structured
+        payload, so before this existed the graph could only ever grow
+        person/conversation/source/task entities -- every project, team,
+        customer and incident anyone ever talked about was invisible to it.
+
+        Follows resolve_source_entities' own conservative policy for a name
+        alone (no unique key backing it) as closely as possible, reusing the
+        exact same matching logic via _match_entity:
+          - an exact name/alias match is trusted directly (safe: two
+            identical normalized names are the same real thing);
+          - a merely-similar match is NOT auto-linked -- it queues a
+            pending resolution candidate for a human to confirm via the
+            existing /v1/entity-resolution-candidates review flow instead,
+            the same as an ambiguous "soft" identifier match does;
+          - the one deliberate deviation from that policy: no match at all
+            still creates a new entity, rather than doing nothing. Doing
+            nothing is exactly what left the graph permanently empty of
+            every business entity type -- a mention in conversation is the
+            only signal chat-based extraction ever gets, so refusing to
+            create from it means nothing new ever enters the graph at all.
+
+        Returns (entity_id, decision) where decision is "matched",
+        "created", or "candidate" (entity_id is None only for "candidate" --
+        the caller must not link a memory to an entity that doesn't exist
+        yet, pending or not).
+        """
+        identifier = {
+            "namespace": "name_mention",
+            "value": name,
+            "label": name,
+        }
+        # Check for an already-confirmed link FIRST, exactly like
+        # resolve_source_entities does for a structured identifier. This is
+        # what makes review actually mean something: decide_resolution_
+        # candidate's approve path calls link_identifier on this same
+        # (namespace, value) pair -- without this check up front, the next
+        # mention of the identical name would just fuzzy-match and queue a
+        # SECOND candidate for the same already-resolved question forever.
+        existing_link = self.lookup_identifier(
+            organization_id, identifier["namespace"], _normalize(name)
+        )
+        if existing_link:
+            return existing_link["entity_id"], "matched"
+        entity, is_exact = self._match_entity(organization_id, identifier)
+        if entity and is_exact:
+            return entity["id"], "matched"
+        if entity:
+            self._create_resolution_candidate(
+                organization_id,
+                entity,
+                {**identifier, "strength": "soft"},
+                source_id,
+            )
+            return None, "candidate"
+        entity_id = new_id("entity")
+        self.graph.upsert_entity(
+            {
+                "id": entity_id,
+                "organization_id": organization_id,
+                "entity_type": entity_type,
+                "name": name,
+                "aliases": aliases or [],
+                "attributes": {
+                    "created_by_extraction": True,
+                    "source_id": source_id,
+                },
+            }
+        )
+        return entity_id, "created"
 
     def _create_resolution_candidate(
         self,

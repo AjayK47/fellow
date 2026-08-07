@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, Iterator
+from uuid import uuid4
+
+log = logging.getLogger("docket.store")
 
 
 def _ser(value: Any) -> str:
@@ -184,6 +189,36 @@ class BrainStore:
                     source TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     received_at TEXT NOT NULL
+                );
+
+                -- The single ordered record of what was actually said in a
+                -- Slack conversation, inbound and outbound alike.
+                --
+                -- Before this existed, a conversation timeline was
+                -- RECONSTRUCTED on every read by unioning raw
+                -- `received_events` with `deliveries` joined to `tasks`.
+                -- Two sources, two write paths, two different latencies --
+                -- and two real bugs: a Task could be shown an inbound
+                -- message that had not been routed to it yet (answering it,
+                -- and acting on it, before the Task that owned it existed),
+                -- while anything Docket sent through the slack_send_message
+                -- TOOL was invisible in its own history, because only
+                -- delivery-path sends wrote a row the reconstruction could
+                -- find. One append-only log written at the two real choke
+                -- points (EventRouter.route for inbound, SlackSender.send
+                -- for every outbound) removes both classes of bug by
+                -- construction.
+                CREATE TABLE IF NOT EXISTS conversation_messages (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    message_id TEXT,
+                    role TEXT NOT NULL,
+                    author TEXT,
+                    text TEXT NOT NULL,
+                    at TEXT NOT NULL,
+                    UNIQUE (organization_id, workspace_id, channel_id, message_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS idempotency_keys (
@@ -392,6 +427,17 @@ class BrainStore:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS mcp_servers (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, name)
                 );
 
                 -- Harness capability/provenance projections.  These tables
@@ -761,6 +807,8 @@ class BrainStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE INDEX IF NOT EXISTS idx_conversation_messages_channel
+                    ON conversation_messages(organization_id, workspace_id, channel_id, at);
                 CREATE INDEX IF NOT EXISTS idx_memories_org_latest
                     ON memories(organization_id, is_latest, status);
                 CREATE INDEX IF NOT EXISTS idx_edges_org_type
@@ -969,12 +1017,19 @@ class BrainStore:
     def get_entity(self, entity_id: str) -> dict[str, Any] | None:
         return self.get_json("entities", entity_id)
 
-    def list_entities(self, organization_id: str, entity_type: str | None = None) -> list[dict[str, Any]]:
+    def list_entities(
+        self,
+        organization_id: str,
+        entity_types: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        types = list(entity_types or [])
         with self.cursor() as cur:
-            if entity_type:
+            if types:
+                placeholders = ",".join("?" * len(types))
                 cur.execute(
-                    "SELECT payload FROM entities WHERE organization_id = ? AND entity_type = ?",
-                    (organization_id, entity_type),
+                    "SELECT payload FROM entities WHERE organization_id = ? "
+                    f"AND entity_type IN ({placeholders})",
+                    (organization_id, *types),
                 )
             else:
                 cur.execute("SELECT payload FROM entities WHERE organization_id = ?", (organization_id,))
@@ -1288,6 +1343,23 @@ class BrainStore:
             )
             return [r["scope_id"] for r in cur.fetchall()]
 
+    def scope_member_ids(self, organization_id: str, scope_id: str) -> list[str]:
+        """The inverse of memberships_for: who belongs to this scope.
+
+        Needed when a scope has to be narrowed after the fact -- correcting a
+        mislabelled public room to private must keep everyone who already
+        spoke in it, or the repair locks out the room's own participants.
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT principal_id FROM principal_memberships
+                WHERE organization_id = ? AND scope_id = ?
+                """,
+                (organization_id, scope_id),
+            )
+            return [r["principal_id"] for r in cur.fetchall()]
+
     # ---- skills / signals / audit ----
 
     def upsert_skill(self, skill: dict[str, Any]) -> None:
@@ -1492,6 +1564,7 @@ class BrainStore:
         "checkpoints",
         "episodes",
         "automations",
+        "mcp_servers",
         "roles",
         "skill_packages",
         "capabilities",
@@ -2324,49 +2397,150 @@ class BrainStore:
         channel_id: str,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """Return one Slack conversation timeline, including Docket replies."""
-        fetch_limit = max(int(limit) * 2, 10)
+        """Return one Slack conversation timeline, including Docket replies.
+
+        Reads the single append-only conversation log. This used to
+        RECONSTRUCT the timeline by unioning raw `received_events` with
+        `deliveries` joined to `tasks` -- see the conversation_messages
+        table comment for the two production bugs that design caused.
+        """
         with self.cursor() as cur:
             cur.execute(
-                """SELECT received_at AS at,
-                          json_extract(payload, '$.data.id') AS message_id,
-                          json_extract(payload, '$.data.actor.id') AS author,
-                          json_extract(payload, '$.data.payload.text') AS text,
-                          'user' AS role
-                FROM received_events
-                WHERE organization_id = ? AND source = 'slack'
-                  AND json_extract(payload, '$.data.scope.workspace_id') = ?
-                  AND json_extract(payload, '$.data.scope.channel_id') = ?
-                ORDER BY received_at DESC LIMIT ?""",
-                (organization_id, workspace_id, channel_id, fetch_limit),
+                """SELECT at, message_id, author, text, role
+                FROM conversation_messages
+                WHERE organization_id = ? AND workspace_id = ? AND channel_id = ?
+                  AND TRIM(text) <> ''
+                ORDER BY at DESC, rowid DESC LIMIT ?""",
+                (organization_id, workspace_id, channel_id, max(1, int(limit))),
             )
-            inbound = [dict(row) for row in cur.fetchall()]
-            cur.execute(
-                """SELECT d.created_at AS at, d.id AS message_id,
-                          'docket' AS author,
-                          COALESCE(
-                              json_extract(d.payload, '$.text'),
-                              json_extract(t.payload, '$.final_answer')
-                          ) AS text,
-                          'assistant' AS role
-                FROM deliveries d
-                JOIN tasks t ON t.id = d.task_id
-                WHERE d.organization_id = ?
-                  AND d.status IN ('completed', 'dry_run')
-                  AND d.idempotency_key LIKE 'slack.%'
-                  AND json_extract(t.payload, '$.metadata.slack.workspace_id') = ?
-                  AND json_extract(t.payload, '$.envelope.destination.id') = ?
-                ORDER BY d.created_at DESC LIMIT ?""",
-                (organization_id, workspace_id, channel_id, fetch_limit),
-            )
-            outbound = [dict(row) for row in cur.fetchall()]
-        timeline = [
-            item
-            for item in [*inbound, *outbound]
-            if (item.get("text") or "").strip()
-        ]
-        timeline.sort(key=lambda item: str(item.get("at") or ""))
+            timeline = [dict(row) for row in cur.fetchall()]
+        timeline.reverse()
         return timeline[-max(1, int(limit)) :]
+
+    def append_conversation_message(
+        self,
+        *,
+        organization_id: str,
+        workspace_id: str,
+        channel_id: str,
+        role: str,
+        text: str,
+        author: str | None = None,
+        message_id: str | None = None,
+        at: str | None = None,
+    ) -> None:
+        """Append one message to a conversation's ordered log.
+
+        Idempotent on message_id so a redelivered Slack event or a retried
+        send never doubles up in the timeline. Never raises: a failure to
+        record history must not break the actual send or the ingest that
+        triggered it.
+        """
+        if not workspace_id or not channel_id or not (text or "").strip():
+            return
+        try:
+            with self.cursor() as cur:
+                cur.execute(
+                    """INSERT OR IGNORE INTO conversation_messages
+                    (id, organization_id, workspace_id, channel_id, message_id,
+                     role, author, text, at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        f"cmsg_{uuid4().hex[:16]}",
+                        organization_id,
+                        workspace_id,
+                        channel_id,
+                        message_id,
+                        role,
+                        author,
+                        text,
+                        at or datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+        except sqlite3.Error:
+            log.warning(
+                "Could not record conversation message for %s/%s",
+                workspace_id,
+                channel_id,
+                exc_info=True,
+            )
+
+    def reserve_delivery(
+        self, delivery: dict[str, Any], *, reclaim_stale_before: str | None = None
+    ) -> dict[str, Any] | None:
+        """Atomically claim a delivery's idempotency key BEFORE the actual
+        outbound send happens -- closes the gap a read-then-send check
+        leaves open (confirmed real: Slack's chat.postMessage does not
+        deduplicate by client_msg_id despite that having been assumed
+        here, so any double-invocation of a send -- a job retried after a
+        transient failure between a successful post and recording it, or
+        any other race -- previously meant two real Slack messages with
+        only one delivery row to show for it, since the write-after-send
+        step upserts by the same UNIQUE(organization_id, idempotency_key)
+        and silently collapses to one row).
+
+        Relies on that same UNIQUE constraint the way enqueue_harness_job
+        already does: an INSERT either wins outright, or fails with
+        IntegrityError because a row for this key already exists -- in
+        which case the caller must not send again. Returns None when this
+        call won the reservation (safe to proceed with the real send);
+        returns the EXISTING row otherwise."""
+        with self.cursor() as cur:
+            try:
+                cur.execute(
+                    """INSERT INTO deliveries
+                    (id, organization_id, task_id, status, idempotency_key, payload,
+                     created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        delivery["id"],
+                        delivery["organization_id"],
+                        delivery.get("task_id"),
+                        delivery["status"],
+                        delivery["idempotency_key"],
+                        _ser(delivery),
+                        delivery["created_at"],
+                        delivery["updated_at"],
+                    ),
+                )
+                return None
+            except sqlite3.IntegrityError:
+                # A reservation that never reached a terminal status is not
+                # proof the message went out: the send may have raised
+                # (network blip, Slack 5xx) or the process may have died
+                # between reserving and sending. Leaving those rows to block
+                # forever would turn one transient Slack error into a
+                # permanently lost message -- strictly worse than the
+                # double-send this reservation exists to prevent. Reclaim
+                # them atomically: the conditional UPDATE only wins if the
+                # row is genuinely abandoned, so a live in-flight send is
+                # still protected.
+                if reclaim_stale_before:
+                    cur.execute(
+                        """UPDATE deliveries
+                        SET id = ?, status = ?, payload = ?, updated_at = ?
+                        WHERE organization_id = ? AND idempotency_key = ?
+                          AND (status = 'failed'
+                               OR (status = 'sending' AND updated_at < ?))""",
+                        (
+                            delivery["id"],
+                            delivery["status"],
+                            _ser(delivery),
+                            delivery["updated_at"],
+                            delivery["organization_id"],
+                            delivery["idempotency_key"],
+                            reclaim_stale_before,
+                        ),
+                    )
+                    if cur.rowcount == 1:
+                        return None
+                cur.execute(
+                    """SELECT payload FROM deliveries
+                    WHERE organization_id = ? AND idempotency_key = ?""",
+                    (delivery["organization_id"], delivery["idempotency_key"]),
+                )
+                row = cur.fetchone()
+                return _de(row["payload"]) if row else None
 
     def upsert_delivery(self, delivery: dict[str, Any]) -> None:
         with self.cursor() as cur:

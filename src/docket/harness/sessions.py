@@ -28,6 +28,17 @@ from docket.harness.router import _looks_like_stop
 _DEFAULT_MANAGER_LEASE_SECONDS = 3600
 _TERMINAL_TASK_STATES = {"completed", "failed", "cancelled"}
 
+# Destinations where the acting principal -- not the room -- decides what is
+# readable. Mirrors AuthorizationService._destination_allows_private(), which
+# grants these the principal's full membership set instead of narrowing to a
+# single room's own scope. Everything else is a shared room whose own scope
+# bounds disclosure regardless of who is speaking.
+_ACTOR_SCOPED_DESTINATION_TYPES = {"dm", "person_private", "internal_agent_session"}
+
+
+def _is_actor_scoped_destination(destination: Any) -> bool:
+    return str((destination or {}).get("type") or "") in _ACTOR_SCOPED_DESTINATION_TYPES
+
 
 class SessionService:
     def __init__(
@@ -185,6 +196,14 @@ class SessionService:
         # from the latest user message and resolves authorization afresh.
         wake_metadata["trigger_kind"] = trigger_kind
         wake_metadata["purpose"] = purpose
+        # Who said this. A room's Session holds every participant's turns in
+        # one transcript, so an unattributed history is genuinely ambiguous --
+        # "same thing here" from a second person reads as the first person
+        # contradicting themselves. build_agent_messages() renders this as a
+        # speaker label; callers that know a display name pass author_name in
+        # message_metadata (see EventRouter._route_reactive).
+        if principal_id:
+            wake_metadata.setdefault("principal_id", principal_id)
         self.append_message(
             organization_id=organization_id,
             session_id=session["id"],
@@ -229,7 +248,20 @@ class SessionService:
         if _looks_like_stop(content):
             self._cancel_task_tree(session["organization_id"], root, reason=content)
             return "abort"
-        if principal_id and (root.get("envelope") or {}).get("principal_id") != principal_id:
+        actor_changed = bool(
+            principal_id
+            and (root.get("envelope") or {}).get("principal_id") != principal_id
+        )
+        if actor_changed and _is_actor_scoped_destination(session.get("destination")):
+            # Pausing to re-authorize only buys anything where the ACTOR, not
+            # the room, determines what may be read. AuthorizationService's
+            # _destination_allows_private() returns True for dm/person_private/
+            # internal_agent_session -- "a personal session has no single room
+            # to narrow to" -- so a DM destination unlocks the actor's entire
+            # membership set, including private channels a second speaker in a
+            # group DM may not belong to. There, a different actor really can
+            # change what is disclosable, and the Task must stop.
+            #
             # Only an executor that is actively inside CompanyAgent._loop()
             # needs an out-of-band interrupt. Stable waiting/queued Tasks
             # will be refreshed by SessionManagerScheduler before resume;
@@ -247,6 +279,16 @@ class SessionService:
                     }
                 )
             return "reauthorize"
+        # A shared room (a channel) falls through to ordinary steering. There
+        # the destination, not the actor, bounds disclosure: a named room only
+        # ever unlocks its OWN scope, and everyone who speaks in it is made a
+        # member of that scope (SlackGateway._ensure_scope), so a second
+        # speaker's authorization is the same set as the first's. Pausing on
+        # every alternating message would make a busy channel thrash through
+        # WAITING_FOR_HUMAN and back for no security gain. The envelope is
+        # still rebuilt from a fresh authz.resolve() on the next resume, in
+        # SessionManagerScheduler._run_once().
+        #
         # An ordinary steering message only injects into the root's own
         # live loop if it's genuinely mid-iteration right now; children are
         # never touched mechanically here -- revising/cancelling a specific

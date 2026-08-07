@@ -55,6 +55,8 @@ class ChildTaskService:
         pi_executor: Any = None,
         max_parallel: int = 3,
         max_depth: int = 2,
+        max_iterations: int = 200,
+        max_tool_calls: int = 500,
     ) -> None:
         self.store = store
         self.queue = queue
@@ -65,6 +67,8 @@ class ChildTaskService:
         self.pi_executor = pi_executor
         self.max_parallel = max(1, max_parallel)
         self.max_depth = max(1, max_depth)
+        self.max_iterations = max(1, max_iterations)
+        self.max_tool_calls = max(1, max_tool_calls)
 
     @staticmethod
     def tool_definition() -> ToolDefinition:
@@ -180,10 +184,12 @@ class ChildTaskService:
                 "goal": spec["prompt"],
                 "envelope": parent["envelope"],
                 "trace_id": parent.get("trace_id"),
-                # Child workers inherit the parent's generous runaway guards;
-                # specialization should not impose a tiny hidden runtime cap.
-                "max_iterations": int(parent.get("max_iterations") or 100),
-                "max_tool_calls": int(parent.get("max_tool_calls") or 150),
+                # General specialists may own a long sequential workflow, so
+                # their configurable envelope is intentionally much larger
+                # than the Session Manager's coordination envelope. Pi Tasks
+                # use heartbeat/checkpoint lifecycle controls instead.
+                "max_iterations": self.max_iterations,
+                "max_tool_calls": self.max_tool_calls,
                 "iteration_count": 0,
                 "tool_call_count": 0,
                 "final_answer": None,

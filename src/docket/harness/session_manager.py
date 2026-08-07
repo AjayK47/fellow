@@ -145,6 +145,8 @@ class SessionManagerScheduler:
                 goal=latest_user_text,
                 trigger_kind=trigger_kind,
                 trigger_event_id=trigger_event_id,
+                max_iterations=agent.max_iterations,
+                max_tool_calls=agent.max_tool_calls,
                 metadata=self._root_task_metadata(session),
             )
             outcome = agent.execute_task(root_task["id"])
@@ -175,6 +177,8 @@ class SessionManagerScheduler:
                 goal=latest_user_text,
                 trigger_kind=trigger_kind,
                 trigger_event_id=trigger_event_id,
+                max_iterations=agent.max_iterations,
+                max_tool_calls=agent.max_tool_calls,
                 metadata=self._root_task_metadata(session),
             )
             outcome = agent.execute_task(root_task["id"])

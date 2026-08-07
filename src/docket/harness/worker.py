@@ -2,12 +2,34 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
 from docket.domain.models import new_id
+from docket.harness.jobs import _CONTENTION_RETRY_SECONDS, JobContention
 from docket.harness.retry import is_retryable_task_error
 from docket.harness.task_run_store import TaskRunStore
+
+# Job kinds that drive a full agent reasoning loop and can legitimately run
+# for many minutes. Everything else -- Slack event routing, attention,
+# delivery, memory capture -- finishes in well under a second.
+#
+# These are separated because drain_once() waits for its whole leased batch
+# to finish before returning: one long agent job in a batch blocks every
+# fast job behind it (head-of-line blocking). That was a real, measured
+# production problem, not a theoretical one -- inbound Slack messages sat
+# unrouted for up to 66 seconds while a single 57-second agent run held the
+# batch, which in turn widened the window for a Task to observe (and act
+# on) a message that had not yet been routed to it. Running the two classes
+# in separate lanes keeps event routing responsive no matter how long an
+# agent run takes.
+AGENT_JOB_KINDS = (
+    "session.dispatch",
+    "task.run_child",
+    "task.pi_poll",
+    "approval.resolve",
+)
 
 
 class HarnessWorker:
@@ -48,6 +70,15 @@ class HarnessWorker:
         self.concurrency = max(1, concurrency)
         self.worker_id = worker_id or new_id("worker")
         self.store = store
+        # One long-lived pool shared by every lane, instead of building and
+        # tearing one down per batch. `pump()` (below) is what the live
+        # loops use: it keeps the pool topped up without ever waiting on
+        # the slowest job in a batch.
+        self._pool = ThreadPoolExecutor(
+            max_workers=self.concurrency, thread_name_prefix="docket-job"
+        )
+        self._inflight: set[Future[dict[str, Any]]] = set()
+        self._inflight_lock = threading.Lock()
         self.task_agent_factory = task_agent_factory
         self.session_manager = session_manager
         self.sessions = sessions
@@ -100,25 +131,70 @@ class HarnessWorker:
     ) -> None:
         self.handlers[kind] = handler
 
+    def agent_job_kinds(self) -> list[str]:
+        """The long-running lane: only kinds this worker actually handles."""
+        return [kind for kind in AGENT_JOB_KINDS if kind in self.handlers]
+
+    def infrastructure_job_kinds(self) -> list[str]:
+        """The fast lane: everything that is not a full agent reasoning loop."""
+        return [kind for kind in self.handlers if kind not in AGENT_JOB_KINDS]
+
+    def available_capacity(self) -> int:
+        """Free slots in the shared pool right now."""
+        with self._inflight_lock:
+            self._inflight = {f for f in self._inflight if not f.done()}
+            return max(0, self.concurrency - len(self._inflight))
+
+    def pump(self, *, kinds: list[str] | None = None) -> dict[str, Any]:
+        """Lease up to the currently free capacity and start those jobs
+        WITHOUT waiting for them to finish. This is what the live worker
+        loops call.
+
+        drain_once() below blocks until every job in its batch completes,
+        which means one slow job stalls everything leased beside it -- the
+        exact head-of-line blocking that had inbound Slack messages waiting
+        on a 57-second agent run. Splitting jobs into lanes bounded that
+        blast radius; this removes it, because a lane keeps leasing and
+        starting new work while its slow jobs are still running.
+
+        Leasing is capped at free capacity rather than batch_size so a job
+        is never leased -- and its lease clock never started -- while it
+        sits waiting for a thread.
+        """
+        capacity = min(self.available_capacity(), self.batch_size)
+        if capacity <= 0:
+            return {"leased": 0, "saturated": True}
+        jobs = self.queue.lease(
+            worker_id=self.worker_id, limit=capacity, kinds=kinds
+        )
+        if jobs:
+            with self._inflight_lock:
+                for job in jobs:
+                    self._inflight.add(self._pool.submit(self._process_job, job))
+        return {"leased": len(jobs), "saturated": False}
+
     def drain_once(self, *, kinds: list[str] | None = None) -> dict[str, Any]:
+        """Lease a batch and wait for all of it. Used by tests and by
+        drain_until_idle(); the live loops use pump() instead."""
         jobs = self.queue.lease(
             worker_id=self.worker_id, limit=self.batch_size, kinds=kinds
         )
         results: list[dict[str, Any]] = []
         if jobs:
-            with ThreadPoolExecutor(
-                max_workers=min(self.concurrency, len(jobs)),
-                thread_name_prefix="docket-job",
-            ) as pool:
-                futures = [pool.submit(self._process_job, job) for job in jobs]
-                for future in as_completed(futures):
-                    results.append(future.result())
+            futures = [self._pool.submit(self._process_job, job) for job in jobs]
+            for future in as_completed(futures):
+                results.append(future.result())
         return {
             "leased": len(jobs),
             "completed": sum("result" in item for item in results),
             "failed": sum("error" in item for item in results),
             "results": results,
         }
+
+    def close(self) -> None:
+        """Stop the shared pool. In-flight jobs are allowed to finish so a
+        shutdown never abandons a leased job mid-execution."""
+        self._pool.shutdown(wait=True)
 
     def _process_job(self, job: dict[str, Any]) -> dict[str, Any]:
         handler = self.handlers.get(job["kind"])
@@ -130,6 +206,13 @@ class HarnessWorker:
             result = handler(job["payload"]) or {}
             self.queue.complete(job["id"], result, worker_id=self.worker_id)
             return {"job_id": job["id"], "kind": job["kind"], "result": result}
+        except JobContention as exc:
+            # Normal contention, not a failure: retry on a short fixed
+            # interval rather than the exponential error backoff. See
+            # jobs.py's _CONTENTION_RETRY_SECONDS for why this distinction
+            # is user-visible.
+            self.queue.fail(job, str(exc), retry_in_seconds=_CONTENTION_RETRY_SECONDS)
+            return {"job_id": job["id"], "kind": job["kind"], "error": str(exc)}
         except Exception as exc:
             self.queue.fail(job, str(exc))
             return {"job_id": job["id"], "kind": job["kind"], "error": str(exc)}
@@ -172,7 +255,13 @@ class HarnessWorker:
             # dispatch() and this read). Requeue instead of acknowledging the
             # wake: once the owner releases, this job is the durable fallback
             # that prevents a message arriving mid-run from being stranded.
-            raise RuntimeError("session_manager_busy")
+            # JobContention rather than a bare RuntimeError: a Manager
+            # being busy is the normal case for any follow-up sent mid-run,
+            # and this job is the ONLY thing that picks the pending
+            # revision back up once the Manager releases -- exponential
+            # error backoff here meant a follow-up could sit unanswered for
+            # minutes after Docket was already free.
+            raise JobContention("session_manager_busy")
         data = outcome.model_dump(mode="json")
         data["dispatched"] = True
         if data["state"] == "failed" and is_retryable_task_error(data.get("error") or ""):
@@ -203,16 +292,24 @@ class HarnessWorker:
 
     def _resolve_approval(self, payload: dict[str, Any]) -> dict[str, Any]:
         agent = self._approval_agent(payload["approval_id"])
+        # Collapse the Approve/Deny buttons before resuming the actual Task,
+        # not after. resume_after_approval() below can run the resumed model
+        # loop for a long time (more tool calls, another turn, sometimes a
+        # whole additional response) -- sequencing the button-collapse edit
+        # after it meant a person saw their own click do nothing for as long
+        # as that resumed work took, and would click Approve again thinking
+        # it hadn't registered. The decision itself (approved/decided_by) is
+        # already final at this point regardless of how the resumed run goes.
+        self.delivery.mark_approval_decided(
+            payload["approval_id"],
+            approved=bool(payload["approved"]),
+            decided_by=payload["decided_by"],
+        )
         outcome = agent.resume_after_approval(
             approval_id=payload["approval_id"],
             approved=bool(payload["approved"]),
             decided_by=payload["decided_by"],
             edited_arguments=payload.get("edited_arguments"),
-        )
-        self.delivery.mark_approval_decided(
-            payload["approval_id"],
-            approved=bool(payload["approved"]),
-            decided_by=payload["decided_by"],
         )
         data = outcome.model_dump(mode="json")
         resolved_task = self.store.get_task(data["task_id"])

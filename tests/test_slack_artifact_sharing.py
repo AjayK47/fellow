@@ -2,9 +2,8 @@
 destination are actually authorized to see, and behaves safely with no
 Slack bot token configured (the default in tests — see conftest.py).
 
-slack_send_artifact auto-executes under the risk-tiered default (it is not
-in the always-gated tier), so these assert directly on execute()'s result
-rather than going through the approval flow.
+These tests exercise delivery authorization after the policy decision has
+already been resolved; mode/reviewer behavior is covered separately.
 """
 
 from __future__ import annotations
@@ -51,7 +50,7 @@ def test_slack_send_artifact_dry_runs_with_no_bot_token_configured(brain):
         name="slack_send_artifact",
         arguments={"artifact_id": artifact["id"]},
     )
-    result = brain.tool_executor.execute(run=run, call=call)
+    result = brain.tool_executor.execute(run=run, call=call, approved=True)
     assert result.status == "completed"
     upload_result = result.output["upload_result"]
     assert upload_result["dry_run"] is True
@@ -78,9 +77,9 @@ def test_slack_send_artifact_respects_scope_even_after_tool_call_is_approved(bra
         name="slack_send_artifact",
         arguments={"artifact_id": private_artifact["id"]},
     )
-    result = brain.tool_executor.execute(run=run, call=call)
-    # The handler still re-checks scope at execution time and fails closed,
-    # even though the tool call itself never paused for approval.
+    result = brain.tool_executor.execute(run=run, call=call, approved=True)
+    # The handler still re-checks scope at execution time and fails closed
+    # after the policy decision.
     assert result.status == "failed"
     assert "scope" in (result.error or "").lower()
 
@@ -93,6 +92,6 @@ def test_slack_send_artifact_rejects_unknown_artifact_id(brain):
         name="slack_send_artifact",
         arguments={"artifact_id": "artifact_does_not_exist"},
     )
-    result = brain.tool_executor.execute(run=run, call=call)
+    result = brain.tool_executor.execute(run=run, call=call, approved=True)
     assert result.status == "failed"
     assert "not found" in (result.error or "").lower()

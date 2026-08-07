@@ -24,7 +24,8 @@ dependencies = [
   "python-pptx>=1.0.0",
   "Pillow>=10.0.0",
   "pymupdf>=1.24.0",
-  "reportlab>=4.0.0",
+  "weasyprint>=62.0",
+  "mcp>=2.0.0,<3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -47,7 +48,11 @@ docket-worker = "docket.worker_main:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-docket = ["builtin_skills/**/SKILL.md", "builtin_skills/**/resources/**"]
+docket = [
+  "builtin_skills/**/SKILL.md",
+  "builtin_skills/**/resources/**",
+  "harness/prompts.md",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

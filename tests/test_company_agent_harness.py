@@ -103,7 +103,7 @@ def test_request_batch_approval_pauses_once_then_pre_approves_declared_actions(b
         arguments={
             "summary": "Set up a recurring check and run some code for it.",
             "actions": [
-                {"tool_name": "automation_create", "description": "Create the recurring check"},
+                {"tool_name": "skill_propose_create", "description": "Draft the recurring check skill"},
                 {"tool_name": "run_code", "description": "Compute the summary"},
             ],
         },
@@ -116,33 +116,25 @@ def test_request_batch_approval_pauses_once_then_pre_approves_declared_actions(b
     assert resolved.status == "completed"
     run = brain.store.get_task(run["id"])
 
-    automation_call = ModelToolCall(
-        id="call_automation",
-        name="automation_create",
-        arguments={
-            "name": "redteam",
-            "goal": "redteam",
-            "conversation_id": "redteam",
-            "destination": {"type": "internal_agent_session", "id": "redteam", "is_private": True},
-        },
+    # Automation tools are native-allow, so a still-gated tool is needed to
+    # prove a declared action consumes exactly one pre-approval unit.
+    proposal_call = ModelToolCall(
+        id="call_proposal",
+        name="skill_propose_create",
+        arguments={"name": "redteam", "description": "redteam", "goal": "redteam"},
     )
-    result = brain.tool_executor.execute(run=run, call=automation_call)
+    result = brain.tool_executor.execute(run=run, call=proposal_call)
     assert result.status != "waiting_for_approval"
     run = brain.store.get_task(run["id"])
 
-    # Only one unit of automation_create was declared -- a second call must
+    # Only one unit of skill_propose_create was declared -- a second call must
     # be gated normally again, not silently pre-approved forever.
-    second_automation_call = ModelToolCall(
-        id="call_automation_2",
-        name="automation_create",
-        arguments={
-            "name": "redteam2",
-            "goal": "redteam2",
-            "conversation_id": "redteam2",
-            "destination": {"type": "internal_agent_session", "id": "redteam2", "is_private": True},
-        },
+    second_proposal_call = ModelToolCall(
+        id="call_proposal_2",
+        name="skill_propose_create",
+        arguments={"name": "redteam2", "description": "redteam2", "goal": "redteam2"},
     )
-    second_result = brain.tool_executor.execute(run=run, call=second_automation_call)
+    second_result = brain.tool_executor.execute(run=run, call=second_proposal_call)
     assert second_result.status == "waiting_for_approval"
 
     run_code_call = ModelToolCall(id="call_run_code", name="run_code", arguments={"code": "print(1)"})
@@ -171,17 +163,12 @@ def test_batch_approval_does_not_pre_approve_undeclared_tools(brain):
         approval_id=batch_result.approval_id, approved=True, decided_by="person_ajay"
     )
     run = brain.store.get_task(run["id"])
-    automation_call = ModelToolCall(
-        id="call_undeclared_automation",
-        name="automation_create",
-        arguments={
-            "name": "redteam3",
-            "goal": "redteam3",
-            "conversation_id": "redteam3",
-            "destination": {"type": "internal_agent_session", "id": "redteam3", "is_private": True},
-        },
+    undeclared_call = ModelToolCall(
+        id="call_undeclared_proposal",
+        name="skill_propose_create",
+        arguments={"name": "redteam3", "description": "redteam3", "goal": "redteam3"},
     )
-    result = brain.tool_executor.execute(run=run, call=automation_call)
+    result = brain.tool_executor.execute(run=run, call=undeclared_call)
     assert result.status == "waiting_for_approval"
 
 
@@ -291,10 +278,11 @@ def test_auto_approve_writes_flag_still_creates_an_approved_record(
     assert approval["decided_by"] == "person_ajay"
 
 
-def test_slack_send_message_suppresses_automatic_final_answer_delivery(brain):
+def test_slack_send_message_suppresses_automatic_final_answer_delivery(brain, monkeypatch):
     """When the model sends its own (possibly richly-formatted) message via
     slack_send_message, the automatic plain-text final-answer delivery must
     not also fire and double-post once the run completes."""
+    monkeypatch.setattr(brain.action_reviewer, "review", lambda **_kwargs: "approve")
     destination = {"type": "slack_channel", "id": "C_TEST", "is_private": False}
     decision = brain.authz.resolve("org_acme", "person_ajay", destination, "reactive_agent")
     envelope = InvocationEnvelope(
@@ -708,10 +696,11 @@ def test_context_is_not_recomputed_across_read_only_iterations(brain):
     assert len(calls) == 1
 
 
-def test_context_is_recomputed_after_a_write_tool_call(brain):
+def test_context_is_recomputed_after_a_write_tool_call(brain, monkeypatch):
     """A write-risk tool call can change facts/memories the model should
     see on its very next turn -- the cache must invalidate in that case,
     not just blindly reuse the first snapshot for the whole run."""
+    monkeypatch.setattr(brain.action_reviewer, "review", lambda **_kwargs: "approve")
     calls = _spy_on_prepare_context(brain)
     brain.company_agent.model = ScriptedModelClient(
         [
@@ -1471,21 +1460,21 @@ def test_slack_has_only_public_private_and_dm_conversation_types(brain):
     assert public.payload["context_key"] == "slack:TACME:CPUBLIC"
     assert private.payload["context_key"] == "slack:TACME:CPRIVATE"
     assert dm.payload["context_key"] == "slack:TACME:DAJAY"
-    assert public.payload["conversation_key"].startswith(
-        "slack:TACME:CPUBLIC:event:"
-    )
-    assert private.payload["conversation_key"].startswith(
-        "slack:TACME:CPRIVATE:event:"
-    )
+    # One Session per room, channels included: the conversation key never
+    # forks per message, so two people raising the same issue in a channel
+    # reach the same Session instead of two isolated ones.
+    assert public.payload["conversation_key"] == "slack:TACME:CPUBLIC"
+    assert private.payload["conversation_key"] == "slack:TACME:CPRIVATE"
     assert dm.payload["conversation_key"] == "slack:TACME:DAJAY"
     assert not public.is_direct_agent_request
     assert not private.is_direct_agent_request
     assert dm.is_direct_agent_request
 
 
-def test_agent_can_change_current_slack_channel_proactivity(brain):
-    # slack_set_channel_proactivity is in the auto-execute tier under the
-    # risk-tiered default — it no longer pauses for human approval.
+def test_agent_can_change_current_slack_channel_proactivity(brain, monkeypatch):
+    # Autonomous mode sends every write through AI review. The reviewer can
+    # approve this reversible organization setting without a human pause.
+    monkeypatch.setattr(brain.action_reviewer, "review", lambda **_kwargs: "approve")
     destination = {"type": "slack_channel", "id": "CSOCIAL", "is_private": False}
     decision = brain.authz.resolve(
         "org_acme", "person_ajay", destination, "reactive_agent"
@@ -1599,9 +1588,15 @@ def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
         "team_id": "TACME",
         "event_id": "EvChannelContextFirst",
         "event": {
-            "type": "app_mention",
+            # Slack emits both `message` and `app_mention` for one mentioned
+            # message; only the `message` copy carries channel_type, which is
+            # what tells Docket the room is public rather than private. Using
+            # it here keeps the fixture representative of what actually
+            # decides the channel's scope.
+            "type": "message",
             "user": "UAJAY",
             "channel": "CSOCIAL",
+            "channel_type": "channel",
             "text": "Hey <@UBOT>",
             "ts": "250.001",
             "client_msg_id": "channel-context-first",
@@ -1682,6 +1677,39 @@ def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
         item["role"] == "assistant" and item["text"] == first_run["final_answer"]
         for item in main_timeline
     )
+
+
+def test_slack_conversation_hides_messages_that_arrived_after_the_task(brain, monkeypatch):
+    """Regression test for a real production bug. recent_slack_messages()
+    reads raw `received_events` (written the instant Slack delivers), while
+    a Task is only created once that message finishes routing into
+    `session_messages` -- a lag of over a minute under load. Without a
+    cutoff the model is shown a message this Task was never assigned,
+    answers it (or worse, acts on it), and then that message's OWN Task
+    answers it a second time. Confirmed live: a Task whose goal was only
+    "Hey" created a water-reminder automation 60s before that request
+    entered the transcript, then the request's own Task replied
+    "Already set up" -- one request, two replies."""
+    run = {
+        "id": "task_lookahead",
+        "organization_id": "org_acme",
+        "created_at": "2026-08-05T19:25:10+00:00",
+        "trigger_event_id": "EvTrigger",
+        "metadata": {"slack": {"workspace_id": "TACME", "channel_id": "CSOCIAL"}},
+        "envelope": {"destination": {"id": "CSOCIAL"}},
+    }
+    monkeypatch.setattr(
+        brain.company_agent.runs.store,
+        "recent_slack_messages",
+        lambda *_args, **_kwargs: [
+            {"at": "2026-08-05T19:24:00+00:00", "message_id": "EvOld", "text": "earlier context", "role": "user"},
+            {"at": "2026-08-05T19:25:13+00:00", "message_id": "EvFuture", "text": "can u ping me every 3 mins", "role": "user"},
+        ],
+    )
+
+    timeline = brain.company_agent._slack_conversation(run)
+
+    assert [item["message_id"] for item in timeline] == ["EvOld"]
 
 
 def test_wake_preserves_slack_conversation_address_for_main_context(brain):

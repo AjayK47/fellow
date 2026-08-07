@@ -75,8 +75,8 @@ class CompanyAgent:
         graph: Any | None = None,
         history_compactor: Any | None = None,
         workspaces: Any | None = None,
-        max_iterations: int = 12,
-        max_tool_calls: int = 24,
+        max_iterations: int = 50,
+        max_tool_calls: int = 100,
         context_token_budget: int = 12_000,
         max_total_tokens: int = 100_000,
         completion_max_tokens: int = 40_000,
@@ -1174,6 +1174,16 @@ class CompanyAgent:
         if run.get("parent_task_id"):
             return
         kinds = ["memory.capture_task", "delivery.send"]
+        # A scheduled firing that made no tool calls observed nothing: its
+        # entire content is text Docket generated for itself, so there is
+        # no new fact about the company to remember. Capturing it anyway
+        # is how a 3-minute reminder automation silently wrote ~480
+        # worthless memories a day ("Task task_x has final answer: 'Time
+        # for a hydration check...'"), permanently degrading retrieval
+        # for every real question. Delivery still happens -- the reminder
+        # itself is the point; only the durable memory write is skipped.
+        if run.get("trigger_kind") == "automation" and not run.get("tool_call_count"):
+            kinds = ["delivery.send"]
         for kind in kinds:
             self.enqueue_job(
                 organization_id=run["organization_id"],
@@ -1202,10 +1212,29 @@ class CompanyAgent:
             limit=11,
         )
         trigger_event_id = run.get("trigger_event_id")
+        # Never show this Task a Slack message that arrived AFTER it was
+        # created. recent_slack_messages() reads raw `received_events`,
+        # which is populated the instant Slack delivers a message -- but a
+        # Task is only created once that message finishes routing into
+        # `session_messages`, and that routing can lag by a minute or more
+        # under load. Without this cutoff the two pipelines disagree: the
+        # prompt shows a message the Task was never assigned, the model
+        # answers it (even acting on it with real tool calls), and then the
+        # same message finishes routing and spawns its OWN Task that
+        # answers it a second time. Confirmed live: a Task whose goal was
+        # just "Hey" created a water-reminder automation 60s before that
+        # request entered the transcript, then the request's own Task
+        # replied "Already set up" -- one request, two replies, plus an
+        # action taken by a Task that was never asked to take it.
+        # A message that genuinely belongs to this Task's turn reaches it
+        # through the Session transcript (`history`) instead: wake() appends
+        # it before signalling, so mid-run steering is unaffected by this.
+        created_at = str(run.get("created_at") or "")
         return [
             item
             for item in messages
             if item.get("message_id") != trigger_event_id
+            and not (created_at and str(item.get("at") or "") > created_at)
         ][-10:]
 
     def _active_skills(self, run: dict[str, Any]) -> list[dict[str, Any]]:

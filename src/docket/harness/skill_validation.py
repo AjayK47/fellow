@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from docket.harness.prompt_library import load
+
 
 SKILL_VALIDATION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -59,17 +61,7 @@ class SkillResponseValidator:
         ]
         result = self.model.generate(
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Validate a draft agent response only against the supplied "
-                        "active-skill contracts. Do not add, remove, reinterpret, or "
-                        "fact-check claims. If invalid, correct only presentation and "
-                        "contract violations while preserving meaning, facts, links, "
-                        "citations, and uncertainty exactly. Return the draft unchanged "
-                        "when valid."
-                    ),
-                },
+                {"role": "system", "content": load("skill_response_validation")},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -86,23 +78,48 @@ class SkillResponseValidator:
             temperature=0.0,
             max_tokens=2200,
         )
+        skill_refs = [
+            {"id": skill["id"], "version": skill["version"]} for skill in validating_skills
+        ]
+        # Validation is a quality check on top of an already-produced draft,
+        # not a hard requirement for the Task to succeed. A malformed or
+        # unusable response from the *validator's own* model call (bad JSON,
+        # or "invalid" with no correction to fall back to) must never raise
+        # and fail the whole Task -- that would discard everything the Task
+        # actually did (real research, real tool calls) over an auxiliary
+        # side-check glitch. Fail open: pass the draft through unvalidated
+        # rather than replacing real work with a hard failure.
         try:
             evaluation = json.loads(result.content)
         except (TypeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"skill response validation returned invalid JSON: {exc}") from exc
+            return {
+                "response": response,
+                "valid": True,
+                "checked": False,
+                "violations": [f"skill_validation_error: invalid JSON from validator: {exc}"],
+                "skill_refs": skill_refs,
+                "usage": result.usage or {},
+            }
         valid = bool(evaluation.get("valid"))
         corrected = str(evaluation.get("corrected_response") or "").strip()
         if not valid and not corrected:
-            raise RuntimeError("skill response validation rejected the response without a correction")
+            return {
+                "response": response,
+                "valid": True,
+                "checked": False,
+                "violations": [
+                    "skill_validation_error: validator reported invalid with no correction",
+                    *[str(v) for v in (evaluation.get("violations") or [])],
+                ],
+                "skill_refs": skill_refs,
+                "usage": result.usage or {},
+            }
         return {
             "response": response if valid else corrected,
             "valid": valid,
             "checked": True,
             "violations": list(evaluation.get("violations") or []),
-            "skill_refs": [
-                {"id": skill["id"], "version": skill["version"]}
-                for skill in validating_skills
-            ],
+            "skill_refs": skill_refs,
             "usage": result.usage or {},
             "model": result.model or getattr(self.model, "model", ""),
         }

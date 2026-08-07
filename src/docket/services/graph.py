@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from docket.domain.models import (
@@ -35,8 +36,12 @@ class GraphService:
     def get_entity(self, entity_id: str) -> dict[str, Any] | None:
         return self.store.get_entity(entity_id)
 
-    def list_entities(self, organization_id: str, entity_type: str | None = None) -> list[dict[str, Any]]:
-        return self.store.list_entities(organization_id, entity_type=entity_type)
+    def list_entities(
+        self,
+        organization_id: str,
+        entity_types: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.store.list_entities(organization_id, entity_types=entity_types)
 
     # ---- edges ----
 

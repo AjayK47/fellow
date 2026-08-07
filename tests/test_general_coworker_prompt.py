@@ -16,3 +16,12 @@ def test_company_claims_still_require_authorized_company_evidence():
     assert "permission-filtered company context" in prompt
     assert "missing company evidence" in prompt
     assert "does not prevent an unrelated public-world answer" in prompt
+
+
+def test_session_manager_delegates_substantial_research_and_report_work():
+    prompt = STABLE_SYSTEM_PROMPT.lower()
+    assert "you are the session manager for root tasks" in prompt
+    assert "call delegate_tasks before doing that piece yourself" in prompt
+    assert "current-event research plus analysis" in prompt
+    assert "one general specialist may own an entire sequential workflow" in prompt
+    assert "directly handle short conversational replies" in prompt

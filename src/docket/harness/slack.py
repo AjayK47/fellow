@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import time
 import uuid
 from typing import Any
@@ -16,6 +17,66 @@ from docket.config import Settings
 from docket.domain.models import new_id, utcnow
 from docket.harness.models import EventActor, EventScope, NormalizedEvent
 from docket.storage.db import BrainStore
+
+# Backstop for the prompt-level rule in prompts.py (STABLE_SYSTEM_PROMPT):
+# a live test showed the model still emitting :droplet: on a water-reminder
+# automation despite that instruction being in its system prompt at the
+# time -- prompt adherence alone isn't reliable enough for a hard rule, so
+# this scrubs the literal characters/shortcodes out of every outbound Slack
+# text deterministically, regardless of what the model actually wrote. Not
+# exhaustive by design: these are the specific emoji already named as a
+# hard block; anything broader stays a model-judgment call per the prompt.
+_BLOCKED_EMOJI_CHARS = ("💧", "💦", "🍆", "🍑", "👅", "🌭", "🍌")
+_BLOCKED_EMOJI_SHORTCODES = (
+    ":droplet:",
+    ":sweat_drops:",
+    ":eggplant:",
+    ":peach:",
+    ":tongue:",
+    ":hotdog:",
+    ":hot_dog:",
+    ":banana:",
+)
+
+
+def _scrub_blocked_emoji(text: str) -> str:
+    if not text:
+        return text
+    scrubbed = text
+    for token in (*_BLOCKED_EMOJI_CHARS, *_BLOCKED_EMOJI_SHORTCODES):
+        scrubbed = scrubbed.replace(token, "")
+    if scrubbed == text:
+        # Nothing was removed: return the message byte-for-byte untouched.
+        return text
+    # Removing an inline emoji leaves a doubled space right where it sat
+    # (e.g. "break, ajay  — grab"), so close that gap -- but ONLY runs of
+    # spaces/tabs. An earlier version collapsed with " ".join(text.split()),
+    # which also destroyed every newline in every outbound message:
+    # paragraph breaks, bullet lists and code blocks in ordinary replies
+    # were being flattened into one long line, whether or not the message
+    # contained an emoji at all.
+    scrubbed = re.sub(r"[ \t]{2,}", " ", scrubbed)
+    scrubbed = re.sub(r"[ \t]+\n", "\n", scrubbed)
+    return scrubbed.strip()
+
+
+def _scrub_blocks(blocks: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Recursively scrub every string value in a Block Kit payload, not
+    just the top-level `text` argument -- section/field text and button
+    labels can carry the same emoji."""
+    if blocks is None:
+        return None
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, str):
+            return _scrub_blocked_emoji(node)
+        if isinstance(node, dict):
+            return {key: _walk(value) for key, value in node.items()}
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        return node
+
+    return _walk(blocks)
 
 
 def verify_slack_signature(
@@ -144,6 +205,7 @@ class SlackGateway:
         self.audit = audit
         self.sessions = sessions
         self._user_profile_cache: dict[str, dict[str, Any]] = {}
+        self._channel_privacy_cache: dict[str, bool] = {}
 
     def accept(
         self,
@@ -369,9 +431,24 @@ class SlackGateway:
             bot_user_id and f"<@{bot_user_id}>" in text
         )
         policy = self._channel_policy(organization_id, channel_id, is_dm)
-        # Conversation context is always keyed by the Slack channel/DM. Agent
-        # execution is separate: DMs retain one continuous agent session,
-        # while addressed channel messages can run independently.
+        # One Session per room, channels included. Context belongs to the
+        # conversation, not to whoever happened to send a message: two people
+        # raising the same issue in a channel must reach the same Session so
+        # the Manager can fold the second message into the work already
+        # running, rather than silently starting a duplicate investigation.
+        #
+        # Channels previously forked a Session per addressed message
+        # (`{context_key}:event:{message_identity}`), which isolated the
+        # transcript, the running summary, and -- most visibly -- steering:
+        # SessionService._steer_active_tasks() resolves the root Task by
+        # Session id, so an addressed "stop" landed in a brand-new empty
+        # Session and cancelled nothing. It also meant mentioning Docket gave
+        # LESS continuity than not mentioning it, since ambient messages
+        # attach to conversation_state.active_session_id (channel-wide) while
+        # addressed ones never consulted it.
+        #
+        # Arbitration between unrelated concurrent requests belongs to the
+        # Session Manager, which has start_parallel_task for exactly that.
         context_key = f"slack:{workspace_id}:{channel_id}"
         conversation_key = context_key
         existing_session = self.store.find_session_by_conversation(
@@ -385,12 +462,90 @@ class SlackGateway:
             or bot_mentioned
             or free_response
         )
-        visibility = (
-            "person_private"
-            if is_dm
-            else "private_channel"
-            if bool(inner.get("is_private")) or policy.get("is_private")
-            else "organization_public"
+        # CRITICAL -- this decides whether a channel's evidence lands in a
+        # private scope or an organization-public one, and getting it wrong
+        # discloses a private channel to the whole workspace.
+        #
+        # `inner.get("is_private")` is NOT a field Slack sends on a message
+        # event. It only exists on a conversations.info channel object, so it
+        # was always None here and the check was dead. With no channel_policy
+        # row either (_channel_policy defaults `is_private` to `is_dm`, i.e.
+        # False for a channel), every private channel fell through to
+        # "organization_public". Confirmed live: a private channel's salary
+        # discussion was readable by a workspace member who was never in it.
+        #
+        # The authoritative signal is already in the event: Slack sets
+        # channel_type="group" for a private channel ("channel" for a public
+        # one, "im"/"mpim" for DMs). The other two inputs are kept as
+        # overrides for an explicit operator policy.
+        #
+        # But channel_type is NOT universal: `message` events carry it,
+        # `app_mention` events do not, and _ignore_event() accepts both. Since
+        # Slack emits both for one mentioned message and they deduplicate
+        # against each other, an app_mention can legitimately be the copy that
+        # gets normalized. Treating "no channel_type" as "not a group" would
+        # reopen exactly the hole above, so an unknown channel type is never
+        # allowed to imply public: it inherits whatever this channel's scope
+        # already records, and failing that, defaults closed to private.
+        # A stored channel policy is an operator's explicit declaration and is
+        # authoritative in BOTH directions -- it is how a deployment that
+        # cannot reach the Slack API (no bot token) still states which rooms
+        # are private, instead of depending on the fallback guess below.
+        stored_policy = self.store.channel_policy(
+            organization_id, "slack", channel_id
+        )
+        policy_declares_privacy = (
+            stored_policy is not None and stored_policy.get("is_private") is not None
+        )
+        explicitly_private = bool(inner.get("is_private")) or bool(
+            policy.get("is_private")
+        )
+        channel_type_known = channel_type in {"channel", "group"}
+        resolved_private: bool | None = None
+        if (
+            not is_dm
+            and not explicitly_private
+            and not channel_type_known
+            and not policy_declares_privacy
+        ):
+            # No channel_type on this event (an app_mention). Ask Slack rather
+            # than guess -- see _fetch_channel_is_private for why guessing is
+            # unsafe in both directions.
+            resolved_private = self._fetch_channel_is_private(
+                workspace_id, channel_id
+            )
+
+        if is_dm:
+            visibility = "person_private"
+        elif explicitly_private or channel_type == "group" or resolved_private:
+            visibility = "private_channel"
+        elif (
+            channel_type == "channel"
+            or resolved_private is False
+            or policy_declares_privacy
+        ):
+            visibility = "organization_public"
+        else:
+            # Slack could not be reached and the event carries no type. Keep
+            # whatever this channel's scope already records; with nothing on
+            # record, stay private -- a room that never delivers is a visible
+            # failure, a room that leaks is a silent one.
+            known_scope = self.store.get_scope(
+                f"scope_slack_{workspace_id}_{channel_id}"
+            )
+            visibility = (
+                "organization_public"
+                if known_scope and bool(known_scope.get("is_public"))
+                else "private_channel"
+            )
+        # Only a real signal -- Slack's event, Slack's API, or an operator
+        # policy -- may widen a scope. An inherited or defaulted guess never
+        # can.
+        privacy_authoritative = (
+            channel_type_known
+            or explicitly_private
+            or policy_declares_privacy
+            or resolved_private is not None
         )
         scope_id = str(
             policy.get("scope_id")
@@ -406,6 +561,7 @@ class SlackGateway:
             channel_id=channel_id,
             principal_id=principal_id,
             visibility=visibility,
+            authoritative=privacy_authoritative,
         )
         event_id = str(payload.get("event_id") or f"slack_{workspace_id}_{ts}")
         event_type = (
@@ -415,10 +571,11 @@ class SlackGateway:
             if bot_mentioned
             else "slack.channel_message"
         )
+        # Still needed for dedupe_key: Slack emits both `message` and
+        # `app_mention` callbacks for one mentioned message, with different
+        # event ids, so deduplication keys off the underlying message.
         client_message_id = str(inner.get("client_msg_id") or "")
         message_identity = client_message_id or f"{channel_id}:{ts}:{source_user_id}"
-        if not is_dm:
-            conversation_key = f"{context_key}:event:{message_identity}"
         return NormalizedEvent(
             id=event_id,
             organization_id=organization_id,
@@ -517,6 +674,50 @@ class SlackGateway:
             self._user_profile_cache[cache_key] = {}
             return {}
 
+    def _fetch_channel_is_private(
+        self, workspace_id: str, channel_id: str
+    ) -> bool | None:
+        """Ask Slack whether a channel is private. None means "could not tell".
+
+        Needed because `channel_type` is only on `message` events, not on
+        `app_mention` -- and both are accepted, deduplicate against each
+        other, and can arrive in either order. Guessing from the absence of
+        the field is not safe in either direction: assume public and a
+        private room leaks; assume private and an ordinary public channel
+        stops delivering. conversations.info answers it definitively.
+
+        Cached per channel for the process lifetime, so this costs one call
+        per channel rather than one per event, and never blocks ingestion.
+        """
+        installation = self.store.slack_installation_by_workspace(workspace_id)
+        token = (installation or {}).get("bot_token") or self.config.slack_bot_token
+        if not channel_id or not token:
+            return None
+        cache_key = f"{workspace_id}:{channel_id}"
+        if cache_key in self._channel_privacy_cache:
+            return self._channel_privacy_cache[cache_key]
+        try:
+            response = httpx.get(
+                "https://slack.com/api/conversations.info",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"channel": channel_id},
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("ok"):
+                return None
+            channel = dict(payload.get("channel") or {})
+            is_private = bool(channel.get("is_private")) or bool(
+                channel.get("is_group")
+            )
+            self._channel_privacy_cache[cache_key] = is_private
+            return is_private
+        except Exception:
+            # Never cache a failure: a transient network error must not pin a
+            # channel's privacy for the rest of the process.
+            return None
+
     def _channel_policy(
         self, organization_id: str, channel_id: str, is_dm: bool
     ) -> dict[str, Any]:
@@ -547,9 +748,20 @@ class SlackGateway:
         channel_id: str,
         principal_id: str,
         visibility: str,
+        authoritative: bool = True,
     ) -> None:
-        if not self.store.get_scope(scope_id):
-            is_public = visibility == "organization_public"
+        """`authoritative` means Slack actually told us this channel's type
+        (or an operator set a policy), rather than the value being an
+        inherited or fail-closed guess. Only an authoritative signal may widen
+        a scope; a guess can narrow but never disclose."""
+        is_public = visibility == "organization_public"
+        # A scope that is private because Slack said so (or an operator set a
+        # policy) is *confirmed* private, and nothing later re-opens it. A
+        # scope that is private only because the channel type was unknown is a
+        # guess, and a real signal is allowed to correct it.
+        confirmed_private = authoritative and not is_public
+        existing = self.store.get_scope(scope_id)
+        if not existing:
             self.store.upsert_scope(
                 {
                     "id": scope_id,
@@ -559,8 +771,50 @@ class SlackGateway:
                     "channel_id": channel_id,
                     "principal_ids": [] if is_public else [principal_id],
                     "is_public": is_public,
+                    "privacy_confirmed": confirmed_private,
                 }
             )
+        elif not is_public and bool(existing.get("is_public")):
+            # Self-healing, one direction only: a scope already on record as
+            # public but now known to be private is corrected in place, so a
+            # deployment that mislabelled private channels before the
+            # channel_type="group" fix repairs itself on the channel's next
+            # message instead of leaking until someone runs a migration.
+            #
+            # Narrowing needs no proof: it can only ever remove access.
+            existing["kind"] = visibility
+            existing["is_public"] = False
+            existing["privacy_confirmed"] = bool(
+                existing.get("privacy_confirmed")
+            ) or confirmed_private
+            existing["principal_ids"] = sorted(
+                set(existing.get("principal_ids") or [])
+                | set(self.store.scope_member_ids(organization_id, scope_id))
+                | {principal_id}
+            )
+            self.store.upsert_scope(existing)
+        elif (
+            is_public
+            and not bool(existing.get("is_public"))
+            and authoritative
+            and not bool(existing.get("privacy_confirmed"))
+        ):
+            # Widening only ever undoes a *guess*. A channel first seen
+            # through an app_mention carries no channel_type, so it is stored
+            # private until a real message event proves otherwise -- that
+            # correction is this branch, and without it a genuinely public
+            # channel Docket only ever sees mentions in would be stuck
+            # private forever.
+            #
+            # A scope confirmed private is never reopened, even if Slack
+            # later reports the room as public. Slack does support converting
+            # a private channel to public, but people who spoke there had a
+            # private expectation at the time; silently re-disclosing that
+            # backlog is not a decision this code should make on its own.
+            existing["kind"] = visibility
+            existing["is_public"] = True
+            existing["principal_ids"] = []
+            self.store.upsert_scope(existing)
         self.store.add_membership(organization_id, principal_id, scope_id)
 
     def _ignore_event(
@@ -629,9 +883,19 @@ class SlackSender:
         blocks: list[dict[str, Any]] | None = None,
         workspace_id: str | None = None,
         idempotency_key: str | None = None,
+        organization_id: str | None = None,
     ) -> dict[str, Any]:
+        text = _scrub_blocked_emoji(text)
+        blocks = _scrub_blocks(blocks)
         token = self._token_for(workspace_id)
         if not token:
+            self._record_outbound(
+                organization_id=organization_id,
+                workspace_id=workspace_id,
+                channel_id=channel_id,
+                text=text,
+                message_id=idempotency_key,
+            )
             return {
                 "ok": False,
                 "dry_run": True,
@@ -641,8 +905,14 @@ class SlackSender:
             }
         body: dict[str, Any] = {"channel": channel_id, "text": text}
         if idempotency_key:
-            # Slack deduplicates chat.postMessage retries by client_msg_id.
-            # UUID5 makes the same durable delivery key stable across crashes.
+            # NOTE: despite what this once said, Slack's chat.postMessage
+            # does NOT deduplicate by client_msg_id for bot-token calls --
+            # that field is for a client's own optimistic-UI reconciliation,
+            # not a server-enforced idempotency guarantee. The real
+            # idempotency guard lives in DeliveryService._reserve(), which
+            # atomically claims the idempotency key before this method is
+            # ever called. client_msg_id is still attached (harmless,
+            # stable across retries) but must not be relied on alone.
             body["client_msg_id"] = str(
                 uuid.uuid5(uuid.NAMESPACE_URL, f"docket:{idempotency_key}")
             )
@@ -661,7 +931,47 @@ class SlackSender:
         payload = response.json()
         if not payload.get("ok"):
             raise RuntimeError(f"Slack delivery failed: {payload.get('error')}")
+        self._record_outbound(
+            organization_id=organization_id,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            text=text,
+            # Slack's own message ts is the natural per-channel identity and
+            # is stable across a retry that Slack itself deduplicated.
+            message_id=str(payload.get("ts") or "") or idempotency_key,
+        )
         return payload
+
+    def _record_outbound(
+        self,
+        *,
+        organization_id: str | None,
+        workspace_id: str | None,
+        channel_id: str,
+        text: str,
+        message_id: str | None,
+    ) -> None:
+        """Append what Docket just said to the conversation log.
+
+        This is the single outbound choke point: EVERY Slack message
+        Docket sends goes through send(), whether it came from the
+        delivery pipeline or straight from the slack_send_message tool.
+        Recording here is what fixed a real blind spot -- the timeline
+        used to be reconstructed from `deliveries` rows, so anything sent
+        by the tool left no trace and Docket could not see its own
+        messages in later turns.
+        """
+        if not self.store or not organization_id or not workspace_id:
+            return
+        self.store.append_conversation_message(
+            organization_id=organization_id,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            role="assistant",
+            text=text,
+            author="docket",
+            message_id=message_id,
+        )
 
     def update_message(
         self,
@@ -676,6 +986,8 @@ class SlackSender:
         approval's Approve/Deny buttons with the actual decision once one
         is made, instead of leaving live buttons on a message whose
         decision has already been acted on."""
+        text = _scrub_blocked_emoji(text)
+        blocks = _scrub_blocks(blocks)
         token = self._token_for(workspace_id)
         if not token:
             return {"ok": False, "dry_run": True, "channel": channel_id, "ts": timestamp}

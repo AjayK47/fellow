@@ -620,3 +620,124 @@ def test_long_distinctive_label_still_fuzzy_resolves(brain):
     )
     assert match is not None
     assert match["id"] == "person_sarah"
+
+
+# ---------------------------------------------------------------------
+# propose_entity_mention: the missing half of graph population.
+#
+# resolve_source_entities only ever creates a business entity from a "hard"
+# identifier in a structured connector payload (an email, a customer_id).
+# An ordinary Slack conversation has none of that -- a name mentioned in
+# free text is the only signal chat-based extraction ever gets. Before this
+# method existed, the graph could only ever grow person/conversation/
+# source/task entities: every project, team, customer and incident anyone
+# ever talked about was invisible to it.
+# ---------------------------------------------------------------------
+
+
+def test_propose_entity_mention_with_no_match_creates_a_new_entity(brain):
+    org = "org_acme"
+    entity_id, decision = brain.reality.propose_entity_mention(
+        org,
+        name="Project Atlas",
+        entity_type="project",
+        source_id="src_test",
+    )
+    assert decision == "created"
+    assert entity_id is not None
+    entity = brain.graph.get_entity(entity_id)
+    assert entity["name"] == "Project Atlas"
+    assert entity["entity_type"] == "project"
+    assert entity["attributes"]["created_by_extraction"] is True
+
+
+def test_propose_entity_mention_with_an_exact_match_links_directly(brain):
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {
+            "id": "customer_acme_corp",
+            "organization_id": org,
+            "entity_type": "customer",
+            "name": "Acme Corp",
+        }
+    )
+    before = len(brain.store.list_entities(org, entity_types=["customer"]))
+    entity_id, decision = brain.reality.propose_entity_mention(
+        org, name="Acme Corp", entity_type="customer", source_id="src_test"
+    )
+    assert decision == "matched"
+    assert entity_id == "customer_acme_corp"
+    # No duplicate was created for an exact match.
+    assert len(brain.store.list_entities(org, entity_types=["customer"])) == before
+
+
+def test_propose_entity_mention_with_a_fuzzy_match_queues_review_not_a_link(brain):
+    """A merely-similar name might be a DIFFERENT real entity -- auto-
+    linking it would silently merge two distinct things. This must queue a
+    pending resolution candidate (the same review flow a soft identifier
+    match already uses) and leave the mention unresolved, never invent a
+    new duplicate entity, and never guess by auto-linking either."""
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {
+            "id": "project_atlas_v1",
+            "organization_id": org,
+            "entity_type": "project",
+            "name": "Project Atlas",
+        }
+    )
+    before = len(brain.store.list_entities(org, entity_types=["project"]))
+    entity_id, decision = brain.reality.propose_entity_mention(
+        org, name="Project Atlas Two", entity_type="project", source_id="src_test"
+    )
+    assert decision == "candidate"
+    assert entity_id is None
+    # No new entity was created for a merely-similar match either.
+    assert len(brain.store.list_entities(org, entity_types=["project"])) == before
+    candidates = brain.reality.list_resolution_candidates(org, status="pending")
+    assert any(c["left_entity_id"] == "project_atlas_v1" for c in candidates)
+
+
+def test_approving_a_mention_candidate_lets_the_next_mention_resolve_fast(brain):
+    """Confirming the candidate must actually close the loop: the next time
+    this exact name comes up, it should hit the fast exact/identifier path
+    instead of queuing another candidate."""
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {
+            "id": "project_atlas_v1",
+            "organization_id": org,
+            "entity_type": "project",
+            "name": "Project Atlas",
+        }
+    )
+    brain.reality.propose_entity_mention(
+        org, name="Project Atlas Two", entity_type="project", source_id="src_test"
+    )
+    [candidate] = brain.reality.list_resolution_candidates(org, status="pending")
+    brain.reality.decide_resolution_candidate(
+        candidate["id"], approved=True, decided_by="person_ajay"
+    )
+
+    entity_id, decision = brain.reality.propose_entity_mention(
+        org, name="Project Atlas Two", entity_type="project", source_id="src_test_2"
+    )
+    assert decision == "matched"
+    assert entity_id == "project_atlas_v1"
+
+
+def test_propose_entity_mention_reuses_the_established_matching_logic(brain):
+    """_candidate_entity's short/generic-label entropy gate must apply here
+    too, via the shared _match_entity helper -- otherwise this new path
+    would be looser than the one it was modeled on."""
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {"id": "person_al", "organization_id": org, "entity_type": "person", "name": "Al Chen"}
+    )
+    entity_id, decision = brain.reality.propose_entity_mention(
+        org, name="al", entity_type="person", source_id="src_test"
+    )
+    # Too short/low-entropy to trust a fuzzy ratio -- must not silently
+    # merge into "Al Chen", so a new entity is created instead.
+    assert decision == "created"
+    assert entity_id != "person_al"

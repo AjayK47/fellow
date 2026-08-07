@@ -8,6 +8,7 @@ import secrets
 import time
 import argparse
 import logging
+import shutil
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -52,34 +53,58 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         brain = reset_app(Path(db) if db else settings.db_path)
     app.state.brain = brain
     brain.indexing.backfill()
-    worker_task: asyncio.Task[None] | None = None
+    worker_tasks: list[asyncio.Task[None]] = []
     if settings.worker_enabled:
-        async def _worker_loop() -> None:
+        # Two independent lanes, not one loop over every job kind.
+        # drain_once() waits for its whole leased batch to finish, so a
+        # single long agent run in a shared batch stalls every fast job
+        # behind it -- measured in production as inbound Slack messages
+        # sitting unrouted for over a minute behind one 57-second agent
+        # run. Splitting the lanes keeps event routing, delivery, and
+        # memory capture responsive regardless of agent run length.
+        async def _lane(kinds: list[str], *, tick_automations: bool) -> None:
             last_dispatcher_tick = 0.0
             while True:
-                if (
+                if tick_automations and (
                     time.monotonic() - last_dispatcher_tick
                     >= settings.dispatcher_tick_interval_seconds
                 ):
                     await asyncio.to_thread(brain.automations.tick)
                     last_dispatcher_tick = time.monotonic()
-                result = await asyncio.to_thread(brain.harness_worker.drain_once)
+                # pump() starts work without waiting for it, so a long
+                # agent run never stalls this loop's next lease.
+                result = await asyncio.to_thread(
+                    brain.harness_worker.pump, kinds=kinds
+                )
                 if result["leased"] == 0:
                     await asyncio.sleep(settings.worker_poll_interval_seconds)
                 else:
                     await asyncio.sleep(0)
 
-        worker_task = asyncio.create_task(
-            _worker_loop(), name="docket-harness-worker"
-        )
+        worker_tasks = [
+            asyncio.create_task(
+                _lane(
+                    brain.harness_worker.infrastructure_job_kinds(),
+                    tick_automations=True,
+                ),
+                name="docket-harness-worker-infra",
+            ),
+            asyncio.create_task(
+                _lane(
+                    brain.harness_worker.agent_job_kinds(), tick_automations=False
+                ),
+                name="docket-harness-worker-agent",
+            ),
+        ]
     yield
     # Coordinated shutdown: stop accepting new Slack events first, then let
     # the worker finish draining in-flight jobs, then close the database.
     slack_stopper = getattr(app.state, "slack_stopper", None)
     if slack_stopper:
         slack_stopper()
-    if worker_task:
+    for worker_task in worker_tasks:
         worker_task.cancel()
+    for worker_task in worker_tasks:
         try:
             await worker_task
         except asyncio.CancelledError:
@@ -283,11 +308,22 @@ def retention_cli(args: argparse.Namespace) -> None:
 
 
 def reset_cli(args: argparse.Namespace) -> None:
-    """Delete the configured local database and its SQLite sidecar files."""
+    """Delete every piece of local Docket state: the database (memories,
+    sessions, tasks, automations, artifacts all live there) and the
+    on-disk task workspaces.
+
+    The workspace tree matters as much as the database here: it is real
+    files written by tasks, it is NOT recreated from the database, and
+    leaving it behind means a "fresh start" still has thousands of stale
+    directories in it (a live install had 4,191 left over, all from an
+    architecture that no longer exists).
+    """
     db_path = settings.db_path.resolve()
+    workspace_root = settings.workspace_root.resolve()
     if not args.yes:
         print(
-            f"This permanently deletes all Docket data in {db_path}. "
+            f"This permanently deletes all Docket data in {db_path} "
+            f"and all task workspaces in {workspace_root}. "
             "Pass --yes to continue."
         )
         raise SystemExit(2)
@@ -307,6 +343,30 @@ def reset_cli(args: argparse.Namespace) -> None:
         print(f"Removed {len(removed)} database file(s).")
     else:
         print(f"Docket database is already clean: {db_path}")
+
+    # Guard against a misconfigured workspace_root (e.g. pointed at "/" or a
+    # home directory) turning a reset into an unrecoverable wipe: only ever
+    # delete a directory that actually looks like Docket's own workspace
+    # tree, and only its contents.
+    if workspace_root.exists() and workspace_root.is_dir():
+        if workspace_root.parent == settings.data_dir.resolve() or workspace_root.name in {
+            "workspaces",
+            ".docket-workspaces",
+        }:
+            workspace_count = 0
+            for child in workspace_root.iterdir():
+                shutil.rmtree(child, ignore_errors=True) if child.is_dir() else child.unlink(
+                    missing_ok=True
+                )
+                workspace_count += 1
+            print(
+                f"Removed {workspace_count} workspace entr(ies) under {workspace_root}."
+            )
+        else:
+            print(
+                f"Skipped workspace cleanup: {workspace_root} does not look like "
+                "a Docket workspace directory. Remove it manually if intended."
+            )
 
 
 def main() -> None:

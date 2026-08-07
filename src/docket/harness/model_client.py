@@ -43,11 +43,19 @@ class OpenRouterModelClient:
         model: str,
         base_url: str,
         timeout_seconds: float = 90.0,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        # See config.py's main_model_reasoning_effort docstring -- gives the
+        # model genuine internal deliberation space before it decides on a
+        # response or tool call, the same native-reasoning feature Hermes
+        # relies on, ported here via OpenRouter's provider-neutral
+        # `reasoning` field rather than any custom prompt-engineered
+        # "think step".
+        self.reasoning_effort = reasoning_effort
         self._context_length: int | None = None
 
     def context_length(self) -> int:
@@ -109,6 +117,8 @@ class OpenRouterModelClient:
                     "schema": response_schema,
                 },
             }
+        if self.reasoning_effort:
+            body["reasoning"] = {"effort": self.reasoning_effort}
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={
@@ -341,6 +351,9 @@ def build_model_clients(
             model=config.chat_model,
             base_url=config.model_base_url,
             timeout_seconds=config.model_timeout_seconds,
+            # Only the main reasoning loop gets extended thinking -- the
+            # small auxiliary classifiers below don't benefit from it.
+            reasoning_effort=config.main_model_reasoning_effort,
         )
         attention = OpenRouterModelClient(
             api_key=config.model_api_key,

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from docket.config import settings_env_file
 
 
 SLACK_MANIFEST = """_metadata:
@@ -67,8 +68,7 @@ class GatewaySetupService:
 
     @staticmethod
     def env_path() -> Path:
-        configured = os.environ.get("DOCKET_ENV_FILE")
-        return Path(configured) if configured else Path.cwd() / ".env"
+        return settings_env_file()
 
     def status(self) -> dict[str, Any]:
         env = self._read_env()

@@ -16,6 +16,7 @@ from docket.services.graph import GraphService
 from docket.services.ingestion import IngestionService
 from docket.services.indexing import IndexingService
 from docket.services.memory import MemoryService
+from docket.services.mcp_client import MCPClientService
 from docket.services.proactive import ProactiveService
 from docket.services.profiles import ProfilesService
 from docket.services.retrieval import RetrievalService
@@ -173,6 +174,11 @@ class DocketApp:
             vision_tools=self.vision_tools,
             audit=self.audit,
         )
+        self.mcp = MCPClientService(
+            store=self.store,
+            registry=self.tool_registry,
+            audit=self.audit,
+        )
         self.tool_output_summarizer = ToolOutputSummarizer(
             model=self.tool_output_summary_model
         )
@@ -242,6 +248,8 @@ class DocketApp:
             audit=self.audit,
             max_parallel=runtime_settings.child_task_max_parallel,
             max_depth=runtime_settings.child_task_max_depth,
+            max_iterations=runtime_settings.child_agent_max_iterations,
+            max_tool_calls=runtime_settings.child_agent_max_tool_calls,
         )
         self.tool_registry.register(
             self.child_tasks.tool_definition(), self.child_tasks.execute
@@ -314,6 +322,7 @@ class DocketApp:
             memory_service=self.memory,
             store=self.store,
             audit=self.audit,
+            reality=self.reality,
         )
         self.harness_memory = HarnessMemoryCapture(
             store=self.store,
@@ -370,7 +379,10 @@ class DocketApp:
         self.tool_registry.register(
             ToolDefinition(
                 name="automation_create",
-                description="Create a durable scheduled Task after approval.",
+                description=(
+                    "Create a durable scheduled automation that wakes this agent "
+                    "on an interval or cron schedule. Executes immediately."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
@@ -382,7 +394,11 @@ class DocketApp:
                     "additionalProperties": False,
                 },
                 risk="write",
-                approval_required=True,
+                # Native allow -- no reviewer call, no human pause, in every
+                # policy mode. See NATIVE_ALLOW_TOOL_NAMES in harness/tools.py
+                # for why scheduling is treated as an internal control surface
+                # rather than an external effect.
+                approval_required=False,
             ),
             lambda args, runtime: {"automation": self.automations.create(
                 organization_id=runtime["organization_id"], name=args["name"], goal=args["goal"],
@@ -393,9 +409,9 @@ class DocketApp:
         self.tool_registry.register(
             ToolDefinition(
                 name="automation_set_enabled",
-                description="Enable or pause one organization automation after approval.",
+                description="Enable or pause one organization automation.",
                 input_schema={"type": "object", "properties": {"automation_id": {"type": "string"}, "enabled": {"type": "boolean"}}, "required": ["automation_id", "enabled"], "additionalProperties": False},
-                risk="write", approval_required=True,
+                risk="write", approval_required=False,
             ),
             lambda args, runtime: self.automations.set_enabled(
                 _automation_owned(args["automation_id"], runtime["organization_id"])["id"], bool(args["enabled"])
@@ -404,9 +420,9 @@ class DocketApp:
         self.tool_registry.register(
             ToolDefinition(
                 name="automation_run_now",
-                description="Fire one enabled automation immediately after approval.",
+                description="Fire one enabled automation immediately.",
                 input_schema={"type": "object", "properties": {"automation_id": {"type": "string"}}, "required": ["automation_id"], "additionalProperties": False},
-                risk="write", approval_required=True,
+                risk="write", approval_required=False,
             ),
             lambda args, runtime: self._run_automation_now(
                 _automation_owned(args["automation_id"], runtime["organization_id"])
@@ -415,9 +431,9 @@ class DocketApp:
         self.tool_registry.register(
             ToolDefinition(
                 name="automation_delete",
-                description="Delete one organization automation after approval.",
+                description="Delete one organization automation.",
                 input_schema={"type": "object", "properties": {"automation_id": {"type": "string"}}, "required": ["automation_id"], "additionalProperties": False},
-                risk="write", approval_required=True,
+                risk="write", approval_required=False,
             ),
             lambda args, runtime: self.automations.delete(
                 _automation_owned(args["automation_id"], runtime["organization_id"])["id"]
@@ -494,14 +510,9 @@ class DocketApp:
 
     def _run_automation_now(self, automation: dict[str, object]) -> dict[str, object]:
         """Queue one automation immediately while retaining normal tick semantics."""
-        from docket.domain.models import utcnow
-
-        automation = dict(automation)
-        automation["next_run_at"] = utcnow().isoformat()
-        automation["status"] = "enabled"
-        automation["updated_at"] = utcnow().isoformat()
-        self.automations._upsert(automation)
-        return self.automations.tick(str(automation["organization_id"]))
+        return self.automations.run_now(
+            str(automation["id"]), str(automation["organization_id"])
+        )
 
     def _process_connector_backfill(
         self, payload: dict[str, object]
@@ -627,6 +638,9 @@ class DocketApp:
         return current
 
     def close(self) -> None:
+        # Drain the worker's shared thread pool before closing the database
+        # underneath it -- an in-flight job still needs the store.
+        self.harness_worker.close()
         self.store.close()
 
 

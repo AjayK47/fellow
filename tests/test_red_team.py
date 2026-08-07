@@ -90,18 +90,23 @@ _WRITE_TOOL_DUMMY_ARGS: dict[str, dict] = {
 
 # Docket's default flipped from "every write asks" to Viktor-style
 # risk-tiered autonomy: only a narrow, always-gated tier still pauses for a
-# human (run_code, automation management, and any destructive/financial/
+# human (run_code, skill proposals, and any destructive/financial/
 # external-comms-shaped connected-app action) — everything else auto-executes,
 # still fully audited and idempotency-checked, just without the human pause.
+# Automation management is native-allow (NATIVE_ALLOW_TOOL_NAMES in
+# harness/tools.py) and is covered by its own test below.
 _ALWAYS_GATED_TOOL_NAMES = {
     "run_code",
+    "skill_propose_create",
+    "skill_propose_update",
+    "request_batch_approval",
+}
+
+_NATIVE_ALLOW_TOOL_NAMES = {
     "automation_create",
     "automation_set_enabled",
     "automation_run_now",
     "automation_delete",
-    "skill_propose_create",
-    "skill_propose_update",
-    "request_batch_approval",
 }
 
 
@@ -159,8 +164,8 @@ def test_action_reviewer_approve_verdict_auto_executes_an_always_gated_tool(
     run = brain.store.get_task(run["id"])
     call = ModelToolCall(
         id="call_reviewer_approve",
-        name="automation_create",
-        arguments=_WRITE_TOOL_DUMMY_ARGS["automation_create"],
+        name="run_code",
+        arguments=_WRITE_TOOL_DUMMY_ARGS["run_code"],
     )
     result = brain.tool_executor.execute(run=run, call=call)
     assert result.status != "waiting_for_approval"
@@ -188,8 +193,8 @@ def test_action_reviewer_deny_verdict_blocks_with_no_approval_record(
     run = brain.store.get_task(run["id"])
     call = ModelToolCall(
         id="call_reviewer_deny",
-        name="automation_create",
-        arguments=_WRITE_TOOL_DUMMY_ARGS["automation_create"],
+        name="run_code",
+        arguments=_WRITE_TOOL_DUMMY_ARGS["run_code"],
     )
     result = brain.tool_executor.execute(run=run, call=call)
     assert result.status == "failed"
@@ -218,8 +223,8 @@ def test_action_reviewer_escalate_verdict_falls_through_to_human_approval(
     run = brain.store.get_task(run["id"])
     call = ModelToolCall(
         id="call_reviewer_escalate",
-        name="automation_create",
-        arguments=_WRITE_TOOL_DUMMY_ARGS["automation_create"],
+        name="run_code",
+        arguments=_WRITE_TOOL_DUMMY_ARGS["run_code"],
     )
     result = brain.tool_executor.execute(run=run, call=call)
     assert result.status == "waiting_for_approval"
@@ -227,7 +232,87 @@ def test_action_reviewer_escalate_verdict_falls_through_to_human_approval(
     assert approval is not None and approval["status"] == "pending"
 
 
-def test_auto_execute_write_tools_run_without_approval(brain):
+def test_automation_tools_are_native_allow_in_every_policy_mode(brain, monkeypatch):
+    """Scheduling is Docket's own control surface, not an external effect:
+    the automation family executes immediately, with no ActionReviewer call
+    and no human pause -- even in supervised mode, and even when the
+    schedule posts somewhere other than the requester's own DM."""
+    reviewed: list[str] = []
+    monkeypatch.setattr(
+        brain.action_reviewer,
+        "review",
+        lambda **kwargs: reviewed.append(kwargs["tool_name"]) or "escalate",
+    )
+    for mode in ("supervised", "autonomous", "restricted"):
+        brain.store.upsert_simple_harness_record(
+            "tool_policies",
+            {
+                "id": "tool_policy:org_acme:*",
+                "organization_id": "org_acme",
+                "tool_name": "*",
+                "mode": mode,
+            },
+        )
+        for name in sorted(_NATIVE_ALLOW_TOOL_NAMES):
+            definition = brain.tool_registry.get(name)
+            assert definition is not None, f"expected {name!r} to be registered"
+            policy = brain.tool_executor.effective_policy(
+                "org_acme", definition.definition
+            )
+            assert policy["execution"] == "direct", (
+                f"{name} resolved to {policy['execution']!r} in {mode} mode"
+            )
+
+    # A shared-channel automation -- the case the old carve-out still gated --
+    # now executes on the spot too.
+    envelope = _envelope(brain, conversation="redteam:automation-native-allow")
+    run = brain.store.get_task(
+        brain.company_agent.create_invocation(
+            envelope=envelope,
+            goal="redteam probe",
+            trigger_kind="reactive",
+            initial_message="redteam probe",
+        )["id"]
+    )
+    call = ModelToolCall(
+        id="call_automation_native_allow",
+        name="automation_create",
+        arguments={
+            "name": "redteam-shared-channel",
+            "goal": "post the standup summary every morning",
+            "conversation_id": "redteam:automation-native-allow",
+            "destination": {"type": "channel", "id": "C_team", "is_private": False},
+        },
+    )
+    result = brain.tool_executor.execute(run=run, call=call)
+    assert result.status == "completed", result.error
+    assert reviewed == []
+    approvals = brain.store.list_harness_records(
+        "approvals", "org_acme", where={"task_id": run["id"]}
+    )
+    assert approvals == []
+
+
+def test_an_explicit_per_tool_override_still_beats_native_allow(brain):
+    """Native allow relaxes the mode default, not an admin's explicit
+    per-tool policy -- an organization can still gate scheduling."""
+    brain.store.upsert_simple_harness_record(
+        "tool_policies",
+        {
+            "id": "tool_policy:org_acme:automation_create",
+            "organization_id": "org_acme",
+            "tool_name": "automation_create",
+            "execution": "ask",
+        },
+    )
+    definition = brain.tool_registry.get("automation_create").definition
+    assert brain.tool_executor.effective_policy("org_acme", definition)[
+        "execution"
+    ] == "ask"
+
+
+def test_autonomous_write_tools_execute_after_ai_review(brain, monkeypatch):
+    monkeypatch.setattr(brain.action_reviewer, "review", lambda **_kwargs: "approve")
     envelope = _envelope(brain, conversation="redteam:auto-execute")
     run = brain.company_agent.create_invocation(
         envelope=envelope,
@@ -258,7 +343,7 @@ def test_auto_execute_write_tools_run_without_approval(brain):
         call = ModelToolCall(id=f"call_{definition.name}", name=definition.name, arguments=args)
         result = brain.tool_executor.execute(run=run, call=call)
         assert result.status != "waiting_for_approval", (
-            f"{definition.name} unexpectedly paused for approval under the new default"
+            f"{definition.name} did not execute after AI approval"
         )
 
     # A low-stakes dynamic Composio action must not pause either.

@@ -74,6 +74,8 @@ def test_ordinary_dm_request_completes_through_the_new_session_task_path(brain):
     assert task is not None
     assert task["worker_type"] == "session_manager"
     assert task["session_id"] == wake["session_id"]
+    assert task["max_iterations"] == 50
+    assert task["max_tool_calls"] == 100
 
     session = sessions.get(wake["session_id"])
     assert session["manager_state"] == "idle"
@@ -132,19 +134,21 @@ def test_tool_call_needing_approval_pauses_and_resumes_through_the_new_path(brai
                 content="",
                 tool_calls=[
                     ModelToolCall(
-                        id="call_automation",
-                        name="automation_create",
+                        id="call_skill_proposal",
+                        # Any always-gated tool works -- this test is about
+                        # the pause/resume state machine, not the tool.
+                        # Automation tools are native-allow and never pause.
+                        name="skill_propose_create",
                         arguments={
                             "name": "session-task-redteam",
+                            "description": "recurring check",
                             "goal": "recurring check",
-                            "conversation_id": "slack:dm:person_ajay:approve",
-                            "destination": {"type": "dm", "id": "D1", "is_private": True},
                         },
                     )
                 ],
                 finish_reason="tool_calls",
             ),
-            ModelResponse(content="Done, automation created."),
+            ModelResponse(content="Done, proposal created."),
         ]
     )
     scheduler, sessions = _scheduler(brain)
@@ -153,7 +157,7 @@ def test_tool_call_needing_approval_pauses_and_resumes_through_the_new_path(brai
         conversation_key="slack:dm:person_ajay:approve",
         destination={"type": "dm", "id": "D1", "is_private": True},
         role="user",
-        content="set up a recurring check",
+        content="propose a skill for the recurring check",
         principal_id="person_ajay",
     )
     outcome = scheduler.dispatch(wake["session_id"])
@@ -191,7 +195,7 @@ def test_tool_call_needing_approval_pauses_and_resumes_through_the_new_path(brai
         approval_id=approval_id, approved=True, decided_by="person_ajay"
     )
     assert resumed.state.value == "completed", resumed.error
-    assert resumed.answer == "Done, automation created."
+    assert resumed.answer == "Done, proposal created."
     final_task = brain.store.get_task(outcome.task_id)
     assert final_task["state"] == "completed"
     assert final_task["execution_owner"] is None

@@ -20,19 +20,22 @@ def test_resolve_approval_job_routes_a_task_backed_approval_to_the_task_agent(br
                 content="",
                 tool_calls=[
                     ModelToolCall(
-                        id="call_automation",
-                        name="automation_create",
+                        id="call_skill_proposal",
+                        # Any always-gated tool works here -- this test is
+                        # about which agent resolves the approval, not about
+                        # the tool itself. Automation tools are native-allow
+                        # and would never produce an approval to route.
+                        name="skill_propose_create",
                         arguments={
-                            "name": "approval-routing-test",
+                            "name": "approval routing test",
+                            "description": "recurring check",
                             "goal": "recurring check",
-                            "conversation_id": "slack:dm:person_ajay:approval-routing",
-                            "destination": {"type": "dm", "id": "D1", "is_private": True},
                         },
                     )
                 ],
                 finish_reason="tool_calls",
             ),
-            ModelResponse(content="Done, automation created."),
+            ModelResponse(content="Done, proposal created."),
         ]
     )
 
@@ -41,7 +44,7 @@ def test_resolve_approval_job_routes_a_task_backed_approval_to_the_task_agent(br
         conversation_key="slack:dm:person_ajay:approval-routing",
         destination={"type": "dm", "id": "D1", "is_private": True},
         role="user",
-        content="set up a recurring check",
+        content="propose a skill for the recurring check",
         principal_id="person_ajay",
     )
     outcome = brain.session_manager.dispatch(wake["session_id"])
@@ -58,7 +61,7 @@ def test_resolve_approval_job_routes_a_task_backed_approval_to_the_task_agent(br
         {"approval_id": approval_id, "approved": True, "decided_by": "person_ajay"}
     )
     assert result["state"] == "completed", result.get("error")
-    assert result["answer"] == "Done, automation created."
+    assert result["answer"] == "Done, proposal created."
 
     final_task = brain.store.get_task(outcome.task_id)
     assert final_task["state"] == "completed"

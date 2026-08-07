@@ -16,8 +16,36 @@ def _default_data_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "data"
 
 
+def settings_env_file() -> Path:
+    """Resolve the gateway env file independently of its launch directory.
+
+    The console is commonly started from ``landing/`` while Docket's ``.env``
+    lives at the repository root.  Pydantic otherwise resolves ``env_file``
+    against the current working directory and silently reads
+    ``landing/.env``.  Prefer an explicit deployment override, then the
+    nearest project root, and finally retain the conventional cwd fallback
+    for installed deployments without a source checkout.
+    """
+    configured = os.environ.get("DOCKET_ENV_FILE")
+    if configured:
+        return Path(configured).expanduser()
+
+    candidates = (Path.cwd(), Path(__file__).resolve().parent)
+    visited: set[Path] = set()
+    for start in candidates:
+        for directory in (start, *start.parents):
+            if directory in visited:
+                continue
+            visited.add(directory)
+            if (directory / "pyproject.toml").is_file():
+                return directory / ".env"
+    return Path.cwd() / ".env"
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="DOCKET_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="DOCKET_", env_file=settings_env_file(), extra="ignore"
+    )
 
     host: str = "127.0.0.1"
     port: int = 8080
@@ -57,6 +85,19 @@ class Settings(BaseSettings):
     tool_output_summary_model: str | None = None
     model_base_url: str = "https://openrouter.ai/api/v1"
     model_timeout_seconds: float = 600.0
+    # Ported from Hermes: enables the underlying model's native extended-
+    # thinking/reasoning tokens via OpenRouter's unified `reasoning` request
+    # field (works across Claude extended thinking, o1/o3, DeepSeek R1,
+    # Gemini thinking, etc. without provider-specific code), so the main
+    # agent loop genuinely deliberates -- including deciding whether to
+    # delegate -- before producing its visible response or tool calls,
+    # instead of reacting turn by turn with no internal reasoning space.
+    # Only applied to the main chat model, not the small auxiliary
+    # classifiers (attention/extraction/tool-output-summary), where deeper
+    # reasoning would only add cost and latency for no real benefit. One
+    # of "low"/"medium"/"high", or None to disable (e.g. a configured
+    # model that rejects the extra field).
+    main_model_reasoning_effort: str | None = "medium"
     # General web research. Search is opt-in because Brave uses a metered API;
     # fetching public pages needs no provider key and remains read-only.
     brave_search_api_key: str | None = Field(
@@ -89,8 +130,11 @@ class Settings(BaseSettings):
     pi_stale_heartbeat_seconds: int = 1800
     pi_poll_interval_seconds: int = 10
     pi_cancel_grace_seconds: int = 20
-    agent_max_iterations: int = 100
-    agent_max_tool_calls: int = 150
+    # Root Session Manager Tasks coordinate the conversation and synthesize
+    # worker results. These are deliberately generous enough for a long,
+    # multi-stage request without making the normal Manager loop unbounded.
+    agent_max_iterations: int = 50
+    agent_max_tool_calls: int = 100
     agent_context_token_budget: int = 200_000
     agent_max_total_tokens: int = 2_000_000
     # Output budget for a single model completion in the loop -- distinct
@@ -103,6 +147,12 @@ class Settings(BaseSettings):
     agent_completion_max_tokens: int = 40_000
     child_task_max_parallel: int = 3
     child_task_max_depth: int = 1
+    # Temporary general specialists get a substantially larger work envelope
+    # than their parent Manager because they may own an entire research,
+    # analysis, or execution sequence end to end. Pi workers are instead
+    # governed by their durable heartbeat/checkpoint lifecycle above.
+    child_agent_max_iterations: int = 200
+    child_agent_max_tool_calls: int = 500
     # A Manager lease is a renewable ownership window, not a runtime limit.
     # Every reasoning iteration extends it by another hour.
     session_manager_lease_seconds: int = 3600
