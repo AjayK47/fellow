@@ -34,8 +34,8 @@ if [ -z "$TODA_BIN" ]; then
 fi
 
 printf '%s\n' "Creating Toda's per-user service…"
-"$TODA_BIN" service install
+"$TODA_BIN" install
 
 printf '\n%s\n' "Toda installed successfully."
-printf '%s\n' "Service status: toda service status"
+printf '%s\n' "Status: toda status"
 printf '%s\n' "Local console: http://127.0.0.1:8080"

@@ -18,7 +18,7 @@ if (-not $toda) {
 }
 
 Write-Host "Creating Toda's per-user service..."
-& $toda service install
+& $toda install
 Write-Host "`nToda installed successfully."
-Write-Host "Service status: toda service status"
+Write-Host "Status: toda status"
 Write-Host "Local console: http://127.0.0.1:8080"

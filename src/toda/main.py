@@ -49,53 +49,126 @@ def _wait_for_gateway(timeout_seconds: float = 30) -> None:
     raise RuntimeError(f"Toda service did not become healthy within {timeout_seconds:g}s")
 
 
+def _gateway_healthy() -> bool:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{settings.port}/health", timeout=1
+        ) as response:
+            return response.status == 200
+    except OSError:
+        return False
+
+
+def _ensure_session_secret(env_path: Path) -> None:
+    existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    if any(
+        line.strip().startswith("TODA_DASHBOARD_SESSION_SECRET=")
+        and line.partition("=")[2].strip()
+        for line in existing.splitlines()
+    ):
+        return
+    separator = "" if not existing or existing.endswith("\n") else "\n"
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text(
+        f"{existing}{separator}TODA_DASHBOARD_SESSION_SECRET={secrets.token_urlsafe(32)}\n",
+        encoding="utf-8",
+    )
+    env_path.chmod(0o600)
+
+
+def _command(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, check=False, capture_output=True, text=True)
+
+
+def _service_error(action: str, result: subprocess.CompletedProcess[str]) -> RuntimeError:
+    detail = (result.stderr or result.stdout or "operating system rejected the request").strip()
+    return RuntimeError(f"Could not {action} Toda: {detail.splitlines()[0]}")
+
+
+def _print_status(*, running: bool, installed: bool, data_dir: Path, log_path: Path) -> None:
+    state = "running" if running else "stopped"
+    print(f"Toda is {state}.")
+    print(f"  Console: http://127.0.0.1:{settings.port}")
+    print(f"  Starts at login: {'yes' if installed else 'no'}")
+    print(f"  Data: {data_dir}")
+    if not running:
+        print("  Next: toda start")
+    else:
+        print(f"  Logs: {log_path}")
+
+
 def service_cli(args: argparse.Namespace) -> None:
-    """Install the one Toda gateway as a per-user login service."""
+    """Manage the one Toda gateway as a per-user login service."""
     data_dir = settings.data_dir.expanduser().resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
     log_path = data_dir / "toda.log"
+    env_path = data_dir / ".env"
     executable = _toda_executable()
     environment = {
         "TODA_DATA_DIR": str(data_dir),
-        "TODA_ENV_FILE": str(data_dir / ".env"),
+        "TODA_ENV_FILE": str(env_path),
         "PYTHONUNBUFFERED": "1",
     }
 
     if args.action == "update":
         uv = shutil.which("uv")
         if not uv:
-            raise SystemExit("uv is required to update Toda")
-        subprocess.run([uv, "tool", "upgrade", "toda-ai"], check=True)
+            raise RuntimeError("uv is required to update Toda")
+        result = _command([uv, "tool", "upgrade", "toda-ai"])
+        if result.returncode:
+            raise _service_error("update", result)
+        print("Toda was updated.")
         args.action = "restart"
-
-    if args.action == "status":
-        if sys.platform == "darwin":
-            result = subprocess.run(
-                ["launchctl", "print", f"gui/{os.getuid()}/ai.toda.gateway"],
-                check=False,
-            )
-        elif os.name == "nt":
-            result = subprocess.run(["schtasks", "/Query", "/TN", "Toda"], check=False)
-        else:
-            result = subprocess.run(
-                ["systemctl", "--user", "is-active", "toda.service"], check=False
-            )
-        raise SystemExit(result.returncode)
 
     if sys.platform == "darwin":
         service_path = Path.home() / "Library" / "LaunchAgents" / "ai.toda.gateway.plist"
         domain = f"gui/{os.getuid()}"
         service_name = f"{domain}/ai.toda.gateway"
-        if args.action in {"stop", "restart"}:
-            subprocess.run(["launchctl", "bootout", service_name], check=False)
-            if args.action == "stop":
-                print("Toda service stopped.")
-                return
-        if args.action == "start" and service_path.exists():
-            subprocess.run(["launchctl", "bootstrap", domain, str(service_path)], check=False)
-            subprocess.run(["launchctl", "kickstart", "-k", service_name], check=True)
-            print("Toda service started.")
+        loaded = _command(["launchctl", "print", service_name]).returncode == 0
+
+        if args.action == "status":
+            _print_status(
+                running=loaded and _gateway_healthy(),
+                installed=service_path.exists(),
+                data_dir=data_dir,
+                log_path=log_path,
+            )
             return
+
+        if args.action == "stop":
+            if not loaded:
+                print("Toda is already stopped.")
+                return
+            result = _command(["launchctl", "bootout", service_name])
+            if result.returncode:
+                raise _service_error("stop", result)
+            print("Toda stopped.")
+            return
+
+        if args.action == "start" and service_path.exists():
+            if loaded and _gateway_healthy():
+                print("Toda is already running.")
+                return
+            if not loaded:
+                result = _command(["launchctl", "bootstrap", domain, str(service_path)])
+                if result.returncode:
+                    raise _service_error("start", result)
+            _wait_for_gateway()
+            print(f"Toda started. Open http://127.0.0.1:{settings.port}")
+            return
+
+        if args.action == "restart" and service_path.exists():
+            if loaded:
+                result = _command(["launchctl", "kickstart", "-k", service_name])
+            else:
+                result = _command(["launchctl", "bootstrap", domain, str(service_path)])
+            if result.returncode:
+                raise _service_error("restart", result)
+            _wait_for_gateway()
+            print(f"Toda restarted. Open http://127.0.0.1:{settings.port}")
+            return
+
+        _ensure_session_secret(env_path)
         service_path.parent.mkdir(parents=True, exist_ok=True)
         service_path.write_bytes(
             plistlib.dumps(
@@ -110,40 +183,67 @@ def service_cli(args: argparse.Namespace) -> None:
                 }
             )
         )
-        subprocess.run(["launchctl", "bootstrap", domain, str(service_path)], check=False)
-        subprocess.run(
-            ["launchctl", "kickstart", "-k", service_name], check=True
+        result = (
+            _command(["launchctl", "kickstart", "-k", service_name])
+            if loaded
+            else _command(["launchctl", "bootstrap", domain, str(service_path)])
         )
+        if result.returncode:
+            raise _service_error("install", result)
     elif os.name == "nt":
+        installed = _command(["schtasks", "/Query", "/TN", "Toda"]).returncode == 0
+        if args.action == "status":
+            _print_status(
+                running=_gateway_healthy(), installed=installed, data_dir=data_dir, log_path=log_path
+            )
+            return
         if args.action in {"stop", "restart"}:
-            subprocess.run(["schtasks", "/End", "/TN", "Toda"], check=False)
+            _command(["schtasks", "/End", "/TN", "Toda"])
             if args.action == "stop":
-                print("Toda service stopped.")
+                print("Toda stopped.")
                 return
         if args.action == "start":
-            subprocess.run(["schtasks", "/Run", "/TN", "Toda"], check=True)
-            print("Toda service started.")
+            result = _command(["schtasks", "/Run", "/TN", "Toda"])
+            if result.returncode:
+                raise _service_error("start", result)
+            _wait_for_gateway()
+            print(f"Toda started. Open http://127.0.0.1:{settings.port}")
             return
+        _ensure_session_secret(env_path)
         command = f'"{executable}" gateway'
-        subprocess.run(
+        result = _command(
             [
                 "schtasks", "/Create", "/F", "/SC", "ONLOGON", "/TN", "Toda",
                 "/TR", command,
-            ],
-            check=True,
+            ]
         )
-        subprocess.run(["schtasks", "/Run", "/TN", "Toda"], check=True)
+        if result.returncode:
+            raise _service_error("install", result)
+        result = _command(["schtasks", "/Run", "/TN", "Toda"])
+        if result.returncode:
+            raise _service_error("start", result)
     else:
         service_path = Path.home() / ".config" / "systemd" / "user" / "toda.service"
+        active = _command(["systemctl", "--user", "is-active", "toda.service"]).returncode == 0
+        if args.action == "status":
+            _print_status(
+                running=active and _gateway_healthy(),
+                installed=service_path.exists(), data_dir=data_dir, log_path=log_path,
+            )
+            return
         if args.action in {"stop", "restart"}:
-            subprocess.run(["systemctl", "--user", "stop", "toda.service"], check=False)
+            _command(["systemctl", "--user", "stop", "toda.service"])
             if args.action == "stop":
-                print("Toda service stopped.")
+                print("Toda stopped.")
                 return
         if args.action == "start":
-            subprocess.run(["systemctl", "--user", "start", "toda.service"], check=True)
-            print("Toda service started.")
+            result = _command(["systemctl", "--user", "start", "toda.service"])
+            if result.returncode:
+                raise _service_error("start", result)
+            _wait_for_gateway()
+            print(f"Toda started. Open http://127.0.0.1:{settings.port}")
             return
+        _ensure_session_secret(env_path)
         service_path.parent.mkdir(parents=True, exist_ok=True)
         service_path.write_text(
             "\n".join(
@@ -157,12 +257,14 @@ def service_cli(args: argparse.Namespace) -> None:
             ),
             encoding="utf-8",
         )
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-        subprocess.run(
-            ["systemctl", "--user", "enable", "--now", "toda.service"], check=True
-        )
+        result = _command(["systemctl", "--user", "daemon-reload"])
+        if result.returncode:
+            raise _service_error("reload the service definition", result)
+        result = _command(["systemctl", "--user", "enable", "--now", "toda.service"])
+        if result.returncode:
+            raise _service_error("install", result)
 
-    print(f"Toda service installed. Logs: {log_path}")
+    print("Toda installed and running in the background.")
     # The installer is already a trusted local process. Issuing the token here
     # works identically on launchd, systemd, and Windows Task Scheduler and
     # avoids scraping platform-specific service logs.
@@ -170,6 +272,7 @@ def service_cli(args: argparse.Namespace) -> None:
     bootstrap = SetupBootstrapToken(data_dir).issue()
     setup_url = f"http://127.0.0.1:{settings.port}/setup?bootstrap={bootstrap}"
     print(f"Continue setup: {setup_url}")
+    print("Manage it with: toda status | toda restart | toda stop")
     if not args.no_open:
         webbrowser.open(setup_url)
 
@@ -199,11 +302,6 @@ def _dashboard_session_secret() -> str:
         return settings.dashboard_session_secret
     if settings.slack_client_secret:
         return settings.slack_client_secret
-    log.warning(
-        "No TODA_DASHBOARD_SESSION_SECRET or TODA_SLACK_CLIENT_SECRET configured; "
-        "using a random per-process session secret. Dashboard logins will not "
-        "survive a restart of this process."
-    )
     return secrets.token_urlsafe(32)
 
 
@@ -673,16 +771,20 @@ def main() -> None:
         action="store_true",
         help="drop and fully rebuild the vec0 tables (needed after an embedding dimension/provider change)",
     )
-    service = sub.add_parser(
-        "service", help="install or inspect the per-user Toda gateway service"
-    )
-    service.add_argument(
-        "action",
-        choices=["install", "start", "stop", "restart", "status", "update"],
-        nargs="?",
-        default="install",
-    )
-    service.add_argument("--no-open", action="store_true", help="do not open the setup browser")
+    for action, help_text in (
+        ("install", "install Toda and start it at login"),
+        ("start", "start Toda in the background"),
+        ("stop", "stop Toda"),
+        ("restart", "restart Toda"),
+        ("status", "show whether Toda is running"),
+        ("update", "update and restart Toda"),
+    ):
+        command = sub.add_parser(action, help=help_text)
+        command.set_defaults(service_action=action)
+        if action == "install":
+            command.add_argument(
+                "--no-open", action="store_true", help="do not open the setup browser"
+            )
     args = parser.parse_args()
     if args.command == "gateway":
         gateway()
@@ -692,8 +794,15 @@ def main() -> None:
         retention_cli(args)
     elif args.command == "reindex":
         reindex_cli(args)
-    elif args.command == "service":
-        service_cli(args)
+    elif hasattr(args, "service_action"):
+        args.action = args.service_action
+        args.no_open = getattr(args, "no_open", False)
+        try:
+            service_cli(args)
+        except (RuntimeError, OSError) as exc:
+            print(f"Toda could not {args.action}: {exc}", file=sys.stderr)
+            print(f"Logs: {settings.data_dir.expanduser().resolve() / 'toda.log'}", file=sys.stderr)
+            raise SystemExit(1) from None
     else:
         serve()
 
