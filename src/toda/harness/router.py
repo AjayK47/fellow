@@ -357,7 +357,9 @@ class EventRouter:
             source_ids=[source["id"]],
         )
         lower = (event.payload.get("text") or "").lower()
-        for entity in self.store.list_entities(event.organization_id):
+        for entity in self.store.find_entity_candidates(
+            event.organization_id, event.payload.get("text") or "", limit=50
+        ):
             if entity["id"] in {
                 event.actor.id,
                 conversation_id,

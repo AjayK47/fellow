@@ -161,12 +161,13 @@ def test_tool_call_needing_approval_pauses_and_resumes_through_the_new_path(brai
         principal_id="person_ajay",
     )
     outcome = scheduler.dispatch(wake["session_id"])
-    assert outcome.state.value == "waiting_for_approval"
+    assert outcome.state.value == "waiting"
     approval_id = outcome.approval_id
     assert approval_id
 
     task = brain.store.get_task(outcome.task_id)
-    assert task["state"] == "waiting_for_approval"
+    assert task["state"] == "waiting"
+    assert task["waiting_for"]["type"] == "approval"
     assert task["execution_owner"] is None  # released, not held mid-pause
 
     session = sessions.get(wake["session_id"])

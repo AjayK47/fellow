@@ -197,6 +197,16 @@ def build_agent_messages(
                 ),
             }
         )
+    organization_memory = str(context.get("organization_memory") or "").strip()
+    if organization_memory:
+        messages.append(
+            {
+                "role": "system",
+                "content": "<organization_memory>\n"
+                + organization_memory[:4_000]
+                + "\n</organization_memory>",
+            }
+        )
     messages.append(
         {
             "role": "system",

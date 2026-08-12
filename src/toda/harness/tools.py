@@ -34,6 +34,8 @@ _CHILD_COORDINATOR_TOOLS = {
     "wait_for_children",
     "plan_create",
     "plan_update",
+    "skill_propose_create",
+    "skill_propose_update",
 }
 
 
@@ -56,6 +58,8 @@ def _infer_capability_id(name: str) -> str:
         return "code.execute"
     if name in {"session_search"}:
         return "session.search"
+    if name in {"task_search", "task_get", "task_continue", "task_cancel"}:
+        return f"task.{name.removeprefix('task_')}"
     if name in {"plan_create", "plan_get", "plan_update"}:
         return "plan.manage"
     if name == "delegate_tasks":
@@ -280,6 +284,7 @@ def build_tool_registry(
     vision_tools: VisionMediaTools | None = None,
     visual_tools: VisualTools | None = None,
     audit: Any | None = None,
+    session_notifier: Any | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
 
@@ -1396,6 +1401,113 @@ def build_tool_registry(
         _session_search,
     )
 
+    def _task_visible(task: dict[str, Any], runtime: dict[str, Any]) -> bool:
+        if task.get("organization_id") != runtime["organization_id"]:
+            return False
+        scope_id = task.get("origin_scope_id")
+        if scope_id:
+            return scope_id in set((runtime.get("envelope") or {}).get("allowed_scope_ids") or [])
+        origin_destination = (task.get("envelope") or {}).get("destination") or {}
+        if origin_destination.get("is_private"):
+            current = runtime.get("destination") or {}
+            return (
+                current.get("type") in {"dm", "person_private", "internal_agent_session"}
+                and task.get("owner_id") == runtime.get("principal_id")
+            ) or current.get("id") == origin_destination.get("id")
+        return "scope_org_public" in set(
+            (runtime.get("envelope") or {}).get("allowed_scope_ids") or []
+        )
+
+    def _task_compact(task: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": task["id"],
+            "goal": task.get("goal"),
+            "state": task.get("state"),
+            "summary": task.get("completion_summary") or task.get("result"),
+            "created_at": task.get("created_at"),
+            "completed_at": task.get("completed_at"),
+        }
+
+    def _task_search(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        query = str(args.get("query") or "").strip()
+        limit = min(int(args.get("limit", 10)), 20)
+        candidates = store.search_root_tasks(
+            runtime["organization_id"], query=query, limit=limit
+        )
+        seen = {item["id"] for item in candidates}
+        embeddings = getattr(retrieval, "embeddings", None)
+        if query and embeddings:
+            vector = embeddings.embed([query])[0]
+            for task_id, _distance in store.vec_search_tasks(
+                runtime["organization_id"], vector, k=max(20, limit * 3)
+            ):
+                if task_id in seen:
+                    continue
+                task = store.get_task(task_id)
+                if task:
+                    candidates.append(task)
+                    seen.add(task_id)
+        visible = [_task_compact(item) for item in candidates if _task_visible(item, runtime)]
+        return {"tasks": visible[:limit]}
+
+    def _task_get(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        task = store.get_task(str(args["task_id"]))
+        if not task or task.get("parent_task_id") is not None or not _task_visible(task, runtime):
+            raise KeyError("task not found")
+        children = [
+            _task_compact(item)
+            for item in store.list_tasks(runtime["organization_id"], parent_task_id=task["id"], limit=100)
+        ]
+        artifacts_out: list[dict[str, Any]] = []
+        if artifacts:
+            artifacts_out = [
+                {"id": item["id"], "title": item.get("title"), "artifact_type": item.get("artifact_type")}
+                for item in artifacts.list(
+                    runtime["organization_id"],
+                    scope_ids=(runtime.get("envelope") or {}).get("allowed_scope_ids") or [],
+                    task_id=task["id"],
+                )
+            ]
+        return {"task": _task_compact(task), "children": children, "artifacts": artifacts_out}
+
+    def _task_continue(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        task = store.get_task(str(args["task_id"]))
+        if not task or task.get("parent_task_id") is not None or not _task_visible(task, runtime):
+            raise KeyError("task not found")
+        if task["state"] in {"completed", "failed", "cancelled"}:
+            raise ValueError("terminal Tasks cannot be continued; start a new Task referencing this one")
+        message = str(args.get("message") or "Continue this Task.")
+        store.push_task_signal(
+            {"id": new_id("tsig"), "organization_id": task["organization_id"], "task_id": task["id"], "kind": "steer", "message": message, "created_at": utcnow().isoformat()}
+        )
+        store.bump_task_revision(task["id"])
+        if session_notifier is not None:
+            session_notifier(task["session_id"], reason="task.continued")
+        return {"task_id": task["id"], "continued": True}
+
+    def _task_cancel(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        task = store.get_task(str(args["task_id"]))
+        if not task or task.get("parent_task_id") is not None or not _task_visible(task, runtime):
+            raise KeyError("task not found")
+        return {"task_id": task["id"], "cancelled": store.cancel_task(task["id"])}
+
+    registry.register(
+        ToolDefinition(name="task_search", description="Search authorized completed or active root Tasks across Sessions.", input_schema=_object_schema({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}, ["query"]), risk="read"),
+        _task_search,
+    )
+    registry.register(
+        ToolDefinition(name="task_get", description="Load one authorized root Task, its child summaries, and artifacts.", input_schema=_object_schema({"task_id": {"type": "string"}}, ["task_id"]), risk="read"),
+        _task_get,
+    )
+    registry.register(
+        ToolDefinition(name="task_continue", description="Steer an authorized active Task from another Session.", input_schema=_object_schema({"task_id": {"type": "string"}, "message": {"type": "string"}}, ["task_id"]), risk="write", idempotency_required=True),
+        _task_continue,
+    )
+    registry.register(
+        ToolDefinition(name="task_cancel", description="Cancel an authorized active root Task.", input_schema=_object_schema({"task_id": {"type": "string"}}, ["task_id"]), risk="write", idempotency_required=True),
+        _task_cancel,
+    )
+
     def _plan_record(runtime: dict[str, Any]) -> dict[str, Any]:
         record = store.get_task(runtime["task_id"])
         if not record:
@@ -1424,22 +1536,17 @@ def build_tool_registry(
             status = str(item.get("status") or "pending")
             if status not in {"pending", "active", "blocked", "completed", "cancelled"}:
                 raise ValueError(f"invalid plan step status: {status}")
-            item.update(
-                {
-                    "id": item_id,
-                    "title": str(item.get("title") or item.get("name") or f"Step {index}"),
-                    "status": status,
-                    "owner": item.get("owner") or item.get("worker_role"),
-                    "dependencies": list(item.get("dependencies") or item.get("dependency_ids") or []),
-                    "evidence": list(item.get("evidence") or []),
-                    "blocker": item.get("blocker"),
-                }
-            )
+            item = {
+                "id": item_id,
+                "title": str(item.get("title") or item.get("name") or f"Step {index}"),
+                "status": status,
+                "depends_on": list(item.get("depends_on") or []),
+            }
             normalized.append(item)
         for item in normalized:
-            unknown = set(item["dependencies"]) - ids
+            unknown = set(item["depends_on"]) - ids
             if unknown:
-                raise ValueError(f"plan step {item['id']} has unknown dependencies: {sorted(unknown)}")
+                raise ValueError(f"plan step {item['id']} has unknown depends_on ids: {sorted(unknown)}")
         return normalized
 
     def _plan_create(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
@@ -1567,7 +1674,7 @@ def build_tool_registry(
         _plan_get,
     )
     registry.register(
-        ToolDefinition(name="plan_update", description="Update the root Task's lightweight checklist, including evidence and blockers. Child Tasks cannot modify it.", input_schema=_object_schema({"title": {"type": "string"}, "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, []), risk="read"),
+        ToolDefinition(name="plan_update", description="Update the root Task's lightweight checklist. Each item has only id, title, status, and depends_on. Child Tasks cannot modify it.", input_schema=_object_schema({"title": {"type": "string"}, "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, []), risk="read"),
         _plan_update,
     )
 

@@ -14,9 +14,9 @@ from toda.services.scope_resolution import resolve_scope
 
 log = logging.getLogger("toda.delivery")
 
-# Matches the citation IDs the model is asked to cite in factual claims
-# (see prompts.py: "Cite source or memory IDs when making factual company
-# claims") — new_id()'s format is "{prefix}_{16 hex chars}".
+# Defense in depth for old Tasks that still contain opaque evidence IDs.
+# Current prompts ask for human-readable citations, but delivery still checks
+# any legacy IDs it encounters before letting content cross a destination.
 _CITED_ID_PATTERN = re.compile(r"\b(?:src|mem)_[0-9a-f]{16}\b")
 
 # Slack hard-caps a section block's text.text at 3000 characters and
@@ -65,6 +65,66 @@ class DeliveryService:
         self.authz = authz
         self.slack = slack_sender
         self.audit = audit
+
+    def deliver_conversation(self, session_id: str, message_id: str) -> dict[str, Any]:
+        session = self.store.get_session(session_id)
+        if not session:
+            raise KeyError(session_id)
+        message = next(
+            (
+                item
+                for item in self.store.list_session_messages(session_id, limit=200)
+                if item.get("id") == message_id and item.get("role") == "assistant"
+            ),
+            None,
+        )
+        if not message:
+            raise KeyError(message_id)
+        destination = session.get("destination") or {}
+        principal_id = session.get("last_actor_principal_id") or "unknown"
+        self.authz.resolve(
+            organization_id=session["organization_id"],
+            acting_principal_id=principal_id,
+            destination=destination,
+            purpose="conversation_delivery",
+        )
+        metadata = session.get("metadata") or {}
+        slack = metadata.get("slack") or {}
+        idempotency_key = f"slack.conversation:{message_id}"
+        existing = self.store.delivery_by_idempotency_key(
+            session["organization_id"], idempotency_key
+        )
+        if existing and existing.get("status") in {"completed", "dry_run"}:
+            return {"session_id": session_id, "delivered": False, "reason": "already_delivered"}
+        result = self.slack.send(
+            channel_id=slack.get("channel_id") or destination.get("id") or "",
+            text=str(message.get("content") or ""),
+            workspace_id=slack.get("workspace_id"),
+            organization_id=session["organization_id"],
+            idempotency_key=idempotency_key,
+        )
+        now = utcnow().isoformat()
+        delivery = {
+            "id": new_id("delivery"),
+            "organization_id": session["organization_id"],
+            "task_id": None,
+            "session_id": session_id,
+            "message_id": message_id,
+            "kind": "conversation",
+            "status": "completed" if result.get("ok") else "dry_run",
+            "idempotency_key": idempotency_key,
+            "provider_result": result,
+            "created_at": now,
+            "updated_at": now,
+        }
+        self.store.upsert_delivery(delivery)
+        self.audit.record(
+            session["organization_id"],
+            "conversation.delivered",
+            {"session_id": session_id, "message_id": message_id},
+            principal_id=principal_id,
+        )
+        return {"session_id": session_id, "delivered": True, "delivery": delivery}
 
     def _clear_ack(self, task: dict[str, Any], slack: dict[str, Any]) -> None:
         """Remove the "still working on it" reaction router.py added to the

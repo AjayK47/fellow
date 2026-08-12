@@ -58,6 +58,8 @@ def test_the_knowledge_lane_holds_exactly_chunking_and_episode_work(brain):
     assert set(worker.knowledge_job_kinds()) == {
         "knowledge.index_evidence",
         "knowledge.consolidate_episode",
+        "memory.capture_task",
+        "skill.curate_task",
     }
 
 

@@ -298,7 +298,7 @@ def test_a_pure_notification_automation_firing_writes_no_durable_memory(brain):
             "tool_call_count": 3,
         }
     )
-    assert enqueued == ["memory.capture_task", "delivery.send"]
+    assert enqueued == ["memory.capture_task", "delivery.send", "skill.curate_task"]
 
     # And an ordinary user-triggered reply is untouched by this rule.
     enqueued.clear()

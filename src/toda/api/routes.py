@@ -307,7 +307,7 @@ class SkillCreateRequest(BaseModel):
     activation: dict[str, Any] = Field(default_factory=dict)
     response_validation: dict[str, Any] = Field(default_factory=dict)
     scope_id: str = "scope_org_public"
-    status: str = "approved"
+    status: str = "active"
     instructions: str = ""
     kind: str = "company"
     immutable: bool = False
@@ -344,6 +344,7 @@ class OrganizationRequest(BaseModel):
     name: str
     region: str | None = None
     attributes: dict[str, Any] = Field(default_factory=dict)
+    memory_md: str = Field(default="", max_length=4000)
 
 
 class MembershipRequest(BaseModel):
@@ -797,6 +798,8 @@ def list_organizations(request: Request) -> dict[str, Any]:
 class OrganizationUpdateRequest(BaseModel):
     name: str | None = None
     about: str | None = None
+    memory_md: str | None = Field(default=None, max_length=4000)
+    proactive_heartbeat: dict[str, Any] | None = None
 
 
 @router.patch("/v1/organizations/{organization_id}")
@@ -811,7 +814,12 @@ def update_organization(
     organization.update(updates)
     brain.store.put_organization(organization)
     brain.audit.record(
-        organization_id, "organization.updated", {"organization_id": organization_id, **updates}
+        organization_id,
+        "organization.memory_updated" if "memory_md" in updates else "organization.updated",
+        {
+            "organization_id": organization_id,
+            **({"memory_length": len(updates["memory_md"])} if "memory_md" in updates else updates),
+        },
     )
     return organization
 
@@ -860,7 +868,7 @@ def invoke_task(body: TaskInvokeRequest, request: Request) -> dict[str, Any]:
         role="user",
         content=body.prompt,
         principal_id=body.principal_id,
-        metadata=body.metadata,
+        metadata={**body.metadata, "force_task": True},
         message_metadata={"application_id": body.application_id},
         trigger_kind=body.trigger_kind,
         purpose=body.purpose,

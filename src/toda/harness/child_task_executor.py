@@ -67,7 +67,7 @@ class ChildTaskExecutor:
         agent = self.agent_factory(runs)
         if task["state"] == AgentRunState.QUEUED.value:
             outcome = agent.execute_task(task_id)
-        elif task["state"] == AgentRunState.WAITING_FOR_CHILDREN.value:
+        elif task["state"] == AgentRunState.WAITING.value and (task.get("waiting_for") or {}).get("type") == "child_task":
             outcome = agent.resume_for_children(task_id)
         else:
             # Already terminal, mid-flight under another owner's live
@@ -75,7 +75,7 @@ class ChildTaskExecutor:
             # (e.g. waiting_for_approval -- Phase 7 links that resume path
             # directly). Nothing to do this tick.
             return {"task_id": task_id, "state": task["state"]}
-        if outcome.state == AgentRunState.WAITING_FOR_APPROVAL and outcome.approval_id:
+        if outcome.state == AgentRunState.WAITING and outcome.approval_id:
             self.queue.enqueue(
                 organization_id=task["organization_id"],
                 kind="delivery.approval",

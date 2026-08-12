@@ -15,6 +15,7 @@ from toda.harness.models import (
     AgentOutcome,
     AgentRunState,
     InvocationEnvelope,
+    ModelResponse,
     ModelToolCall,
     ToolResult,
     TriggerKind,
@@ -80,6 +81,7 @@ class CompanyAgent:
         context_token_budget: int = 12_000,
         max_total_tokens: int = 100_000,
         completion_max_tokens: int = 40_000,
+        embeddings: Any | None = None,
     ) -> None:
         self.runs = runs
         self.context_service = context_service
@@ -97,6 +99,7 @@ class CompanyAgent:
         self.context_token_budget = context_token_budget
         self.max_total_tokens = max_total_tokens
         self.completion_max_tokens = completion_max_tokens
+        self.embeddings = embeddings
 
     def create_invocation(
         self,
@@ -117,11 +120,7 @@ class CompanyAgent:
             metadata=metadata,
         )
         active = self.runs.store.find_root_task_for_session(session["id"])
-        if active and active["state"] in {
-            AgentRunState.WAITING_FOR_HUMAN.value,
-            AgentRunState.WAITING_FOR_APPROVAL.value,
-            AgentRunState.PAUSED.value,
-        }:
+        if active and active["state"] == AgentRunState.WAITING.value:
             run = active
             if initial_message:
                 self.runs.add_message(
@@ -188,10 +187,14 @@ class CompanyAgent:
             )
             self.graph.add_edge(
                 envelope.organization_id,
-                "EXECUTED_BY",
+                "REQUESTED_BY",
                 run["id"],
                 envelope.principal_id,
             )
+            for entity_id in list((metadata or {}).get("entity_ids") or [])[:20]:
+                self.graph.add_edge(
+                    envelope.organization_id, "ABOUT", run["id"], entity_id
+                )
             if parent_run_id:
                 self.graph.add_edge(
                     envelope.organization_id,
@@ -212,11 +215,7 @@ class CompanyAgent:
                 answer=run.get("final_answer"),
                 trace_id=run["trace_id"],
             )
-        if run["state"] in {
-            AgentRunState.WAITING_FOR_APPROVAL.value,
-            AgentRunState.WAITING_FOR_HUMAN.value,
-            AgentRunState.WAITING_FOR_CHILDREN.value,
-        }:
+        if run["state"] == AgentRunState.WAITING.value:
             return AgentOutcome(
                 task_id=run_id,
                 state=AgentRunState(run["state"]),
@@ -313,14 +312,16 @@ class CompanyAgent:
                         trace_id=cancelled["trace_id"],
                     )
                 if signal.get("kind") == "reauthorize":
+                    run["waiting_for"] = {"type": "user", "reason": "current_actor_changed"}
+                    self.runs.update(run)
                     paused = self.runs.transition(
                         run["id"],
-                        AgentRunState.WAITING_FOR_HUMAN,
+                        AgentRunState.WAITING,
                         event_payload={"reason": "current_actor_changed"},
                     )
                     return AgentOutcome(
                         task_id=run["id"],
-                        state=AgentRunState.WAITING_FOR_HUMAN,
+                        state=AgentRunState.WAITING,
                         trace_id=paused["trace_id"],
                     )
                 # SessionService already persisted ordinary steering in the
@@ -471,6 +472,10 @@ class CompanyAgent:
                 ).model_dump(mode="json")
                 context_dirty = False
             context = cached_context
+            organization = self.runs.store.get_organization(run["organization_id"]) or {}
+            context["organization_memory"] = str(
+                organization.get("memory_md") or organization.get("about") or ""
+            )[:4_000]
 
             messages = build_agent_messages(
                 run=run,
@@ -604,12 +609,22 @@ class CompanyAgent:
                 run.get("tool_call_count", 0),
                 run["max_tool_calls"],
             )
-            response = self.model.generate(
-                messages=messages,
-                tools=schemas,
-                temperature=0.1,
-                max_tokens=self.completion_max_tokens,
+            promoted_response = (run.get("metadata") or {}).get(
+                "promoted_model_response"
             )
+            if promoted_response:
+                run_metadata = dict(run.get("metadata") or {})
+                run_metadata.pop("promoted_model_response", None)
+                run["metadata"] = run_metadata
+                self.runs.update(run)
+                response = ModelResponse(**promoted_response)
+            else:
+                response = self.model.generate(
+                    messages=messages,
+                    tools=schemas,
+                    temperature=0.1,
+                    max_tokens=self.completion_max_tokens,
+                )
             if response.tool_calls:
                 response.tool_calls = self._deduplicate_tool_calls(
                     run["id"], response.tool_calls
@@ -720,6 +735,36 @@ class CompanyAgent:
                     len(answer),
                 )
                 completed = self.runs.complete(run["id"], answer)
+                if not completed.get("parent_task_id"):
+                    children = self.runs.store.list_tasks(
+                        completed["organization_id"],
+                        parent_task_id=completed["id"],
+                        limit=100,
+                    )
+                    child_bits = [
+                        str(child.get("result") or child.get("final_answer") or "")[:600]
+                        for child in children
+                        if child.get("result") or child.get("final_answer")
+                    ]
+                    completed["completion_summary"] = "\n".join(
+                        [
+                            f"Goal: {completed.get('goal') or ''}",
+                            f"Outcome: {answer[:2000]}",
+                            *(f"Child result: {bit}" for bit in child_bits),
+                        ]
+                    )[:6_000]
+                    self.runs.store.update_task(completed)
+                    self.runs.store.index_root_task(completed)
+                    if self.embeddings:
+                        task_text = str(completed["completion_summary"])
+                        vector = self.embeddings.embed([task_text])[0]
+                        self.runs.store.upsert_task_embedding(
+                            task_id=completed["id"],
+                            organization_id=completed["organization_id"],
+                            model=str(getattr(self.embeddings, "model", "embedding")),
+                            embedding=vector,
+                            content_hash=hashlib.sha256(task_text.encode("utf-8")).hexdigest(),
+                        )
                 if self.graph:
                     self.graph.upsert_entity(
                         {
@@ -736,6 +781,25 @@ class CompanyAgent:
                             },
                         }
                     )
+                    artifacts_service = getattr(self.tools, "artifacts", None)
+                    if artifacts_service:
+                        for artifact in artifacts_service.list(
+                            completed["organization_id"], task_id=completed["id"]
+                        ):
+                            self.graph.add_edge(
+                                completed["organization_id"],
+                                "PRODUCED",
+                                completed["id"],
+                                artifact["id"],
+                            )
+                    for skill_ref in list((completed.get("metadata") or {}).get("skill_refs") or []):
+                        if skill_ref.get("id"):
+                            self.graph.add_edge(
+                                completed["organization_id"],
+                                "USED_SKILL",
+                                completed["id"],
+                                skill_ref["id"],
+                            )
                 self._enqueue_post_run_jobs(completed)
                 self.audit.record(
                     run["organization_id"],
@@ -854,10 +918,11 @@ class CompanyAgent:
                     self._append_tool_result(run, result)
                     run["pending_question"] = result.output.get("question")
                     run["pending_question_choices"] = result.output.get("choices")
+                    run["waiting_for"] = {"type": "user"}
                     self.runs.update(run)
                     self.runs.transition(
                         run["id"],
-                        AgentRunState.WAITING_FOR_HUMAN,
+                        AgentRunState.WAITING,
                         event_payload={
                             "question": result.output.get("question"),
                             "reason": result.output.get("reason"),
@@ -890,7 +955,7 @@ class CompanyAgent:
                         )
                     return AgentOutcome(
                         task_id=run["id"],
-                        state=AgentRunState.WAITING_FOR_HUMAN,
+                        state=AgentRunState.WAITING,
                         answer=result.output.get("question"),
                         trace_id=run["trace_id"],
                     )
@@ -898,10 +963,11 @@ class CompanyAgent:
                     run["pending_approval_id"] = result.approval_id
                     run["pending_tool_call_id"] = call.id
                     run["pending_tool_name"] = call.name
+                    run["waiting_for"] = {"type": "approval", "id": result.approval_id}
                     self.runs.update(run)
                     self.runs.transition(
                         run["id"],
-                        AgentRunState.WAITING_FOR_APPROVAL,
+                        AgentRunState.WAITING,
                         event_payload={
                             "approval_id": result.approval_id,
                             "tool_name": call.name,
@@ -909,7 +975,7 @@ class CompanyAgent:
                     )
                     return AgentOutcome(
                         task_id=run["id"],
-                        state=AgentRunState.WAITING_FOR_APPROVAL,
+                        state=AgentRunState.WAITING,
                         approval_id=result.approval_id,
                         trace_id=run["trace_id"],
                     )
@@ -925,10 +991,14 @@ class CompanyAgent:
                     ) or []
                     run["pending_tool_call_id"] = call.id
                     run["pending_tool_name"] = call.name
+                    run["waiting_for"] = {
+                        "type": "child_task",
+                        "ids": run["pending_child_task_ids"],
+                    }
                     self.runs.update(run)
                     self.runs.transition(
                         run["id"],
-                        AgentRunState.WAITING_FOR_CHILDREN,
+                        AgentRunState.WAITING,
                         event_payload={
                             "child_task_ids": run["pending_child_task_ids"],
                             "tool_name": call.name,
@@ -936,7 +1006,7 @@ class CompanyAgent:
                     )
                     return AgentOutcome(
                         task_id=run["id"],
-                        state=AgentRunState.WAITING_FOR_CHILDREN,
+                        state=AgentRunState.WAITING,
                         trace_id=run["trace_id"],
                     )
                 self._append_tool_result(run, result)
@@ -973,6 +1043,7 @@ class CompanyAgent:
         run.pop("pending_approval_id", None)
         run.pop("pending_tool_call_id", None)
         run.pop("pending_tool_name", None)
+        run["waiting_for"] = None
         self.runs.update(run)
         if result:
             self._append_tool_result(run, result)
@@ -1000,10 +1071,13 @@ class CompanyAgent:
                 metadata={"principal_id": principal_id, "continuation": True},
             )
         self.runs.transition(run_id, AgentRunState.RUNNING)
+        run = self.runs.get(run_id) or run
+        run["waiting_for"] = None
+        self.runs.update(run)
         return self._run_loop_protected(self.runs.get(run_id) or run)
 
     def resume_for_children(self, run_id: str) -> AgentOutcome:
-        """Wake a delegate_tasks parent paused at WAITING_FOR_CHILDREN.
+        """Wake a delegated parent paused on `waiting_for.type=child_task`.
 
         Called whenever the Session Manager scheduler sees the root (or any
         ancestor) Task in that state -- typically because a child's terminal
@@ -1067,6 +1141,7 @@ class CompanyAgent:
         ]
         self.runs.transition(run["id"], AgentRunState.RUNNING)
         run = self.runs.get(run["id"]) or run
+        run["waiting_for"] = None
         if unfinished:
             run["pending_child_task_ids"] = child_task_ids
         else:
@@ -1197,6 +1272,10 @@ class CompanyAgent:
         if run.get("parent_task_id"):
             return
         kinds = ["memory.capture_task", "delivery.send"]
+        if int(run.get("tool_call_count") or 0) > 0 or self.runs.store.list_tasks(
+            run["organization_id"], parent_task_id=run["id"], limit=1
+        ):
+            kinds.append("skill.curate_task")
         # A scheduled firing that made no tool calls observed nothing: its
         # entire content is text Toda generated for itself, so there is
         # no new fact about the company to remember. Capturing it anyway

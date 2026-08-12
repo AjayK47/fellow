@@ -79,6 +79,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # memory capture responsive regardless of agent run length.
         async def _lane(kinds: list[str], *, tick_automations: bool) -> None:
             last_dispatcher_tick = 0.0
+            last_recovery_tick = 0.0
             while True:
                 if tick_automations and (
                     time.monotonic() - last_dispatcher_tick
@@ -86,6 +87,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ):
                     await asyncio.to_thread(brain.automations.tick)
                     last_dispatcher_tick = time.monotonic()
+                if tick_automations and time.monotonic() - last_recovery_tick >= 30:
+                    for organization in brain.store.list_organizations():
+                        await asyncio.to_thread(
+                            brain.recovery_heartbeat.tick, organization["id"]
+                        )
+                        await asyncio.to_thread(
+                            brain.proactive.heartbeat, organization["id"]
+                        )
+                    last_recovery_tick = time.monotonic()
                 # pump() starts work without waiting for it, so a long
                 # agent run never stalls this loop's next lease.
                 result = await asyncio.to_thread(

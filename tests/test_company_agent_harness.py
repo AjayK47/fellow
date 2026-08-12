@@ -42,6 +42,7 @@ def _sign(secret: str, body: bytes, timestamp: str) -> str:
 
 
 def test_reactive_run_is_durable_and_captures_memory(brain):
+    brain.session_manager.conversation_agent = None
     wake = brain.sessions.wake(
         organization_id="org_acme",
         conversation_key="api:test:thread",
@@ -211,7 +212,7 @@ def test_write_tool_pauses_and_resumes_from_approval(brain):
         initial_message="Delete the acme/exports repository",
     )
     outcome = brain.company_agent.execute_task(run["id"])
-    assert outcome.state.value == "waiting_for_approval"
+    assert outcome.state.value == "waiting"
     approval = brain.store.get_harness_record("approvals", outcome.approval_id)
     assert approval["status"] == "pending"
     assert approval["tool_name"] == "COMPOSIO_EXECUTE"
@@ -471,7 +472,7 @@ def test_resume_after_approval_failure_does_not_leave_a_zombie_run(brain):
         initial_message="Delete the acme/zombie repository",
     )
     outcome = brain.company_agent.execute_task(run["id"])
-    assert outcome.state.value == "waiting_for_approval"
+    assert outcome.state.value == "waiting"
 
     resumed = brain.company_agent.resume_after_approval(
         approval_id=outcome.approval_id,
@@ -486,6 +487,7 @@ def test_resume_after_approval_failure_does_not_leave_a_zombie_run(brain):
 
 
 def test_a_non_retryable_run_failure_notifies_slack_instead_of_going_silent(brain):
+    brain.session_manager.conversation_agent = None
     """A run failing closed (no hang, no partial write) is not the same as
     the human waiting on it in Slack ever hearing about it -- before this,
     a non-retryable failure (e.g. malformed model tool-call arguments) left
@@ -535,6 +537,7 @@ def test_a_non_retryable_run_failure_notifies_slack_instead_of_going_silent(brai
 
 
 def test_a_retryable_run_failure_does_not_notify_slack_before_retrying(brain):
+    brain.session_manager.conversation_agent = None
     """A transient error (rate limit, timeout, ...) is retried by the queue
     and commonly recovers silently -- notifying Slack the first time it
     fails would be a false alarm, not useful signal."""
@@ -761,7 +764,7 @@ def test_read_and_write_calls_in_one_iteration_still_pause_correctly(brain):
         initial_message="Look up context then delete the repository",
     )
     outcome = brain.company_agent.execute_task(run["id"])
-    assert outcome.state.value == "waiting_for_approval"
+    assert outcome.state.value == "waiting"
 
     messages = brain.store.list_session_messages(run["session_id"])
     tool_messages = [m for m in messages if m["role"] == "tool"]
@@ -902,7 +905,7 @@ def _pending_approval(brain, *, conversation: str) -> str:
         initial_message="Delete the acme/exports repository",
     )
     outcome = brain.company_agent.execute_task(run["id"])
-    assert outcome.state.value == "waiting_for_approval"
+    assert outcome.state.value == "waiting"
     return outcome.approval_id
 
 
@@ -1017,7 +1020,7 @@ def _pending_question_with_choices(brain, *, conversation: str) -> tuple[str, li
         initial_message="Handle the export failure",
     )
     outcome = brain.company_agent.execute_task(run["id"])
-    assert outcome.state.value == "waiting_for_human"
+    assert outcome.state.value == "waiting"
     return run["id"], choices
 
 
@@ -1135,7 +1138,7 @@ def test_choice_button_click_resumes_session_manager_task(brain):
     )
     waiting = brain.session_manager.dispatch(wake["session_id"])
     assert waiting is not None
-    assert waiting.state.value == "waiting_for_human"
+    assert waiting.state.value == "waiting"
 
     brain.company_agent.model = ScriptedModelClient(
         [ModelResponse(content="Rolling back now.")]
@@ -1297,6 +1300,7 @@ def test_status_checkpoint_tracking_and_live_update_message(brain):
 
 
 def test_signed_slack_mention_routes_through_full_harness(brain):
+    brain.session_manager.conversation_agent = None
     secret = "test-signing-secret"
     brain.slack_gateway.config.slack_signing_secret = secret
     brain.slack_gateway.config.slack_bot_user_id = "UBOT"
@@ -1346,6 +1350,7 @@ def test_signed_slack_mention_routes_through_full_harness(brain):
 
 
 def test_message_and_app_mention_callbacks_for_one_slack_message_are_deduped(brain):
+    brain.session_manager.conversation_agent = None
     brain.slack_gateway.config.slack_bot_user_id = "UBOT"
     common_event = {
         "user": "UAJAY",
@@ -1588,6 +1593,7 @@ def test_ambient_slack_uses_contextual_attention_before_waking(brain):
 
 
 def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
+    brain.session_manager.conversation_agent = None
     brain.slack_gateway.config.slack_bot_user_id = "UBOT"
     first_payload = {
         "type": "event_callback",
@@ -1776,6 +1782,7 @@ def test_wake_preserves_slack_conversation_address_for_main_context(brain):
 
 
 def test_stale_active_session_does_not_strand_ambient_messages(brain):
+    brain.session_manager.conversation_agent = None
     """A conversation's active_session_id is only ever set by attention's
     own wake path and is never cleared on completion -- if that Session's
     root Task already finished (e.g. a direct-mention Task answered and
@@ -2090,7 +2097,7 @@ def test_agent_can_wait_for_human_and_resume(brain):
         initial_message="Prepare the issue",
     )
     outcome = brain.company_agent.execute_task(run["id"])
-    assert outcome.state.value == "waiting_for_human"
+    assert outcome.state.value == "waiting"
     assert "Which Linear team" in outcome.answer
     brain.harness_worker.drain_until_idle()
     resumed = brain.company_agent.resume_with_human_message(
@@ -2278,6 +2285,7 @@ def test_deferred_profile_refresh_and_reindex_jobs(api_client):
 
 
 def test_transient_model_failure_is_retried_by_durable_queue(brain):
+    brain.session_manager.conversation_agent = None
     class FlakyModel:
         model = "flaky"
 

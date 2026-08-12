@@ -31,7 +31,7 @@ def _slack_envelope(brain, *, conversation: str) -> InvocationEnvelope:
     )
 
 
-def test_resolver_separates_destination_mandatory_and_task_optional_skills(brain):
+def test_resolver_preloads_only_destination_mandatory_skills(brain):
     resolved = brain.skills.resolve_for_task(
         organization_id="org_acme",
         task="Investigate the export failure before fixing it",
@@ -46,16 +46,20 @@ def test_resolver_separates_destination_mandatory_and_task_optional_skills(brain
     )
 
     slack = next(skill for skill in resolved if skill["name"] == "Write for Slack")
-    investigation = next(
-        skill for skill in resolved if skill["name"] == "Investigate Before Fixing"
-    )
     assert slack["activation_mode"] == "mandatory"
     assert slack["activation_reason"] == "destination_mandatory"
-    assert investigation["activation_mode"] == "optional"
-    assert investigation["activation_reason"] == "task_relevant"
+    assert all(skill["activation_mode"] == "mandatory" for skill in resolved)
 
 
 def test_active_skill_versions_are_pinned_to_the_task(brain):
+    authored = brain.skills.create(
+        organization_id="org_acme",
+        name="Mandatory release language",
+        description="Required wording for release status.",
+        goal="Use the release convention.",
+        activation_mode="mandatory",
+        activation={"destination_types": ["slack_channel"]},
+    )
     task = brain.company_agent.create_invocation(
         envelope=_slack_envelope(brain, conversation="slack:T:channel_eng:event:pin"),
         goal="Investigate the export failure before fixing it",
@@ -63,9 +67,7 @@ def test_active_skill_versions_are_pinned_to_the_task(brain):
         initial_message="Investigate the export failure before fixing it",
     )
     first = brain.company_agent._active_skills(task)
-    pinned_procedure = next(
-        skill for skill in first if skill["name"] == "Handle Export Failure"
-    )
+    pinned_procedure = next(skill for skill in first if skill["id"] == authored["id"])
     proposal = brain.skills.propose_update(
         pinned_procedure["id"], {"description": "A newly proposed procedure."}
     )
@@ -75,7 +77,7 @@ def test_active_skill_versions_are_pinned_to_the_task(brain):
     persisted = brain.store.get_task(task["id"])
     pinned = brain.company_agent._active_skills(persisted)
     pinned_again = next(
-        skill for skill in pinned if skill["name"] == "Handle Export Failure"
+        skill for skill in pinned if skill["id"] == authored["id"]
     )
     assert pinned_again["version"] == pinned_procedure["version"]
 
@@ -166,7 +168,15 @@ def test_platform_skills_are_visible_without_memory_public_scope(brain):
     )
     names = {skill["name"] for skill in active}
     assert "Write for Slack" in names
-    assert "PDF and Document Handling" in names
+    catalog_names = {
+        skill["name"]
+        for skill in brain.skills.index_for_run(
+            organization_id="org_acme",
+            task="read and summarize a PDF",
+            allowed_scope_ids=[],
+        )
+    }
+    assert "PDF and Document Handling" in catalog_names
 
 
 def test_document_skills_activate_with_real_run_scoped_capabilities(brain):
@@ -189,17 +199,13 @@ def test_document_skills_activate_with_real_run_scoped_capabilities(brain):
         initial_message="Create a PDF report",
     )
     task = brain.store.get_task(task["id"])
-    resolved = brain.skills.resolve_for_task(
+    catalog = brain.skills.index_for_run(
         organization_id="org_acme",
         task="Create a PDF document report artifact",
-        destination={"type": "slack_channel", "id": "channel_eng", "is_private": False},
-        trigger_kind="reactive",
-        purpose="reactive_agent",
         allowed_scope_ids=["scope_channel_eng"],
-        optional_limit=20,
         available_capabilities=brain.tool_executor.available_capabilities(task),
     )
-    names = {skill["name"] for skill in resolved}
+    names = {skill["name"] for skill in catalog if skill["readiness"] == "ready"}
     assert "PDF and Document Handling" in names
 
 

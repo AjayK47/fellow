@@ -48,12 +48,13 @@ def test_resolve_approval_job_routes_a_task_backed_approval_to_the_task_agent(br
         principal_id="person_ajay",
     )
     outcome = brain.session_manager.dispatch(wake["session_id"])
-    assert outcome.state.value == "waiting_for_approval"
+    assert outcome.state.value == "waiting"
     approval_id = outcome.approval_id
     assert approval_id
 
     task = brain.store.get_task(outcome.task_id)
-    assert task["state"] == "waiting_for_approval"
+    assert task["state"] == "waiting"
+    assert task["waiting_for"]["type"] == "approval"
 
     # This is the real production job handler -- not CompanyAgent called
     # directly -- proving HarnessWorker itself resolves the right agent.

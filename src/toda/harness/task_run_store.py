@@ -22,37 +22,15 @@ _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
         AgentRunState.FAILED.value,
     },
     AgentRunState.RUNNING.value: {
-        AgentRunState.WAITING_FOR_TOOL.value,
-        AgentRunState.WAITING_FOR_APPROVAL.value,
-        AgentRunState.WAITING_FOR_HUMAN.value,
-        AgentRunState.WAITING_FOR_CHILDREN.value,
-        AgentRunState.PAUSED.value,
+        AgentRunState.WAITING.value,
         AgentRunState.COMPLETED.value,
         AgentRunState.FAILED.value,
         AgentRunState.CANCELLED.value,
     },
-    AgentRunState.WAITING_FOR_TOOL.value: {
-        AgentRunState.RUNNING.value,
-        AgentRunState.FAILED.value,
-        AgentRunState.CANCELLED.value,
-    },
-    AgentRunState.WAITING_FOR_APPROVAL.value: {
+    AgentRunState.WAITING.value: {
         AgentRunState.RUNNING.value,
         AgentRunState.CANCELLED.value,
         AgentRunState.FAILED.value,
-    },
-    AgentRunState.WAITING_FOR_HUMAN.value: {
-        AgentRunState.RUNNING.value,
-        AgentRunState.CANCELLED.value,
-    },
-    AgentRunState.WAITING_FOR_CHILDREN.value: {
-        AgentRunState.RUNNING.value,
-        AgentRunState.CANCELLED.value,
-        AgentRunState.FAILED.value,
-    },
-    AgentRunState.PAUSED.value: {
-        AgentRunState.RUNNING.value,
-        AgentRunState.CANCELLED.value,
     },
     AgentRunState.FAILED.value: {AgentRunState.QUEUED.value},
 }
@@ -163,6 +141,20 @@ class TaskRunStore:
         worker_type = (metadata or {}).get("worker_type") or (
             "general" if parent_run_id else "session_manager"
         )
+        destination = envelope.destination.model_dump(mode="json")
+        if destination.get("type") in {"dm", "person_private", "internal_agent_session"}:
+            origin_scope_id = f"scope_person_{envelope.principal_id}"
+        elif destination.get("is_private"):
+            origin_scope_id = next(
+                (
+                    scope_id
+                    for scope_id in envelope.allowed_scope_ids
+                    if scope_id != "scope_org_public"
+                ),
+                None,
+            )
+        else:
+            origin_scope_id = "scope_org_public"
         task = {
             "id": task_id,
             "organization_id": envelope.organization_id,
@@ -174,6 +166,9 @@ class TaskRunStore:
             # did -- a freshly created Task is immediately claimable.
             "state": AgentRunState.QUEUED.value,
             "worker_type": worker_type,
+            "owner_id": envelope.principal_id,
+            "origin_session_id": session_id,
+            "origin_scope_id": origin_scope_id,
             "trigger_kind": trigger,
             "trigger_event_id": trigger_event_id,
             "prompt": goal,
@@ -186,6 +181,7 @@ class TaskRunStore:
             "tool_call_count": 0,
             "final_answer": None,
             "result": None,
+            "completion_summary": None,
             "error": None,
             "events": [
                 {
@@ -282,6 +278,21 @@ class TaskRunStore:
                 raise RuntimeError(
                     f"task lease lost while transitioning {run_id} to {target}"
                 )
+            if target in {
+                AgentRunState.COMPLETED.value,
+                AgentRunState.FAILED.value,
+                AgentRunState.CANCELLED.value,
+            }:
+                attempts = self._raw_store.list_task_attempts(run_id)
+                running = next(
+                    (item for item in reversed(attempts) if item.get("status") == "running"),
+                    None,
+                )
+                if running:
+                    running["status"] = target
+                    running["updated_at"] = now
+                    running["last_heartbeat_at"] = now
+                    self._raw_store.update_task_attempt(running)
         return task
 
     def update(self, run: dict[str, Any], *, checkpoint_reason: str | None = None) -> None:
@@ -319,6 +330,33 @@ class TaskRunStore:
             raise RuntimeError(f"task lease lost while renewing {run_id}")
         if self.lease_heartbeat is not None and not self.lease_heartbeat():
             raise RuntimeError("session manager lease lost")
+        task = self.get(run_id)
+        if task:
+            attempts = self._raw_store.list_task_attempts(run_id)
+            running = next(
+                (item for item in reversed(attempts) if item.get("status") == "running"),
+                None,
+            )
+            now = utcnow().isoformat()
+            if running:
+                running["last_heartbeat_at"] = now
+                running["updated_at"] = now
+                self._raw_store.update_task_attempt(running)
+            else:
+                self._raw_store.create_task_attempt(
+                    {
+                        "id": new_id("attempt"),
+                        "organization_id": task["organization_id"],
+                        "task_id": run_id,
+                        "attempt_number": len(attempts) + 1,
+                        "status": "running",
+                        "worker_id": self.owner,
+                        "last_heartbeat_at": now,
+                        "progress": None,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
 
     def checkpoint(self, run: dict[str, Any], *, reason: str) -> dict[str, Any]:
         checkpoints = self._raw_store.list_harness_records(
@@ -349,6 +387,15 @@ class TaskRunStore:
                     item["created_at"],
                 ),
             )
+        attempts = self._raw_store.list_task_attempts(run["id"])
+        running = next(
+            (entry for entry in reversed(attempts) if entry.get("status") == "running"),
+            None,
+        )
+        if running:
+            running["progress"] = reason
+            running["updated_at"] = item["created_at"]
+            self._raw_store.update_task_attempt(running)
         return item
 
     def add_message(
@@ -413,6 +460,7 @@ class TaskRunStore:
             raise KeyError(run_id)
         task["final_answer"] = answer
         task["result"] = answer
+        task["waiting_for"] = None
         self.update(task)
         return self.transition(run_id, AgentRunState.COMPLETED)
 
@@ -421,6 +469,7 @@ class TaskRunStore:
         if not task:
             raise KeyError(run_id)
         task["error"] = error
+        task["waiting_for"] = None
         self.update(task)
         return self.transition(
             run_id,

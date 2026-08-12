@@ -111,6 +111,7 @@ def test_non_slack_direct_requests_are_not_reacted_to(brain, monkeypatch):
 
 
 def test_delivering_the_final_answer_clears_the_ack_reaction(brain, monkeypatch):
+    brain.session_manager.conversation_agent = None
     react = MagicMock(return_value={"ok": True})
     unreact = MagicMock(return_value={"ok": True})
     monkeypatch.setattr(brain.slack_sender, "react", react)
@@ -142,6 +143,7 @@ def test_delivering_the_final_answer_clears_the_ack_reaction(brain, monkeypatch)
 
 
 def test_delivering_a_task_failure_also_clears_the_ack_reaction(brain, monkeypatch):
+    brain.session_manager.conversation_agent = None
     unreact = MagicMock(return_value={"ok": True})
     monkeypatch.setattr(brain.slack_sender, "react", MagicMock(return_value={"ok": True}))
     monkeypatch.setattr(brain.slack_sender, "unreact", unreact)

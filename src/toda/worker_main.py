@@ -23,6 +23,7 @@ async def run_worker() -> None:
     # since drain_once() waits for its whole leased batch.
     async def _lane(kinds: list[str], *, tick_automations: bool) -> None:
         last_dispatcher_tick = 0.0
+        last_recovery_tick = 0.0
         while not stopping.is_set():
             if tick_automations and (
                 time.monotonic() - last_dispatcher_tick
@@ -30,6 +31,11 @@ async def run_worker() -> None:
             ):
                 brain.automations.tick()
                 last_dispatcher_tick = time.monotonic()
+            if tick_automations and time.monotonic() - last_recovery_tick >= 30:
+                for organization in brain.store.list_organizations():
+                    brain.recovery_heartbeat.tick(organization["id"])
+                    brain.proactive.heartbeat(organization["id"])
+                last_recovery_tick = time.monotonic()
             result = await asyncio.to_thread(
                 brain.harness_worker.pump, kinds=kinds
             )

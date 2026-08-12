@@ -85,6 +85,8 @@ _WRITE_TOOL_DUMMY_ARGS: dict[str, dict] = {
     "automation_set_enabled": {"automation_id": "automation_redteam", "enabled": False},
     "automation_run_now": {"automation_id": "automation_redteam"},
     "automation_delete": {"automation_id": "automation_redteam"},
+    "task_continue": {"task_id": "task_redteam", "message": "continue"},
+    "task_cancel": {"task_id": "task_redteam"},
     "slack_send_message": {"text": "redteam"},
     "slack_react": {"timestamp": "0.0", "name": "white_check_mark"},
     "request_batch_approval": {

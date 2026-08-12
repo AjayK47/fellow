@@ -109,7 +109,7 @@ class SkillsService:
         response_validation: dict[str, Any] | None = None,
         platform_key: str | None = None,
         scope_id: str = "scope_org_public",
-        status: str = "approved",
+        status: str = "active",
         instructions: str = "",
         kind: str = "company",
         immutable: bool = False,
@@ -158,7 +158,7 @@ class SkillsService:
             description=description,
             goal=goal,
             version=1,
-            status=SkillStatus(status) if status in SkillStatus._value2member_map_ else SkillStatus.APPROVED,
+            status=SkillStatus(status) if status in SkillStatus._value2member_map_ else SkillStatus.ACTIVE,
             inputs=inputs or [],
             preconditions=preconditions or [],
             steps=step_models,
@@ -255,7 +255,7 @@ class SkillsService:
         )
         if slack is None:
             raise RuntimeError("The mandatory Slack communication package is missing")
-        if slack.get("status") != SkillStatus.APPROVED.value:
+        if slack.get("status") != SkillStatus.ACTIVE.value:
             raise RuntimeError("The mandatory Slack communication skill is not approved")
         return materialized
 
@@ -290,7 +290,7 @@ class SkillsService:
         approved = [
             skill
             for skill in self.list(organization_id)
-            if skill.get("status") == SkillStatus.APPROVED.value
+            if skill.get("status") == SkillStatus.ACTIVE.value
             and skill_is_visible(skill)
         ]
 
@@ -331,28 +331,12 @@ class SkillsService:
             and applies(skill)
             and ready(skill)
         ]
-        mandatory_ids = {skill["id"] for skill in mandatory}
-        relevant = self.search(
-            organization_id,
-            task,
-            limit=max(optional_limit * 3, 10),
-        )
-        approved_by_id = {skill["id"]: skill for skill in approved}
-        optional = [
-            approved_by_id[skill["id"]]
-            for skill in relevant
-            if skill["id"] in approved_by_id
-            and skill["id"] not in mandatory_ids
-            and skill.get("activation_mode", "optional") == "optional"
-            and applies(approved_by_id[skill["id"]])
-            and ready(approved_by_id[skill["id"]])
-        ][:optional_limit]
+        # Optional Skill bodies stay out of the base prompt. The compact
+        # catalog is always present and the model loads a relevant body with
+        # skill_view. Only mandatory operating constraints are preloaded.
         return [
             self._active_skill(skill, reason="destination_mandatory")
             for skill in mandatory
-        ] + [
-            self._active_skill(skill, reason="task_relevant")
-            for skill in optional
         ]
 
     def index_for_run(
@@ -394,7 +378,7 @@ class SkillsService:
         for skill in catalog:
             if len(records) >= limit:
                 break
-            if skill.get("status") != SkillStatus.APPROVED.value:
+            if skill.get("status") != SkillStatus.ACTIVE.value:
                 continue
             if not (
                 skill.get("platform_key")
@@ -475,7 +459,7 @@ class SkillsService:
         authoritative guidance. Pass include_status explicitly (e.g. for the
         admin console) to see other statuses.
         """
-        allowed_status = include_status or {SkillStatus.APPROVED.value}
+        allowed_status = include_status or {SkillStatus.ACTIVE.value}
         skills = [
             s for s in self.store.list_skills(organization_id)
             if s.get("status") in allowed_status
@@ -515,7 +499,7 @@ class SkillsService:
 
     def prepare(self, skill_id: str, context_warnings: list[str] | None = None) -> dict[str, Any] | None:
         skill = self.get(skill_id)
-        if not skill or skill.get("status") != SkillStatus.APPROVED.value:
+        if not skill or skill.get("status") != SkillStatus.ACTIVE.value:
             return None
         return {
             "skill": skill,
@@ -575,6 +559,8 @@ class SkillsService:
                 "activation_mode",
                 "activation",
                 "response_validation",
+                "instructions",
+                "origin",
             }:
                 new_version[k] = v
         validation = self.validate_definition(new_version)
@@ -600,7 +586,7 @@ class SkillsService:
         if not proposed:
             return None
         approved = dict(proposed)
-        approved["status"] = SkillStatus.APPROVED.value
+        approved["status"] = SkillStatus.ACTIVE.value
         approved["updated_at"] = utcnow().isoformat()
         self.store.upsert_skill_version(approved)
         self.store.upsert_skill(approved)
@@ -613,7 +599,7 @@ class SkillsService:
             return None
         if skill.get("platform_key") or skill.get("immutable") or skill.get("kind") in {"builtin", "connector"}:
             raise ValueError("platform skills cannot be deprecated")
-        skill["status"] = SkillStatus.DEPRECATED.value
+        skill["status"] = SkillStatus.DISABLED.value
         skill["updated_at"] = utcnow().isoformat()
         self.store.upsert_skill(skill)
         self.store.upsert_skill_version(skill)

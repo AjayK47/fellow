@@ -21,11 +21,9 @@ from toda.harness.models import (
 from toda.harness.retry import is_retryable_task_error
 from toda.harness.task_run_store import TaskRunStore
 
-# WAITING_FOR_APPROVAL is deliberately not resumable from here -- resolving
+# An approval wait is deliberately not resumable from here -- resolving
 # an approval wakes the parent Task directly (Phase 7), not through a new
 # Session message.
-_RESUMABLE_HUMAN_STATES = {AgentRunState.WAITING_FOR_HUMAN.value}
-_RESUMABLE_CHILD_STATES = {AgentRunState.WAITING_FOR_CHILDREN.value}
 _TERMINAL_STATES = {
     AgentRunState.COMPLETED.value,
     AgentRunState.FAILED.value,
@@ -41,6 +39,7 @@ class SessionManagerScheduler:
         authz: Any,
         sessions: Any,
         agent_factory: Any,
+        conversation_agent: Any | None = None,
         lease_seconds: int = 3600,
         task_lease_seconds: int = 3600,
     ) -> None:
@@ -52,6 +51,7 @@ class SessionManagerScheduler:
         self.authz = authz
         self.sessions = sessions
         self.agent_factory = agent_factory
+        self.conversation_agent = conversation_agent
         self.lease_seconds = lease_seconds
         self.task_lease_seconds = task_lease_seconds
 
@@ -131,7 +131,24 @@ class SessionManagerScheduler:
             root_task["updated_at"] = utcnow().isoformat()
             self.store.update_task(root_task)
 
-        if root_task is None:
+        if root_task is None and self.conversation_agent is not None:
+            envelope = self._build_envelope(
+                organization_id=session["organization_id"],
+                principal_id=principal_id,
+                conversation_id=session["conversation_key"],
+                destination=destination,
+                purpose=purpose,
+            )
+            outcome = self.conversation_agent.run(
+                session=session,
+                envelope=envelope,
+                runs=runs,
+                trigger_kind=trigger_kind,
+                trigger_event_id=trigger_event_id,
+                task_metadata=self._root_task_metadata(session),
+                model=self.conversation_agent.model or agent.model,
+            )
+        elif root_task is None:
             envelope = self._build_envelope(
                 organization_id=session["organization_id"],
                 principal_id=principal_id,
@@ -152,18 +169,33 @@ class SessionManagerScheduler:
             outcome = agent.execute_task(root_task["id"])
         elif root_task["state"] == AgentRunState.QUEUED.value:
             outcome = agent.execute_task(root_task["id"])
-        elif root_task["state"] in _RESUMABLE_HUMAN_STATES:
+        elif root_task["state"] == AgentRunState.WAITING.value and (root_task.get("waiting_for") or {}).get("type") == "user":
             outcome = agent.resume_with_human_message(
                 root_task["id"],
                 message=latest_user_text,
                 principal_id=principal_id,
                 persist_message=False,
             )
-        elif root_task["state"] in _RESUMABLE_CHILD_STATES:
+        elif root_task["state"] == AgentRunState.WAITING.value and (root_task.get("waiting_for") or {}).get("type") == "child_task":
             outcome = agent.resume_for_children(root_task["id"])
+        elif root_task["state"] in _TERMINAL_STATES and self.conversation_agent is not None:
+            envelope = self._build_envelope(
+                organization_id=session["organization_id"],
+                principal_id=principal_id,
+                conversation_id=session["conversation_key"],
+                destination=destination,
+                purpose=purpose,
+            )
+            outcome = self.conversation_agent.run(
+                session=session,
+                envelope=envelope,
+                trigger_kind=trigger_kind,
+                trigger_event_id=trigger_event_id,
+                runs=runs,
+                task_metadata=self._root_task_metadata(session),
+                model=self.conversation_agent.model or agent.model,
+            )
         elif root_task["state"] in _TERMINAL_STATES:
-            # Session revision advanced (new message) after the root Task
-            # already finished -- start a fresh root Task for this turn.
             envelope = self._build_envelope(
                 organization_id=session["organization_id"],
                 principal_id=principal_id,
@@ -172,18 +204,14 @@ class SessionManagerScheduler:
                 purpose=purpose,
             )
             root_task = runs.create_run(
-                session_id=session_id,
-                envelope=envelope,
-                goal=latest_user_text,
-                trigger_kind=trigger_kind,
-                trigger_event_id=trigger_event_id,
-                max_iterations=agent.max_iterations,
-                max_tool_calls=agent.max_tool_calls,
+                session_id=session_id, envelope=envelope, goal=latest_user_text,
+                trigger_kind=trigger_kind, trigger_event_id=trigger_event_id,
+                max_iterations=agent.max_iterations, max_tool_calls=agent.max_tool_calls,
                 metadata=self._root_task_metadata(session),
             )
             outcome = agent.execute_task(root_task["id"])
         else:
-            # queued/running/waiting_for_tool/waiting_for_approval -- not
+            # queued/running/approval waits -- not
             # independently resumable from here; leave it for the approval
             # flow or a later tick once it naturally reaches a stable state.
             return AgentOutcome(
@@ -216,7 +244,7 @@ class SessionManagerScheduler:
         # delegates (ChildTaskService.execute() inherits it from here).
         metadata: dict[str, Any] = {"worker_type": "session_manager"}
         session_metadata = session.get("metadata") or {}
-        for key in ("slack", "role_skill_ids", "attention_decision"):
+        for key in ("slack", "role_skill_ids", "attention_decision", "force_task", "automation_id"):
             if session_metadata.get(key):
                 metadata[key] = session_metadata[key]
         return metadata

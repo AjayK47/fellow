@@ -25,6 +25,7 @@ REQUIRED = {
     "available_skills_header",
     "active_skills_header",
     "automation_trigger_guidance",
+    "conversation_manager",
     "steer_guidance",
     "untrusted_event_header",
     "untrusted_tool_result_header",

@@ -285,7 +285,7 @@ class SessionService:
         # member of that scope (SlackGateway._ensure_scope), so a second
         # speaker's authorization is the same set as the first's. Pausing on
         # every alternating message would make a busy channel thrash through
-        # WAITING_FOR_HUMAN and back for no security gain. The envelope is
+        # a user-input wait and back for no security gain. The envelope is
         # still rebuilt from a fresh authz.resolve() on the next resume, in
         # SessionManagerScheduler._run_once().
         #

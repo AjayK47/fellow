@@ -56,6 +56,7 @@ def _make_task(
     parent_task_id: str | None = None,
     root_task_id: str | None = None,
     prompt: str = "do the work",
+    waiting_for_type: str = "child_task",
 ) -> dict:
     now = utcnow().isoformat()
     task_id = new_id("task")
@@ -85,6 +86,11 @@ def _make_task(
         "created_at": now,
         "updated_at": now,
     }
+    if state == AgentRunState.WAITING.value:
+        task["waiting_for"] = {
+            "type": waiting_for_type,
+            "ids": [],
+        }
     brain.store.create_task(task)
     if state == AgentRunState.RUNNING.value:
         brain.store.claim_task(task_id, owner="exec_seed", lease_seconds=1800)
@@ -118,7 +124,7 @@ def test_explicit_stop_cancels_root_and_active_children_without_a_model_call(bra
     session_id = _session_id(brain, "slack:dm:person_ajay:stop")
     root = _make_task(
         brain, session_id=session_id, worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
     general_child = _make_task(
         brain, session_id=session_id, worker_type="general", state=AgentRunState.RUNNING.value,
@@ -240,7 +246,7 @@ def test_actor_change_on_waiting_root_does_not_leave_a_stale_pause_signal(brain)
         brain,
         session_id=session_id,
         worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
 
     result = brain.sessions.wake(
@@ -262,7 +268,8 @@ def test_waiting_root_resumes_under_current_actor_envelope(brain):
         brain,
         session_id=session_id,
         worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_HUMAN.value,
+        state=AgentRunState.WAITING.value,
+        waiting_for_type="user",
     )
     brain.company_agent.model = ScriptedModelClient(
         [ModelResponse(content="Handled using the current actor.")]
@@ -296,7 +303,7 @@ def test_session_manager_can_start_unrelated_root_in_same_session(brain):
         brain,
         session_id=session_id,
         worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
 
     created = brain.child_tasks.start_root(
@@ -313,7 +320,7 @@ def test_session_manager_can_start_unrelated_root_in_same_session(brain):
     assert parallel["root_task_id"] == parallel["id"]
     assert parallel["state"] == AgentRunState.QUEUED.value
     assert parallel["prompt"] == "Investigate the unrelated invoice question"
-    assert brain.store.get_task(original["id"])["state"] == "waiting_for_children"
+    assert brain.store.get_task(original["id"])["state"] == "waiting"
     assert brain.sessions.get(session_id)["manager_state"] == "queued"
 
 
@@ -321,7 +328,7 @@ def test_manage_child_task_cancels_a_general_child(brain):
     session_id = _session_id(brain, "slack:dm:person_ajay:cancel-child")
     root = _make_task(
         brain, session_id=session_id, worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
     child = _make_task(
         brain, session_id=session_id, worker_type="general", state=AgentRunState.RUNNING.value,
@@ -340,7 +347,7 @@ def test_manage_child_task_rejects_a_task_that_is_not_actually_a_child(brain):
     session_id = _session_id(brain, "slack:dm:person_ajay:not-a-child")
     root = _make_task(
         brain, session_id=session_id, worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
     unrelated = _make_task(
         brain, session_id=session_id, worker_type="general", state=AgentRunState.RUNNING.value,
@@ -373,7 +380,7 @@ def test_manage_child_task_revises_a_pi_child_and_restarts_with_new_prompt_same_
     session_id = _session_id(brain, "slack:dm:person_ajay:revise-pi")
     root = _make_task(
         brain, session_id=session_id, worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
     child = _make_task(
         brain, session_id=session_id, worker_type="pi", state=AgentRunState.QUEUED.value,

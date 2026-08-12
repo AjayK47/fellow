@@ -77,7 +77,7 @@ class SkillPackage(BaseModel):
             "description": manifest.description,
             "goal": manifest.description,
             "version": 1,
-            "status": "approved",
+            "status": "active",
             "inputs": list(manifest.inputs),
             "preconditions": list(manifest.preconditions),
             "steps": list(manifest.steps),

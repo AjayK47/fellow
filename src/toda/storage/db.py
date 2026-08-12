@@ -31,7 +31,7 @@ log = logging.getLogger("toda.store")
 # the shortlist entirely and the small tenant silently gets zero semantic
 # results. Partitioning makes `k` mean "k within this org", which is the
 # only reading that is correct in a shared database.
-_VEC_TABLES = ("vec_chunks", "vec_memories", "vec_episodes")
+_VEC_TABLES = ("vec_chunks", "vec_memories", "vec_episodes", "vec_tasks")
 
 # The vec0 column width is fixed at CREATE time, but the true width is a
 # property of whatever embedding provider is configured — not of any
@@ -636,6 +636,16 @@ class BrainStore:
                     updated_at TEXT NOT NULL,
                     completed_at TEXT
                 );
+                CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+                    task_id UNINDEXED, organization_id UNINDEXED, content
+                );
+                CREATE TABLE IF NOT EXISTS task_embeddings (
+                    task_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    embedding TEXT NOT NULL,
+                    content_hash TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS task_attempts (
                     id TEXT PRIMARY KEY,
@@ -993,6 +1003,23 @@ class BrainStore:
         with self._vector_lock:
             current = self.vector_dimensions()
             if current == dimensions:
+                # A newer Toda release may add another derived vector index
+                # while retaining the same embedding width. Create only the
+                # missing table; rebuilding healthy indexes would be wasteful.
+                with self.cursor() as cur:
+                    for table in _VEC_TABLES:
+                        cur.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                            (table,),
+                        )
+                        if cur.fetchone() is None:
+                            cur.execute(
+                                f"""CREATE VIRTUAL TABLE {table} USING vec0(
+                                    organization_id TEXT partition key,
+                                    id TEXT PRIMARY KEY,
+                                    embedding float[{int(dimensions)}] distance_metric=cosine
+                                )"""
+                            )
                 return False
             with self.cursor() as cur:
                 if current is not None:
@@ -1034,7 +1061,7 @@ class BrainStore:
         if force and target:
             self._force_rebuild_vector_tables(target)
 
-        counts = {"chunks": 0, "memories": 0, "episodes": 0, "skipped_wrong_width": 0}
+        counts = {"chunks": 0, "memories": 0, "episodes": 0, "tasks": 0, "skipped_wrong_width": 0}
         for table, source_sql, upsert in (
             (
                 "chunks",
@@ -1051,6 +1078,11 @@ class BrainStore:
                 "SELECT id, organization_id, summary_embedding AS vec FROM episodes "
                 "WHERE summary_embedding IS NOT NULL AND summary_embedding != 'null'",
                 self.vec_upsert_episode,
+            ),
+            (
+                "tasks",
+                "SELECT task_id AS id, organization_id, embedding AS vec FROM task_embeddings",
+                self.vec_upsert_task,
             ),
         ):
             with self.cursor() as cur:
@@ -1372,6 +1404,22 @@ class BrainStore:
                 cur.execute("SELECT payload FROM entities WHERE organization_id = ?", (organization_id,))
             return [_de(r["payload"]) for r in cur.fetchall()]
 
+    def find_entity_candidates(
+        self, organization_id: str, text: str, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        tokens = [token.lower() for token in re.findall(r"[\w.-]{2,}", text or "")]
+        if not tokens:
+            return []
+        clauses = " OR ".join("lower(payload) LIKE ?" for _ in tokens[:12])
+        params = [organization_id, *(f"%{token}%" for token in tokens[:12]), int(limit)]
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT payload FROM entities WHERE organization_id = ?
+                AND ({clauses}) LIMIT ?""",
+                params,
+            )
+            return [_de(row["payload"]) for row in cur.fetchall()]
+
     def upsert_edge(self, edge: dict[str, Any]) -> None:
         with self.cursor() as cur:
             cur.execute(
@@ -1423,14 +1471,18 @@ class BrainStore:
         return results
 
     def neighbors(self, organization_id: str, node_id: str, edge_types: list[str] | None = None) -> list[dict[str, Any]]:
-        edges = self.list_edges(organization_id)
-        out = []
-        for e in edges:
-            if edge_types and e["edge_type"] not in edge_types:
-                continue
-            if e["from_id"] == node_id or e["to_id"] == node_id:
-                out.append(e)
-        return out
+        clauses = ["organization_id = ?", "valid_until IS NULL", "(from_id = ? OR to_id = ?)"]
+        params: list[Any] = [organization_id, node_id, node_id]
+        if edge_types:
+            placeholders = ",".join("?" for _ in edge_types)
+            clauses.append(f"edge_type IN ({placeholders})")
+            params.extend(edge_types)
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT payload FROM edges WHERE {' AND '.join(clauses)}",
+                params,
+            )
+            return [_de(row["payload"]) for row in cur.fetchall()]
 
     # ---- memories ----
 
@@ -1524,6 +1576,9 @@ class BrainStore:
     def vec_upsert_episode(self, organization_id: str, episode_id: str, embedding: list[float]) -> None:
         self._vec_upsert("vec_episodes", organization_id, episode_id, embedding)
 
+    def vec_upsert_task(self, organization_id: str, task_id: str, embedding: list[float]) -> None:
+        self._vec_upsert("vec_tasks", organization_id, task_id, embedding)
+
     def _vec_search(
         self, table: str, organization_id: str, embedding: list[float], k: int
     ) -> list[tuple[str, float]]:
@@ -1560,6 +1615,11 @@ class BrainStore:
         self, organization_id: str, embedding: list[float], k: int = 50
     ) -> list[tuple[str, float]]:
         return self._vec_search("vec_episodes", organization_id, embedding, k)
+
+    def vec_search_tasks(
+        self, organization_id: str, embedding: list[float], k: int = 50
+    ) -> list[tuple[str, float]]:
+        return self._vec_search("vec_tasks", organization_id, embedding, k)
 
     def get_chunk(self, chunk_id: str) -> dict[str, Any] | None:
         with self.cursor() as cur:
@@ -2345,7 +2405,73 @@ class BrainStore:
                     task.get("completed_at"),
                 ),
             )
+            if task.get("parent_task_id") is None:
+                cur.execute(
+                    "INSERT INTO tasks_fts(task_id, organization_id, content) VALUES (?, ?, ?)",
+                    (task["id"], task["organization_id"], str(task.get("goal") or "")),
+                )
         return task
+
+    def index_root_task(self, task: dict[str, Any]) -> None:
+        if task.get("parent_task_id") is not None:
+            return
+        content = "\n".join(
+            str(value or "")
+            for value in (task.get("goal"), task.get("completion_summary"), task.get("result"))
+        )
+        with self.cursor() as cur:
+            cur.execute("DELETE FROM tasks_fts WHERE task_id = ?", (task["id"],))
+            cur.execute(
+                "INSERT INTO tasks_fts(task_id, organization_id, content) VALUES (?, ?, ?)",
+                (task["id"], task["organization_id"], content),
+            )
+
+    def upsert_task_embedding(
+        self,
+        *,
+        task_id: str,
+        organization_id: str,
+        model: str,
+        embedding: list[float],
+        content_hash: str,
+    ) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT OR REPLACE INTO task_embeddings
+                (task_id, organization_id, model, embedding, content_hash)
+                VALUES (?, ?, ?, ?, ?)""",
+                (task_id, organization_id, model, _ser(embedding), content_hash),
+            )
+        self.vec_upsert_task(organization_id, task_id, embedding)
+
+    def search_root_tasks(
+        self, organization_id: str, *, query: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        query = str(query or "").strip()
+        with self.cursor() as cur:
+            if query:
+                tokens = re.findall(r"[\w-]+", query, flags=re.UNICODE)
+                if not tokens:
+                    return []
+                expression = " AND ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+                cur.execute(
+                    """SELECT t.payload, t.state, t.execution_owner,
+                               t.execution_lease_expires_at, t.wake_revision,
+                               t.processed_revision
+                    FROM tasks_fts f JOIN tasks t ON t.id = f.task_id
+                    WHERE f.organization_id = ? AND tasks_fts MATCH ?
+                      AND t.parent_task_id IS NULL
+                    ORDER BY bm25(tasks_fts), t.updated_at DESC LIMIT ?""",
+                    (organization_id, expression, int(limit)),
+                )
+            else:
+                cur.execute(
+                    f"""SELECT {self._TASK_COLUMNS} FROM tasks
+                    WHERE organization_id = ? AND parent_task_id IS NULL
+                    ORDER BY updated_at DESC LIMIT ?""",
+                    (organization_id, int(limit)),
+                )
+            return [self._task_row(row) for row in cur.fetchall()]
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         with self.cursor() as cur:
@@ -2436,8 +2562,8 @@ class BrainStore:
 
     def claim_task(self, task_id: str, *, owner: str, lease_seconds: int) -> bool:
         # Claimable from any non-terminal state, not just queued/running --
-        # a Task resuming from waiting_for_approval/waiting_for_human/
-        # waiting_for_tool back into RUNNING must be re-claimable exactly
+        # a Task resuming from the generic waiting state back into RUNNING
+        # must be re-claimable exactly
         # like a fresh queued Task. Only completed/failed/cancelled (and
         # whatever's currently held under a live lease) are ineligible.
         now = datetime.now(timezone.utc)
@@ -2544,6 +2670,26 @@ class BrainStore:
                 payload = ?, updated_at = ?, completed_at = NULL
                 WHERE id = ? AND state IN ('failed', 'cancelled')""",
                 (_ser(task), now, task_id),
+            )
+            return cur.rowcount > 0
+
+    def requeue_expired_task(self, task_id: str, *, now: str | None = None) -> bool:
+        now = now or datetime.now(timezone.utc).isoformat()
+        with self.cursor(immediate=True) as cur:
+            cur.execute("SELECT payload FROM tasks WHERE id = ?", (task_id,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            task = _de(row["payload"])
+            task["state"] = "queued"
+            task["updated_at"] = now
+            task.setdefault("events", []).append({"type": "task.stale_requeued", "at": now})
+            cur.execute(
+                """UPDATE tasks SET state = 'queued', execution_owner = NULL,
+                   execution_lease_expires_at = NULL, payload = ?, updated_at = ?
+                   WHERE id = ? AND state = 'running'
+                     AND execution_lease_expires_at < ?""",
+                (_ser(task), now, task_id, now),
             )
             return cur.rowcount > 0
 

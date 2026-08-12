@@ -559,7 +559,7 @@ class SlackGateway:
         task = self.store.get_task(task_id)
         if not task:
             raise KeyError("task not found")
-        if task.get("state") != "waiting_for_human":
+        if task.get("state") != "waiting" or (task.get("waiting_for") or {}).get("type") != "user":
             return {"accepted": False, "reason": "Task is no longer waiting for a response"}
         choices = task.get("pending_question_choices") or []
         try:
@@ -590,7 +590,7 @@ class SlackGateway:
         # Appending the continuation is also a Session wake. Without the
         # revision bump below, the durable dispatch job can claim an idle
         # Session but the Manager has no new revision to process, leaving the
-        # Task stuck in waiting_for_human.
+        # Task stuck waiting for a user response.
         # notify() both advances the durable Session revision and enqueues its
         # one dispatch job. Enqueuing a second key here let two queue workers
         # race the same Manager; the loser correctly reported it busy, but

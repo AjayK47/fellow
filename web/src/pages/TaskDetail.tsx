@@ -36,7 +36,7 @@ export default function TaskDetail() {
       <PageHeader
         title={fmt(task.prompt || task.goal, 70) || "Task"}
         subtitle={`id ${taskId}`}
-        actions={<div className="flex gap-2"><Link to="/tasks" className="btn-ghost no-underline">← back</Link>{["queued", "running", "waiting_for_children"].includes(String(task.state)) && <button className="btn-ghost" onClick={cancel}>Cancel</button>}{["failed", "cancelled"].includes(String(task.state)) && <button className="btn" onClick={retry}>Retry</button>}</div>}
+        actions={<div className="flex gap-2"><Link to="/tasks" className="btn-ghost no-underline">← back</Link>{["queued", "running", "waiting"].includes(String(task.state)) && <button className="btn-ghost" onClick={cancel}>Cancel</button>}{["failed", "cancelled"].includes(String(task.state)) && <button className="btn" onClick={retry}>Retry</button>}</div>}
       />
       {loading && !data && <Section><Card><Empty>loading…</Empty></Card></Section>}
       {error && <Section><Card><Empty>error: {error}</Empty></Card></Section>}

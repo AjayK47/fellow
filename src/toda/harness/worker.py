@@ -42,6 +42,8 @@ AGENT_JOB_KINDS = (
 KNOWLEDGE_JOB_KINDS = (
     "knowledge.index_evidence",
     "knowledge.consolidate_episode",
+    "memory.capture_task",
+    "skill.curate_task",
 )
 
 
@@ -117,6 +119,9 @@ class HarnessWorker:
             ),
             "delivery.send": lambda payload: self.delivery.deliver_task(
                 payload["task_id"]
+            ),
+            "delivery.conversation": lambda payload: self.delivery.deliver_conversation(
+                payload["session_id"], payload["message_id"]
             ),
             "delivery.failure": lambda payload: self.delivery.deliver_task_failure(
                 payload["task_id"]
@@ -343,7 +348,7 @@ class HarnessWorker:
         data["dispatched"] = True
         if data["state"] == "failed" and is_retryable_task_error(data.get("error") or ""):
             raise RuntimeError(data["error"])
-        if data["state"] == "waiting_for_approval" and data.get("approval_id"):
+        if data["state"] == "waiting" and data.get("approval_id"):
             task = self.store.get_task(data["task_id"])
             self.queue.enqueue(
                 organization_id=task["organization_id"],
@@ -407,7 +412,7 @@ class HarnessWorker:
                     resolved_task["session_id"],
                     reason=f"child_task.approval_{data['state']}",
                 )
-        if data["state"] == "waiting_for_approval" and data.get("approval_id"):
+        if data["state"] == "waiting" and data.get("approval_id"):
             task = self.store.get_task(data["task_id"])
             self.queue.enqueue(
                 organization_id=task["organization_id"],

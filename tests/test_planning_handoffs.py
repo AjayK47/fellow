@@ -77,7 +77,7 @@ def _start_root_with_plan_and_child(brain, *, artifact_id: str | None = None):
     )
     outcome = brain.session_manager.dispatch(wake["session_id"])
     assert outcome is not None
-    assert outcome.state.value == "waiting_for_children"
+    assert outcome.state.value == "waiting"
     root = brain.store.get_task(outcome.task_id)
     child = brain.store.get_task(root["pending_child_task_ids"][0])
     return root, child

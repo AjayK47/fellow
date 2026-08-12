@@ -203,7 +203,7 @@ class ContextService:
         }
         relevant_skills = []
         for skill in self.store.list_skills(organization_id):
-            if skill.get("status") != "approved":
+            if skill.get("status") != "active":
                 continue
             haystack = " ".join(
                 [

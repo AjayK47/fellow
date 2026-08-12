@@ -113,8 +113,8 @@ class ScopeKind(str, Enum):
 
 class SkillStatus(str, Enum):
     DRAFT = "draft"
-    APPROVED = "approved"
-    DEPRECATED = "deprecated"
+    ACTIVE = "active"
+    DISABLED = "disabled"
 
 
 class SignalType(str, Enum):
@@ -298,7 +298,7 @@ class Skill(BaseModel):
     description: str
     goal: str
     version: int = 1
-    status: SkillStatus = SkillStatus.APPROVED
+    status: SkillStatus = SkillStatus.ACTIVE
     inputs: list[str] = Field(default_factory=list)
     preconditions: list[str] = Field(default_factory=list)
     steps: list[SkillStep] = Field(default_factory=list)

@@ -132,11 +132,8 @@ def test_capture_task_writes_to_the_conversations_own_scope(brain):
     assert source["scope_id"] == "scope_priv_f"
 
 
-def test_recurring_task_prompt_gets_proposed_as_a_skill_draft(brain):
-    """Self-improvement layer: the same underlying ask across three SEPARATE
-    Tasks gets flagged as a pattern and drafted as a skill for review -- a
-    single Task's own reasoning has no visibility into Tasks other
-    than itself, so nothing inside one run could ever notice this."""
+def test_task_memory_capture_does_not_create_skill_drafts(brain):
+    """Memory capture and Skill curation are deliberately separate lanes."""
     goal = "Check the export worker queue for backlog and report anything stuck"
     destination = {"type": "internal_agent_session", "id": "pattern-test", "is_private": True}
     for i in range(3):
@@ -160,18 +157,10 @@ def test_recurring_task_prompt_gets_proposed_as_a_skill_draft(brain):
         assert outcome.state.value == "completed"
         brain.harness_memory.capture_task(run["id"])
 
-    signals = brain.store.list_harness_records(
-        "task_pattern_signals", "org_acme", where={"status": "proposed"}
-    )
-    assert len(signals) == 1
-    signal = signals[0]
-    assert signal["occurrence_count"] == 3
-    assert signal["proposed_skill_id"]
-
-    skill = brain.skills.get(signal["proposed_skill_id"])
-    assert skill is not None
-    assert skill["status"] == "draft"
-    assert skill["goal"] == goal
+    assert brain.store.list_harness_records(
+        "task_pattern_signals", "org_acme"
+    ) == []
+    assert not [skill for skill in brain.skills.list("org_acme") if skill.get("status") == "draft"]
 
 
 def _run_dict(*, organization_id: str, principal_id: str, destination: dict, final_answer: str) -> dict:

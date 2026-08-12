@@ -4,7 +4,7 @@ Where synchronous delegation would block waiting for every child to finish
 before returning, delegate_tasks creates child Tasks, enqueues each one for
 independent execution by a worker (ChildTaskExecutor, dispatched off the
 durable job queue), and immediately pauses the calling Task at
-WAITING_FOR_CHILDREN -- releasing its execution lease so no Python thread
+waiting with `waiting_for.type=child_task` -- releasing its execution lease so no Python thread
 blocks on the children. Each child's terminal transition notifies the owning
 Session, which is what eventually lets the Session Manager scheduler resume
 this Task via CompanyAgent.resume_for_children().
@@ -32,7 +32,7 @@ class AwaitingChildren(Exception):
     """Raised by ChildTaskService.execute() once child Tasks have been
     created and enqueued. Caught by ToolExecutor.execute() and turned into
     a ToolResult(status="waiting_for_children") so _loop() pauses the
-    calling Task at WAITING_FOR_CHILDREN instead of blocking for a result."""
+    calling Task in the generic waiting state instead of blocking for a result."""
 
     def __init__(self, *, child_task_ids: list[str]) -> None:
         self.child_task_ids = child_task_ids
@@ -231,6 +231,9 @@ class ChildTaskService:
                 "root_task_id": root_task_id,
                 "state": AgentRunState.QUEUED.value,
                 "worker_type": spec["worker_type"],
+                "owner_id": parent.get("owner_id") or parent["envelope"]["principal_id"],
+                "origin_session_id": parent.get("origin_session_id") or parent["session_id"],
+                "origin_scope_id": parent.get("origin_scope_id"),
                 "trigger_kind": TriggerKind.TOOL_CONTINUATION.value,
                 "trigger_event_id": None,
                 "prompt": spec["prompt"],
@@ -247,6 +250,7 @@ class ChildTaskService:
                 "tool_call_count": 0,
                 "final_answer": None,
                 "result": None,
+                "completion_summary": None,
                 "error": None,
                 "events": [
                     {
@@ -475,6 +479,9 @@ class ChildTaskService:
             "root_task_id": task_id,
             "state": AgentRunState.QUEUED.value,
             "worker_type": "session_manager",
+            "owner_id": current.get("owner_id") or current["envelope"]["principal_id"],
+            "origin_session_id": current.get("origin_session_id") or current["session_id"],
+            "origin_scope_id": current.get("origin_scope_id"),
             "trigger_kind": TriggerKind.TOOL_CONTINUATION.value,
             "trigger_event_id": None,
             "prompt": arguments["prompt"],
@@ -487,6 +494,7 @@ class ChildTaskService:
             "tool_call_count": 0,
             "final_answer": None,
             "result": None,
+            "completion_summary": None,
             "error": None,
             "events": [
                 {

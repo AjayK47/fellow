@@ -14,11 +14,7 @@ from toda.domain.models import new_id, utcnow
 class AgentRunState(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
-    WAITING_FOR_TOOL = "waiting_for_tool"
-    WAITING_FOR_APPROVAL = "waiting_for_approval"
-    WAITING_FOR_HUMAN = "waiting_for_human"
-    WAITING_FOR_CHILDREN = "waiting_for_children"
-    PAUSED = "paused"
+    WAITING = "waiting"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -192,7 +188,9 @@ class AttentionEvaluation(BaseModel):
 
 
 class AgentOutcome(BaseModel):
-    task_id: str
+    task_id: str | None = None
+    session_id: str | None = None
+    kind: Literal["conversation", "task"] = "task"
     state: AgentRunState
     answer: str | None = None
     approval_id: str | None = None

@@ -123,10 +123,11 @@ def test_root_task_delegates_three_children_and_synthesizes_result(brain):
 
     outcome = brain.session_manager.dispatch(wake["session_id"])
     assert outcome is not None
-    assert outcome.state.value == "waiting_for_children"
+    assert outcome.state.value == "waiting"
 
     root_task = brain.store.get_task(outcome.task_id)
-    assert root_task["state"] == "waiting_for_children"
+    assert root_task["state"] == "waiting"
+    assert root_task["waiting_for"]["type"] == "child_task"
     assert root_task["execution_owner"] is None  # released, not held mid-wait
     child_ids = root_task["pending_child_task_ids"]
     assert len(child_ids) == 3
@@ -229,7 +230,7 @@ def _dispatch_delegation(brain, *, conversation_key: str, tasks: list[dict]):
     )
     outcome = brain.session_manager.dispatch(wake["session_id"])
     assert outcome is not None
-    assert outcome.state.value == "waiting_for_children"
+    assert outcome.state.value == "waiting"
     return wake, brain.store.get_task(outcome.task_id)
 
 
@@ -331,7 +332,7 @@ def test_partial_child_completion_can_wait_then_continue_sequentially(brain):
     )
     waiting = brain.session_manager.dispatch(wake["session_id"])
     assert waiting is not None
-    assert waiting.state.value == "waiting_for_children"
+    assert waiting.state.value == "waiting"
     root = brain.store.get_task(root["id"])
     assert root["pending_child_task_ids"] == [first_id, second_id]
     assert root["execution_owner"] is None
@@ -387,7 +388,7 @@ def test_adding_children_after_partial_result_preserves_running_siblings(brain):
     )
     outcome = brain.session_manager.dispatch(wake["session_id"])
     assert outcome is not None
-    assert outcome.state.value == "waiting_for_children"
+    assert outcome.state.value == "waiting"
     updated = brain.store.get_task(root["id"])
     assert still_running_id in updated["pending_child_task_ids"]
     assert len(updated["pending_child_task_ids"]) == 2

@@ -60,6 +60,9 @@ from toda.harness.child_tasks import ChildTaskService
 from toda.harness.child_task_executor import ChildTaskExecutor
 from toda.harness.pi_task_executor import PiTaskExecutor
 from toda.harness.session_manager import SessionManagerScheduler
+from toda.harness.conversation import ConversationAgent
+from toda.harness.skill_curator import SkillCurator
+from toda.harness.recovery import RecoveryHeartbeat
 from toda.harness.sessions import SessionService
 from toda.harness.task_run_store import TaskRunStore
 
@@ -154,6 +157,9 @@ class TodaApp:
             cdp_enabled=runtime_settings.browser_cdp_enabled,
         )
         self.visual_tools = VisualTools(self.artifacts)
+        self.sessions = SessionService(
+            store=self.store, audit=self.audit, queue=self.harness_jobs
+        )
         self.policy = PolicyEngine(
             self.store,
             self.audit,
@@ -187,6 +193,7 @@ class TodaApp:
             vision_tools=self.vision_tools,
             visual_tools=self.visual_tools,
             audit=self.audit,
+            session_notifier=self.sessions.notify,
         )
         self.mcp = MCPClientService(
             store=self.store,
@@ -235,6 +242,7 @@ class TodaApp:
                 context_token_budget=runtime_settings.agent_context_token_budget,
                 max_total_tokens=runtime_settings.agent_max_total_tokens,
                 completion_max_tokens=runtime_settings.agent_completion_max_tokens,
+                embeddings=self.embeddings,
             )
 
         self.company_agent = _task_agent_factory(
@@ -245,14 +253,20 @@ class TodaApp:
             )
         )
 
-        self.sessions = SessionService(
-            store=self.store, audit=self.audit, queue=self.harness_jobs
+        self.conversation_agent = ConversationAgent(
+            store=self.store,
+            model=None,
+            tools=self.tool_executor,
+            context_service=self.context,
+            task_agent_factory=_task_agent_factory,
+            delivery_enqueue=self.harness_jobs.enqueue,
         )
         self.session_manager = SessionManagerScheduler(
             store=self.store,
             authz=self.authz,
             sessions=self.sessions,
             agent_factory=_task_agent_factory,
+            conversation_agent=self.conversation_agent,
             lease_seconds=runtime_settings.session_manager_lease_seconds,
             task_lease_seconds=runtime_settings.task_execution_lease_seconds,
         )
@@ -351,6 +365,12 @@ class TodaApp:
             embeddings=self.embeddings,
             skills=self.skills,
         )
+        self.skill_curator = SkillCurator(
+            store=self.store,
+            skills=self.skills,
+            model=self.extraction_model,
+            audit=self.audit,
+        )
         self.delivery = DeliveryService(
             store=self.store,
             authz=self.authz,
@@ -376,6 +396,21 @@ class TodaApp:
         )
         self.harness_worker.register("task.run_child", self.child_task_executor.run)
         self.harness_worker.register("task.pi_poll", self.child_task_executor.poll_pi)
+        self.harness_worker.register(
+            "skill.curate_task",
+            lambda payload: self.skill_curator.review(payload["task_id"]),
+        )
+        self.recovery_heartbeat = RecoveryHeartbeat(
+            store=self.store, sessions=self.sessions, queue=self.harness_jobs
+        )
+        self.harness_worker.register(
+            "system.recover",
+            lambda payload: self.recovery_heartbeat.tick(payload["organization_id"]),
+        )
+        self.harness_worker.register(
+            "proactive.heartbeat",
+            lambda payload: self.proactive.heartbeat(payload["organization_id"]),
+        )
         self.automations = AutomationService(
             store=self.store,
             sessions=self.sessions,

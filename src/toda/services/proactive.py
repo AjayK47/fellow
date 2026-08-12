@@ -19,6 +19,9 @@ from toda.services.graph import GraphService
 from toda.services.retrieval import RetrievalService
 from toda.services.signals import SignalsService
 from toda.storage.db import BrainStore
+from toda.domain.models import utcnow
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 
 def decide(candidate: ProactiveCandidate) -> ProactiveDecision:
@@ -84,6 +87,88 @@ class ProactiveService:
         self.graph = graph
         self.audit = audit
         self.signals = signals
+
+    def heartbeat(
+        self,
+        organization_id: str,
+        *,
+        acting_principal_id: str = "toda_system",
+        destination: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Evaluate only events newer than the durable organization watermark.
+
+        The empty path performs no model call (this service is policy/retrieval
+        based today) and no repeated evaluation. Recurring user schedules stay
+        in AutomationService rather than this heartbeat.
+        """
+        organization = self.store.get_organization(organization_id) or {}
+        policy = organization.get("proactive_heartbeat") or {}
+        if policy.get("enabled") is False:
+            return {"organization_id": organization_id, "evaluated": 0, "decisions": [], "disabled": True}
+        quiet = policy.get("quiet_hours") or {}
+        if quiet.get("start") and quiet.get("end"):
+            try:
+                local = datetime.now(ZoneInfo(str(policy.get("timezone") or "UTC"))).strftime("%H:%M")
+                start, end = str(quiet["start"]), str(quiet["end"])
+                in_quiet = start <= local < end if start < end else local >= start or local < end
+                if in_quiet:
+                    return {"organization_id": organization_id, "evaluated": 0, "decisions": [], "quiet_hours": True}
+            except (ValueError, KeyError):
+                pass
+        watermark_id = f"proactive:{organization_id}"
+        watermark = self.store.get_harness_record("automation_watermarks", watermark_id) or {}
+        since = watermark.get("last_seen_at")
+        events = [
+            event
+            for event in self.store.list_audit(organization_id)
+            if event.get("event_type") in {
+                "memory.created",
+                "case.created",
+                "case.updated",
+                "task.failed",
+            }
+            and (not since or str(event.get("created_at") or "") > since)
+        ]
+        if not events:
+            return {"organization_id": organization_id, "evaluated": 0, "decisions": []}
+        decisions = []
+        dest = destination or {"type": "internal_agent_session", "id": "proactive", "is_private": True}
+        for event in events[-100:]:
+            cooldown_seconds = int(policy.get("cooldown_seconds") or 900)
+            last_notified_at = watermark.get("last_notified_at")
+            if last_notified_at:
+                try:
+                    elapsed = (utcnow() - datetime.fromisoformat(str(last_notified_at))).total_seconds()
+                    if elapsed < cooldown_seconds:
+                        continue
+                except ValueError:
+                    pass
+            decisions.append(
+                self.evaluate(
+                    organization_id=organization_id,
+                    trigger={
+                        "type": event.get("event_type"),
+                        "text": str((event.get("payload") or {}).get("content") or (event.get("payload") or {}).get("error") or ""),
+                    },
+                    acting_principal_id=acting_principal_id,
+                    destination=dest,
+                    mode="heartbeat",
+                )
+            )
+        now = utcnow().isoformat()
+        self.store.upsert_harness_projection(
+            "automation_watermarks",
+            {
+                "id": watermark_id,
+                "organization_id": organization_id,
+                "status": "active",
+                "last_seen_at": max(str(item.get("created_at") or now) for item in events),
+                "last_notified_at": now if decisions else watermark.get("last_notified_at"),
+                "created_at": watermark.get("created_at") or now,
+                "updated_at": now,
+            },
+        )
+        return {"organization_id": organization_id, "evaluated": len(events), "decisions": decisions}
 
     def evaluate_candidate(self, candidate: ProactiveCandidate | dict[str, Any]) -> ProactiveEvaluationResult:
         if isinstance(candidate, dict):
