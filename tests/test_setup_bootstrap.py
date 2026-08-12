@@ -53,3 +53,26 @@ def test_setup_status_is_resumable_from_persisted_configuration(empty_brain, tmp
     env_contents = env_file.read_text()
     assert "test-key" in env_contents
     assert "qwen/qwen3-embedding-8b" in env_contents
+
+
+def test_setup_status_never_returns_slack_bot_token(empty_brain, tmp_path, monkeypatch):
+    monkeypatch.setenv("TODA_ENV_FILE", str(tmp_path / ".env"))
+    empty_brain.store.put_organization({"id": "org_safe", "name": "Safe Co"})
+    empty_brain.store.upsert_slack_installation(
+        {
+            "id": "slack:org_safe:T_SAFE",
+            "organization_id": "org_safe",
+            "workspace_id": "T_SAFE",
+            "workspace_name": "Safe Co",
+            "bot_user_id": "U_BOT",
+            "bot_token": "must-never-leave-backend",
+        }
+    )
+    service = GatewaySetupService(
+        empty_brain.store, empty_brain.graph, empty_brain.audit
+    )
+
+    encoded = str(service.status())
+
+    assert "must-never-leave-backend" not in encoded
+    assert service.status()["slack"]["installations"][0]["workspace_id"] == "T_SAFE"

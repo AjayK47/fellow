@@ -83,7 +83,7 @@ class GatewaySetupService:
         tool_connections = self._json_env(env, "TODA_TOOL_CONNECTIONS")
         organizations = self.store.list_organizations()
         installations = [
-            item
+            {key: value for key, value in item.items() if key != "bot_token"}
             for organization in organizations
             for item in self.store.list_harness_records(
                 "slack_installations", organization["id"]
