@@ -1,7 +1,7 @@
 """Organization tool modes and immediate per-tool policy overrides."""
 
-from docket.harness.models import InvocationEnvelope, ModelToolCall, ToolDefinition
-from docket.harness.tools import NATIVE_ALLOW_TOOL_NAMES
+from toda.harness.models import InvocationEnvelope, ModelToolCall, ToolDefinition
+from toda.harness.tools import NATIVE_ALLOW_TOOL_NAMES
 
 
 def _task(brain, conversation: str = "policy:test") -> dict:

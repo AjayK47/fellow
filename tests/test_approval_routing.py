@@ -8,8 +8,8 @@ actually runs, not CompanyAgent.resume_after_approval() called directly
 
 from __future__ import annotations
 
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import ModelResponse, ModelToolCall
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import ModelResponse, ModelToolCall
 
 
 def test_resolve_approval_job_routes_a_task_backed_approval_to_the_task_agent(brain):

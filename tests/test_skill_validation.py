@@ -7,9 +7,9 @@ Unterminated string starting at..." killed an entire request."""
 
 from __future__ import annotations
 
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import ModelResponse
-from docket.harness.skill_validation import SkillResponseValidator
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import ModelResponse
+from toda.harness.skill_validation import SkillResponseValidator
 
 _VALIDATING_SKILL = {
     "id": "skill_test",

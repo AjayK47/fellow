@@ -17,16 +17,19 @@ import time
 
 
 def test_every_job_kind_lands_in_exactly_one_lane(brain):
-    """A kind in neither lane would never be processed by the gateway at
-    all (main.py drives the two lanes and nothing else); a kind in both
-    would be leased by two loops at once."""
+    """A kind in no lane would never be processed by the gateway at all
+    (main.py drives exactly these three lanes and nothing else); a kind in
+    more than one would be leased by two loops at once."""
     worker = brain.harness_worker
     agent = set(worker.agent_job_kinds())
     infra = set(worker.infrastructure_job_kinds())
+    knowledge = set(worker.knowledge_job_kinds())
     every_kind = set(worker.handlers)
 
     assert agent & infra == set()
-    assert agent | infra == every_kind
+    assert agent & knowledge == set()
+    assert infra & knowledge == set()
+    assert agent | infra | knowledge == every_kind
 
 
 def test_the_agent_lane_holds_exactly_the_full_reasoning_loop_kinds(brain):
@@ -44,6 +47,51 @@ def test_the_agent_lane_holds_exactly_the_full_reasoning_loop_kinds(brain):
     # The latency-sensitive path that actually regressed in production.
     assert "event.route" in worker.infrastructure_job_kinds()
     assert "delivery.send" in worker.infrastructure_job_kinds()
+
+
+def test_the_knowledge_lane_holds_exactly_chunking_and_episode_work(brain):
+    """Slow/remote like the agent lane, but not a conversational turn --
+    isolated in its own pool so ingest volume can't starve control jobs
+    (memory ingestion/retrieval plan §9)."""
+    worker = brain.harness_worker
+
+    assert set(worker.knowledge_job_kinds()) == {
+        "knowledge.index_evidence",
+        "knowledge.consolidate_episode",
+    }
+
+
+def test_knowledge_jobs_run_on_their_own_pool_not_the_main_one(brain):
+    """A saturated main pool must not block a knowledge job, and vice
+    versa -- that's the entire point of a third pool."""
+    worker = brain.harness_worker
+    worker.concurrency = 1
+    release = threading.Event()
+    worker.register("test.block_main", lambda _payload: release.wait(timeout=10) or {})
+    brain.harness_jobs.enqueue(
+        organization_id="org_acme",
+        kind="test.block_main",
+        payload={},
+        idempotency_key="lane-test:main-block",
+    )
+    assert worker.pump(kinds=["test.block_main"])["leased"] == 1
+    # Main pool is now fully saturated (concurrency=1) -- a knowledge job
+    # must still be able to start on its own pool.
+    finished: list[str] = []
+    worker.register("knowledge.index_evidence", lambda _payload: finished.append("k") or {})
+    brain.harness_jobs.enqueue(
+        organization_id="org_acme",
+        kind="knowledge.index_evidence",
+        payload={"source_id": "does_not_matter"},
+        idempotency_key="lane-test:knowledge",
+    )
+    assert worker.pump(kinds=worker.knowledge_job_kinds())["leased"] == 1
+    for _ in range(100):
+        if "k" in finished:
+            break
+        time.sleep(0.05)
+    assert "k" in finished, "knowledge job was blocked behind a saturated main pool"
+    release.set()
 
 
 def test_pump_starts_new_work_while_a_slow_job_is_still_running(brain):

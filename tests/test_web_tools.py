@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from docket.services.web_tools import WebTools
-from docket.harness.prompts import frame_untrusted_tool_result
+from toda.providers import ToolConnection
+from toda.services.web_tools import BraveSearchProvider, WebTools
+from toda.harness.prompts import frame_untrusted_tool_result
 
 
 def test_brave_search_normalizes_results(monkeypatch: pytest.MonkeyPatch):
@@ -16,8 +17,12 @@ def test_brave_search_normalizes_results(monkeypatch: pytest.MonkeyPatch):
         def json(self):
             return {"web": {"results": [{"title": "One", "url": "https://example.com", "description": "Result"}]}}
 
-    monkeypatch.setattr("docket.services.web_tools.httpx.get", lambda *args, **kwargs: Response())
-    result = WebTools(brave_api_key="brave-test").search("company research")
+    monkeypatch.setattr("toda.services.web_tools.httpx.get", lambda *args, **kwargs: Response())
+    result = WebTools(
+        search_provider=BraveSearchProvider(
+            ToolConnection(provider="brave", api_key="brave-test")
+        )
+    ).search("company research")
     assert result["configured"] is True
     assert result["results"] == [{"title": "One", "url": "https://example.com", "description": "Result"}]
 
@@ -41,9 +46,11 @@ def test_firecrawl_fetch_returns_markdown(monkeypatch: pytest.MonkeyPatch):
                 },
             }
 
-    monkeypatch.setattr("docket.services.web_tools.WebTools._validate_public_url", staticmethod(lambda url: None))
-    monkeypatch.setattr("docket.services.web_tools.httpx.post", lambda *args, **kwargs: Response())
-    result = WebTools(firecrawl_api_key="fc-test").fetch("https://example.com")
+    monkeypatch.setattr("toda.services.web_tools.WebTools._validate_public_url", staticmethod(lambda url: None))
+    monkeypatch.setattr("toda.services.web_tools.httpx.post", lambda *args, **kwargs: Response())
+    result = WebTools(
+        extract_connection=ToolConnection(provider="firecrawl", api_key="fc-test")
+    ).fetch("https://example.com")
     assert result["provider"] == "firecrawl"
     assert result["content"] == "# Extracted page"
 

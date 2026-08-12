@@ -6,8 +6,9 @@ import { PageHeader, Section, Card, Empty, Pill, Modal } from "../components";
 
 type Status = {
   environment_file?: string;
-  model?: Record<string, unknown>;
-  embedding?: Record<string, unknown>;
+  available_providers?: Json[];
+  providers?: Json[];
+  assignments?: Record<string, Record<string, unknown>>;
   slack?: Record<string, unknown>;
   tools?: Record<string, unknown>;
   organizations?: Json[];
@@ -181,12 +182,15 @@ export default function Setup() {
   const [toolsResult, setToolsResult] = useState<{ ok: boolean; message: string; restartRequired?: boolean } | null>(null);
   const [slackResult, setSlackResult] = useState<{ ok: boolean; message: string; restartRequired?: boolean } | null>(null);
   const [savingModel, setSavingModel] = useState(false);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [modelOptions, setModelOptions] = useState<Record<string, unknown>[]>([]);
   const [savingTools, setSavingTools] = useState(false);
   const [savingSlack, setSavingSlack] = useState(false);
 
   const slack = data?.slack || {};
-  const model = data?.model || {};
-  const embedding = data?.embedding || {};
+  const providers = (data?.providers ?? []) as Record<string, unknown>[];
+  const assignments = (data?.assignments ?? {}) as Record<string, Record<string, unknown>>;
+  const availableProviders = (data?.available_providers ?? []) as Record<string, unknown>[];
   const tools = data?.tools || {};
   const organizations = (data?.organizations ?? []) as Record<string, unknown>[];
 
@@ -196,13 +200,17 @@ export default function Setup() {
     setSavingModel(true);
     setModelResult(null);
     try {
-      await api.post("/v1/gateway/setup/openrouter", {
+      const assignments = Object.fromEntries(
+        ["main", "attention", "extraction", "embedding", "vision", "image", "transcription", "tts"]
+          .map((role) => [role, String(form.get(role) || "").trim()])
+          .filter(([, model]) => model)
+      );
+      await api.post("/v1/gateway/setup/providers", {
+        connection_id: String(form.get("connection_id") || ""),
+        provider: String(form.get("provider") || "openrouter"),
         api_key: String(form.get("api_key") || ""),
-        chat_model: String(form.get("chat_model") || "openai/gpt-5.6-luna"),
-        attention_model: String(form.get("attention_model") || "") || null,
-        extraction_model: String(form.get("extraction_model") || "") || null,
-        embedding_api_key: String(form.get("embedding_api_key") || "") || null,
-        embedding_model: String(form.get("embedding_model") || "qwen/qwen3-embedding-8b"),
+        base_url: String(form.get("base_url") || "") || null,
+        assignments,
       });
       setModelResult({ ok: true, message: "Saved to .env", restartRequired: true });
       setTick((t) => t + 1);
@@ -213,6 +221,26 @@ export default function Setup() {
     }
   }
 
+  async function loadModels(form: HTMLFormElement) {
+    const data = new FormData(form);
+    setLoadingModels(true);
+    setModelResult(null);
+    try {
+      const result = await api.post("/v1/gateway/setup/model-catalog", {
+        provider: String(data.get("provider") || "openrouter"),
+        api_key: String(data.get("api_key") || "") || null,
+        base_url: String(data.get("base_url") || "") || null,
+      }) as Record<string, unknown>;
+      const models = Array.isArray(result.models) ? result.models as Record<string, unknown>[] : [];
+      setModelOptions(models);
+      setModelResult({ ok: true, message: `Loaded ${models.length} models` });
+    } catch (e) {
+      setModelResult({ ok: false, message: e instanceof ApiError ? e.message : String(e) });
+    } finally {
+      setLoadingModels(false);
+    }
+  }
+
   async function saveTools(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
@@ -220,8 +248,12 @@ export default function Setup() {
     setToolsResult(null);
     try {
       await api.post("/v1/gateway/setup/tools", {
-        brave_search_api_key: String(form.get("brave_search_api_key") || "") || null,
-        firecrawl_api_key: String(form.get("firecrawl_api_key") || "") || null,
+        connection_id: String(form.get("connection_id") || ""),
+        provider: String(form.get("provider") || "brave"),
+        api_key: String(form.get("api_key") || "") || null,
+        base_url: String(form.get("base_url") || "") || null,
+        use_for_search: form.get("use_for_search") === "on",
+        use_for_extraction: form.get("use_for_extraction") === "on",
         web_fetch_enabled: form.get("web_fetch_enabled") === "on",
       });
       setToolsResult({ ok: true, message: "Saved to .env", restartRequired: true });
@@ -276,39 +308,33 @@ export default function Setup() {
       {data && (
         <>
           <Section>
-            <Card title="Inference (OpenRouter)">
+            <Card title="Model providers">
               <StatusGrid
                 rows={[
-                  ["configured", model.configured ? <Pill tone="good">yes</Pill> : <Pill tone="bad">no</Pill>],
-                  ["provider", String(model.model_provider)],
-                  ["chat model", String(model.chat_model || "—")],
-                  ["embedding configured", embedding.configured ? <Pill tone="good">yes</Pill> : <Pill tone="bad">no</Pill>],
-                  ["embedding model", String(embedding.embedding_model || "—")],
+                  ["connections", providers.length ? <Pill tone="good">{providers.length}</Pill> : <Pill tone="bad">none</Pill>],
+                  ["main", String(assignments.main?.model || "deterministic offline")],
+                  ["embedding", String(assignments.embedding?.model || "deterministic offline")],
                 ]}
               />
-              <ConfigSection label="Update inference configuration">
+              <ConfigSection label="Add provider and assign model roles">
                 <form className="grid gap-3" onSubmit={saveModel}>
-                  <Field label="OpenRouter API key (required)">
-                    <input className="input" name="api_key" type="password" placeholder="sk-or-…" required />
-                  </Field>
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    <Field label="Chat model">
-                      <input className="input" name="chat_model" defaultValue={String(model.chat_model || "openai/gpt-5.6-luna")} />
-                    </Field>
-                    <Field label="Embedding model">
-                      <input className="input" name="embedding_model" defaultValue={String(embedding.embedding_model || "qwen/qwen3-embedding-8b")} />
-                    </Field>
-                    <Field label="Attention model (optional)">
-                      <input className="input" name="attention_model" placeholder="defaults to chat model" />
-                    </Field>
-                    <Field label="Extraction model (optional)">
-                      <input className="input" name="extraction_model" placeholder="defaults to chat model" />
-                    </Field>
+                    <Field label="Connection name"><input className="input" name="connection_id" placeholder="openrouter-company" required /></Field>
+                    <Field label="Provider"><select className="input" name="provider" defaultValue="openrouter">{availableProviders.map((item) => <option key={String(item.id)} value={String(item.id)}>{String(item.name)}</option>)}</select></Field>
+                    <Field label="Provider API key"><input className="input" name="api_key" type="password" placeholder="not required for local providers" /></Field>
+                    <Field label="Custom base URL"><input className="input" name="base_url" placeholder="optional" /></Field>
+                    <Field label="Main model"><input className="input" name="main" list="provider-models" placeholder="provider model id" /></Field>
+                    <Field label="Embedding model"><input className="input" name="embedding" list="provider-models" placeholder="optional" /></Field>
+                    <Field label="Attention model"><input className="input" name="attention" list="provider-models" placeholder="defaults to main" /></Field>
+                    <Field label="Extraction model"><input className="input" name="extraction" list="provider-models" placeholder="defaults to main" /></Field>
+                    <Field label="Vision model"><input className="input" name="vision" list="provider-models" placeholder="optional" /></Field>
+                    <Field label="Image model"><input className="input" name="image" list="provider-models" placeholder="optional" /></Field>
+                    <Field label="Speech-to-text model"><input className="input" name="transcription" list="provider-models" placeholder="optional" /></Field>
+                    <Field label="Text-to-speech model"><input className="input" name="tts" list="provider-models" placeholder="optional" /></Field>
                   </div>
-                  <Field label="Separate embedding API key (optional)">
-                    <input className="input" name="embedding_api_key" type="password" placeholder="defaults to the key above" />
-                  </Field>
+                  <datalist id="provider-models">{modelOptions.map((item) => <option key={String(item.id)} value={String(item.id)}>{String(item.name || item.description || "")}</option>)}</datalist>
                   <div className="flex items-center gap-3">
+                    <button className="btn-secondary" type="button" disabled={loadingModels} onClick={(event) => event.currentTarget.form && loadModels(event.currentTarget.form)}>{loadingModels ? "Loading…" : "Load models"}</button>
                     <button className="btn" type="submit" disabled={savingModel}>
                       {savingModel ? "Saving…" : "Save"}
                     </button>
@@ -323,21 +349,21 @@ export default function Setup() {
             <Card title="Web tools">
               <StatusGrid
                 rows={[
-                  ["brave search", tools.brave_search_configured ? <Pill tone="good">set</Pill> : <Pill tone="muted">off</Pill>],
-                  ["firecrawl", tools.firecrawl_configured ? <Pill tone="good">set</Pill> : <Pill tone="muted">off</Pill>],
+                  ["search", tools.search_connection ? <Pill tone="good">{String(tools.search_connection)}</Pill> : <Pill tone="muted">off</Pill>],
+                  ["extraction", tools.extract_connection ? <Pill tone="good">{String(tools.extract_connection)}</Pill> : <Pill tone="muted">direct fetch</Pill>],
                   ["web fetch", tools.web_fetch_enabled ? <Pill tone="good">on</Pill> : <Pill tone="muted">off</Pill>],
                 ]}
               />
               <ConfigSection label="Update web tools">
                 <form className="grid gap-3" onSubmit={saveTools}>
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    <Field label="Brave Search API key (optional)">
-                      <input className="input" name="brave_search_api_key" type="password" placeholder="leave blank to keep current" />
-                    </Field>
-                    <Field label="Firecrawl API key (optional)">
-                      <input className="input" name="firecrawl_api_key" type="password" placeholder="leave blank to keep current" />
-                    </Field>
+                    <Field label="Connection name"><input className="input" name="connection_id" placeholder="brave-company" required /></Field>
+                    <Field label="Provider"><select className="input" name="provider"><option value="brave">Brave</option><option value="tavily">Tavily</option><option value="exa">Exa</option><option value="firecrawl">Firecrawl</option><option value="searxng">SearXNG</option></select></Field>
+                    <Field label="API key"><input className="input" name="api_key" type="password" placeholder="not required for SearXNG" /></Field>
+                    <Field label="Custom / instance URL"><input className="input" name="base_url" placeholder="required for SearXNG" /></Field>
                   </div>
+                  <label className="flex items-center gap-2 text-[12px] font-medium text-ink"><input type="checkbox" name="use_for_search" defaultChecked className="h-4 w-4 rounded border-line accent-brand" />Use for search</label>
+                  <label className="flex items-center gap-2 text-[12px] font-medium text-ink"><input type="checkbox" name="use_for_extraction" className="h-4 w-4 rounded border-line accent-brand" />Use for extraction (Firecrawl only)</label>
                   <label className="flex items-center gap-2 text-[12px] font-medium text-ink">
                     <input
                       type="checkbox"

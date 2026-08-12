@@ -8,11 +8,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from docket.harness.automations import (
+from toda.harness.automations import (
     compute_next_run_at,
     next_cron_fire,
 )
-from docket.harness.prompts import AUTOMATION_TRIGGER_GUIDANCE, build_agent_messages
+from toda.harness.prompts import AUTOMATION_TRIGGER_GUIDANCE, build_agent_messages
 
 
 def _destination() -> dict:
@@ -268,7 +268,7 @@ def test_automation_trigger_guidance_only_appears_for_automation_runs():
 
 def test_a_pure_notification_automation_firing_writes_no_durable_memory(brain):
     """A scheduled firing that made no tool calls observed nothing -- its
-    whole content is text Docket generated for itself, so there is no new
+    whole content is text Toda generated for itself, so there is no new
     company fact to remember. Capturing it anyway is how a 3-minute
     reminder automation silently wrote ~480 worthless memories a day
     ("Task task_x has final answer: 'Time for a hydration check...'"),

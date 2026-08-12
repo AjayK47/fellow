@@ -13,9 +13,9 @@ from datetime import timedelta
 
 import pytest
 
-from docket.domain.models import new_id, utcnow
-from docket.harness.models import AgentRunState, DestinationEnvelope, InvocationEnvelope
-from docket.harness.pi_task_executor import check_hardline_floor
+from toda.domain.models import new_id, utcnow
+from toda.harness.models import AgentRunState, DestinationEnvelope, InvocationEnvelope
+from toda.harness.pi_task_executor import check_hardline_floor
 
 
 def _provision_workspace(brain) -> None:
@@ -42,7 +42,7 @@ def _make_pi_task(brain, *, session_id: str, prompt: str = "fix it") -> dict:
     envelope = InvocationEnvelope(
         organization_id="org_acme",
         principal_id="person_ajay",
-        application_id="slack_docket",
+        application_id="slack_toda",
         conversation_id="slack:dm:person_ajay:pi-direct",
         destination=DestinationEnvelope(type="dm", id="D1", is_private=True),
         purpose="reactive_agent",

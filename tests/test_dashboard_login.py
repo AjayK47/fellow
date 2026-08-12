@@ -7,7 +7,16 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from docket.config import settings
+from toda.config import settings
+
+
+@pytest.fixture(autouse=True)
+def signed_out(api_client):
+    """This module's subject is the login lifecycle itself, so it starts
+    from a genuinely signed-out client -- the shared api_client fixture
+    arrives pre-authenticated for the tenant-guarded data routes."""
+    api_client.cookies.clear()
+    return api_client
 
 
 class FakeSlackResponse:
@@ -33,6 +42,24 @@ def test_session_dev_bypass_returns_synthetic_session(api_client, monkeypatch: p
     body = resp.json()
     assert body["organization_id"] == settings.default_org_id
     assert body["auth_disabled"] is True
+
+
+def test_local_admin_token_creates_the_normal_dashboard_session(
+    api_client, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(settings, "local_admin_token", "a-strong-local-token")
+    methods = api_client.get("/v1/auth/methods")
+    assert methods.status_code == 200
+    assert methods.json()["local_token"] is True
+
+    denied = api_client.post("/v1/session/local", json={"token": "wrong"})
+    assert denied.status_code == 401
+    accepted = api_client.post(
+        "/v1/session/local", json={"token": "a-strong-local-token"}
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["organization_id"] == settings.default_org_id
+    assert api_client.get("/v1/session").status_code == 200
 
 
 def test_slack_login_requires_configuration(api_client, monkeypatch: pytest.MonkeyPatch):
@@ -90,11 +117,11 @@ def test_oidc_callback_no_installation_redirects_to_install(
 ):
     state = _do_login(api_client, monkeypatch)
     monkeypatch.setattr(
-        "docket.api.routes.httpx.post",
+        "toda.api.routes.httpx.post",
         lambda *a, **k: FakeSlackResponse({"ok": True, "access_token": "xoxe-fake"}),
     )
     monkeypatch.setattr(
-        "docket.api.routes.httpx.get",
+        "toda.api.routes.httpx.get",
         lambda *a, **k: FakeSlackResponse(
             {
                 "sub": "U_NEW",
@@ -136,11 +163,11 @@ def test_oidc_callback_success_sets_session_for_existing_installation(
 
     state = _do_login(api_client, monkeypatch)
     monkeypatch.setattr(
-        "docket.api.routes.httpx.post",
+        "toda.api.routes.httpx.post",
         lambda *a, **k: FakeSlackResponse({"ok": True, "access_token": "xoxe-fake"}),
     )
     monkeypatch.setattr(
-        "docket.api.routes.httpx.get",
+        "toda.api.routes.httpx.get",
         lambda *a, **k: FakeSlackResponse(
             {
                 "sub": "U_MEMBER",

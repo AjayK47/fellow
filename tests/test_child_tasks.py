@@ -19,8 +19,8 @@ import time
 
 import pytest
 
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import ModelResponse, ModelToolCall, ToolDefinition
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import ModelResponse, ModelToolCall, ToolDefinition
 
 _FAKE_PI_SUCCESS_JSON = (
     '{"type": "result", "status": "success", '

@@ -3,11 +3,21 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "docket"
+name = "toda-ai"
 version = "0.1.0"
-description = "Graph-native organizational memory and context platform for enterprise agents"
+description = "Self-hosted organizational coworker with permission-scoped memory and durable tasks"
 readme = "README.md"
 license = "MIT"
+authors = [{name = "Ajay K"}]
+keywords = ["ai-agent", "slack", "organizational-memory", "self-hosted", "coworker"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business",
+]
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115.0",
@@ -23,38 +33,51 @@ dependencies = [
   "openpyxl>=3.1.0",
   "python-pptx>=1.0.0",
   "Pillow>=10.0.0",
+  "matplotlib>=3.9.0",
   "pymupdf>=1.24.0",
   "weasyprint>=62.0",
   "mcp>=2.0.0,<3.0.0",
+  "sqlite-vec>=0.1.9",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.3.0",
   "pytest-asyncio>=0.24.0",
+  "ruff>=0.12.0",
 ]
 browser = [
   "playwright>=1.50.0",
 ]
 
 [project.scripts]
-docket = "docket.main:main"
-docket-gateway = "docket.main:main"
-docket-seed = "docket.fixtures.seed:main"
-docket-slack = "docket.slack_socket:main"
-docket-worker = "docket.worker_main:main"
+toda = "toda.main:main"
+toda-gateway = "toda.main:main"
+toda-seed = "toda.fixtures.seed:main"
+toda-slack = "toda.slack_socket:main"
+toda-worker = "toda.worker_main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-docket = [
+toda = [
   "builtin_skills/**/SKILL.md",
   "builtin_skills/**/resources/**",
   "harness/prompts.md",
+  "harness/infographic_runtime/*.mjs",
+  "harness/infographic_runtime/package*.json",
+  "static/**",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

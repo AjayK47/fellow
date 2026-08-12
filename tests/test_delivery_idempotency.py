@@ -6,9 +6,9 @@ from typing import Any
 
 import pytest
 
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import InvocationEnvelope, ModelResponse
-from docket.harness.slack import SlackSender
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import InvocationEnvelope, ModelResponse
+from toda.harness.slack import SlackSender
 
 
 def _slack_envelope(brain) -> InvocationEnvelope:
@@ -19,7 +19,7 @@ def _slack_envelope(brain) -> InvocationEnvelope:
     return InvocationEnvelope(
         organization_id="org_acme",
         principal_id="person_ajay",
-        application_id="slack_docket",
+        application_id="slack_toda",
         conversation_id="slack:C_TEST:delivery-idempotency",
         destination=destination,
         purpose="reactive_agent",
@@ -124,7 +124,7 @@ def test_a_send_already_reserved_by_another_attempt_is_never_sent_again(brain):
     # Simulate a concurrent attempt that claimed this exact idempotency key
     # moments ago and is still mid-send (a fresh timestamp -- an old one is
     # treated as abandoned and deliberately reclaimable, covered below).
-    from docket.domain.models import utcnow
+    from toda.domain.models import utcnow
 
     now = utcnow().isoformat()
     idempotency_key = f"slack.final:{task['id']}"
@@ -209,7 +209,7 @@ def test_slack_retries_use_the_same_client_message_id(monkeypatch):
         posted.append(kwargs["json"])
         return _Response()
 
-    monkeypatch.setattr("docket.harness.slack.httpx.post", fake_post)
+    monkeypatch.setattr("toda.harness.slack.httpx.post", fake_post)
     sender = SlackSender(bot_token="xoxb-test")
     for _ in range(2):
         sender.send(
@@ -241,7 +241,7 @@ def test_blocked_emoji_are_scrubbed_before_the_real_slack_call(monkeypatch):
         posted.append(kwargs["json"])
         return _Response()
 
-    monkeypatch.setattr("docket.harness.slack.httpx.post", fake_post)
+    monkeypatch.setattr("toda.harness.slack.httpx.post", fake_post)
     sender = SlackSender(bot_token="xoxb-test")
     sender.send(
         channel_id="C_TEST",

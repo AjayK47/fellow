@@ -4,8 +4,8 @@ import argparse
 
 import pytest
 
-from docket.config import settings
-from docket.main import reset_cli
+from toda.config import settings
+from toda.main import reset_cli
 
 
 def test_reset_requires_explicit_yes_and_removes_database_sidecars(tmp_path, monkeypatch):
@@ -51,7 +51,7 @@ def test_reset_also_clears_task_workspaces(tmp_path, monkeypatch):
     assert list(workspace_root.iterdir()) == []
 
 
-def test_reset_refuses_a_workspace_root_that_is_not_dockets_own(tmp_path, monkeypatch):
+def test_reset_refuses_a_workspace_root_that_is_not_toda_owned(tmp_path, monkeypatch):
     """Guard against a misconfigured workspace_root (pointed at a home
     directory, say) turning a reset into an unrecoverable wipe."""
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")

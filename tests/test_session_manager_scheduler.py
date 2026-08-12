@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import pytest
 
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import ModelResponse, ModelToolCall
-from docket.harness.runtime import CompanyAgent
-from docket.harness.session_manager import SessionManagerScheduler
-from docket.harness.sessions import SessionService
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import ModelResponse, ModelToolCall
+from toda.harness.runtime import CompanyAgent
+from toda.harness.session_manager import SessionManagerScheduler
+from toda.harness.sessions import SessionService
 
 
 def _scheduler(brain) -> tuple[SessionManagerScheduler, SessionService]:
@@ -187,7 +187,7 @@ def test_tool_call_needing_approval_pauses_and_resumes_through_the_new_path(brai
             completion_max_tokens=old.completion_max_tokens,
         )
 
-    from docket.harness.task_run_store import TaskRunStore
+    from toda.harness.task_run_store import TaskRunStore
 
     resume_runs = TaskRunStore(brain.store, owner="executor-resume", lease_seconds=1800)
     resume_agent = agent_factory(resume_runs)

@@ -4,15 +4,19 @@ secret-scrubbed environment, approval-gated at registration."""
 
 from __future__ import annotations
 
-import os
+import socket
+import tempfile
+from pathlib import Path
 
-from docket.harness.run_code import (
+import pytest
+
+from toda.harness.run_code import (
     RUN_CODE_CANDIDATE_TOOLS,
     RunCodeSandbox,
     generate_stub_module,
     scrub_child_env,
 )
-from docket.harness.tools import build_tool_registry
+from toda.harness.tools import build_tool_registry
 
 
 class _FakeDefinition:
@@ -34,21 +38,36 @@ class _FakeRegistry:
         return self._tools.get(name)
 
 
+@pytest.fixture
+def unix_socket_available():
+    """Skip subprocess integration only when the host forbids AF_UNIX."""
+    with tempfile.TemporaryDirectory(prefix="toda_sock_", dir="/tmp") as directory:
+        path = Path(directory) / "probe.sock"
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.bind(str(path))
+        except PermissionError:
+            pytest.skip("host sandbox does not permit Unix-domain sockets")
+        finally:
+            probe.close()
+            path.unlink(missing_ok=True)
+
+
 def test_scrub_child_env_removes_secret_shaped_names_and_keeps_safe_ones():
     source = {
         "PATH": "/usr/bin",
-        "HOME": "/home/docket",
+        "HOME": "/home/toda",
         "OPENAI_API_KEY": "sk-should-not-leak",
-        "DOCKET_SLACK_BOT_TOKEN": "xoxb-should-not-leak",
+        "TODA_SLACK_BOT_TOKEN": "xoxb-should-not-leak",
         "DATABASE_PASSWORD": "hunter2",
         "SOME_WEBHOOK_URL": "https://internal/hook",
         "RANDOM_APP_SETTING": "keep-me",
     }
     scrubbed = scrub_child_env(source)
     assert scrubbed["PATH"] == "/usr/bin"
-    assert scrubbed["HOME"] == "/home/docket"
+    assert scrubbed["HOME"] == "/home/toda"
     assert "OPENAI_API_KEY" not in scrubbed
-    assert "DOCKET_SLACK_BOT_TOKEN" not in scrubbed
+    assert "TODA_SLACK_BOT_TOKEN" not in scrubbed
     assert "DATABASE_PASSWORD" not in scrubbed
     assert "SOME_WEBHOOK_URL" not in scrubbed
     # Not on the safe-prefix allowlist and not secret-shaped -> dropped by
@@ -65,7 +84,7 @@ def test_generate_stub_module_only_exposes_named_tools():
     assert "SALLY_RPC_SOCKET" in source and "SALLY_RPC_TOKEN" in source
 
 
-def test_sandbox_runs_a_trivial_script_and_captures_stdout():
+def test_sandbox_runs_a_trivial_script_and_captures_stdout(unix_socket_available):
     sandbox = RunCodeSandbox(registry=_FakeRegistry({}), allowed_tools=(), timeout_seconds=10, max_tool_calls=5)
     result = sandbox.run("print('hello from sandbox')", runtime={})
     assert result["status"] == "success"
@@ -74,7 +93,7 @@ def test_sandbox_runs_a_trivial_script_and_captures_stdout():
     assert result["tool_calls_made"] == 0
 
 
-def test_sandbox_dispatches_an_allowed_read_tool_callback():
+def test_sandbox_dispatches_an_allowed_read_tool_callback(unix_socket_available):
     registry = _FakeRegistry(
         {"echo_tool": _FakeRegistered(lambda args, rt: {"echo": args.get("text")})}
     )
@@ -82,14 +101,14 @@ def test_sandbox_dispatches_an_allowed_read_tool_callback():
         registry=registry, allowed_tools=("echo_tool",), timeout_seconds=10, max_tool_calls=5
     )
     result = sandbox.run(
-        "import docket_tools\nprint(docket_tools.echo_tool(text='hi'))", runtime={"organization_id": "org_acme"}
+        "import toda_tools\nprint(toda_tools.echo_tool(text='hi'))", runtime={"organization_id": "org_acme"}
     )
     assert result["status"] == "success"
     assert result["tool_calls_made"] == 1
     assert "'echo': 'hi'" in result["output"]
 
 
-def test_sandbox_rejects_a_tool_not_on_the_allow_list():
+def test_sandbox_rejects_a_tool_not_on_the_allow_list(unix_socket_available):
     registry = _FakeRegistry(
         {"echo_tool": _FakeRegistered(lambda args, rt: {"echo": "x"})}
     )
@@ -99,13 +118,15 @@ def test_sandbox_rejects_a_tool_not_on_the_allow_list():
     # The stub module is only generated for allowed_tools, so an
     # out-of-allow-list name isn't even a callable attribute on it.
     result = sandbox.run(
-        "import docket_tools\nprint(docket_tools.brain_query_facts())", runtime={}
+        "import toda_tools\nprint(toda_tools.brain_query_facts())", runtime={}
     )
     assert result["status"] == "error"
     assert "no attribute" in result["output"] or "AttributeError" in result["output"]
 
 
-def test_sandbox_blocks_a_write_risk_tool_even_if_misconfigured_onto_the_allow_list():
+def test_sandbox_blocks_a_write_risk_tool_even_if_misconfigured_onto_the_allow_list(
+    unix_socket_available,
+):
     """Defense in depth: the per-call risk re-check must hold even if the
     allow-list itself were ever misconfigured to include a non-read tool."""
     registry = _FakeRegistry(
@@ -118,13 +139,13 @@ def test_sandbox_blocks_a_write_risk_tool_even_if_misconfigured_onto_the_allow_l
         max_tool_calls=5,
     )
     result = sandbox.run(
-        "import docket_tools\nprint(docket_tools.shell_like_tool())", runtime={}
+        "import toda_tools\nprint(toda_tools.shell_like_tool())", runtime={}
     )
     assert result["status"] == "success"
     assert "not read-safe" in result["output"]
 
 
-def test_sandbox_enforces_the_tool_call_limit():
+def test_sandbox_enforces_the_tool_call_limit(unix_socket_available):
     calls = {"count": 0}
 
     def _handler(args, rt):
@@ -136,23 +157,25 @@ def test_sandbox_enforces_the_tool_call_limit():
         registry=registry, allowed_tools=("echo_tool",), timeout_seconds=10, max_tool_calls=2
     )
     script = (
-        "import docket_tools\n"
+        "import toda_tools\n"
         "for _ in range(4):\n"
-        "    print(docket_tools.echo_tool())\n"
+        "    print(toda_tools.echo_tool())\n"
     )
     result = sandbox.run(script, runtime={})
     assert result["tool_calls_made"] == 2
     assert "tool call limit reached" in result["output"]
 
 
-def test_sandbox_kills_a_script_that_exceeds_the_timeout():
+def test_sandbox_kills_a_script_that_exceeds_the_timeout(unix_socket_available):
     sandbox = RunCodeSandbox(registry=_FakeRegistry({}), allowed_tools=(), timeout_seconds=1, max_tool_calls=5)
     result = sandbox.run("import time\ntime.sleep(5)", runtime={})
     assert result["status"] == "timeout"
     assert "timed out" in result["error"]
 
 
-def test_sandbox_child_process_does_not_inherit_secret_shaped_env_vars(monkeypatch):
+def test_sandbox_child_process_does_not_inherit_secret_shaped_env_vars(
+    monkeypatch, unix_socket_available
+):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-leak-into-sandbox")
     sandbox = RunCodeSandbox(registry=_FakeRegistry({}), allowed_tools=(), timeout_seconds=10, max_tool_calls=5)
     result = sandbox.run(
@@ -163,11 +186,8 @@ def test_sandbox_child_process_does_not_inherit_secret_shaped_env_vars(monkeypat
     assert "sk-should-not-leak" not in result["output"]
 
 
-def test_run_code_is_registered_by_default_and_approval_gated(brain):
-    registered = brain.tool_registry.get("run_code")
-    assert registered is not None
-    assert registered.definition.risk == "write"
-    assert registered.definition.approval_required is True
+def test_run_code_is_disabled_by_default(brain):
+    assert brain.tool_registry.get("run_code") is None
 
 
 def test_run_code_registers_with_read_only_intersection_and_is_approval_gated(brain):
@@ -194,7 +214,9 @@ def test_run_code_registers_with_read_only_intersection_and_is_approval_gated(br
             assert registry.get(name).definition.risk == "read"
 
 
-def test_run_code_end_to_end_calls_back_into_a_real_read_tool(brain):
+def test_run_code_end_to_end_calls_back_into_a_real_read_tool(
+    brain, unix_socket_available
+):
     registry = build_tool_registry(
         store=brain.store,
         retrieval=brain.retrieval,
@@ -217,8 +239,8 @@ def test_run_code_end_to_end_calls_back_into_a_real_read_tool(brain):
         "task_id": "task_test_run_code",
     }
     script = (
-        "import docket_tools\n"
-        "result = docket_tools.brain_search(query='Acme export')\n"
+        "import toda_tools\n"
+        "result = toda_tools.brain_search(query='Acme export')\n"
         "print(result.get('count'))\n"
     )
     output = run_code.handler({"code": script}, runtime)

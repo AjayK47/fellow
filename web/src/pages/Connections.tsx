@@ -159,7 +159,7 @@ function OAuthConnectBody({
     return (
       <>
         <p className="text-[13px] leading-relaxed text-muted">
-          Opens {label} in a new tab so you can sign in and authorize Docket via
+          Opens {label} in a new tab so you can sign in and authorize Toda via
           Composio. Come back here once you've approved it — this page picks it up
           automatically.
         </p>

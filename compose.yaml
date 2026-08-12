@@ -1,0 +1,25 @@
+services:
+  toda:
+    build:
+      context: .
+    image: toda-ai:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TODA_HOST: 0.0.0.0
+      TODA_DATA_DIR: /var/lib/toda
+      TODA_WORKSPACE_ROOT: /var/lib/toda/workspaces
+    ports:
+      # Intentionally loopback-only. Put an authenticated TLS proxy in front
+      # before changing this binding.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - toda-data:/var/lib/toda
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  toda-data:

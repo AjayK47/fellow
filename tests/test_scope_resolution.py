@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import pytest
 
-from docket.harness.models import InvocationEnvelope
-from docket.services.scope_resolution import resolve_scope
+from toda.harness.models import InvocationEnvelope
+from toda.services.scope_resolution import resolve_scope
 
 
 def _make_channel_scope(brain, *, scope_id: str, channel_id: str, is_public: bool) -> None:

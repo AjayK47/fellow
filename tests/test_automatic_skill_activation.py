@@ -6,9 +6,9 @@ import json
 
 import pytest
 
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import InvocationEnvelope, ModelResponse
-from docket.harness.skill_validation import SkillResponseValidator
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import InvocationEnvelope, ModelResponse
+from toda.harness.skill_validation import SkillResponseValidator
 
 
 def _slack_envelope(brain, *, conversation: str) -> InvocationEnvelope:

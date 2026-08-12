@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from docket.harness.models import InvocationEnvelope
+from toda.harness.models import InvocationEnvelope
 
 
 def _envelope(brain, *, conversation: str, is_private: bool = True) -> InvocationEnvelope:

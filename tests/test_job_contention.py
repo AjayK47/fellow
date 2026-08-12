@@ -8,7 +8,7 @@ whenever someone sends a follow-up mid-run -- and that retrying job is the
 ONLY thing that picks the pending revision back up once the Manager
 releases. Under exponential backoff the retries land at 1s, 2s, 4s, 8s ...
 capped at 300s, so a follow-up sent during a 60-second run could sit
-unanswered for minutes after Docket was already free, with nothing wrong
+unanswered for minutes after Toda was already free, with nothing wrong
 in any log.
 """
 
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from docket.harness.jobs import JobContention
+from toda.harness.jobs import JobContention
 
 
 def _retry_delay_seconds(brain, job_id: str, *, failed_at: datetime) -> float:
@@ -27,7 +27,7 @@ def _retry_delay_seconds(brain, job_id: str, *, failed_at: datetime) -> float:
 
 
 def test_contention_retries_fast_while_real_errors_back_off(brain):
-    from docket.domain.models import utcnow
+    from toda.domain.models import utcnow
 
     contended = brain.harness_jobs.enqueue(
         organization_id="org_acme",
@@ -58,7 +58,7 @@ def test_contention_retries_fast_while_real_errors_back_off(brain):
 def test_worker_routes_a_contention_exception_to_the_fast_retry(brain):
     """The classification must hold end to end through _process_job, not
     just when fail() is called directly."""
-    from docket.domain.models import utcnow
+    from toda.domain.models import utcnow
 
     brain.harness_worker.register(
         "test.contended", lambda _payload: (_ for _ in ()).throw(JobContention("busy"))

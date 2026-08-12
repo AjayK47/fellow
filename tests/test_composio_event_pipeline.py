@@ -8,6 +8,8 @@ import hmac
 import json
 import time
 
+from tests.conftest import sign_in
+
 
 def _signature(
     secret: str, webhook_id: str, timestamp: str, body: bytes
@@ -293,7 +295,7 @@ def test_connection_sync_link_and_trigger_creation_are_org_scoped(
     )
     assert linked.status_code == 200
     assert linked_args == {
-        "user_id": "docket:org_acme",
+        "user_id": "toda:org_acme",
         "auth_config_id": "ac_github",
         "callback_url": "https://brain.test/integrations",
         "alias": None,
@@ -317,7 +319,7 @@ def test_connection_sync_link_and_trigger_creation_are_org_scoped(
     )
     assert created.status_code == 200, created.text
     assert trigger_args["connected_account_id"] == "ca_synced_github"
-    assert trigger_args["user_id"] == "docket:org_acme"
+    assert trigger_args["user_id"] == "toda:org_acme"
 
     wrong_org = api_client.post(
         "/v1/composio/triggers",
@@ -327,7 +329,9 @@ def test_connection_sync_link_and_trigger_creation_are_org_scoped(
             "trigger_slug": "GITHUB_ISSUE_EVENT",
         },
     )
-    assert wrong_org.status_code == 404
+    # The tenant guard (api/routes.py:enforce_tenant) rejects a request
+    # naming another organization before the handler ever runs.
+    assert wrong_org.status_code == 403
 
 
 def test_toolkit_browsing_is_not_limited_to_the_curated_four(api_client, monkeypatch):
@@ -536,6 +540,20 @@ def test_api_key_connect_reuses_an_existing_matching_auth_config(api_client, mon
 def test_credential_connect_rejects_an_unknown_organization(api_client, monkeypatch):
     brain = api_client.app.state.brain
     brain.composio.api_key = "test-only"
+    response = api_client.post(
+        "/v1/composio/connections:credentials",
+        json={
+            "organization_id": "org_does_not_exist",
+            "toolkit": "stripe",
+            "auth_scheme": "API_KEY",
+            "credentials": {"generic_api_key": "sk_test_dummy"},
+        },
+    )
+    assert response.status_code == 403  # rejected by the tenant guard first
+
+    # Signed in AS that organization, the route's own existence check is
+    # what rejects it -- both layers are load-bearing.
+    sign_in(api_client, organization_id="org_does_not_exist")
     response = api_client.post(
         "/v1/composio/connections:credentials",
         json={

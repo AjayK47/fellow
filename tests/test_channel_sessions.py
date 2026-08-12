@@ -4,7 +4,7 @@ Channels used to fork a Session per addressed message
 (`{context_key}:event:{message_identity}`), which tied context to the sender
 instead of the conversation. Two people raising the same issue got two
 isolated Task trees, an addressed "stop" landed in a brand-new empty Session
-and cancelled nothing, and mentioning Docket gave LESS continuity than not
+and cancelled nothing, and mentioning Toda gave LESS continuity than not
 mentioning it (ambient messages attach to the channel-wide
 conversation_state.active_session_id; addressed ones never consulted it).
 
@@ -15,8 +15,8 @@ actor's whole membership set rather than a single room's scope.
 
 from __future__ import annotations
 
-from docket.domain.models import new_id, utcnow
-from docket.harness.models import (
+from toda.domain.models import new_id, utcnow
+from toda.harness.models import (
     AgentRunState,
     DestinationEnvelope,
     InvocationEnvelope,
@@ -27,7 +27,8 @@ GROUP_DM = {"type": "dm", "id": "GTEAM", "is_private": True}
 
 
 def _slack_event(
-    *, channel: str, channel_type: str, user: str, text: str, ts: str
+    *, channel: str, channel_type: str, user: str, text: str, ts: str,
+    thread_ts: str | None = None,
 ) -> dict:
     return {
         "type": "event_callback",
@@ -41,6 +42,7 @@ def _slack_event(
             "text": text,
             "ts": ts,
             "client_msg_id": f"msg-{ts}",
+            **({"thread_ts": thread_ts} if thread_ts else {}),
         },
     }
 
@@ -51,7 +53,7 @@ def _root_task(brain, *, session_id: str, principal_id: str, destination: dict) 
     envelope = InvocationEnvelope(
         organization_id="org_acme",
         principal_id=principal_id,
-        application_id="slack_docket",
+        application_id="slack_toda",
         conversation_id="slack:TACME:CENG",
         destination=DestinationEnvelope(**destination),
         purpose="reactive_agent",
@@ -125,6 +127,46 @@ def test_two_addressed_channel_messages_resolve_to_one_session(brain):
     assert first.payload["conversation_key"] == first.payload["context_key"]
     # Distinct messages must still deduplicate independently.
     assert first.dedupe_key != second.dedupe_key
+
+
+def test_threads_are_routing_metadata_inside_the_channel_session(brain):
+    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+
+    root = brain.slack_gateway.normalize(
+        _slack_event(
+            channel="CENG", channel_type="channel", user="UAJAY",
+            text="<@UBOT> investigate", ts="10.0",
+        )
+    )
+    first_thread = brain.slack_gateway.normalize(
+        _slack_event(
+            channel="CENG", channel_type="channel", user="UAJAY",
+            text="<@UBOT> first follow-up", ts="11.0", thread_ts="10.0",
+        )
+    )
+    second_thread = brain.slack_gateway.normalize(
+        _slack_event(
+            channel="CENG", channel_type="channel", user="USANJAY",
+            text="<@UBOT> separate thread", ts="21.0", thread_ts="20.0",
+        )
+    )
+
+    assert {
+        root.payload["conversation_key"],
+        first_thread.payload["conversation_key"],
+        second_thread.payload["conversation_key"],
+    } == {"slack:TACME:CENG"}
+    assert root.payload["thread_ts"] is None
+    assert first_thread.payload["thread_ts"] == "10.0"
+    assert second_thread.payload["thread_ts"] == "20.0"
+
+    routed = brain.event_router.route(first_thread.model_dump(mode="json"))
+    assert routed["route"] == "session_wake"
+    session = brain.store.find_session_by_conversation(
+        "org_acme", "slack:TACME:CENG"
+    )
+    messages = brain.store.list_session_messages(session["id"])
+    assert messages[-1]["metadata"]["thread_ts"] == "10.0"
 
 
 def test_a_second_speaker_wakes_the_same_session_not_a_new_one(brain):
@@ -293,7 +335,7 @@ def test_the_same_speaker_never_triggers_reauthorization(brain):
 def test_user_turns_carry_their_speaker_into_the_prompt(brain):
     """One room, one transcript, several people -- an unattributed history
     makes a second person's "same thing here" read as the first person."""
-    from docket.harness.prompts import build_agent_messages
+    from toda.harness.prompts import build_agent_messages
 
     wake = brain.sessions.wake(
         organization_id="org_acme",
@@ -338,7 +380,7 @@ def test_user_turns_carry_their_speaker_into_the_prompt(brain):
 
 
 def test_an_unattributed_message_renders_exactly_as_before(brain):
-    from docket.harness.prompts import build_agent_messages
+    from toda.harness.prompts import build_agent_messages
 
     session = brain.sessions.resolve(
         organization_id="org_acme",

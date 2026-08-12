@@ -43,7 +43,7 @@ import Reality from "./pages/Reality";
 import Jobs from "./pages/Jobs";
 import Audit from "./pages/Audit";
 import Login from "./pages/Login";
-import { api, ORG, fetchSession, logout, DashboardSession } from "./api";
+import { api, ORG, fetchSession, logout, onUnauthorized, DashboardSession } from "./api";
 import { useVisibleInterval } from "./components";
 
 type NavItem = { to: string; label: string; end?: boolean; icon: typeof Activity };
@@ -140,7 +140,7 @@ function Sidebar({
         <span className="flex h-8 w-8 items-center justify-center rounded-[10px] bg-brand text-acid">
           <Sparkles size={16} strokeWidth={2.4} />
         </span>
-        <span className="text-[15px] font-semibold tracking-tight text-ink">Docket</span>
+        <span className="text-[15px] font-semibold tracking-tight text-ink">Toda</span>
       </Link>
 
       <nav className="mt-8 grid gap-6">
@@ -315,6 +315,14 @@ export default function App() {
       setLoginError(err);
       window.history.replaceState({}, "", window.location.pathname);
     }
+    // A login that expires mid-session turns every subsequent request into
+    // a 401; without this the console would keep rendering a stale page
+    // whose every refresh silently fails. Dropping session state sends the
+    // person back to the login screen instead.
+    onUnauthorized(() => {
+      setLoginError("session_expired");
+      setSession(null);
+    });
     fetchSession()
       .then(setSession)
       .catch(() => setSession(null));

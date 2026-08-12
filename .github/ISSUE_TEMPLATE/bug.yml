@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible Toda defect
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, company data, or vulnerability details.
+  - type: input
+    id: version
+    attributes: {label: Toda version}
+    validations: {required: true}
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation
+      options: [Docker Compose, Source checkout, Python package, Other]
+    validations: {required: true}
+  - type: textarea
+    id: reproduce
+    attributes: {label: Reproduction steps}
+    validations: {required: true}
+  - type: textarea
+    id: expected
+    attributes: {label: Expected behavior}
+    validations: {required: true}
+  - type: textarea
+    id: logs
+    attributes: {label: Sanitized logs}

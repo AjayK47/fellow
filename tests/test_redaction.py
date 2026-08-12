@@ -4,7 +4,7 @@ capture, and episode consolidation flow through."""
 
 from __future__ import annotations
 
-from docket.services.redaction import redact, scan
+from toda.services.redaction import redact, scan
 
 
 def test_redact_replaces_aws_access_key():

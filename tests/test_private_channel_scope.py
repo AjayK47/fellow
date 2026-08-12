@@ -18,7 +18,7 @@ The authoritative signal was in the payload all along: Slack sets
 
 from __future__ import annotations
 
-from docket.harness.models import DestinationEnvelope
+from toda.harness.models import DestinationEnvelope
 
 
 def _event(channel: str, channel_type: str, *, user: str = "UAJAY", ts: str = "1.0") -> dict:
@@ -240,7 +240,7 @@ def test_an_unknown_channel_type_inherits_a_known_public_scope(brain):
 
 
 def test_an_authoritative_public_signal_can_widen_a_guessed_private_scope(brain):
-    """A public channel Docket only ever sees through mentions would otherwise
+    """A public channel Toda only ever sees through mentions would otherwise
     be stuck private forever, since a guess may never widen."""
     guessed = brain.slack_gateway.normalize(_mention_event("CLATERPUB"))
     scope_id = guessed.scope.scope_id
@@ -263,7 +263,7 @@ def test_a_guess_can_never_widen_a_private_scope(brain):
 
 
 def test_a_confirmed_private_scope_is_never_reopened_by_slack(brain):
-    """Slack supports converting a private channel to public. Docket does not
+    """Slack supports converting a private channel to public. Toda does not
     follow it: people who spoke while the room was private had a private
     expectation, and re-disclosing that backlog is not an automatic decision."""
     private = brain.slack_gateway.normalize(_event("CCONVERT", "group"))

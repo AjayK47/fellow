@@ -7,9 +7,9 @@ latencies, and two real production bugs:
 
   * a Task could be shown an inbound message that had not been routed to it
     yet, and act on it, before the Task that owned that message existed;
-  * anything Docket sent through the slack_send_message TOOL left no trace
+  * anything Toda sent through the slack_send_message TOOL left no trace
     at all, because only delivery-path sends wrote a row the reconstruction
-    could find -- so Docket could not see its own messages on later turns.
+    could find -- so Toda could not see its own messages on later turns.
 
 Both are closed by construction now: one append-only log, written at the two
 real choke points (EventRouter.route inbound, SlackSender.send outbound).
@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from docket.harness.slack import SlackSender
+from toda.harness.slack import SlackSender
 
 
 def _timeline(brain, *, workspace_id: str = "TACME", channel_id: str = "CSOCIAL"):
@@ -57,7 +57,7 @@ def test_inbound_and_outbound_share_one_ordered_timeline(brain):
 
 def test_a_tool_sent_message_is_visible_in_the_conversation(brain):
     """slack_send_message writes no delivery record, so under the old
-    reconstruction this message was invisible to Docket forever."""
+    reconstruction this message was invisible to Toda forever."""
     brain.slack_sender.send(
         channel_id="CSOCIAL",
         text="Sent straight from the tool, not the delivery pipeline.",
@@ -122,7 +122,7 @@ def test_scrubbing_an_emoji_never_reflows_the_rest_of_the_message(monkeypatch):
             return {"ok": True, "channel": "C", "ts": "1.0"}
 
     monkeypatch.setattr(
-        "docket.harness.slack.httpx.post",
+        "toda.harness.slack.httpx.post",
         lambda *a, **kw: (posted.append(kw["json"]), _Response())[1],
     )
     sender = SlackSender(bot_token="xoxb-test")

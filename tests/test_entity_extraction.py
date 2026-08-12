@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import json
 
-from docket.harness import extraction as extraction_module
-from docket.harness.extraction import (
+from toda.harness import extraction as extraction_module
+from toda.harness.extraction import (
     _PROPOSABLE_ENTITY_TYPES,
     ModelMemoryExtractor,
 )
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import ModelResponse
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import ModelResponse
 
 
 def _extractor(brain, response_content: str) -> ModelMemoryExtractor:
@@ -37,7 +37,7 @@ def _extractor(brain, response_content: str) -> ModelMemoryExtractor:
 def _source(brain, content: str) -> dict:
     return brain.ingestion.ingest(
         organization_id="org_acme",
-        source_system="docket_agent",
+        source_system="toda_agent",
         source_type="agent_task",
         external_id="task_extraction_test",
         content=content,

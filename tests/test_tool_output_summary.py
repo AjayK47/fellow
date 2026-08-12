@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import json
 
-from docket.harness.model_client import DeterministicHarnessModel, ScriptedModelClient
-from docket.harness.models import ModelResponse, ModelToolCall, ToolDefinition
-from docket.harness.tool_output_summary import ToolOutputSummarizer
+from toda.harness.model_client import DeterministicHarnessModel, ScriptedModelClient
+from toda.harness.models import ModelResponse, ModelToolCall, ToolDefinition
+from toda.harness.tool_output_summary import ToolOutputSummarizer
 
 
 def _big_serialized(n: int = 5000) -> str:

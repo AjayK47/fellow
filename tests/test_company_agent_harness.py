@@ -7,8 +7,8 @@ import hmac
 import json
 import time
 
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import (
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import (
     InvocationEnvelope,
     ModelResponse,
     ModelToolCall,
@@ -237,7 +237,7 @@ def test_auto_approve_writes_flag_still_creates_an_approved_record(
     """The dev-only auto_approve_writes flag must skip the human pause, not
     the approval trail itself — a real approval record should still exist,
     just already resolved rather than pending."""
-    from docket.harness import tools as tools_module
+    from toda.harness import tools as tools_module
 
     monkeypatch.setattr(tools_module.settings, "auto_approve_writes", True)
     # No Composio API key is configured for this test org, so execution
@@ -323,7 +323,7 @@ def test_resolving_an_approval_updates_the_original_slack_message(brain):
     whose approval has already been decided — resolving it should edit the
     original Slack message in place, regardless of whether the decision
     came from a Slack button click or the dashboard."""
-    from docket.domain.models import utcnow
+    from toda.domain.models import utcnow
 
     now = utcnow().isoformat()
     approval_id = "approval_slack_update_test"
@@ -374,7 +374,7 @@ def test_approval_card_truncates_a_large_argument_preview_instead_of_failing(bra
     pdf_create) must still produce a postable approval card instead of
     silently dead-lettering with the human never seeing an approval
     prompt at all."""
-    from docket.domain.models import utcnow
+    from toda.domain.models import utcnow
 
     run = brain.company_agent.create_invocation(
         envelope=_envelope(brain, conversation="api:huge-approval:thread"),
@@ -417,8 +417,8 @@ def test_approval_card_truncates_a_large_argument_preview_instead_of_failing(bra
     # The Approve/Deny buttons must still be present and untouched.
     actions = sent[0]["blocks"][1]
     assert [el["action_id"] for el in actions["elements"]] == [
-        "docket_approve",
-        "docket_deny",
+        "toda_approve",
+        "toda_deny",
     ]
 
 
@@ -587,7 +587,7 @@ def test_a_retryable_run_failure_does_not_notify_slack_before_retrying(brain):
 def test_parallel_read_tool_calls_execute_concurrently(brain):
     """H-08: independent read-risk tool calls proposed in one iteration must
     run concurrently, not one after another."""
-    from docket.harness.models import ToolDefinition
+    from toda.harness.models import ToolDefinition
 
     call_log: list[tuple[str, float]] = []
 
@@ -934,7 +934,7 @@ def test_socket_mode_interaction_resolves_approval(brain):
 
     result = brain.slack_gateway.accept_interaction(
         body=_interaction_payload(
-            action_id="docket_approve",
+            action_id="toda_approve",
             approval_id=approval_id,
             user_id="U_APPROVER",
         ),
@@ -952,7 +952,7 @@ def test_socket_mode_interaction_resolves_approval(brain):
     # or attempt to re-resolve an already-decided approval.
     duplicate = brain.slack_gateway.accept_interaction(
         body=_interaction_payload(
-            action_id="docket_approve",
+            action_id="toda_approve",
             approval_id=approval_id,
             user_id="U_APPROVER",
         ),
@@ -966,7 +966,7 @@ def test_socket_mode_interaction_resolves_approval(brain):
 
 
 def test_socket_mode_interaction_rejects_unauthorized_approver(brain):
-    from docket.harness.slack import UnauthorizedApprover
+    from toda.harness.slack import UnauthorizedApprover
 
     approval_id = _pending_approval(brain, conversation="api:socket-approval:unauth")
     # No identity mapping is registered for this Slack user, so it resolves
@@ -975,7 +975,7 @@ def test_socket_mode_interaction_rejects_unauthorized_approver(brain):
     try:
         brain.slack_gateway.accept_interaction(
             body=_interaction_payload(
-                action_id="docket_approve",
+                action_id="toda_approve",
                 approval_id=approval_id,
                 user_id="U_STRANGER",
             ),
@@ -1056,7 +1056,7 @@ def test_choice_button_click_resumes_run_with_selected_text(brain):
 
     result = brain.slack_gateway.accept_interaction(
         body=_choice_interaction_payload(
-            action_id="docket_choice", task_id=task_id, index=0, user_id="U_CHOOSER"
+            action_id="toda_choice", task_id=task_id, index=0, user_id="U_CHOOSER"
         ),
         allow_unsigned=True,
     )
@@ -1089,7 +1089,7 @@ def test_choice_select_click_resumes_run_with_selected_text(brain):
 
     result = brain.slack_gateway.accept_interaction(
         body=_choice_interaction_payload(
-            action_id="docket_choice_select",
+            action_id="toda_choice_select",
             task_id=task_id,
             index=1,
             user_id="U_CHOOSER2",
@@ -1152,7 +1152,7 @@ def test_choice_button_click_resumes_session_manager_task(brain):
     )
     result = brain.slack_gateway.accept_interaction(
         body=_choice_interaction_payload(
-            action_id="docket_choice",
+            action_id="toda_choice",
             task_id=waiting.task_id,
             index=0,
             user_id="U_TASK_CHOOSER",
@@ -1175,7 +1175,7 @@ def test_choice_interaction_on_already_resumed_run_is_a_noop(brain):
     brain.company_agent.model = ScriptedModelClient([ModelResponse(content="Done.")])
     first = brain.slack_gateway.accept_interaction(
         body=_choice_interaction_payload(
-            action_id="docket_choice", task_id=task_id, index=0, user_id="U_FIRST"
+            action_id="toda_choice", task_id=task_id, index=0, user_id="U_FIRST"
         ),
         allow_unsigned=True,
     )
@@ -1187,7 +1187,7 @@ def test_choice_interaction_on_already_resumed_run_is_a_noop(brain):
     # not raise or attempt to resume a run that has already finished.
     second = brain.slack_gateway.accept_interaction(
         body=_choice_interaction_payload(
-            action_id="docket_choice", task_id=task_id, index=1, user_id="U_SECOND"
+            action_id="toda_choice", task_id=task_id, index=1, user_id="U_SECOND"
         ),
         allow_unsigned=True,
     )
@@ -1222,19 +1222,25 @@ def test_status_checkpoint_tracking_and_live_update_message(brain):
         trigger_kind="reactive",
         initial_message="Cross-toolkit task",
     )
-    linear_call = ModelToolCall(id="c1", name="linear_create_issue", arguments={})
-    linear_definition = ToolDefinition(
-        name="linear_create_issue",
-        description="d",
-        input_schema={"type": "object"},
-        toolkits=["linear"],
+    linear_call = ModelToolCall(
+        id="c1",
+        name="COMPOSIO_EXECUTE",
+        arguments={"tool_slug": "LINEAR_CREATE_ISSUE", "arguments": {}},
     )
-    github_call = ModelToolCall(id="c2", name="github_create_issue", arguments={})
-    github_definition = ToolDefinition(
-        name="github_create_issue",
+    linear_definition = ToolDefinition(
+        name="COMPOSIO_EXECUTE",
         description="d",
         input_schema={"type": "object"},
-        toolkits=["github"],
+    )
+    github_call = ModelToolCall(
+        id="c2",
+        name="COMPOSIO_EXECUTE",
+        arguments={"tool_slug": "GITHUB_CREATE_ISSUE", "arguments": {}},
+    )
+    github_definition = ToolDefinition(
+        name="COMPOSIO_EXECUTE",
+        description="d",
+        input_schema={"type": "object"},
     )
 
     brain.company_agent._track_checkpoint(run, linear_call, linear_definition)
@@ -1590,7 +1596,7 @@ def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
         "event": {
             # Slack emits both `message` and `app_mention` for one mentioned
             # message; only the `message` copy carries channel_type, which is
-            # what tells Docket the room is public rather than private. Using
+            # what tells Toda the room is public rather than private. Using
             # it here keeps the fixture representative of what actually
             # decides the channel's scope.
             "type": "message",
@@ -1623,7 +1629,7 @@ def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
                         "urgency": "normal",
                         "decision": "WAKE_MAIN_AGENT",
                         "confidence": 0.99,
-                        "reason": "The user is responding to Docket's preceding message.",
+                        "reason": "The user is responding to Toda's preceding message.",
                         "suggested_goal": "Answer the user's conversational follow-up.",
                         "related_entity_ids": [],
                         "existing_task_id": None,
@@ -1658,7 +1664,7 @@ def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
     timeline = attention_context["recent_conversation"]
     assert len(timeline) <= 10
     assert any(
-        item["author"] == "docket" and item["text"] == first_run["final_answer"]
+        item["author"] == "toda" and item["text"] == first_run["final_answer"]
         for item in timeline
     )
     # The current message is supplied separately as new_event, so the literal
@@ -1713,7 +1719,7 @@ def test_slack_conversation_hides_messages_that_arrived_after_the_task(brain, mo
 
 
 def test_wake_preserves_slack_conversation_address_for_main_context(brain):
-    from docket.harness.models import (
+    from toda.harness.models import (
         AttentionDecision,
         AttentionEvaluation,
         EventActor,
@@ -1779,9 +1785,9 @@ def test_stale_active_session_does_not_strand_ambient_messages(brain):
     instead treat the stale pointer as no active work and wake a fresh
     root Task (find_root_task_for_session excludes terminal states,
     exactly like the old stale-root check did)."""
-    from docket.domain.models import utcnow
-    from docket.harness.model_client import ScriptedModelClient
-    from docket.harness.models import EventActor, EventScope, ModelResponse, NormalizedEvent
+    from toda.domain.models import utcnow
+    from toda.harness.model_client import ScriptedModelClient
+    from toda.harness.models import EventActor, EventScope, ModelResponse, NormalizedEvent
 
     context_key = "slack:TACME:CSTALE"
     brain.company_agent.model = ScriptedModelClient(
@@ -1894,7 +1900,7 @@ def _create_onboarding_role(brain, **overrides) -> dict:
 
 
 def test_role_trigger_wakes_the_main_agent_with_matching_goal(brain):
-    from docket.harness.models import EventActor, EventScope, NormalizedEvent
+    from toda.harness.models import EventActor, EventScope, NormalizedEvent
 
     role = _create_onboarding_role(brain)
     context_key = "slack:TACME:CHIRING"
@@ -1937,7 +1943,7 @@ def test_role_trigger_wakes_the_main_agent_with_matching_goal(brain):
 
 
 def test_role_with_no_matching_event_does_not_spuriously_wake(brain):
-    from docket.harness.models import EventActor, EventScope, NormalizedEvent
+    from toda.harness.models import EventActor, EventScope, NormalizedEvent
 
     _create_onboarding_role(brain)
     context_key = "slack:TACME:CFINANCE"
@@ -2202,7 +2208,7 @@ def test_operational_dashboard_and_list_routes(api_client):
     status = api_client.get("/v1/harness/status")
     assert status.status_code == 200
     assert status.json()["database"]["backend"] == "sqlite"
-    assert "model_key_configured" in status.json()["models"]
+    assert "connections_configured" in status.json()["models"]
     assert api_client.get("/admin").status_code == 200
 
 
@@ -2257,7 +2263,7 @@ def test_deferred_profile_refresh_and_reindex_jobs(api_client):
         "/v1/admin/profiles:refresh",
         json={
             "organization_id": "org_acme",
-            "entity_id": "project_docket",
+            "entity_id": "project_toda",
         },
     )
     reindex_job = api_client.post(

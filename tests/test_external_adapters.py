@@ -1,7 +1,7 @@
 import hashlib
 import hmac
 
-from docket.adapters import (
+from toda.adapters import (
     normalize_composio_trigger,
     normalize_slack_event,
     verify_slack_signature,

@@ -8,7 +8,7 @@ already been resolved; mode/reviewer behavior is covered separately.
 
 from __future__ import annotations
 
-from docket.harness.models import InvocationEnvelope, ModelToolCall
+from toda.harness.models import InvocationEnvelope, ModelToolCall
 
 
 def _envelope(brain, *, destination: dict) -> InvocationEnvelope:

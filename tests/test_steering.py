@@ -16,17 +16,17 @@ from __future__ import annotations
 
 import time
 
-from docket.domain.models import new_id, utcnow
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import AgentRunState, DestinationEnvelope, InvocationEnvelope
-from docket.harness.models import ModelResponse
+from toda.domain.models import new_id, utcnow
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import AgentRunState, DestinationEnvelope, InvocationEnvelope
+from toda.harness.models import ModelResponse
 
 
 def _envelope() -> dict:
     return InvocationEnvelope(
         organization_id="org_acme",
         principal_id="person_ajay",
-        application_id="slack_docket",
+        application_id="slack_toda",
         conversation_id="slack:dm:person_ajay:steering",
         destination=DestinationEnvelope(type="dm", id="D1", is_private=True),
         purpose="reactive_agent",
@@ -198,7 +198,7 @@ def test_ordinary_steer_message_is_injected_into_the_active_roots_next_iteration
 
 
 def test_wake_with_no_active_root_task_does_not_signal_anything(brain):
-    session_id = _session_id(brain, "slack:dm:person_ajay:idle")
+    _session_id(brain, "slack:dm:person_ajay:idle")
     result = brain.sessions.wake(
         organization_id="org_acme",
         conversation_key="slack:dm:person_ajay:idle",

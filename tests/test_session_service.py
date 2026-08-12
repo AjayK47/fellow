@@ -3,8 +3,8 @@ lifecycle the Manager scheduler relies on."""
 
 from __future__ import annotations
 
-from docket.harness.sessions import SessionService
-from docket.services.audit import AuditService
+from toda.harness.sessions import SessionService
+from toda.services.audit import AuditService
 
 
 def _service(brain) -> SessionService:

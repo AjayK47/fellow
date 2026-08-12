@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from docket.domain.models import utcnow
+from toda.domain.models import utcnow
 
 
 def test_superseded_edge_stops_being_current_but_stays_queryable_historically(brain):

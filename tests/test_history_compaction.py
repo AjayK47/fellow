@@ -7,15 +7,15 @@ from __future__ import annotations
 
 import json
 
-from docket.domain.models import new_id, utcnow
-from docket.harness.history_compaction import (
+from toda.domain.models import new_id, utcnow
+from toda.harness.history_compaction import (
     COMPACTION_SCHEMA,
     SUMMARY_PREFIX,
     HistoryCompactor,
 )
-from docket.harness.model_client import DeterministicHarnessModel, ScriptedModelClient
-from docket.harness.models import InvocationEnvelope, ModelResponse
-from docket.harness.prompts import build_agent_messages
+from toda.harness.model_client import DeterministicHarnessModel, ScriptedModelClient
+from toda.harness.models import InvocationEnvelope, ModelResponse
+from toda.harness.prompts import build_agent_messages
 
 
 def _messages(n: int, *, role: str = "user", prefix: str = "msg") -> list[dict]:
@@ -160,7 +160,7 @@ def test_slack_session_context_and_company_memory_are_separate_prompt_blocks():
         history=[{"role": "user", "content": "current request"}],
         slack_conversation=[
             {"role": "user", "author": "Ajay", "text": "earlier message"},
-            {"role": "assistant", "author": "docket", "text": "earlier reply"},
+            {"role": "assistant", "author": "toda", "text": "earlier reply"},
         ],
     )
     slack_block = next(

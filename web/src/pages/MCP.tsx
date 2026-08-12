@@ -60,7 +60,7 @@ function AddServer({ onSaved }: { onSaved: () => void }) {
       });
       const id = String(created.id);
       if (authType === "oauth") {
-        const popup = window.open("about:blank", "docket-mcp-oauth", "popup,width=620,height=760");
+        const popup = window.open("about:blank", "toda-mcp-oauth", "popup,width=620,height=760");
         const result = await api.post<{ connected: boolean; authorization_url?: string }>(
           `/v1/mcp/servers/${id}:oauth-start`,
           { organization_id: ORG },
@@ -136,7 +136,7 @@ export default function MCP() {
 
   useEffect(() => {
     const completed = (event: MessageEvent) => {
-      if (event.origin === window.location.origin && event.data?.type === "docket:mcp-oauth-complete") setRevision((value) => value + 1);
+      if (event.origin === window.location.origin && event.data?.type === "toda:mcp-oauth-complete") setRevision((value) => value + 1);
     };
     window.addEventListener("message", completed);
     return () => window.removeEventListener("message", completed);
@@ -155,7 +155,7 @@ export default function MCP() {
 
   return (
     <>
-      <PageHeader title="MCP servers" subtitle="Connect remote or local MCP servers. Docket discovers their tools, namespaces them, and applies the same readiness and execution policies as native tools." />
+      <PageHeader title="MCP servers" subtitle="Connect remote or local MCP servers. Toda discovers their tools, namespaces them, and applies the same readiness and execution policies as native tools." />
       <Section><AddServer onSaved={() => setRevision((value) => value + 1)} /></Section>
       <Section>
         <Card title="Connected servers" meta={String(data?.count ?? 0)}>

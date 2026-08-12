@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from docket.harness.task_run_store import TaskRunStore
-from docket.storage.db import BrainStore
+from toda.harness.task_run_store import TaskRunStore
+from toda.storage.db import BrainStore
 
 
 def _make_store() -> BrainStore:
@@ -20,7 +20,7 @@ def _make_store() -> BrainStore:
 
 
 def _now() -> str:
-    from docket.domain.models import utcnow
+    from toda.domain.models import utcnow
 
     return utcnow().isoformat()
 

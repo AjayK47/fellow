@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from docket.harness.models import InvocationEnvelope
-from docket.mcp_tools import bind_mcp_handlers, mcp_tool_specs
+from toda.harness.models import InvocationEnvelope
+from toda.mcp_tools import bind_mcp_handlers, mcp_tool_specs
 
 
 def test_mcp_tools_cover_core_brain_operations(brain):

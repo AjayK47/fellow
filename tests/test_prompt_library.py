@@ -2,20 +2,20 @@
 
 import pytest
 
-from docket.harness import prompt_library
-from docket.harness.action_review import REVIEW_SYSTEM_PROMPT
-from docket.harness.history_compaction import (
+from toda.harness import prompt_library
+from toda.harness.action_review import REVIEW_SYSTEM_PROMPT
+from toda.harness.history_compaction import (
     COMPACTION_SYSTEM_PROMPT,
     SUMMARY_PREFIX,
 )
-from docket.harness.prompts import (
+from toda.harness.prompts import (
     ATTENTION_SYSTEM_PROMPT,
     AUTOMATION_TRIGGER_GUIDANCE,
     STABLE_SYSTEM_PROMPT,
     STEER_GUIDANCE,
     frame_untrusted_tool_result,
 )
-from docket.harness.tool_output_summary import TOOL_OUTPUT_SUMMARY_SYSTEM_PROMPT
+from toda.harness.tool_output_summary import TOOL_OUTPUT_SUMMARY_SYSTEM_PROMPT
 
 # Every prompt the harness loads by name. A rename or deletion in prompts.md
 # must fail here rather than at the first live model call.
@@ -34,6 +34,7 @@ REQUIRED = {
     "action_review",
     "tool_output_summary",
     "memory_extraction",
+    "skill_synthesis",
     "skill_response_validation",
     "image_analysis",
     "image_analysis_default_question",

@@ -1,16 +1,73 @@
-# Docket
+# Toda
 
-Docket is a company-wide agent harness: one accountable main agent can
-observe organizational events, retrieve permission-safe company context,
-reason with tools, create bounded child Tasks, request approval for
-writes, and preserve what happened as durable organizational memory.
+**The self-hosted organizational coworker for Slack.**
+
+Toda observes the conversations it is permitted to see, remembers company
+decisions, investigates substantial work through durable specialist Tasks,
+and requests approval before consequential actions. It gives a team one
+accountable coworker instead of a collection of disconnected chatbots.
+
+> **Alpha:** Toda Community is ready for local evaluation and small
+> self-hosted pilots. It is not a managed multi-tenant SaaS and must not be
+> exposed directly to the public internet. Read [SECURITY.md](SECURITY.md).
+
+## What it looks like
+
+```text
+You: What is blocking the Acme renewal?
+
+Toda:
+  1. Searches authorized Slack, CRM, tickets, and prior decisions.
+  2. Delegates independent CRM and engineering investigations.
+  3. Correlates their evidence into one cited briefing.
+  4. Offers to update the account plan.
+  5. Requests approval before writing to the CRM.
+```
+
+The core differences from a desktop automation agent are organizational:
+
+- permission-scoped memory and retrieval;
+- one durable Session Manager per conversation;
+- restart-safe general and coding Tasks;
+- proactive attention to authorized ambient events;
+- policy, approval, idempotency, and delivery checks around real actions;
+- a complete operator console and audit trail.
+
+## Five-minute local start
+
+Requirements: Python 3.11+ and Docker with Compose.
+
+```bash
+git clone REPOSITORY_URL toda
+cd toda
+python3 scripts/bootstrap.py
+docker compose up --build -d
+docker compose exec toda toda-seed
+```
+
+Open <http://127.0.0.1:8080> and use the administrator token printed by the
+bootstrap command. This starts the deterministic provider, so the complete
+runtime can be evaluated without an API key or paid inference.
+
+To use a real model or connect Slack, edit `.env` and restart with
+`docker compose up -d`.
+
+See [the deployment guide](docs/DEPLOYMENT.md) and
+[security policy](SECURITY.md) before changing the loopback-only port binding.
+
+## How Toda is structured
+
+Toda is a company-wide agent harness: one accountable main agent can observe
+organizational events, retrieve permission-safe company context, reason with
+tools, create bounded child Tasks, request approval for writes, and preserve
+what happened as durable organizational memory.
 
 It is not a collection of permanent autonomous agents. Slack, connectors,
 automations, and direct API requests all enter the same tenant-aware runtime.
 The Session Manager owns the response; child Tasks are durable, independently
 leased workers that return evidence to their parent Task.
 
-SQLite is the definitive database for this implementation. Relational state,
+SQLite is the definitive database for the community implementation. Relational state,
 graph nodes and edges, FTS5 indexes, embedding vectors, temporal facts, cases,
 agent checkpoints, approvals, artifacts, audit events, and the durable job
 queue live in one portable database file.
@@ -57,7 +114,7 @@ flowchart LR
     end
 
     subgraph Operate["Operator surface"]
-        Console["Docket Console — React SPA"]
+        Console["Toda Console — React SPA"]
     end
 
     Console -->|same /v1 API as any client| Tasks
@@ -111,14 +168,14 @@ flowchart LR
 | Console | Operator-facing React SPA: dashboard, Session/Task/approval/job inspection, per-tool policy, skill draft approval, automation authoring, and a force-directed graph explorer | `web/src/` |
 
 Built-in and connector procedures are not database-only rows. The authoritative
-content lives in validated `src/docket/builtin_skills/**/SKILL.md` packages.
+content lives in validated `src/toda/builtin_skills/**/SKILL.md` packages.
 SQLite materializes a tenant-aware index so company skills can be reset or
 versioned independently. Each Task resolves mandatory destination skills and
 relevant optional skills, checks declared capabilities, and pins the package
 hash and instructions into its trace. Use `GET /v1/skills/catalog` to inspect
 the package inventory and readiness; the Skills console shows the same view.
 
-### Docket Console
+### Toda Console
 
 The console (`web/`) is a React, Vite, and Tailwind single-page app served as
 static files by the same FastAPI process (`web/dist`, mounted at `/`). It has
@@ -133,9 +190,11 @@ Pages are organized by what they let an operator do, not by data source:
 - **Dashboard** — active Tasks, pending approvals, and a permission-scoped
   activity feed, refreshed on a short poll rather than a push channel.
 - **Sessions / Session detail** — the primary way to browse conversations. A
-  session is one conversation key (a Slack DM, channel, or thread) — there is
+  session is one conversation key (a Slack DM or channel). Slack thread
+  metadata stays inside its owning channel/DM Session and never creates a
+  separate Manager — there is
   no user-facing "start a new session" action, since a session begins
-  implicitly the first time someone messages Docket there and every
+  implicitly the first time someone messages Toda there and every
   subsequent message in that same place reuses it. Session detail shows the
   full transcript plus the list of Tasks it contains, since one
   session commonly spans several Tasks over time. `GET /v1/sessions` and
@@ -214,7 +273,7 @@ always performed for an acting principal and destination.
 ## What is implemented
 
 - Slack Events API and Socket Mode gateways with signature verification,
-  event deduplication, mention/DM activation, thread sessions, and channel
+  event deduplication, mention/DM activation, channel-scoped sessions, and channel
   policies
 - Organization-scoped Composio account discovery, connection links, trigger
   management, signed webhooks, dynamic tool search/describe/execute, and
@@ -249,14 +308,15 @@ always performed for an acting principal and destination.
   deterministic zero-cost providers for tests and local development
 - Optional Brave Search and a safe public-page fetch tool; both are read-only,
   and fetched web content is explicitly treated as untrusted evidence
-- 44 immutable Hermes-adapted skill packages with YAML frontmatter, provenance,
+- 51 immutable built-in skill packages with YAML frontmatter, provenance,
   readiness checks, progressive body loading, Slack response validation, and
   company-skill draft/approval workflows
 - Root-confined per-Task workspace list/search/read/write/patch/diff tools,
   session search, durable Task plans, explicit Slack actions, and approval-gated
   automation management
-- Capability registry and per-Task capability/tool references; typed PDF,
-  DOCX, XLSX, PPTX, OCR, browser, vision, and image contracts report
+- Capability registry and per-Task capability/tool references; deterministic
+  calculation, SVG chart creation, and AntV SVG/PNG infographics run natively,
+  while typed PDF, DOCX, XLSX, PPTX, OCR, browser, vision, image, and Graphviz diagram contracts report
   `setup_needed` when optional runtimes are absent instead of accepting
   arbitrary paths or shell commands
 - Immutable package security scanning, package indexes, workspace expiry and
@@ -307,12 +367,12 @@ npm --prefix web run build
 Start the local gateway:
 
 ```bash
-uv run docket gateway
+uv run toda gateway
 ```
 
 Open the onboarding UI at <http://127.0.0.1:8080/setup>. It configures
 OpenRouter, generates the Slack app manifest, validates local Slack credentials,
-maps the workspace to a Docket tenant, and writes only to the local
+maps the workspace to a Toda tenant, and writes only to the local
 ignored `.env`. Restart the same command after saving a connection; configured
 Slack Socket Mode starts alongside the API and durable worker.
 
@@ -320,22 +380,22 @@ The same local UI optionally accepts Brave Search and Firecrawl keys. Brave
 finds public sources; Firecrawl converts public pages and URL-addressable PDFs
 to clean markdown. Without Firecrawl, `web_fetch` uses a safe, read-only direct
 fetch fallback; without Brave, the agent does not get web search. Browser
-automation and unrestricted shell/computer control are not part of the company
-gateway's trusted tool surface. `run_code` remains a bounded, approval-gated
-read-only sandbox; workspace tools operate only inside a per-run directory under
-the configured workspace root.
+automation, model-generated code execution, and Pi coding workers are optional
+high-risk capabilities. `run_code` is bounded and approval-gated, but approval
+is not an OS-level sandbox. Review `SECURITY.md` before enabling these surfaces;
+workspace tools remain confined to the configured organizational workspace.
 
 The gateway creates the SQLite database when needed but does not seed demo data.
 For a synthetic Acme organization, seed it explicitly:
 
 ```bash
-uv run docket-seed
+uv run toda-seed
 ```
 
-To remove all local Docket data and start over, stop the gateway and run:
+To remove all local Toda data and start over, stop the gateway and run:
 
 ```bash
-uv run docket reset --yes
+uv run toda reset --yes
 ```
 
 This deletes the configured SQLite database and its sidecar files, but does not
@@ -343,7 +403,7 @@ touch `.env` or source code.
 
 Open:
 
-- Docket Console: <http://127.0.0.1:8080/>
+- Toda Console: <http://127.0.0.1:8080/>
 - Control room: <http://127.0.0.1:8080/admin>
 - Gateway setup: <http://127.0.0.1:8080/setup>
 - Graph explorer: <http://127.0.0.1:8080/explorer>
@@ -354,8 +414,8 @@ The API starts an in-process durable worker by default. To run API and worker
 separately:
 
 ```bash
-DOCKET_WORKER_ENABLED=false uv run docket
-uv run docket-worker
+TODA_WORKER_ENABLED=false uv run toda
+uv run toda-worker
 ```
 
 ## Configuration
@@ -367,60 +427,75 @@ Settings are loaded from `.env`. See `.env.example` for the complete template.
 No external key is required:
 
 ```dotenv
-DOCKET_DATA_DIR=data
-DOCKET_DB_NAME=brain.db
-DOCKET_EMBEDDING_PROVIDER=deterministic
-DOCKET_MODEL_PROVIDER=deterministic
-DOCKET_WORKER_ENABLED=true
+TODA_DATA_DIR=data
+TODA_DB_NAME=brain.db
+TODA_PROVIDER_CONNECTIONS={}
+TODA_MODEL_ASSIGNMENTS={}
+TODA_WORKER_ENABLED=true
 ```
 
 This mode exercises the complete ingestion, permission, memory, graph, policy,
 job, and runtime machinery without paid inference. Its generated agent answers
 are deterministic test behavior, not production reasoning.
 
-### Live OpenRouter configuration
+### Live provider configuration
 
 ```dotenv
-OPENROUTER_API_KEY=...
-
-DOCKET_EMBEDDING_PROVIDER=openrouter
-DOCKET_EMBEDDING_MODEL=qwen/qwen3-embedding-8b
-
-DOCKET_MODEL_PROVIDER=openrouter
-DOCKET_CHAT_MODEL=openai/gpt-5.6-luna
-DOCKET_ATTENTION_MODEL=openai/gpt-5.6-luna
-DOCKET_EXTRACTION_MODEL=openai/gpt-5.6-luna
+TODA_PROVIDER_CONNECTIONS={"openrouter-company":{"provider":"openrouter","api_key":"sk-or-..."}}
+TODA_MODEL_ASSIGNMENTS={"main":{"connection":"openrouter-company","model":"openai/gpt-5.4"},"attention":{"connection":"openrouter-company","model":"openai/gpt-5-mini"},"extraction":{"connection":"openrouter-company","model":"openai/gpt-5-mini"},"embedding":{"connection":"openrouter-company","model":"qwen/qwen3-embedding-8b"}}
 ```
 
-`DOCKET_EXTRACTION_MODEL` may be omitted; extraction then uses the main
-chat model. Model inference and embeddings are offloaded to OpenRouter, so
-local compute remains light.
+Omitted auxiliary roles fall back to `main`. Credentials belong to the named
+provider connection and are not repeated for embeddings or media models.
+
+### Browser and media providers
+
+Browser, vision, image generation, transcription, and speech are separate
+capabilities. They do not inherit the chat model implicitly. The agent always
+sees stable vendor-neutral tools (`vision_analyze`, `image_generate`,
+`media_transcribe`, and `text_to_speech`), while deployment configuration owns
+the provider and model selection.
+
+Set `TODA_MAIN_MODEL_SUPPORTS_VISION=true` to pass pixels to the main
+multimodal model, or add a `vision` model assignment for a separate model.
+Image, transcription, and TTS use `image`, `transcription`, and `tts` model
+assignments. Omitting a role disables that capability. Slack
+voice files are downloaded and transcribed in the background routing job,
+stored in the Slack room's permission scope, and added to the message context.
+Distributed Slack installations need the `files:read` OAuth scope.
+
+The browser is enabled with `TODA_BROWSER_ENABLED=true` and a comma-separated
+`TODA_BROWSER_ALLOWED_DOMAINS` allowlist. Its snapshot output assigns refs
+such as `@e1` for later click/type actions, and it exposes image discovery,
+screenshots, console/network logs, dialogs, and vision-assisted inspection.
+An optional `browser_cdp` surface is separately gated by
+`TODA_BROWSER_CDP_ENABLED=true` and permits only a small read-only CDP method
+allowlist.
 
 Every new source chunk and extracted atomic memory is embedded once. Retrieval
 first filters by permission, then combines lexical matching, FTS5, graph
-context, and exact cosine scoring. Exact scoring is appropriate for
-development and small pilots. A large deployment should replace that scoring
-implementation with `sqlite-vec` or a managed vector index while retaining the
-same service boundary.
+context, and a `sqlite-vec` ANN index. Larger deployments can replace the
+indexing implementation while retaining the same authorization and retrieval
+service boundaries.
 
 ### Runtime and proactivity controls
 
 ```dotenv
-DOCKET_AGENT_MAX_ITERATIONS=12
-DOCKET_AGENT_MAX_TOOL_CALLS=24
-DOCKET_AGENT_CONTEXT_TOKEN_BUDGET=12000
-DOCKET_AGENT_MAX_TOTAL_TOKENS=100000
+TODA_AGENT_MAX_ITERATIONS=12
+TODA_AGENT_MAX_TOOL_CALLS=24
+TODA_AGENT_CONTEXT_TOKEN_BUDGET=12000
+TODA_AGENT_MAX_TOTAL_TOKENS=100000
 
-DOCKET_CHILD_TASK_MAX_PARALLEL=3
-DOCKET_CHILD_TASK_MAX_DEPTH=1
+TODA_CHILD_TASK_MAX_PARALLEL=3
+TODA_CHILD_TASK_MAX_DEPTH=1
 
-DOCKET_WORKER_ENABLED=true
-DOCKET_WORKER_POLL_INTERVAL_SECONDS=0.5
-DOCKET_WORKER_CONCURRENCY=4
+TODA_WORKER_ENABLED=true
+TODA_WORKER_POLL_INTERVAL_SECONDS=0.5
+TODA_WORKER_CONCURRENCY=4
 
-DOCKET_ATTENTION_MINIMUM_CONFIDENCE=0.72
-DOCKET_PROACTIVE_COOLDOWN_SECONDS=900
-DOCKET_EPISODE_QUIET_SECONDS=300
+TODA_ATTENTION_MINIMUM_CONFIDENCE=0.72
+TODA_PROACTIVE_COOLDOWN_SECONDS=900
+TODA_EPISODE_QUIET_SECONDS=300
 ```
 
 Child Tasks are additionally capped per Task by iterations, tool calls, token
@@ -441,9 +516,9 @@ an explicit failure rather than silently applying an outdated write.
 Configure:
 
 ```dotenv
-DOCKET_SLACK_SIGNING_SECRET=...
-DOCKET_SLACK_BOT_TOKEN=xoxb-...
-DOCKET_SLACK_BOT_USER_ID=U...
+TODA_SLACK_SIGNING_SECRET=...
+TODA_SLACK_BOT_TOKEN=xoxb-...
+TODA_SLACK_BOT_USER_ID=U...
 ```
 
 Expose the API over HTTPS and configure the Slack app:
@@ -458,17 +533,17 @@ POST https://your-host/v1/slack/interactions
 Add an app-level token:
 
 ```dotenv
-DOCKET_SLACK_APP_TOKEN=xapp-...
+TODA_SLACK_APP_TOKEN=xapp-...
 ```
 
 Run the unified gateway:
 
 ```bash
-uv run docket gateway
+uv run toda gateway
 ```
 
 The setup UI creates the installation, identity mapping, and optional first
-channel policy. `uv run docket-slack` remains available when you
+channel policy. `uv run toda-slack` remains available when you
 intentionally want the Slack listener as a separate process. The lower-level
 API equivalents are:
 
@@ -491,9 +566,9 @@ touching their config or restarting the process. That flow is a separate,
 additive path:
 
 ```dotenv
-DOCKET_SLACK_CLIENT_ID=...
-DOCKET_SLACK_CLIENT_SECRET=...
-DOCKET_PUBLIC_URL=https://your-host
+TODA_SLACK_CLIENT_ID=...
+TODA_SLACK_CLIENT_SECRET=...
+TODA_PUBLIC_URL=https://your-host
 ```
 
 ```text
@@ -506,7 +581,7 @@ deterministically from the Slack team id) and its own bot token, stored in the
 `slack_installations` table rather than `.env` — a public app has as many bot
 tokens as it has installs, and routing the right token to the right workspace
 happens per-request (`SlackSender._token_for`, `SlackGateway._fetch_user_profile`)
-rather than through a single global `DOCKET_SLACK_BOT_TOKEN`. Reinstalling
+rather than through a single global `TODA_SLACK_BOT_TOKEN`. Reinstalling
 (revoke and re-authorize) updates the same tenant rather than creating a
 duplicate. The single-workspace `.env` flow above still works unmodified and
 takes priority as a fallback wherever a workspace has no stored installation.
@@ -516,26 +591,32 @@ takes priority as a fallback wherever a workspace has no stored installation.
 The gateway remains lightweight by default. Tool contracts are always present
 in the capability catalog, but a missing optional runtime is shown as
 `setup_needed` and is not exposed to a model call. Install the supported extras
-inside the active Conda environment when needed:
+inside the active environment when needed:
 
 ```bash
-uv sync --extra documents   # PDF/DOCX/XLSX/PPTX/OCR dependencies
+uv sync --extra dev         # contributor test tooling
 uv sync --extra browser     # Playwright (also install its browser binaries)
 ```
 
-Document tools consume and return Docket artifact IDs; browser tools require an
+Document tools consume and return Toda artifact IDs; browser tools require an
 explicit allowlisted-domain deployment; vision/image tools require provider
 flags and credentials. None can access arbitrary host paths or silently bypass
-approval.
+approval. `calculate` and `chart_create` are available in the base install;
+`diagram_render` additionally requires the Graphviz `dot` binary to be installed
+by the deployment's operating-system package manager. `infographic_create`
+uses the pinned local Node runtime under
+`src/toda/harness/infographic_runtime`; run `npm install` in that directory
+after a fresh checkout. It renders AntV DSL offline into a scoped editable SVG
+and a PNG preview suitable for Slack delivery.
 
 ## Composio setup
 
 Configure:
 
 ```dotenv
-DOCKET_COMPOSIO_API_KEY=...
-DOCKET_COMPOSIO_WEBHOOK_SECRET=...
-DOCKET_COMPOSIO_TOOLKIT_VERSIONS=latest
+TODA_COMPOSIO_API_KEY=...
+TODA_COMPOSIO_WEBHOOK_SECRET=...
+TODA_COMPOSIO_TOOLKIT_VERSIONS=latest
 ```
 
 The typical onboarding flow is:
@@ -686,14 +767,14 @@ nothing is deleted without an explicit invocation.
 
 ```bash
 # Dry run: count what's older than 90 days without deleting anything
-uv run docket retention --organization-id org_acme --older-than-days 90
+uv run toda retention --organization-id org_acme --older-than-days 90
 
 # Actually delete it
-uv run docket retention --organization-id org_acme --older-than-days 90 \
+uv run toda retention --organization-id org_acme --older-than-days 90 \
   --apply --confirmed-by alice@example.com
 
 # Permanently delete an entire organization and all of its data
-uv run docket retention --organization-id org_acme \
+uv run toda retention --organization-id org_acme \
   --delete-organization --confirm org_acme
 ```
 
@@ -705,28 +786,28 @@ endpoint.
 
 ## Deployment boundaries
 
-The current build is usable for local development and a controlled small
-pilot. Before exposing it as a company-wide production service, add or replace:
+Toda Community is usable for local evaluation and controlled self-hosted
+pilots. It authenticates the console through Slack OpenID or a local
+administrator token, authenticates remote ingestion with bearer keys, and
+defaults high-risk optional runtimes off. A public or larger deployment still
+requires TLS termination, a production secret manager, encrypted backups,
+monitoring, and a deployment design appropriate for SQLite's single-host write
+workload. Follow [the deployment guide](docs/DEPLOYMENT.md) and
+[security policy](SECURITY.md).
 
-- Authentication and trusted principal derivation at the HTTP boundary
-- A production secret manager and TLS termination
-- An ANN vector index when exact cosine scoring becomes too expensive
-- Multi-process deployment design appropriate for the SQLite write workload,
-  or managed storage behind the existing interfaces
-- Vendor-specific Slack and Composio acceptance tests against the intended
-  production installations
-
-The harness intentionally does not expose terminal access, browser automation,
-arbitrary code execution, dynamic code loading, or automatic unapproved
-production writes. Raw evidence is treated as untrusted data, never as
-instructions. External mutations remain policy checked, approval gated,
-idempotent, and auditable.
+Raw evidence is treated as untrusted data, never as instructions. External
+mutations remain policy checked, approval gated when required, idempotent, and
+auditable.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, the test commands
 expected to pass before a PR, and the working principles this codebase holds
 to.
+
+Security reports follow [SECURITY.md](SECURITY.md), community behavior follows
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), and releases follow
+[docs/RELEASING.md](docs/RELEASING.md).
 
 ## License
 

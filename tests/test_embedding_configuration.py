@@ -1,17 +1,21 @@
-"""Model and embedding configuration are independent of each other."""
+"""Provider credentials are shared while model roles remain independent."""
 
 from __future__ import annotations
 
-from docket.config import Settings
+from toda.config import Settings
 
 
-def test_model_and_embedding_api_keys_are_configured_independently(monkeypatch):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-model-key")
-    monkeypatch.setenv("DOCKET_EMBEDDING_API_KEY", "test-embedding-key")
-    monkeypatch.setenv("DOCKET_EMBEDDING_MODEL", "qwen/qwen3-embedding-8b")
-    monkeypatch.setenv("DOCKET_EMBEDDING_PROVIDER", "openrouter")
+def test_provider_credentials_are_stored_once_and_roles_reference_them(monkeypatch):
+    monkeypatch.setenv(
+        "TODA_PROVIDER_CONNECTIONS",
+        '{"openrouter-company":{"provider":"openrouter","api_key":"shared-key"}}',
+    )
+    monkeypatch.setenv(
+        "TODA_MODEL_ASSIGNMENTS",
+        '{"main":{"connection":"openrouter-company","model":"openai/gpt-5.4"},'
+        '"embedding":{"connection":"openrouter-company","model":"qwen/qwen3-embedding-8b"}}',
+    )
     settings = Settings(_env_file=None)
-    assert settings.model_api_key == "test-model-key"
-    assert settings.embedding_api_key == "test-embedding-key"
-    assert settings.embedding_model == "qwen/qwen3-embedding-8b"
-    assert settings.embedding_provider == "openrouter"
+    assert settings.provider_connections["openrouter-company"].api_key == "shared-key"
+    assert settings.model_assignments["main"].connection == "openrouter-company"
+    assert settings.model_assignments["embedding"].model == "qwen/qwen3-embedding-8b"

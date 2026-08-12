@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import json
 
-from docket.harness.action_review import ActionReviewer
-from docket.harness.model_client import DeterministicHarnessModel, ScriptedModelClient
-from docket.harness.models import ModelResponse
+from toda.harness.action_review import ActionReviewer
+from toda.harness.model_client import DeterministicHarnessModel, ScriptedModelClient
+from toda.harness.models import ModelResponse
 
 
 def test_reviewer_escalates_for_the_deterministic_model():

@@ -6,6 +6,17 @@ export class ApiError extends Error {
   }
 }
 
+// Every /v1 data route is bound to the signed-in workspace server-side, so
+// an expired or cleared login turns every request into a 401. Without a
+// hook for that the console would sit on a stale page showing empty tables
+// and failed refreshes forever, with nothing telling the person to sign in
+// again. App registers a handler that drops back to the login screen.
+let unauthorizedHandler: (() => void) | null = null;
+
+export function onUnauthorized(handler: () => void): void {
+  unauthorizedHandler = handler;
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -36,6 +47,10 @@ async function request<T>(
     }
   }
   if (!res.ok) {
+    // /v1/session is how "am I signed in?" is *asked* — a 401 from it is an
+    // answer, not a session that just expired, so it must not recurse into
+    // the handler that re-asks.
+    if (res.status === 401 && path !== "/v1/session") unauthorizedHandler?.();
     throw new ApiError(res.status, typeof data === "string" ? data : JSON.stringify(data));
   }
   return data as T;
@@ -63,6 +78,22 @@ export interface DashboardSession {
   principal_id: string;
   workspace_name: string | null;
   auth_disabled: boolean;
+}
+
+export interface AuthMethods {
+  local_token: boolean;
+  slack: boolean;
+}
+
+export async function fetchAuthMethods(): Promise<AuthMethods> {
+  return request<AuthMethods>("GET", "/v1/auth/methods");
+}
+
+export async function localLogin(token: string): Promise<DashboardSession> {
+  const session = await request<DashboardSession>("POST", "/v1/session/local", { token });
+  ORG = session.organization_id;
+  PRINCIPAL = session.principal_id;
+  return session;
 }
 
 /** Resolves the signed-in workspace/person from the server session cookie.

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from docket.harness.models import (
+from toda.harness.models import (
     DestinationEnvelope,
     InvocationEnvelope,
     ModelToolCall,
 )
-from docket.services.policy import PolicyEngine
+from toda.services.policy import PolicyEngine
 
 
 def _account(brain):
@@ -17,7 +17,7 @@ def _account(brain):
         "toolkit": "linear",
         "connected_account_id": "ca_test_linear",
         "status": "active",
-        "composio_user_id": "docket:org_acme",
+        "composio_user_id": "toda:org_acme",
         "principal_id": "connector:ca_test_linear",
         "scope_id": "scope_org_public",
         "learn": True,
@@ -35,17 +35,17 @@ def test_ingestion_materializes_object_identity_fact_and_case(brain):
         source_system="linear",
         source_type="issue.updated",
         external_id="LIN-501",
-        content="Issue: Docket status is investigating. Ajay owns the incident.",
+        content="Issue: Toda status is investigating. Ajay owns the incident.",
         scope_id="scope_org_public",
         author_entity_id="person_ajay",
-        entity_ids=["project_docket"],
+        entity_ids=["project_toda"],
         metadata={
             "object_type": "issue",
             "object_id": "LIN-501",
             "connected_account_id": "ca_test_linear",
             "raw_data": {
                 "id": "LIN-501",
-                "title": "Docket incident",
+                "title": "Toda incident",
                 "status": "investigating",
                 "owner_id": "ajay-linear",
                 "owner_email": "ajay@example.com",
@@ -191,7 +191,7 @@ def _connector_objects(brain, external_id):
 def test_bitemporal_facts_preserve_history_and_resolve_conflicts(brain):
     first = brain.reality.assert_fact(
         organization_id="org_acme",
-        subject_id="project_docket",
+        subject_id="project_toda",
         predicate="status",
         object_value="planning",
         scope_id="scope_org_public",
@@ -203,7 +203,7 @@ def test_bitemporal_facts_preserve_history_and_resolve_conflicts(brain):
     known_before = first["system_from"]
     second = brain.reality.assert_fact(
         organization_id="org_acme",
-        subject_id="project_docket",
+        subject_id="project_toda",
         predicate="status",
         object_value="active",
         scope_id="scope_org_public",
@@ -214,14 +214,14 @@ def test_bitemporal_facts_preserve_history_and_resolve_conflicts(brain):
     )
     current = brain.reality.current_facts(
         "org_acme",
-        subject_id="project_docket",
+        subject_id="project_toda",
         predicate="status",
         valid_at="2026-03-01T00:00:00+00:00",
     )
     assert [fact["object_value"] for fact in current] == ["active"]
     historical = brain.reality.current_facts(
         "org_acme",
-        subject_id="project_docket",
+        subject_id="project_toda",
         predicate="status",
         valid_at="2026-01-15T00:00:00+00:00",
         known_at=known_before,
@@ -290,7 +290,7 @@ def test_conditional_policy_default_deny_and_forbid_precedence(brain):
         organization_id="org_acme",
         policy_key="linear-writes",
         effect="permit",
-        actions=["linear_update_issue"],
+        actions=["COMPOSIO_EXECUTE"],
         conditions={"destination.type": "dm"},
         approval_required=True,
         created_by="person_ajay",
@@ -298,12 +298,12 @@ def test_conditional_policy_default_deny_and_forbid_precedence(brain):
     )
     allowed = brain.policy.evaluate(
         organization_id="org_acme",
-        action="linear_update_issue",
+        action="COMPOSIO_EXECUTE",
         context={"destination": {"type": "dm"}},
     )
     denied_by_default = brain.policy.evaluate(
         organization_id="org_acme",
-        action="linear_update_issue",
+        action="COMPOSIO_EXECUTE",
         context={"destination": {"type": "slack_channel"}},
     )
     assert allowed["decision"] == "allow"
@@ -314,14 +314,14 @@ def test_conditional_policy_default_deny_and_forbid_precedence(brain):
         organization_id="org_acme",
         policy_key="incident-freeze",
         effect="forbid",
-        actions=["linear_update_issue"],
+        actions=["COMPOSIO_EXECUTE"],
         conditions={"action.arguments.status": "closed"},
         created_by="person_ajay",
         status="active",
     )
     forbidden = brain.policy.evaluate(
         organization_id="org_acme",
-        action="linear_update_issue",
+        action="COMPOSIO_EXECUTE",
         context={
             "destination": {"type": "dm"},
             "action": {"arguments": {"status": "closed"}},
@@ -430,7 +430,7 @@ def test_reality_api_exposes_permission_filtered_facts_and_artifacts(api_client)
         "/v1/facts",
         json={
             "organization_id": "org_acme",
-            "subject_id": "project_docket",
+            "subject_id": "project_toda",
             "predicate": "status",
             "object_value": "active",
             "scope_id": "scope_org_public",
@@ -443,7 +443,7 @@ def test_reality_api_exposes_permission_filtered_facts_and_artifacts(api_client)
         params={
             "organization_id": "org_acme",
             "acting_principal_id": "person_ajay",
-            "subject_id": "project_docket",
+            "subject_id": "project_toda",
         },
     )
     assert facts.status_code == 200
@@ -527,7 +527,7 @@ def test_policy_changes_are_pending_until_explicit_activation(api_client):
             "organization_id": "org_acme",
             "policy_key": "company-writes",
             "effect": "permit",
-            "actions": ["linear_create_issue"],
+            "actions": ["COMPOSIO_EXECUTE"],
             "conditions": {"destination.type": "dm"},
             "approval_required": True,
             "created_by": "person_ajay",

@@ -18,6 +18,39 @@ htmlcov/
 web/node_modules/
 web/dist/
 web/*.tsbuildinfo
+src/toda/static/console/
 
 # macOS
 .DS_Store
+node_modules/
+
+# Toda runtime state and local operator material
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.env.bak*
+
+# Private research/reference worktrees and generated product experiments
+harnesses/
+old/
+build/
+dist/
+imgs/
+landing/
+site/
+--help
+
+# Private implementation notes are not part of the community distribution
+*_PLAN.md
+*_HANDOFF.md
+*_TODO.md
+*ANALYSIS*.md
+HARNESS_*.md
+*_HARNESS_UNDERSTANDING.md
+IMPLEMENTATION_STATUS.md
+CLAUDE.md
+.claude/
+.commandcode/
