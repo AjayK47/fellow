@@ -14,6 +14,7 @@ import sys
 import threading
 import webbrowser
 import plistlib
+import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Callable
@@ -33,6 +34,19 @@ log = logging.getLogger("toda")
 
 def _toda_executable() -> str:
     return shutil.which("toda") or str(Path(sys.executable).with_name("toda"))
+
+
+def _wait_for_gateway(timeout_seconds: float = 30) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    url = f"http://127.0.0.1:{settings.port}/health"
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as response:
+                if response.status == 200:
+                    return
+        except OSError:
+            time.sleep(0.25)
+    raise RuntimeError(f"Toda service did not become healthy within {timeout_seconds:g}s")
 
 
 def service_cli(args: argparse.Namespace) -> None:
@@ -152,6 +166,7 @@ def service_cli(args: argparse.Namespace) -> None:
     # The installer is already a trusted local process. Issuing the token here
     # works identically on launchd, systemd, and Windows Task Scheduler and
     # avoids scraping platform-specific service logs.
+    _wait_for_gateway()
     bootstrap = SetupBootstrapToken(data_dir).issue()
     setup_url = f"http://127.0.0.1:{settings.port}/setup?bootstrap={bootstrap}"
     print(f"Continue setup: {setup_url}")
