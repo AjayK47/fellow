@@ -97,6 +97,19 @@ def _print_status(*, running: bool, installed: bool, data_dir: Path, log_path: P
         print(f"  Logs: {log_path}")
 
 
+def setup_cli(args: argparse.Namespace) -> None:
+    """Issue a fresh local setup link for this installation."""
+    if not _gateway_healthy():
+        raise RuntimeError("Toda is not running. Run `toda start`, then `toda setup`.")
+    data_dir = settings.data_dir.expanduser().resolve()
+    token = SetupBootstrapToken(data_dir).issue()
+    url = f"http://127.0.0.1:{settings.port}/setup?bootstrap={token}"
+    print("Toda setup is ready:")
+    print(url)
+    if not args.no_open:
+        webbrowser.open(url)
+
+
 def service_cli(args: argparse.Namespace) -> None:
     """Manage the one Toda gateway as a per-user login service."""
     data_dir = settings.data_dir.expanduser().resolve()
@@ -309,8 +322,14 @@ def _dashboard_session_secret() -> str:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     owner = getattr(app.state, "database_owner", None)
     if owner is None:
+        prebuilt_brain = getattr(app.state, "prebuilt_brain", None)
         db = os.environ.get("TODA_DB")
-        owner = DatabaseOwner(Path(db) if db else settings.db_path)
+        owner_path = (
+            prebuilt_brain.store.db_path
+            if prebuilt_brain is not None
+            else Path(db) if db else settings.db_path
+        )
+        owner = DatabaseOwner(owner_path)
         app.state.database_owner = owner
     owner.acquire()
     worker_tasks: list[asyncio.Task[None]] = []
@@ -785,6 +804,8 @@ def main() -> None:
             command.add_argument(
                 "--no-open", action="store_true", help="do not open the setup browser"
             )
+    setup = sub.add_parser("setup", help="open the installation setup flow")
+    setup.add_argument("--no-open", action="store_true", help="print the setup link without opening it")
     args = parser.parse_args()
     if args.command == "gateway":
         gateway()
@@ -794,6 +815,12 @@ def main() -> None:
         retention_cli(args)
     elif args.command == "reindex":
         reindex_cli(args)
+    elif args.command == "setup":
+        try:
+            setup_cli(args)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(1) from None
     elif hasattr(args, "service_action"):
         args.action = args.service_action
         args.no_open = getattr(args, "no_open", False)

@@ -303,10 +303,12 @@ function Topbar({ pendingApprovals, onOpenNavigation }: { pendingApprovals: numb
 }
 
 type SessionState = "pending" | DashboardSession | null;
+type SetupState = "pending" | boolean;
 
 export default function App() {
   const [pendingApprovals, setPendingApprovals] = useState(0);
   const [session, setSession] = useState<SessionState>("pending");
+  const [setupComplete, setSetupComplete] = useState<SetupState>("pending");
   const [loginError, setLoginError] = useState<string | null>(null);
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
 
@@ -325,9 +327,10 @@ export default function App() {
       setLoginError("session_expired");
       setSession(null);
     });
-    fetchSession()
-      .then(setSession)
-      .catch(() => setSession(null));
+    fetchSession().then(setSession).catch(() => setSession(null));
+    api.get<{ setup?: { complete?: boolean } }>("/v1/gateway/setup/status")
+      .then((status) => setSetupComplete(Boolean(status.setup?.complete)))
+      .catch(() => setSetupComplete(true));
   }, []);
 
   const pollApprovals = useCallback(async () => {
@@ -354,7 +357,8 @@ export default function App() {
     return <Setup />;
   }
 
-  if (session === "pending") return null;
+  if (session === "pending" || setupComplete === "pending") return null;
+  if (!setupComplete) return <Setup />;
   if (!session) return <Login error={loginError} />;
 
   async function handleSignOut() {

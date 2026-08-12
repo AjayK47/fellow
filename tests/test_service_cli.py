@@ -93,3 +93,15 @@ def test_status_is_short_and_human_readable(tmp_path, capsys):
     assert output.startswith("Toda is running.")
     assert "Starts at login: yes" in output
     assert "launchctl" not in output
+
+
+def test_setup_cli_prints_fresh_link(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(main, "_gateway_healthy", lambda: True)
+    monkeypatch.setattr(main.settings, "data_dir", tmp_path)
+    monkeypatch.setattr(main.SetupBootstrapToken, "issue", lambda _self: "fresh-token")
+
+    main.setup_cli(argparse.Namespace(no_open=True))
+
+    output = capsys.readouterr().out
+    assert "Toda setup is ready:" in output
+    assert "/setup?bootstrap=fresh-token" in output

@@ -226,7 +226,7 @@ export default function Setup() {
         {error && error !== "null" && <div className="setup-alert is-bad">Could not read setup state: {error}</div>}
         {authError && <div className="setup-alert is-bad">The bootstrap link is invalid or expired. Restart Toda to issue another.</div>}
         {!loading && !canWrite && (
-          <div className="setup-alert"><KeyRound size={17} /> Open the complete bootstrap URL printed by <code>toda gateway</code> to change this installation.</div>
+          <div className="setup-alert"><KeyRound size={17} /> Run <code>toda setup</code> in Terminal to open a secure setup link.</div>
         )}
 
         {data && active === "system" && (
