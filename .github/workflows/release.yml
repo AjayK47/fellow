@@ -33,8 +33,7 @@ jobs:
         working-directory: web
       - name: Include the console in the Python distribution
         run: |
-          mkdir -p src/toda/static/console
-          cp -R web/dist/. src/toda/static/console/
+          diff -qr web/dist src/toda/static/console
       - run: uv build
       - uses: actions/upload-artifact@v7
         with:

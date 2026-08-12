@@ -143,6 +143,15 @@ class BrainStore:
                     payload TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS entity_aliases (
+                    organization_id TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    normalized TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    PRIMARY KEY (organization_id, entity_id, normalized, kind)
+                );
+
                 CREATE TABLE IF NOT EXISTS edges (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
@@ -892,13 +901,18 @@ class BrainStore:
                 CREATE INDEX IF NOT EXISTS idx_edges_org_type
                     ON edges(organization_id, edge_type);
                 CREATE INDEX IF NOT EXISTS idx_edges_from_id
-                    ON edges(from_id);
+                    ON edges(organization_id, from_id, edge_type, valid_until);
                 CREATE INDEX IF NOT EXISTS idx_edges_to_id
-                    ON edges(to_id);
+                    ON edges(organization_id, to_id, edge_type, valid_until);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_active_unique
+                    ON edges(organization_id, edge_type, from_id, to_id)
+                    WHERE valid_until IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_sources_org
                     ON sources(organization_id);
                 CREATE INDEX IF NOT EXISTS idx_entities_org
                     ON entities(organization_id, entity_type);
+                CREATE INDEX IF NOT EXISTS idx_entity_alias_lookup
+                    ON entity_aliases(organization_id, normalized, entity_id);
                 CREATE INDEX IF NOT EXISTS idx_chunks_org_scope ON chunks(organization_id, scope_id);
                 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_org_scope
                     ON memory_embeddings(organization_id, scope_id);
@@ -955,6 +969,12 @@ class BrainStore:
                     ON tasks(root_task_id);
                 CREATE INDEX IF NOT EXISTS idx_tasks_org_state
                     ON tasks(organization_id, state, worker_type);
+                CREATE INDEX IF NOT EXISTS idx_tasks_expired_lease
+                    ON tasks(organization_id, state, execution_lease_expires_at);
+                CREATE INDEX IF NOT EXISTS idx_tasks_recovery_waiting
+                    ON tasks(organization_id, state, parent_task_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_audit_events_since
+                    ON audit_events(organization_id, event_type, created_at);
                 CREATE INDEX IF NOT EXISTS idx_task_attempts_task
                     ON task_attempts(task_id, attempt_number);
                 CREATE INDEX IF NOT EXISTS idx_task_signals_task
@@ -1368,7 +1388,24 @@ class BrainStore:
     # ---- entities / edges ----
 
     def upsert_entity(self, entity: dict[str, Any]) -> None:
-        with self.cursor() as cur:
+        organization_id = entity["organization_id"]
+        aliases: list[tuple[str, str]] = [(str(entity["name"]), "name")]
+        aliases.extend((str(value), "alias") for value in entity.get("aliases") or [])
+        aliases.append((str(entity["id"]), "id"))
+        for key in ("email", "slack_id", "external_id"):
+            value = entity.get(key) or (entity.get("attributes") or {}).get(key)
+            if value:
+                aliases.append((str(value), key))
+        alias_rows: set[tuple[str, str, str]] = set()
+        for alias, kind in aliases:
+            normalized = alias.casefold().strip()
+            if not normalized:
+                continue
+            alias_rows.add((alias, normalized, kind))
+            for token in re.findall(r"[\w@.+-]{2,}", normalized):
+                alias_rows.add((alias, token, f"{kind}_token"))
+
+        with self.cursor(immediate=True) as cur:
             cur.execute(
                 """
                 INSERT OR REPLACE INTO entities(id, organization_id, entity_type, name, payload)
@@ -1376,11 +1413,24 @@ class BrainStore:
                 """,
                 (
                     entity["id"],
-                    entity["organization_id"],
+                    organization_id,
                     entity["entity_type"] if isinstance(entity["entity_type"], str) else entity["entity_type"].value,
                     entity["name"],
                     _ser(entity),
                 ),
+            )
+            cur.execute(
+                "DELETE FROM entity_aliases WHERE organization_id = ? AND entity_id = ?",
+                (organization_id, entity["id"]),
+            )
+            cur.executemany(
+                """INSERT INTO entity_aliases
+                (organization_id, entity_id, alias, normalized, kind)
+                VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (organization_id, entity["id"], alias, normalized, kind)
+                    for alias, normalized, kind in sorted(alias_rows)
+                ],
             )
 
     def get_entity(self, entity_id: str) -> dict[str, Any] | None:
@@ -1410,15 +1460,33 @@ class BrainStore:
         tokens = [token.lower() for token in re.findall(r"[\w.-]{2,}", text or "")]
         if not tokens:
             return []
-        clauses = " OR ".join("lower(payload) LIKE ?" for _ in tokens[:12])
-        params = [organization_id, *(f"%{token}%" for token in tokens[:12]), int(limit)]
+        selected = tokens[:12]
+        placeholders = ",".join("?" for _ in selected)
         with self.cursor() as cur:
             cur.execute(
-                f"""SELECT payload FROM entities WHERE organization_id = ?
-                AND ({clauses}) LIMIT ?""",
-                params,
+                f"""SELECT e.payload, COUNT(*) AS matches
+                FROM entity_aliases a
+                JOIN entities e ON e.id = a.entity_id
+                WHERE a.organization_id = ? AND a.normalized IN ({placeholders})
+                GROUP BY e.id
+                ORDER BY matches DESC, e.name
+                LIMIT ?""",
+                (organization_id, *selected, int(limit)),
             )
             return [_de(row["payload"]) for row in cur.fetchall()]
+
+    def get_active_edge(
+        self, organization_id: str, edge_type: str, from_id: str, to_id: str
+    ) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM edges WHERE organization_id = ?
+                AND edge_type = ? AND from_id = ? AND to_id = ?
+                AND valid_until IS NULL LIMIT 1""",
+                (organization_id, edge_type, from_id, to_id),
+            )
+            row = cur.fetchone()
+            return _de(row["payload"]) if row else None
 
     def upsert_edge(self, edge: dict[str, Any]) -> None:
         with self.cursor() as cur:
@@ -1527,14 +1595,56 @@ class BrainStore:
         if status:
             clauses.append("status = ?")
             params.append(status)
+        if scope_ids is not None:
+            if not scope_ids:
+                return []
+            placeholders = ",".join("?" for _ in scope_ids)
+            clauses.append(f"scope_id IN ({placeholders})")
+            params.extend(scope_ids)
         sql = f"SELECT payload FROM memories WHERE {' AND '.join(clauses)}"
         with self.cursor() as cur:
             cur.execute(sql, params)
             rows = [_de(r["payload"]) for r in cur.fetchall()]
-        if scope_ids is not None:
-            allowed = set(scope_ids)
-            rows = [m for m in rows if m.get("scope_id") in allowed]
         return rows
+
+    def list_current_memories(
+        self,
+        organization_id: str,
+        *,
+        entity_ids: Sequence[str] | None = None,
+        memory_types: Sequence[str] | None = None,
+        scope_ids: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = [
+            "m.organization_id = ?",
+            "m.is_latest = 1",
+            "m.status IN ('active', 'confirmed')",
+        ]
+        params: list[Any] = [organization_id]
+        if memory_types:
+            placeholders = ",".join("?" for _ in memory_types)
+            clauses.append(f"m.memory_type IN ({placeholders})")
+            params.extend(memory_types)
+        if scope_ids is not None:
+            if not scope_ids:
+                return []
+            placeholders = ",".join("?" for _ in scope_ids)
+            clauses.append(f"m.scope_id IN ({placeholders})")
+            params.extend(scope_ids)
+        if entity_ids:
+            placeholders = ",".join("?" for _ in entity_ids)
+            clauses.append(
+                "EXISTS (SELECT 1 FROM edges e WHERE e.organization_id = m.organization_id "
+                "AND e.from_id = m.id AND e.edge_type = 'ABOUT' "
+                f"AND e.to_id IN ({placeholders}) AND e.valid_until IS NULL)"
+            )
+            params.extend(entity_ids)
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT m.payload FROM memories m WHERE {' AND '.join(clauses)}",
+                params,
+            )
+            return [_de(row["payload"]) for row in cur.fetchall()]
 
     def mark_superseded(self, memory_id: str, superseded_at: str) -> None:
         mem = self.get_memory(memory_id)
@@ -1923,6 +2033,34 @@ class BrainStore:
                     (organization_id,),
                 )
             return [_de(r["payload"]) for r in cur.fetchall()]
+
+    def list_audit_since(
+        self,
+        organization_id: str,
+        *,
+        after: str | None,
+        event_types: Sequence[str],
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return only new heartbeat-relevant events in durable order."""
+        kinds = list(dict.fromkeys(event_types))
+        if not kinds:
+            return []
+        placeholders = ",".join("?" for _ in kinds)
+        clauses = ["organization_id = ?", f"event_type IN ({placeholders})"]
+        params: list[Any] = [organization_id, *kinds]
+        if after:
+            clauses.append("created_at > ?")
+            params.append(after)
+        params.append(max(1, int(limit)))
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT payload FROM audit_events
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at, id LIMIT ?""",
+                params,
+            )
+            return [_de(row["payload"]) for row in cur.fetchall()]
 
     def save_authz(self, decision: dict[str, Any]) -> None:
         with self.cursor() as cur:
@@ -2513,6 +2651,53 @@ class BrainStore:
             params.append(int(limit))
         with self.cursor() as cur:
             cur.execute(sql, params)
+            return [self._task_row(row) for row in cur.fetchall()]
+
+    def list_expired_running_tasks(
+        self, organization_id: str, *, now: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT {self._TASK_COLUMNS} FROM tasks
+                WHERE organization_id = ? AND state = 'running'
+                  AND execution_lease_expires_at IS NOT NULL
+                  AND execution_lease_expires_at < ?
+                ORDER BY execution_lease_expires_at LIMIT ?""",
+                (organization_id, now, max(1, int(limit))),
+            )
+            return [self._task_row(row) for row in cur.fetchall()]
+
+    def list_parents_waiting_for_children(
+        self, organization_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT {self._TASK_COLUMNS} FROM tasks
+                WHERE organization_id = ? AND state = 'waiting'
+                  AND parent_task_id IS NULL
+                  AND json_extract(payload, '$.waiting_for.type') = 'child_task'
+                ORDER BY updated_at LIMIT ?""",
+                (organization_id, max(1, int(limit))),
+            )
+            return [self._task_row(row) for row in cur.fetchall()]
+
+    def list_completed_tasks_missing_delivery(
+        self, organization_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT {self._TASK_COLUMNS} FROM tasks t
+                WHERE t.organization_id = ? AND t.state = 'completed'
+                  AND t.parent_task_id IS NULL
+                  AND COALESCE(json_extract(t.payload, '$.final_answer'), '') <> ''
+                  AND NOT EXISTS (
+                    SELECT 1 FROM deliveries d
+                    WHERE d.organization_id = t.organization_id
+                      AND d.idempotency_key = 'slack.final:' || t.id
+                  )
+                ORDER BY t.completed_at LIMIT ?""",
+                (organization_id, max(1, int(limit))),
+            )
             return [self._task_row(row) for row in cur.fetchall()]
 
     def update_task(self, task: dict[str, Any]) -> None:

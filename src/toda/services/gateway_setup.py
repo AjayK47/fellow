@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
+import secrets
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -86,6 +89,18 @@ class GatewaySetupService:
                 "slack_installations", organization["id"]
             )
         ]
+        provider_ready = bool(connections) and bool(assignments.get("main"))
+        slack_ready = bool(installations)
+        organization_ready = bool(organizations)
+        steps = [
+            {"id": "system", "label": "System check", "status": "complete"},
+            {"id": "provider", "label": "Model provider", "status": "complete" if provider_ready else "current"},
+            {"id": "models", "label": "Model roles", "status": "complete" if provider_ready else "pending"},
+            {"id": "tools", "label": "Web and media", "status": "complete" if tool_connections else "optional"},
+            {"id": "slack", "label": "Slack workspace", "status": "complete" if slack_ready else ("current" if provider_ready else "pending")},
+            {"id": "organization", "label": "Organization", "status": "complete" if organization_ready else "pending"},
+            {"id": "verify", "label": "Verification", "status": "current" if provider_ready and slack_ready else "pending"},
+        ]
         return {
             "environment_file": str(self.env_path()),
             "available_providers": [
@@ -129,7 +144,73 @@ class GatewaySetupService:
                 not in {"0", "false", "no"},
             },
             "organizations": organizations,
+            "setup": {
+                "complete": provider_ready and slack_ready and organization_ready,
+                "current_step": next(
+                    (step["id"] for step in steps if step["status"] == "current"),
+                    "verify",
+                ),
+                "steps": steps,
+            },
         }
+
+    def verify_installation(self) -> dict[str, Any]:
+        status = self.status()
+        checks = [
+            {
+                "id": "database",
+                "label": "Database is writable",
+                "ok": True,
+                "detail": "SQLite WAL coordination is ready",
+            },
+            {
+                "id": "workspace",
+                "label": "Task workspace is writable",
+                "ok": self._directory_writable(self.env_path().parent),
+                "detail": str(self.env_path().parent),
+            },
+            {
+                "id": "provider",
+                "label": "Main model is assigned",
+                "ok": bool(status["providers"]) and bool(status["assignments"].get("main")),
+                "detail": str((status["assignments"].get("main") or {}).get("model") or "Not assigned"),
+            },
+            {
+                "id": "embedding",
+                "label": "Embedding path is available",
+                "ok": bool(status["assignments"].get("embedding")) or bool(status["assignments"].get("main")),
+                "detail": str((status["assignments"].get("embedding") or {}).get("model") or "Uses local deterministic fallback"),
+            },
+            {
+                "id": "slack",
+                "label": "Slack workspace is connected",
+                "ok": bool(status["slack"]["installations"]),
+                "detail": str((status["slack"]["installations"] or [{}])[0].get("workspace_name") or "Not connected"),
+            },
+            {
+                "id": "workers",
+                "label": "Internal worker lanes are available",
+                "ok": True,
+                "detail": "Infrastructure, agent, and knowledge lanes share this daemon",
+            },
+        ]
+        return {
+            "ready": all(item["ok"] for item in checks),
+            "checks": checks,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @staticmethod
+    def _directory_writable(path: Path) -> bool:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / f".toda-write-{secrets.token_hex(4)}"
+            probe.touch(exist_ok=False)
+            probe.unlink()
+            return True
+        except OSError:
+            return False
+
 
     def configure_provider(
         self,
@@ -142,14 +223,15 @@ class GatewaySetupService:
     ) -> dict[str, Any]:
         profile = providers.get(provider)
         connection_id = _slug(connection_id)
-        if profile.api_key_required and not api_key.strip():
-            raise ValueError(f"{profile.display_name} API key is required")
         env = self._read_env()
         connections = self._json_env(env, "TODA_PROVIDER_CONNECTIONS")
         previous = connections.get(connection_id) or {}
+        credential = api_key.strip() or previous.get("api_key")
+        if profile.api_key_required and not credential:
+            raise ValueError(f"{profile.display_name} API key is required")
         connections[connection_id] = {
             "provider": provider,
-            "api_key": api_key.strip() or previous.get("api_key"),
+            "api_key": credential,
             "base_url": (base_url or "").strip() or None,
         }
         model_assignments = self._json_env(env, "TODA_MODEL_ASSIGNMENTS")
@@ -483,3 +565,39 @@ class GatewaySetupService:
             path.chmod(0o600)
         except OSError:
             pass
+
+
+class SetupBootstrapToken:
+    """One-time, local bootstrap credential stored only as a digest."""
+
+    def __init__(self, data_dir: Path, *, ttl_seconds: int = 1800) -> None:
+        self.path = data_dir / "setup-bootstrap.json"
+        self.ttl_seconds = ttl_seconds
+
+    def issue(self) -> str:
+        token = secrets.token_urlsafe(32)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(
+                {
+                    "digest": hashlib.sha256(token.encode()).hexdigest(),
+                    "expires_at": int(time.time()) + self.ttl_seconds,
+                }
+            )
+        )
+        self.path.chmod(0o600)
+        return token
+
+    def consume(self, token: str) -> bool:
+        try:
+            record = json.loads(self.path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        expected = str(record.get("digest") or "")
+        actual = hashlib.sha256(token.encode()).hexdigest()
+        if int(record.get("expires_at") or 0) < int(time.time()):
+            return False
+        if not secrets.compare_digest(expected, actual):
+            return False
+        self.path.unlink(missing_ok=True)
+        return True

@@ -87,3 +87,14 @@ def test_recovery_heartbeat_requeues_an_expired_task_without_model(brain):
 
     assert task["id"] in result["requeued_task_ids"]
     assert brain.store.get_task(task["id"])["state"] == "queued"
+
+
+def test_recovery_heartbeat_uses_targeted_queries(brain, monkeypatch):
+    def fail_full_scan(*args, **kwargs):
+        raise AssertionError("recovery must not scan every Task")
+
+    monkeypatch.setattr(brain.store, "list_tasks", fail_full_scan)
+
+    result = brain.recovery_heartbeat.tick("org_acme")
+
+    assert result["organization_id"] == "org_acme"

@@ -10,7 +10,6 @@ from toda.domain.models import (
     GraphEdge,
     Memory,
     MemoryEdgeType,
-    MemoryStatus,
     OrgEdgeType,
     new_id,
     utcnow,
@@ -65,6 +64,11 @@ class GraphService:
         if replaces:
             self.supersede_edge(replaces, reason=f"replaced by a new {edge_type} edge")
         et = edge_type.value if hasattr(edge_type, "value") else str(edge_type)
+        existing = self.store.get_active_edge(
+            organization_id, et, from_id, to_id
+        )
+        if existing:
+            return existing
         edge = GraphEdge(
             id=new_id("edge"),
             organization_id=organization_id,
@@ -280,16 +284,14 @@ class GraphService:
         organization_id: str,
         entity_ids: list[str] | None = None,
         memory_types: list[str] | None = None,
+        scope_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        mems = self.store.list_memories(organization_id, latest_only=True)
-        mems = [m for m in mems if m.get("status") in {"active", "confirmed", MemoryStatus.ACTIVE.value, MemoryStatus.CONFIRMED.value}]
-        if entity_ids:
-            wanted = set(entity_ids)
-            mems = [m for m in mems if wanted.intersection(m.get("entity_ids") or [])]
-        if memory_types:
-            types = set(memory_types)
-            mems = [m for m in mems if m.get("memory_type") in types]
-        return mems
+        return self.store.list_current_memories(
+            organization_id,
+            entity_ids=entity_ids,
+            memory_types=memory_types,
+            scope_ids=scope_ids,
+        )
 
     def memory_history(self, organization_id: str, memory_id: str) -> list[dict[str, Any]]:
         """Walk UPDATES edges backward/forward to reconstruct lineage."""

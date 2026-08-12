@@ -39,6 +39,8 @@ jobs:
         working-directory: web
       - run: npm run build
         working-directory: web
+      - name: Verify packaged console matches the build
+        run: diff -qr web/dist src/toda/static/console
 
   container:
     runs-on: ubuntu-latest

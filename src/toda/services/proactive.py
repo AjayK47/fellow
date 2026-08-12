@@ -118,22 +118,22 @@ class ProactiveService:
         watermark_id = f"proactive:{organization_id}"
         watermark = self.store.get_harness_record("automation_watermarks", watermark_id) or {}
         since = watermark.get("last_seen_at")
-        events = [
-            event
-            for event in self.store.list_audit(organization_id)
-            if event.get("event_type") in {
+        events = self.store.list_audit_since(
+            organization_id,
+            after=since,
+            event_types=[
                 "memory.created",
                 "case.created",
                 "case.updated",
                 "task.failed",
-            }
-            and (not since or str(event.get("created_at") or "") > since)
-        ]
+            ],
+            limit=100,
+        )
         if not events:
             return {"organization_id": organization_id, "evaluated": 0, "decisions": []}
         decisions = []
         dest = destination or {"type": "internal_agent_session", "id": "proactive", "is_private": True}
-        for event in events[-100:]:
+        for event in events:
             cooldown_seconds = int(policy.get("cooldown_seconds") or 900)
             last_notified_at = watermark.get("last_notified_at")
             if last_notified_at:

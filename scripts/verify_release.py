@@ -24,6 +24,8 @@ REQUIRED = {
     "THIRD_PARTY_NOTICES.md",
     "Dockerfile",
     "compose.yaml",
+    "install.sh",
+    "install.ps1",
     ".dockerignore",
     ".env.example",
     "pyproject.toml",
@@ -59,6 +61,8 @@ def main() -> int:
     scripts = project.get("project", {}).get("scripts", {})
     if scripts.get("toda") != "toda.main:main":
         errors.append("the toda CLI entry point is missing")
+    if not (ROOT / "install.sh").stat().st_mode & 0o111:
+        errors.append("install.sh must be executable")
 
     for skill in sorted((ROOT / "src/toda/builtin_skills").glob("*/SKILL.md")):
         text = skill.read_text(encoding="utf-8")

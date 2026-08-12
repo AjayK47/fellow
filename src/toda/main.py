@@ -9,7 +9,11 @@ import time
 import argparse
 import logging
 import shutil
+import subprocess
+import sys
 import threading
+import webbrowser
+import plistlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Callable
@@ -20,9 +24,139 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from toda.api.routes import enforce_tenant, router
 from toda.config import settings
+from toda.runtime_owner import DatabaseOwner
 from toda.services.container import TodaApp, get_app, reset_app
+from toda.services.gateway_setup import GatewaySetupService, SetupBootstrapToken
 
 log = logging.getLogger("toda")
+
+
+def _toda_executable() -> str:
+    return shutil.which("toda") or str(Path(sys.executable).with_name("toda"))
+
+
+def service_cli(args: argparse.Namespace) -> None:
+    """Install the one Toda gateway as a per-user login service."""
+    data_dir = settings.data_dir.expanduser().resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    log_path = data_dir / "toda.log"
+    executable = _toda_executable()
+    environment = {
+        "TODA_DATA_DIR": str(data_dir),
+        "TODA_ENV_FILE": str(data_dir / ".env"),
+        "PYTHONUNBUFFERED": "1",
+    }
+
+    if args.action == "update":
+        uv = shutil.which("uv")
+        if not uv:
+            raise SystemExit("uv is required to update Toda")
+        subprocess.run([uv, "tool", "upgrade", "toda-ai"], check=True)
+        args.action = "restart"
+
+    if args.action == "status":
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/ai.toda.gateway"],
+                check=False,
+            )
+        elif os.name == "nt":
+            result = subprocess.run(["schtasks", "/Query", "/TN", "Toda"], check=False)
+        else:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", "toda.service"], check=False
+            )
+        raise SystemExit(result.returncode)
+
+    if sys.platform == "darwin":
+        service_path = Path.home() / "Library" / "LaunchAgents" / "ai.toda.gateway.plist"
+        domain = f"gui/{os.getuid()}"
+        service_name = f"{domain}/ai.toda.gateway"
+        if args.action in {"stop", "restart"}:
+            subprocess.run(["launchctl", "bootout", service_name], check=False)
+            if args.action == "stop":
+                print("Toda service stopped.")
+                return
+        if args.action == "start" and service_path.exists():
+            subprocess.run(["launchctl", "bootstrap", domain, str(service_path)], check=False)
+            subprocess.run(["launchctl", "kickstart", "-k", service_name], check=True)
+            print("Toda service started.")
+            return
+        service_path.parent.mkdir(parents=True, exist_ok=True)
+        service_path.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "ai.toda.gateway",
+                    "ProgramArguments": [executable, "gateway"],
+                    "EnvironmentVariables": environment,
+                    "RunAtLoad": True,
+                    "KeepAlive": True,
+                    "StandardOutPath": str(log_path),
+                    "StandardErrorPath": str(log_path),
+                }
+            )
+        )
+        subprocess.run(["launchctl", "bootstrap", domain, str(service_path)], check=False)
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", service_name], check=True
+        )
+    elif os.name == "nt":
+        if args.action in {"stop", "restart"}:
+            subprocess.run(["schtasks", "/End", "/TN", "Toda"], check=False)
+            if args.action == "stop":
+                print("Toda service stopped.")
+                return
+        if args.action == "start":
+            subprocess.run(["schtasks", "/Run", "/TN", "Toda"], check=True)
+            print("Toda service started.")
+            return
+        command = f'"{executable}" gateway'
+        subprocess.run(
+            [
+                "schtasks", "/Create", "/F", "/SC", "ONLOGON", "/TN", "Toda",
+                "/TR", command,
+            ],
+            check=True,
+        )
+        subprocess.run(["schtasks", "/Run", "/TN", "Toda"], check=True)
+    else:
+        service_path = Path.home() / ".config" / "systemd" / "user" / "toda.service"
+        if args.action in {"stop", "restart"}:
+            subprocess.run(["systemctl", "--user", "stop", "toda.service"], check=False)
+            if args.action == "stop":
+                print("Toda service stopped.")
+                return
+        if args.action == "start":
+            subprocess.run(["systemctl", "--user", "start", "toda.service"], check=True)
+            print("Toda service started.")
+            return
+        service_path.parent.mkdir(parents=True, exist_ok=True)
+        service_path.write_text(
+            "\n".join(
+                [
+                    "[Unit]", "Description=Toda organizational coworker", "After=network-online.target", "",
+                    "[Service]", f'ExecStart="{executable.replace(chr(34), chr(92) + chr(34))}" gateway', "Restart=on-failure", "RestartSec=3",
+                    *(f'Environment=\"{key}={value}\"' for key, value in environment.items()),
+                    f"StandardOutput=append:{log_path}", f"StandardError=append:{log_path}", "",
+                    "[Install]", "WantedBy=default.target", "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", "toda.service"], check=True
+        )
+
+    print(f"Toda service installed. Logs: {log_path}")
+    # The installer is already a trusted local process. Issuing the token here
+    # works identically on launchd, systemd, and Windows Task Scheduler and
+    # avoids scraping platform-specific service logs.
+    bootstrap = SetupBootstrapToken(data_dir).issue()
+    setup_url = f"http://127.0.0.1:{settings.port}/setup?bootstrap={bootstrap}"
+    print(f"Continue setup: {setup_url}")
+    if not args.no_open:
+        webbrowser.open(setup_url)
 
 
 def validate_runtime_exposure() -> None:
@@ -60,93 +194,104 @@ def _dashboard_session_secret() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    prebuilt_brain = getattr(app.state, "prebuilt_brain", None)
-    if prebuilt_brain is not None:
-        brain = prebuilt_brain
-    else:
+    owner = getattr(app.state, "database_owner", None)
+    if owner is None:
         db = os.environ.get("TODA_DB")
-        brain = reset_app(Path(db) if db else settings.db_path)
-    app.state.brain = brain
-    brain.indexing.backfill()
+        owner = DatabaseOwner(Path(db) if db else settings.db_path)
+        app.state.database_owner = owner
+    owner.acquire()
     worker_tasks: list[asyncio.Task[None]] = []
-    if settings.worker_enabled:
-        # Two independent lanes, not one loop over every job kind.
-        # drain_once() waits for its whole leased batch to finish, so a
-        # single long agent run in a shared batch stalls every fast job
-        # behind it -- measured in production as inbound Slack messages
-        # sitting unrouted for over a minute behind one 57-second agent
-        # run. Splitting the lanes keeps event routing, delivery, and
-        # memory capture responsive regardless of agent run length.
-        async def _lane(kinds: list[str], *, tick_automations: bool) -> None:
-            last_dispatcher_tick = 0.0
-            last_recovery_tick = 0.0
-            while True:
-                if tick_automations and (
-                    time.monotonic() - last_dispatcher_tick
-                    >= settings.dispatcher_tick_interval_seconds
-                ):
-                    await asyncio.to_thread(brain.automations.tick)
-                    last_dispatcher_tick = time.monotonic()
-                if tick_automations and time.monotonic() - last_recovery_tick >= 30:
-                    for organization in brain.store.list_organizations():
-                        await asyncio.to_thread(
-                            brain.recovery_heartbeat.tick, organization["id"]
-                        )
-                        await asyncio.to_thread(
-                            brain.proactive.heartbeat, organization["id"]
-                        )
-                    last_recovery_tick = time.monotonic()
-                # pump() starts work without waiting for it, so a long
-                # agent run never stalls this loop's next lease.
-                result = await asyncio.to_thread(
-                    brain.harness_worker.pump, kinds=kinds
-                )
-                if result["leased"] == 0:
-                    await asyncio.sleep(settings.worker_poll_interval_seconds)
-                else:
-                    await asyncio.sleep(0)
+    brain: TodaApp | None = None
+    try:
+        prebuilt_brain = getattr(app.state, "prebuilt_brain", None)
+        if prebuilt_brain is not None:
+            brain = prebuilt_brain
+        else:
+            db = os.environ.get("TODA_DB")
+            brain = reset_app(Path(db) if db else settings.db_path)
+        app.state.brain = brain
+        brain.indexing.backfill()
+        if settings.worker_enabled:
+            # Independent lanes keep long agent work and ingestion from
+            # delaying infrastructure jobs, while all lanes remain inside
+            # the single database-owning process.
+            async def _lane(kinds: list[str], *, tick_automations: bool) -> None:
+                last_dispatcher_tick = 0.0
+                last_recovery_tick = 0.0
+                while True:
+                    if tick_automations and (
+                        time.monotonic() - last_dispatcher_tick
+                        >= settings.dispatcher_tick_interval_seconds
+                    ):
+                        await asyncio.to_thread(brain.automations.tick)
+                        last_dispatcher_tick = time.monotonic()
+                    if (
+                        tick_automations
+                        and time.monotonic() - last_recovery_tick >= 30
+                    ):
+                        for organization in brain.store.list_organizations():
+                            await asyncio.to_thread(
+                                brain.recovery_heartbeat.tick, organization["id"]
+                            )
+                            await asyncio.to_thread(
+                                brain.proactive.heartbeat, organization["id"]
+                            )
+                        last_recovery_tick = time.monotonic()
+                    # pump() starts work without waiting for it, so a long
+                    # agent run never stalls this loop's next lease.
+                    result = await asyncio.to_thread(
+                        brain.harness_worker.pump, kinds=kinds
+                    )
+                    if result["leased"] == 0:
+                        await asyncio.sleep(settings.worker_poll_interval_seconds)
+                    else:
+                        await asyncio.sleep(0)
 
-        worker_tasks = [
-            asyncio.create_task(
-                _lane(
-                    brain.harness_worker.infrastructure_job_kinds(),
-                    tick_automations=True,
+            worker_tasks = [
+                asyncio.create_task(
+                    _lane(
+                        brain.harness_worker.infrastructure_job_kinds(),
+                        tick_automations=True,
+                    ),
+                    name="toda-harness-worker-infra",
                 ),
-                name="toda-harness-worker-infra",
-            ),
-            asyncio.create_task(
-                _lane(
-                    brain.harness_worker.agent_job_kinds(), tick_automations=False
+                asyncio.create_task(
+                    _lane(
+                        brain.harness_worker.agent_job_kinds(), tick_automations=False
+                    ),
+                    name="toda-harness-worker-agent",
                 ),
-                name="toda-harness-worker-agent",
-            ),
-            asyncio.create_task(
-                _lane(
-                    brain.harness_worker.knowledge_job_kinds(), tick_automations=False
+                asyncio.create_task(
+                    _lane(
+                        brain.harness_worker.knowledge_job_kinds(), tick_automations=False
+                    ),
+                    name="toda-harness-worker-knowledge",
                 ),
-                name="toda-harness-worker-knowledge",
-            ),
-        ]
-    yield
-    # Coordinated shutdown: stop accepting new Slack events first, then let
-    # the worker finish draining in-flight jobs, then close the database.
-    slack_stopper = getattr(app.state, "slack_stopper", None)
-    if slack_stopper:
-        slack_stopper()
-    for worker_task in worker_tasks:
-        worker_task.cancel()
-    for worker_task in worker_tasks:
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
-    brain.close()
+            ]
+        yield
+    finally:
+        # Coordinated shutdown: stop accepting new Slack events first, then let
+        # the worker finish draining in-flight jobs, then close the database.
+        slack_stopper = getattr(app.state, "slack_stopper", None)
+        if slack_stopper:
+            slack_stopper()
+        for worker_task in worker_tasks:
+            worker_task.cancel()
+        for worker_task in worker_tasks:
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+        if brain is not None:
+            brain.close()
+        owner.release()
 
 
 def create_app(
     *,
     prebuilt_brain: TodaApp | None = None,
     slack_stopper: Callable[[], None] | None = None,
+    database_owner: DatabaseOwner | None = None,
 ) -> FastAPI:
     app = FastAPI(
         title="Toda",
@@ -156,6 +301,7 @@ def create_app(
     )
     app.state.prebuilt_brain = prebuilt_brain
     app.state.slack_stopper = slack_stopper
+    app.state.database_owner = database_owner
     # Applied to the whole router rather than per route: a data endpoint
     # that forgets the tenant check is exactly the failure this prevents,
     # and there are ~163 of them.
@@ -248,9 +394,20 @@ def gateway() -> None:
     Slack Socket Mode, so the process runs one service container and one
     worker loop rather than two independent copies of each.
     """
+    owner = DatabaseOwner(settings.db_path)
+    owner.acquire()
     brain = reset_app(settings.db_path)
     brain.indexing.backfill()
     _register_composio_webhook(brain)
+    setup_status = GatewaySetupService(
+        brain.store, brain.graph, brain.audit, skills=brain.skills
+    ).status()
+    if not (setup_status.get("setup") or {}).get("complete"):
+        bootstrap = SetupBootstrapToken(settings.data_dir).issue()
+        print(
+            "Toda setup: "
+            f"http://127.0.0.1:{settings.port}/setup?bootstrap={bootstrap}"
+        , flush=True)
 
     slack_stopper: Callable[[], None] | None = None
     if settings.slack_app_token:
@@ -281,12 +438,22 @@ def gateway() -> None:
     else:
         print("Toda gateway: configure Slack at http://127.0.0.1:8080/setup")
 
-    gateway_app = create_app(prebuilt_brain=brain, slack_stopper=slack_stopper)
-    serve(gateway_app)
+    gateway_app = create_app(
+        prebuilt_brain=brain,
+        slack_stopper=slack_stopper,
+        database_owner=owner,
+    )
+    try:
+        serve(gateway_app)
+    finally:
+        # Lifespan normally releases this. Keep startup failures safe too.
+        owner.release()
 
 
 def retention_cli(args: argparse.Namespace) -> None:
     """Preview or apply retention cleanup, or delete an organization entirely."""
+    owner = DatabaseOwner(settings.db_path)
+    owner.acquire()
     brain = get_app(settings.db_path)
     try:
         if args.delete_organization:
@@ -340,6 +507,7 @@ def retention_cli(args: argparse.Namespace) -> None:
         raise SystemExit(2) from exc
     finally:
         brain.close()
+        owner.release()
 
 
 def reset_cli(args: argparse.Namespace) -> None:
@@ -363,16 +531,21 @@ def reset_cli(args: argparse.Namespace) -> None:
         )
         raise SystemExit(2)
 
+    owner = DatabaseOwner(db_path)
+    owner.acquire()
     removed: list[Path] = []
-    for path in (
-        db_path,
-        Path(f"{db_path}-wal"),
-        Path(f"{db_path}-shm"),
-        Path(f"{db_path}-journal"),
-    ):
-        if path.exists():
-            path.unlink()
-            removed.append(path)
+    try:
+        for path in (
+            db_path,
+            Path(f"{db_path}-wal"),
+            Path(f"{db_path}-shm"),
+            Path(f"{db_path}-journal"),
+        ):
+            if path.exists():
+                path.unlink()
+                removed.append(path)
+    finally:
+        owner.release()
     if removed:
         print(f"Reset Toda database: {db_path}")
         print(f"Removed {len(removed)} database file(s).")
@@ -409,6 +582,8 @@ def reindex_cli(args: argparse.Namespace) -> None:
     remain the source of truth (storage/db.py:reindex_vectors). Needed
     after a bulk backfill, or to repopulate the indexes after an embedding
     model change rebuilt them empty."""
+    owner = DatabaseOwner(settings.db_path)
+    owner.acquire()
     brain = get_app(settings.db_path)
     try:
         counts = brain.store.reindex_vectors(force=args.force)
@@ -424,6 +599,7 @@ def reindex_cli(args: argparse.Namespace) -> None:
             )
     finally:
         brain.close()
+        owner.release()
 
 
 def main() -> None:
@@ -482,6 +658,16 @@ def main() -> None:
         action="store_true",
         help="drop and fully rebuild the vec0 tables (needed after an embedding dimension/provider change)",
     )
+    service = sub.add_parser(
+        "service", help="install or inspect the per-user Toda gateway service"
+    )
+    service.add_argument(
+        "action",
+        choices=["install", "start", "stop", "restart", "status", "update"],
+        nargs="?",
+        default="install",
+    )
+    service.add_argument("--no-open", action="store_true", help="do not open the setup browser")
     args = parser.parse_args()
     if args.command == "gateway":
         gateway()
@@ -491,6 +677,8 @@ def main() -> None:
         retention_cli(args)
     elif args.command == "reindex":
         reindex_cli(args)
+    elif args.command == "service":
+        service_cli(args)
     else:
         serve()
 

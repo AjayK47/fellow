@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, NavLink, Route, Routes, useNavigate } from "react-router-dom";
 import {
   Activity,
@@ -24,72 +24,76 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import Overview from "./pages/Overview";
-import Sessions from "./pages/Sessions";
-import SessionDetail from "./pages/SessionDetail";
-import Approvals from "./pages/Approvals";
-import Policies from "./pages/Policies";
-import Tools from "./pages/Tools";
-import Skills from "./pages/Skills";
 import Setup from "./pages/Setup";
-import Connections from "./pages/Connections";
-import Channels from "./pages/Channels";
-import Automations from "./pages/Automations";
-import MCP from "./pages/MCP";
-import Tasks from "./pages/Tasks";
-import TaskDetail from "./pages/TaskDetail";
-import Graph from "./pages/Graph";
-import Reality from "./pages/Reality";
-import Jobs from "./pages/Jobs";
-import Audit from "./pages/Audit";
 import Login from "./pages/Login";
 import { api, ORG, fetchSession, logout, onUnauthorized, DashboardSession } from "./api";
 import { useVisibleInterval } from "./components";
+
+const Overview = lazy(() => import("./pages/Overview"));
+const Sessions = lazy(() => import("./pages/Sessions"));
+const SessionDetail = lazy(() => import("./pages/SessionDetail"));
+const Approvals = lazy(() => import("./pages/Approvals"));
+const Policies = lazy(() => import("./pages/Policies"));
+const Tools = lazy(() => import("./pages/Tools"));
+const Skills = lazy(() => import("./pages/Skills"));
+const Connections = lazy(() => import("./pages/Connections"));
+const Channels = lazy(() => import("./pages/Channels"));
+const Automations = lazy(() => import("./pages/Automations"));
+const MCP = lazy(() => import("./pages/MCP"));
+const Tasks = lazy(() => import("./pages/Tasks"));
+const TaskDetail = lazy(() => import("./pages/TaskDetail"));
+const Graph = lazy(() => import("./pages/Graph"));
+const Reality = lazy(() => import("./pages/Reality"));
+const Jobs = lazy(() => import("./pages/Jobs"));
+const Audit = lazy(() => import("./pages/Audit"));
 
 type NavItem = { to: string; label: string; end?: boolean; icon: typeof Activity };
 type NavGroup = { title: string; items: NavItem[] };
 
 const GROUPS: NavGroup[] = [
   {
-    title: "Observe",
+    title: "Work",
     items: [
-      { to: "/", label: "Dashboard", end: true, icon: Activity },
-      { to: "/sessions", label: "Sessions", icon: Sparkles },
+      { to: "/tasks", label: "Tasks", icon: Kanban },
+      { to: "/sessions", label: "Sessions", icon: MessageSquare },
       { to: "/approvals", label: "Approvals", icon: CheckCircle2 },
+    ],
+  },
+  {
+    title: "Knowledge",
+    items: [
+      { to: "/reality", label: "Company knowledge", icon: Database },
+      { to: "/graph", label: "Relationships", icon: Share2 },
+      { to: "/connections", label: "Sources", icon: Plug },
+    ],
+  },
+  {
+    title: "Automate",
+    items: [
+      { to: "/automations", label: "Automations", icon: Clock },
+      { to: "/skills", label: "Skills", icon: BookOpen },
     ],
   },
   {
     title: "Govern",
     items: [
-      { to: "/policies", label: "Policies", icon: ShieldCheck },
+      { to: "/policies", label: "Access & policies", icon: ShieldCheck },
+      { to: "/audit", label: "Audit", icon: ScrollText },
+    ],
+  },
+  {
+    title: "Settings",
+    items: [
+      { to: "/setup", label: "Configuration", icon: Settings2 },
       { to: "/tools", label: "Tools", icon: Wrench },
-      { to: "/skills", label: "Skills", icon: BookOpen },
-    ],
-  },
-  {
-    title: "Wire",
-    items: [
-      { to: "/setup", label: "Setup", icon: Settings2 },
-      { to: "/connections", label: "Integrations", icon: Plug },
-      { to: "/channels", label: "Channels", icon: MessageSquare },
-      { to: "/automations", label: "Automations", icon: Clock },
+      { to: "/channels", label: "Slack", icon: MessageSquare },
       { to: "/mcp", label: "MCP servers", icon: Server },
-      { to: "/tasks", label: "Tasks", icon: Kanban },
-    ],
-  },
-  {
-    title: "Know",
-    items: [
-      { to: "/graph", label: "Graph", icon: Share2 },
-      { to: "/reality", label: "Reality", icon: Database },
+      { to: "/jobs", label: "System", icon: ListChecks },
     ],
   },
 ];
 
-const OPERATIONS: NavItem[] = [
-  { to: "/jobs", label: "Jobs", icon: ListChecks },
-  { to: "/audit", label: "Audit", icon: ScrollText },
-];
+const OPERATIONS: NavItem[] = [];
 
 const ALL_NAV = [...GROUPS.flatMap((g) => g.items), ...OPERATIONS];
 
@@ -101,8 +105,8 @@ function NavRow({ item, badge, onNavigate }: { item: NavItem; badge?: number; on
       end={item.end}
       onClick={onNavigate}
       className={({ isActive }) =>
-        `group flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] font-medium no-underline transition-colors ${
-          isActive ? "bg-brand-soft text-brand" : "text-ink/70 hover:bg-paper hover:text-ink"
+        `group relative flex items-center gap-2.5 px-3 py-2 text-[13px] font-medium no-underline transition-colors ${
+          isActive ? "bg-brand-soft text-brand after:absolute after:inset-y-0 after:left-0 after:w-[2px] after:bg-brand" : "text-ink/70 hover:bg-paper hover:text-ink"
         }`
       }
     >
@@ -161,14 +165,12 @@ function Sidebar({
         ))}
       </nav>
 
-      <div className="mt-6 grid gap-0.5 border-t border-line pt-5">
-        <div className="px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted">
-          Operations
+      {OPERATIONS.length > 0 && (
+        <div className="mt-6 grid gap-0.5 border-t border-line pt-5">
+          <div className="px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted">Operations</div>
+          {OPERATIONS.map((it) => <NavRow key={it.to} item={it} onNavigate={onNavigate} />)}
         </div>
-        {OPERATIONS.map((it) => (
-          <NavRow key={it.to} item={it} onNavigate={onNavigate} />
-        ))}
-      </div>
+      )}
 
       <div className="mt-auto grid gap-3 border-t border-line pt-5">
         <a
@@ -345,6 +347,13 @@ export default function App() {
   // 20s (and paused entirely while the tab isn't visible) is plenty.
   useVisibleInterval(pollApprovals, 20_000);
 
+  // First-run setup must work before Slack or an organization login exists.
+  // Its write endpoints still require the one-time bootstrap token issued by
+  // the local Toda daemon; this only changes the visual shell.
+  if (window.location.pathname === "/setup") {
+    return <Setup />;
+  }
+
   if (session === "pending") return null;
   if (!session) return <Login error={loginError} />;
 
@@ -396,6 +405,7 @@ export default function App() {
         <Topbar pendingApprovals={pendingApprovals} onOpenNavigation={() => setMobileNavigationOpen(true)} />
         <main className="overflow-y-auto">
           <div className="mx-auto w-full max-w-[1400px] p-4 pb-20 sm:p-6 sm:pb-20 lg:p-8 lg:pb-20">
+            <Suspense fallback={<div className="console-loading"><span /> Reading the desk…</div>}>
             <Routes>
               <Route path="/sessions" element={<Sessions />} />
               <Route path="/sessions/:sessionId" element={<SessionDetail />} />
@@ -416,6 +426,7 @@ export default function App() {
               <Route path="/audit" element={<Audit />} />
               <Route path="/" element={<Overview />} />
             </Routes>
+            </Suspense>
           </div>
         </main>
       </div>

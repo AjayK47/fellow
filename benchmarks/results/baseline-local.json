@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "created_at": "2026-08-12T18:23:40.329703+00:00",
+  "dataset": {
+    "organizations": 1,
+    "people": 1000,
+    "teams": 100,
+    "private_memories": 1000,
+    "root_tasks": 2000,
+    "queued_jobs": 250
+  },
+  "environment": {
+    "python": "3.12.12",
+    "platform": "macOS-26.4.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "sqlite": "3.50.4"
+  },
+  "metrics": {
+    "seed_ms": 1513.733,
+    "entity_alias_lookup": {
+      "median_ms": 0.023,
+      "p95_ms": 0.059,
+      "samples": 50
+    },
+    "graph_neighbor_lookup": {
+      "median_ms": 0.138,
+      "p95_ms": 0.157,
+      "samples": 50
+    },
+    "authorized_memory_lookup": {
+      "median_ms": 0.101,
+      "p95_ms": 0.115,
+      "samples": 50
+    },
+    "unauthorized_memory_lookup": {
+      "median_ms": 0.078,
+      "p95_ms": 0.091,
+      "samples": 50
+    },
+    "task_history_search": {
+      "median_ms": 0.16,
+      "p95_ms": 0.176,
+      "samples": 50
+    },
+    "concurrent_200_task_searches": {
+      "median_ms": 62.455,
+      "p95_ms": 62.455,
+      "samples": 1
+    },
+    "lease_100_jobs": {
+      "median_ms": 1.515,
+      "p95_ms": 1.515,
+      "samples": 1
+    }
+  },
+  "assertions": {
+    "exact_alias_resolves": true,
+    "relationship_resolves": true,
+    "authorized_memory_visible": true,
+    "unauthorized_memory_hidden": true,
+    "task_history_resolves": true,
+    "job_leases_are_unique": true
+  },
+  "passed": true
+}

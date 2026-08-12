@@ -92,37 +92,13 @@ async def _socket_url(app_token: str) -> str:
 
 
 async def run_socket_mode(
-    brain: TodaApp | None = None,
+    brain: TodaApp,
     *,
     stop_event: threading.Event | None = None,
 ) -> None:
-    """Run the Slack Socket Mode client against *brain*.
-
-    When *brain* is omitted (the standalone ``toda-slack`` deployment
-    mode), this builds and owns its own ``TodaApp`` plus worker-drain loop,
-    exactly as before. When a *brain* is supplied (the combined ``gateway``
-    command), this becomes a pure transport attached to that already-running
-    instance: it does not seed, backfill, or drain jobs itself — the caller's
-    own lifespan already does that against the same shared instance.
-    """
+    """Run Slack Socket Mode as a transport of the owning Toda daemon."""
     if not settings.slack_app_token:
         raise RuntimeError("TODA_SLACK_APP_TOKEN is required")
-    owns_brain = brain is None
-    if owns_brain:
-        brain = TodaApp(settings.db_path)
-        brain.indexing.backfill()
-
-    worker: asyncio.Task[None] | None = None
-    if owns_brain:
-        async def worker_loop() -> None:
-            while True:
-                result = await asyncio.to_thread(brain.harness_worker.drain_once)
-                await asyncio.sleep(
-                    0 if result["leased"] else settings.worker_poll_interval_seconds
-                )
-
-        worker = asyncio.create_task(worker_loop())
-
     await _ensure_installation(brain)
 
     stop_event = stop_event or threading.Event()
@@ -201,19 +177,4 @@ async def run_socket_mode(
                     break
                 await asyncio.sleep(2)
     finally:
-        if owns_brain:
-            if worker:
-                worker.cancel()
-                try:
-                    await worker
-                except asyncio.CancelledError:
-                    pass
-            brain.close()
-
-
-def main() -> None:
-    asyncio.run(run_socket_mode())
-
-
-if __name__ == "__main__":
-    main()
+        log.info("Slack Socket Mode stopped")

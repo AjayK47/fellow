@@ -38,6 +38,7 @@ dependencies = [
   "weasyprint>=62.0",
   "mcp>=2.0.0,<3.0.0",
   "sqlite-vec>=0.1.9",
+  "filelock>=3.16.0",
 ]
 
 [project.optional-dependencies]
@@ -54,8 +55,6 @@ browser = [
 toda = "toda.main:main"
 toda-gateway = "toda.main:main"
 toda-seed = "toda.fixtures.seed:main"
-toda-slack = "toda.slack_socket:main"
-toda-worker = "toda.worker_main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

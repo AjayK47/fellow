@@ -349,6 +349,23 @@ Requirements:
 - [`uv`](https://docs.astral.sh/uv/)
 - Node.js, only to build the console (`web/`)
 
+For a released build, install and open the local setup UI in one command:
+
+```bash
+curl -fsSL https://toda.ai/install.sh | sh
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://toda.ai/install.ps1 | iex
+```
+
+The installer uses `uv` to verify and install the published Python package,
+creates a per-user login service, starts the single Toda gateway, and opens the
+short-lived local bootstrap link. Set `TODA_VERSION=X.Y.Z` before running it to
+pin a release. The source-checkout workflow below is for contributors.
+
 Install and create the local configuration:
 
 ```bash

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from pydantic import Field
@@ -14,8 +15,12 @@ from toda.providers import ModelAssignment, ProviderConnection, ToolConnection
 def _default_data_dir() -> Path:
     env = os.environ.get("TODA_DATA_DIR")
     if env:
-        return Path(env)
-    return Path(__file__).resolve().parents[2] / "data"
+        return Path(env).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Toda"
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Toda"
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "toda"
 
 
 def settings_env_file() -> Path:
@@ -41,7 +46,7 @@ def settings_env_file() -> Path:
             visited.add(directory)
             if (directory / "pyproject.toml").is_file():
                 return directory / ".env"
-    return Path.cwd() / ".env"
+    return _default_data_dir() / ".env"
 
 
 class Settings(BaseSettings):

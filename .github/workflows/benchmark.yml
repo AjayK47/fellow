@@ -1,0 +1,43 @@
+name: Organizational benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "benchmarks/**"
+      - "src/toda/storage/**"
+      - "src/toda/services/graph.py"
+      - "src/toda/harness/**"
+      - ".github/workflows/benchmark.yml"
+  pull_request:
+    paths:
+      - "benchmarks/**"
+      - "src/toda/storage/**"
+      - "src/toda/services/graph.py"
+      - "src/toda/harness/**"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+      - name: Run reproducible workload
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            uv run --no-sync python benchmarks/organization_1000.py --people 200 --tasks 400 --output benchmark.json
+          else
+            uv run --no-sync python benchmarks/organization_1000.py --output benchmark.json
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: toda-organization-benchmark-${{ github.sha }}
+          path: benchmark.json

@@ -171,6 +171,7 @@ def test_local_gateway_setup_configures_models_and_slack(
     initial = client.get("/v1/gateway/setup/status")
     assert initial.status_code == 200
     assert initial.json()["providers"] == []
+    # A signed-in operator may reconfigure setup without a first-run token.
     model = client.post(
         "/v1/gateway/setup/providers",
         json={

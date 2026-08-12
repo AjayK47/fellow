@@ -32,7 +32,7 @@ from toda.harness.slack import (
     _slack_identity_key,
     resolve_slack_principal,
 )
-from toda.services.gateway_setup import GatewaySetupService, SLACK_MANIFEST
+from toda.services.gateway_setup import GatewaySetupService, SetupBootstrapToken, SLACK_MANIFEST
 
 router = APIRouter()
 
@@ -69,6 +69,7 @@ _TENANT_EXEMPT_PATHS = frozenset(
         "/v1/mcp/oauth/callback",
         "/v1/composio/webhooks",
         "/v1/gateway/setup/status",
+        "/v1/gateway/setup/bootstrap",
         "/v1/gateway/setup/slack-manifest",
         # First-run wizard: names the organization it is creating, so there
         # is by definition no workspace to be signed into yet. These write
@@ -79,6 +80,7 @@ _TENANT_EXEMPT_PATHS = frozenset(
         "/v1/gateway/setup/model-catalog",
         "/v1/gateway/setup/tools",
         "/v1/gateway/setup/slack",
+        "/v1/gateway/setup/verify",
         "/v1/events",
         "/v1/events:batch",
     }
@@ -700,6 +702,10 @@ class LocalLoginRequest(BaseModel):
     token: str
 
 
+class SetupBootstrapRequest(BaseModel):
+    token: str
+
+
 # ---- health ----
 
 
@@ -708,11 +714,16 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "toda"}
 
 
-def _local_gateway_setup(request: Request) -> GatewaySetupService:
+def _local_gateway_setup(request: Request, *, write: bool = False) -> GatewaySetupService:
     """Token-writing setup is intentionally limited to a local operator."""
     host = (request.client.host if request.client else "").lower()
     if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
         raise HTTPException(403, "Gateway setup is only available from localhost")
+    if write and not (
+        request.session.get("setup_authorized")
+        or request.session.get("organization_id")
+    ):
+        raise HTTPException(401, "Exchange the temporary setup bootstrap token first")
     brain = _app(request)
     return GatewaySetupService(
         brain.store, brain.graph, brain.audit, skills=brain.skills
@@ -721,7 +732,21 @@ def _local_gateway_setup(request: Request) -> GatewaySetupService:
 
 @router.get("/v1/gateway/setup/status")
 def gateway_setup_status(request: Request) -> dict[str, Any]:
-    return _local_gateway_setup(request).status()
+    status = _local_gateway_setup(request).status()
+    status["write_authorized"] = bool(
+        request.session.get("setup_authorized")
+        or request.session.get("organization_id")
+    )
+    return status
+
+
+@router.post("/v1/gateway/setup/bootstrap")
+def gateway_setup_bootstrap(body: SetupBootstrapRequest, request: Request) -> dict[str, bool]:
+    _local_gateway_setup(request)
+    if not SetupBootstrapToken(Settings().data_dir).consume(body.token):
+        raise HTTPException(401, "Bootstrap token is invalid or expired")
+    request.session["setup_authorized"] = True
+    return {"authorized": True}
 
 
 @router.get("/v1/gateway/setup/slack-manifest")
@@ -735,7 +760,7 @@ def gateway_setup_provider(
     body: GatewayProviderSetupRequest, request: Request
 ) -> dict[str, Any]:
     try:
-        return _local_gateway_setup(request).configure_provider(**body.model_dump())
+        return _local_gateway_setup(request, write=True).configure_provider(**body.model_dump())
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -755,7 +780,7 @@ def gateway_setup_tools(
     body: GatewayToolsSetupRequest, request: Request
 ) -> dict[str, Any]:
     try:
-        return _local_gateway_setup(request).configure_tools(**body.model_dump())
+        return _local_gateway_setup(request, write=True).configure_tools(**body.model_dump())
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -765,11 +790,16 @@ def gateway_setup_slack(
     body: GatewaySlackSetupRequest, request: Request
 ) -> dict[str, Any]:
     try:
-        return _local_gateway_setup(request).connect_slack(**body.model_dump())
+        return _local_gateway_setup(request, write=True).connect_slack(**body.model_dump())
     except httpx.HTTPError as exc:
         raise HTTPException(502, "Unable to validate Slack credentials") from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/v1/gateway/setup/verify")
+def gateway_setup_verify(request: Request) -> dict[str, Any]:
+    return _local_gateway_setup(request, write=True).verify_installation()
 
 
 @router.post("/v1/organizations")
@@ -3226,27 +3256,23 @@ def graph_explorer_data(
 
 @router.get("/explorer", include_in_schema=False)
 def graph_explorer_page() -> FileResponse:
-    if _CONSOLE_DIST.is_dir():
-        return FileResponse(_CONSOLE_DIST / "index.html")
-    return FileResponse(Path(__file__).resolve().parents[1] / "static" / "explorer.html")
+    if not _CONSOLE_DIST.is_dir():
+        raise HTTPException(503, "Toda Console is not included in this build")
+    return FileResponse(_CONSOLE_DIST / "index.html")
 
 
 @router.get("/admin", include_in_schema=False)
 def harness_admin_page() -> FileResponse:
-    if _CONSOLE_DIST.is_dir():
-        return FileResponse(_CONSOLE_DIST / "index.html")
-    return FileResponse(
-        Path(__file__).resolve().parents[1] / "static" / "admin.html"
-    )
+    if not _CONSOLE_DIST.is_dir():
+        raise HTTPException(503, "Toda Console is not included in this build")
+    return FileResponse(_CONSOLE_DIST / "index.html")
 
 
 @router.get("/setup", include_in_schema=False)
 def gateway_setup_page() -> FileResponse:
-    if _CONSOLE_DIST.is_dir():
-        return FileResponse(_CONSOLE_DIST / "index.html")
-    return FileResponse(
-        Path(__file__).resolve().parents[1] / "static" / "setup.html"
-    )
+    if not _CONSOLE_DIST.is_dir():
+        raise HTTPException(503, "Toda Console is not included in this build")
+    return FileResponse(_CONSOLE_DIST / "index.html")
 
 
 @router.post("/v1/scopes")

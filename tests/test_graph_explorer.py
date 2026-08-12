@@ -109,6 +109,38 @@ def test_paths_between_returns_empty_when_unreachable(brain):
     assert brain.graph.paths_between(org, "person_a", "service_never_connected") == []
 
 
+def test_entity_candidates_use_normalized_alias_index(brain):
+    brain.graph.upsert_entity(
+        {
+            "id": "person_alias_test",
+            "organization_id": "org_acme",
+            "entity_type": "person",
+            "name": "Maya Srinivasan",
+            "aliases": ["migration-owner"],
+            "attributes": {"email": "maya@example.com", "slack_id": "U123MAYA"},
+        }
+    )
+
+    by_alias = brain.store.find_entity_candidates("org_acme", "migration-owner")
+    by_email = brain.store.find_entity_candidates("org_acme", "maya@example.com")
+    by_name_token = brain.store.find_entity_candidates("org_acme", "Srinivasan")
+
+    assert by_alias[0]["id"] == "person_alias_test"
+    assert by_email[0]["id"] == "person_alias_test"
+    assert by_name_token[0]["id"] == "person_alias_test"
+
+
+def test_active_graph_edges_are_idempotent(brain):
+    first = brain.graph.add_edge("org_acme", "OWNS", "person_ajay", "project_toda")
+    second = brain.graph.add_edge("org_acme", "OWNS", "person_ajay", "project_toda")
+
+    assert second["id"] == first["id"]
+    matches = brain.store.list_edges(
+        "org_acme", edge_type="OWNS", from_id="person_ajay", to_id="project_toda"
+    )
+    assert len(matches) == 1
+
+
 def test_supersede_edge_endpoint_closes_without_replacement(api_client):
     api_client.post(
         "/v1/entities",

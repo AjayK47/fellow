@@ -1,9 +1,17 @@
 # Toda Harness Restructuring Plan
 
-Status: proposed implementation plan
+Status: implemented baseline; organization-scale benchmark published
 
 Scope: agent harness, Tasks, memory, Skills, heartbeats, and Task recall
-Out of scope: landing page, onboarding flow, company-site enrichment, and branding
+Related delivery: `PRODUCT_UI_AND_ONBOARDING_PLAN.md` and `BENCHMARKS.md`
+
+Implementation note (August 2026): the durable Task/runtime restructuring in
+this document is present in the codebase. One Toda daemon owns SQLite and all
+worker lanes; relational entity/edge tables provide bounded graph traversal;
+recovery and proactive heartbeats use indexed candidate queries; and the public
+1,000-member workload is implemented in `benchmarks/organization_1000.py`.
+Future changes should be based on benchmark evidence rather than adding a new
+database or service preemptively.
 
 ## 1. Objective
 
@@ -736,6 +744,11 @@ Build a synthetic 1,000-person organization and measure:
 - Per-organization fairness and cost.
 
 Only after measurement should Toda decide whether a larger installation needs PostgreSQL, a separate vector service, or a graph projection.
+
+Implemented in `benchmarks/organization_1000.py` with results documented in
+`BENCHMARKS.md`. The baseline covers 1,000 people, 100 teams, scoped memory,
+relational graph lookups, 2,000 root Tasks, concurrent FTS retrieval, and atomic
+job leasing. CI publishes the machine-readable report as an artifact.
 
 ## 20. Existing components to retain
 

@@ -11,9 +11,10 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <header className="flex flex-wrap items-center justify-between gap-4">
+    <header className="flex flex-wrap items-end justify-between gap-4 border-b border-line pb-5">
       <div>
-        <h1 className="m-0 text-[26px] font-semibold tracking-tight text-ink">{title}</h1>
+        <div className="mb-2 font-mono text-[10px] uppercase tracking-[0.14em] text-brand">Toda control desk</div>
+        <h1 className="m-0 text-[30px] font-semibold tracking-[-0.045em] text-ink">{title}</h1>
         {subtitle && <p className="mt-1 max-w-[620px] text-[13px] text-muted">{subtitle}</p>}
       </div>
       {actions && <div className="flex flex-none flex-wrap items-center gap-2">{actions}</div>}
@@ -119,7 +120,7 @@ export function StatePill({ state }: { state: string }) {
   return <Pill tone={tone}>{state}</Pill>;
 }
 
-/** Icon-bubble stat card used on the dashboard and other overview panels. */
+/** Compact operational counter used on the control desk. */
 export function StatCard({
   icon,
   label,
@@ -144,16 +145,17 @@ export function StatCard({
   const deltaClass =
     deltaTone === "bad" ? "text-bad" : deltaTone === "muted" ? "text-muted" : "text-good";
   return (
-    <div className="card flex items-start justify-between gap-3 p-4">
-      <div>
-        <div className={`flex h-9 w-9 items-center justify-center rounded-full ${bubble}`}>
-          {icon}
+    <div className="card relative flex min-h-[142px] items-start justify-between gap-3 overflow-hidden p-4">
+      <div className="absolute inset-x-0 top-0 h-[2px] bg-line"><span className="block h-full w-8 bg-brand" /></div>
+      <div className="w-full">
+        <div className="flex items-center justify-between">
+          <div className="font-mono text-[10px] uppercase tracking-wider text-muted">{label}</div>
+          <div className={`flex h-7 w-7 items-center justify-center rounded-[2px] ${bubble}`}>{icon}</div>
         </div>
-        <div className="mt-3 text-[12px] text-muted">{label}</div>
-        <div className="mt-0.5 text-[24px] font-semibold leading-tight tracking-tight text-ink">
+        <div className="mt-5 font-mono text-[27px] font-medium leading-none tracking-tight text-ink tabular-nums">
           {value}
         </div>
-        {delta && <div className={`mt-1 text-[11px] font-medium ${deltaClass}`}>{delta}</div>}
+        {delta && <div className={`mt-2 text-[11px] font-medium ${deltaClass}`}>{delta}</div>}
       </div>
     </div>
   );
