@@ -9,7 +9,7 @@
   "organization": {
     "id": "org_acme",
     "name": "Acme",
-    "owner_email": null
+    "owner_email": "you@example.com"
   },
   "models": {
     "providers": {

@@ -2415,7 +2415,6 @@ def dashboard_auth_status(request: Request) -> dict[str, Any]:
             if len(organizations) == 1
             else None
         ),
-        "access_requests_enabled": len(organizations) == 1 and not _auth(request).needs_owner,
     }
 
 

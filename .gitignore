@@ -2,6 +2,11 @@
 # reads; config.example.json is the tracked, redacted template.
 config.json
 !config.example.json
+# Toda no longer reads .env, but stray ones still turn up in a working
+# tree and hold real credentials. Keep ignoring them so an `add -A` can
+# never sweep one into a commit.
+.env
+.env.*
 
 # Python tooling caches and build artifacts
 .venv/
