@@ -210,6 +210,9 @@ class Settings(BaseSettings):
     # random per-process key (sessions won't survive a restart in that case).
     dashboard_session_secret: str | None = None
     dashboard_auth_disabled: bool = False
+    # Optional member-facing dashboard login. Local administration uses the
+    # one-time setup credential and never depends on a Slack redirect URL.
+    slack_dashboard_login_enabled: bool = False
     # Self-hosted installations can authenticate an operator without Slack
     # OAuth using one strong, deployment-owned token. The token is exchanged
     # for the same signed session cookie as Slack login and is never stored in

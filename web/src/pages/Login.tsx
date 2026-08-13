@@ -3,7 +3,7 @@ import { KeyRound, Slack } from "lucide-react";
 import { fetchAuthMethods, localLogin } from "../api";
 
 export default function Login({ error }: { error?: string | null }) {
-  const [methods, setMethods] = useState({ local_token: false, slack: true });
+  const [methods, setMethods] = useState({ local_token: false, slack: false });
   const [token, setToken] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -45,8 +45,7 @@ export default function Login({ error }: { error?: string | null }) {
           Sign in to Toda
         </h1>
         <p className="mt-2 text-[13px] leading-relaxed text-muted">
-          Use your self-hosted administrator token or the Slack workspace this
-          installation belongs to.
+          Use the administrator credential created by this self-hosted installation.
         </p>
         {message && (
           <p className="mt-3 rounded-lg bg-bad-soft px-3 py-2 text-[12.5px] text-bad">
@@ -72,6 +71,11 @@ export default function Login({ error }: { error?: string | null }) {
               <KeyRound size={15} /> {submitting ? "Signing in…" : "Sign in locally"}
             </button>
           </form>
+        )}
+        {!methods.local_token && !methods.slack && (
+          <div className="mt-6 border-l-2 border-brand bg-brand-soft px-4 py-3 text-left text-[12px] leading-relaxed text-ink">
+            Run <code className="font-mono">toda setup</code> on the host machine to establish local administrator access.
+          </div>
         )}
         {methods.slack && (
           <a

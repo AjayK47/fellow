@@ -62,13 +62,33 @@ def test_local_admin_token_creates_the_normal_dashboard_session(
     assert api_client.get("/v1/session").status_code == 200
 
 
+def test_local_admin_uses_the_installed_organization(
+    api_client, monkeypatch: pytest.MonkeyPatch
+):
+    brain = api_client.app.state.brain
+    for organization in brain.store.list_organizations():
+        brain.retention.delete_organization(
+            organization["id"], confirmation=organization["id"]
+        )
+    brain.store.put_organization({"id": "org_forechain", "name": "Forechain AI"})
+    monkeypatch.setattr(settings, "local_admin_token", "local-token")
+
+    accepted = api_client.post("/v1/session/local", json={"token": "local-token"})
+
+    assert accepted.status_code == 200
+    assert accepted.json()["organization_id"] == "org_forechain"
+    assert accepted.json()["workspace_name"] == "Forechain AI"
+
+
 def test_slack_login_requires_configuration(api_client, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(settings, "slack_dashboard_login_enabled", True)
     monkeypatch.setattr(settings, "slack_client_id", None)
     resp = api_client.get("/slack/login", follow_redirects=False)
     assert resp.status_code == 503
 
 
 def test_slack_login_redirects_to_slack_authorize(api_client, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(settings, "slack_dashboard_login_enabled", True)
     monkeypatch.setattr(settings, "slack_client_id", "test-client-id")
     monkeypatch.setattr(settings, "public_url", "https://gateway.example.com")
     resp = api_client.get("/slack/login", follow_redirects=False)
@@ -85,6 +105,7 @@ def _do_login(api_client, monkeypatch: pytest.MonkeyPatch) -> str:
     """Drives /slack/login far enough to obtain a valid, session-bound
     CSRF state value for a subsequent callback call."""
     monkeypatch.setattr(settings, "slack_client_id", "test-client-id")
+    monkeypatch.setattr(settings, "slack_dashboard_login_enabled", True)
     monkeypatch.setattr(settings, "slack_client_secret", "test-client-secret")
     monkeypatch.setattr(settings, "public_url", "https://gateway.example.com")
     resp = api_client.get("/slack/login", follow_redirects=False)

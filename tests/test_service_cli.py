@@ -38,6 +38,7 @@ def test_session_secret_is_created_once(tmp_path):
 
     assert env_path.read_text() == first
     assert first.count("TODA_DASHBOARD_SESSION_SECRET=") == 1
+    assert first.count("TODA_LOCAL_ADMIN_TOKEN=") == 1
 
 
 def test_macos_restart_kicks_loaded_service_without_unloading(monkeypatch, tmp_path, capsys):

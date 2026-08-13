@@ -61,16 +61,29 @@ def _gateway_healthy() -> bool:
 
 def _ensure_session_secret(env_path: Path) -> None:
     existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    if any(
+    has_session_secret = any(
         line.strip().startswith("TODA_DASHBOARD_SESSION_SECRET=")
         and line.partition("=")[2].strip()
         for line in existing.splitlines()
-    ):
+    )
+    has_admin_token = any(
+        line.strip().startswith("TODA_LOCAL_ADMIN_TOKEN=")
+        and line.partition("=")[2].strip()
+        for line in existing.splitlines()
+    )
+    if has_session_secret and has_admin_token:
         return
     separator = "" if not existing or existing.endswith("\n") else "\n"
+    additions: list[str] = []
+    if not has_session_secret:
+        additions.append(
+            f"TODA_DASHBOARD_SESSION_SECRET={secrets.token_urlsafe(32)}"
+        )
+    if not has_admin_token:
+        additions.append(f"TODA_LOCAL_ADMIN_TOKEN={secrets.token_urlsafe(32)}")
     env_path.parent.mkdir(parents=True, exist_ok=True)
     env_path.write_text(
-        f"{existing}{separator}TODA_DASHBOARD_SESSION_SECRET={secrets.token_urlsafe(32)}\n",
+        f"{existing}{separator}{chr(10).join(additions)}\n",
         encoding="utf-8",
     )
     env_path.chmod(0o600)
@@ -102,6 +115,7 @@ def setup_cli(args: argparse.Namespace) -> None:
     if not _gateway_healthy():
         raise RuntimeError("Toda is not running. Run `toda start`, then `toda setup`.")
     data_dir = settings.data_dir.expanduser().resolve()
+    _ensure_session_secret(data_dir / ".env")
     token = SetupBootstrapToken(data_dir).issue()
     url = f"http://127.0.0.1:{settings.port}/setup?bootstrap={token}"
     print("Toda setup is ready:")

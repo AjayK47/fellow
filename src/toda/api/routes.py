@@ -746,6 +746,12 @@ def gateway_setup_bootstrap(body: SetupBootstrapRequest, request: Request) -> di
     if not SetupBootstrapToken(Settings().data_dir).consume(body.token):
         raise HTTPException(401, "Bootstrap token is invalid or expired")
     request.session["setup_authorized"] = True
+    organizations = _app(request).store.list_organizations()
+    if len(organizations) == 1:
+        organization = organizations[0]
+        request.session["organization_id"] = organization["id"]
+        request.session["principal_id"] = "person_local_admin"
+        request.session["workspace_name"] = organization.get("name") or "Toda Self-hosted"
     return {"authorized": True}
 
 
@@ -790,7 +796,11 @@ def gateway_setup_slack(
     body: GatewaySlackSetupRequest, request: Request
 ) -> dict[str, Any]:
     try:
-        return _local_gateway_setup(request, write=True).connect_slack(**body.model_dump())
+        result = _local_gateway_setup(request, write=True).connect_slack(**body.model_dump())
+        request.session["organization_id"] = body.organization_id
+        request.session["principal_id"] = "person_local_admin"
+        request.session["workspace_name"] = body.organization_name
+        return result
     except httpx.HTTPError as exc:
         raise HTTPException(502, "Unable to validate Slack credentials") from exc
     except ValueError as exc:
@@ -2452,6 +2462,8 @@ def slack_oauth_callback(request: Request, code: str | None = None, error: str |
 def slack_login(request: Request) -> RedirectResponse:
     from toda.config import settings as _settings
 
+    if not _settings.slack_dashboard_login_enabled:
+        raise HTTPException(404, "Slack dashboard login is not enabled")
     if not _settings.slack_client_id or not _settings.public_url:
         raise HTTPException(
             503,
@@ -2583,7 +2595,11 @@ def dashboard_auth_methods() -> dict[str, bool]:
 
     return {
         "local_token": bool(_settings.local_admin_token),
-        "slack": bool(_settings.slack_client_id),
+        "slack": bool(
+            _settings.slack_dashboard_login_enabled
+            and _settings.slack_client_id
+            and _settings.public_url
+        ),
     }
 
 
@@ -2594,13 +2610,19 @@ def local_dashboard_login(body: LocalLoginRequest, request: Request) -> dict[str
     configured = _settings.local_admin_token or ""
     if not configured or not hmac.compare_digest(body.token, configured):
         raise HTTPException(401, "Invalid local administrator token")
-    request.session["organization_id"] = _settings.default_org_id
+    organizations = _app(request).store.list_organizations()
+    if len(organizations) != 1:
+        raise HTTPException(409, "Local administrator login requires exactly one organization")
+    organization = organizations[0]
+    organization_id = organization["id"]
+    workspace_name = organization.get("name") or "Toda Self-hosted"
+    request.session["organization_id"] = organization_id
     request.session["principal_id"] = "person_local_admin"
-    request.session["workspace_name"] = "Toda Self-hosted"
+    request.session["workspace_name"] = workspace_name
     return {
-        "organization_id": _settings.default_org_id,
+        "organization_id": organization_id,
         "principal_id": "person_local_admin",
-        "workspace_name": "Toda Self-hosted",
+        "workspace_name": workspace_name,
         "auth_disabled": False,
     }
 
