@@ -99,7 +99,7 @@ def test_health_and_the_console_spa_stay_reachable_while_signed_out(api_client):
 
 
 def test_dev_bypass_disables_the_guard(api_client, monkeypatch):
-    monkeypatch.setattr(settings, "dashboard_auth_disabled", True)
+    monkeypatch.setattr(settings.dashboard, "auth_disabled", True)
     api_client.cookies.clear()
     assert api_client.get("/v1/metrics", params={"organization_id": "org_acme"}).status_code == 200
 
@@ -133,7 +133,7 @@ def test_local_ingestion_remains_keyless():
 
 
 def test_remote_ingestion_requires_a_configured_bearer_key(monkeypatch):
-    monkeypatch.setattr(settings, "api_keys", "first-secret,second-secret")
+    monkeypatch.setattr(settings.server, "api_keys", ["first-secret", "second-secret"])
     with pytest.raises(HTTPException) as exc:
         _enforce_ingest_auth(_ingest_request("203.0.113.10"))
     assert exc.value.status_code == 401

@@ -397,14 +397,14 @@ class SlackGateway:
         allow_unsigned: bool = False,
     ) -> dict[str, Any]:
         if not allow_unsigned:
-            if not self.config.slack_signing_secret:
+            if not self.config.slack.signing_secret:
                 raise RuntimeError("Slack signing secret is not configured")
             if not verify_slack_signature(
-                signing_secret=self.config.slack_signing_secret,
+                signing_secret=self.config.slack.signing_secret,
                 timestamp=headers.get("x-slack-request-timestamp", ""),
                 signature=headers.get("x-slack-signature", ""),
                 body=body,
-                tolerance_seconds=self.config.slack_signature_tolerance_seconds,
+                tolerance_seconds=self.config.slack.signature_tolerance_seconds,
             ):
                 raise PermissionError("Invalid Slack request signature")
         payload = json.loads(body.decode("utf-8"))
@@ -476,14 +476,14 @@ class SlackGateway:
         """
         headers = headers or {}
         if not allow_unsigned:
-            if not self.config.slack_signing_secret:
+            if not self.config.slack.signing_secret:
                 raise RuntimeError("Slack signing secret is not configured")
             if not verify_slack_signature(
-                signing_secret=self.config.slack_signing_secret,
+                signing_secret=self.config.slack.signing_secret,
                 timestamp=headers.get("x-slack-request-timestamp", ""),
                 signature=headers.get("x-slack-signature", ""),
                 body=body,
-                tolerance_seconds=self.config.slack_signature_tolerance_seconds,
+                tolerance_seconds=self.config.slack.signature_tolerance_seconds,
             ):
                 raise PermissionError("Invalid Slack request signature")
             parsed = parse_qs(body.decode("utf-8"))
@@ -644,8 +644,8 @@ class SlackGateway:
         existing_session = self.store.find_session_by_conversation(
             organization_id, conversation_key
         )
-        free_response = channel_id in self._csv_set(
-            self.config.slack_free_response_channels
+        free_response = channel_id in set(
+            self.config.slack.free_response_channels
         ) or bool(policy.get("free_response"))
         direct = bool(
             is_dm
@@ -829,7 +829,7 @@ class SlackGateway:
         installation = self.store.slack_installation_by_workspace(workspace_id)
         if installation:
             return installation["organization_id"]
-        return self.config.default_org_id
+        return self.config.organization.id
 
     def _principal_for_user(
         self,
@@ -856,7 +856,7 @@ class SlackGateway:
         ingestion, so the ID remains the safe fallback.
         """
         installation = self.store.slack_installation_by_workspace(workspace_id)
-        token = (installation or {}).get("bot_token") or self.config.slack_bot_token
+        token = (installation or {}).get("bot_token") or self.config.slack.bot_token
         if not source_user_id or not token:
             return {}
         cache_key = f"{workspace_id}:{source_user_id}"
@@ -889,7 +889,7 @@ class SlackGateway:
         channel's privacy -- or its name -- for the rest of the process.
         """
         installation = self.store.slack_installation_by_workspace(workspace_id)
-        token = (installation or {}).get("bot_token") or self.config.slack_bot_token
+        token = (installation or {}).get("bot_token") or self.config.slack.bot_token
         if not channel_id or not token:
             return None
         cache_key = f"{workspace_id}:{channel_id}"
@@ -949,7 +949,7 @@ class SlackGateway:
         policy = self.store.channel_policy(organization_id, "slack", channel_id)
         if policy:
             return policy
-        allowed = self._csv_set(self.config.slack_allowed_channels)
+        allowed = set(self.config.slack.allowed_channels)
         return {
             "enabled": is_dm or not allowed or channel_id in allowed,
             "observe": True,
@@ -1087,12 +1087,8 @@ class SlackGateway:
         installation = self.store.slack_installation_by_workspace(workspace_id)
         return (
             (installation or {}).get("bot_user_id")
-            or self.config.slack_bot_user_id
+            or self.config.slack.bot_user_id
         )
-
-    @staticmethod
-    def _csv_set(raw: str) -> set[str]:
-        return {value.strip() for value in (raw or "").split(",") if value.strip()}
 
 
 class SlackSender:

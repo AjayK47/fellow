@@ -37,6 +37,17 @@ _TIMED_TABLES: dict[str, str] = {
 }
 
 _TENANT_TABLES = [
+    # Dashboard identity. Deleting a tenant has to remove the people who could
+    # sign into it: leaving these behind left live sessions that still
+    # authenticated against a deleted organization, and made a reinstall
+    # impossible because the owner account outlived its own organization.
+    # dashboard_users and dashboard_login_attempts are NOT here -- an account is
+    # global and only joined to an organization through organization_members,
+    # so they are cleaned up by _delete_orphaned_accounts below.
+    "dashboard_sessions",
+    "dashboard_invitations",
+    "dashboard_access_requests",
+    "organization_members",
     "chunks_fts",
     "memories_fts",
     "episodes_fts",
@@ -168,6 +179,36 @@ class RetentionService:
         )
         return result
 
+    @staticmethod
+    def _delete_orphaned_accounts(cur: Any, existing_tables: set[str]) -> dict[str, int]:
+        """Remove dashboard accounts left with no organization to belong to.
+
+        A dashboard account is global and reaches an organization only through
+        organization_members, so it survives the tenant sweep above. An account
+        with no remaining membership can never sign in anywhere and is exactly
+        what blocks a reinstall ("the installation owner already exists"), so it
+        goes with the tenant that was its only home.
+        """
+        counts: dict[str, int] = {}
+        if "dashboard_users" not in existing_tables:
+            return counts
+        orphan_filter = (
+            "SELECT id FROM dashboard_users WHERE id NOT IN "
+            "(SELECT user_id FROM organization_members)"
+            if "organization_members" in existing_tables
+            else "SELECT id FROM dashboard_users"
+        )
+        cur.execute(f"DELETE FROM dashboard_users WHERE id IN ({orphan_filter})")
+        counts["dashboard_users"] = max(cur.rowcount, 0)
+        # Login attempts are transient rate-limiting state keyed by an opaque
+        # attempt_key -- no email, no organization to filter on. Once the
+        # accounts they throttled are gone the rows are meaningless, and
+        # leaving them would rate-limit whoever sets the install up next.
+        if counts["dashboard_users"] and "dashboard_login_attempts" in existing_tables:
+            cur.execute("DELETE FROM dashboard_login_attempts")
+            counts["dashboard_login_attempts"] = max(cur.rowcount, 0)
+        return counts
+
     def delete_organization(
         self, organization_id: str, *, confirmation: str
     ) -> dict[str, Any]:
@@ -198,6 +239,7 @@ class RetentionService:
                 "DELETE FROM organizations WHERE id = ?", (organization_id,)
             )
             counts["organizations"] = max(cur.rowcount, 0)
+            counts.update(self._delete_orphaned_accounts(cur, existing_tables))
         return {
             "organization_id": organization_id,
             "deleted": counts,

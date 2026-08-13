@@ -403,7 +403,7 @@ def seed_starter_skills(brain: TodaApp, organization_id: str = ORG) -> list[dict
 
 
 def main() -> None:
-    db = Path(sys.argv[1]) if len(sys.argv) > 1 else settings.db_path
+    db = Path(sys.argv[1]) if len(sys.argv) > 1 else settings.storage.db_path
     if db.exists():
         db.unlink()
     brain = reset_app(db)

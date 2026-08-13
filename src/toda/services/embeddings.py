@@ -9,7 +9,7 @@ from typing import Protocol
 
 import httpx
 
-from toda.config import Settings
+from toda.config import Settings, settings as _loaded_settings
 from toda.providers import ProviderResolver
 
 
@@ -66,9 +66,9 @@ class OpenAICompatibleEmbeddingProvider:
 
 
 def build_embedding_provider(config: Settings | None = None) -> EmbeddingProvider:
-    config = config or Settings()
+    config = config or _loaded_settings
     resolved = ProviderResolver(
-        config.provider_connections, config.model_assignments
+        config.models.providers, config.models.assignments
     ).resolve("embedding")
     if resolved:
         if resolved.profile.api_mode != "chat_completions":
@@ -80,4 +80,4 @@ def build_embedding_provider(config: Settings | None = None) -> EmbeddingProvide
             resolved.assignment.model,
             resolved.profile.endpoint(resolved.connection),
         )
-    return DeterministicEmbeddingProvider(config.embedding_dimensions)
+    return DeterministicEmbeddingProvider(config.models.embedding_dimensions)

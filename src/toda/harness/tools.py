@@ -2644,7 +2644,7 @@ class ToolExecutor:
             record["approval_id"] = approval["id"]
             record["updated_at"] = utcnow().isoformat()
             self.store.upsert_harness_tool_call(record)
-            if settings.auto_approve_writes:
+            if settings.dashboard.auto_approve_writes:
                 # Dev-only bypass: the approval record and tool_call linkage
                 # above still exist and still go through the same
                 # resolve_approval path (judgment recording, precondition

@@ -53,7 +53,6 @@ browser = [
 
 [project.scripts]
 toda = "toda.main:main"
-toda-gateway = "toda.main:main"
 toda-seed = "toda.fixtures.seed:main"
 
 [tool.setuptools.packages.find]

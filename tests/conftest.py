@@ -23,9 +23,34 @@ DASHBOARD_SESSION_SECRET = "test-dashboard-session-secret"
 
 
 def sign_in(client: TestClient, *, organization_id: str = "org_acme", principal_id: str = "person_ajay") -> None:
-    """Set the console login cookie SessionMiddleware would issue."""
+    """Create a revocable dashboard session and sign its opaque cookie."""
+    from toda.services.dashboard_auth import DashboardAuthService
+
+    store = client.app.state.brain.store
+    auth = DashboardAuthService(store)
+    user = store.dashboard_user_by_email("tests@toda.local")
+    if not user:
+        user = auth.create_owner(
+            organization_id=organization_id,
+            email="tests@toda.local",
+            name="Test owner",
+            password="test-password-strong",
+        )
+    member = store.organization_member(organization_id, user["id"])
+    if not member:
+        member = {
+            "organization_id": organization_id,
+            "user_id": user["id"],
+            "principal_id": principal_id,
+            "role": "owner",
+            "status": "active",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+    store.upsert_organization_member({**member, "principal_id": principal_id})
+    session = auth.create_session(organization_id, user["id"])
     payload = base64.b64encode(
-        json.dumps({"organization_id": organization_id, "principal_id": principal_id}).encode()
+        json.dumps({"dashboard_session_id": session["token"]}).encode()
     )
     signed = itsdangerous.TimestampSigner(DASHBOARD_SESSION_SECRET).sign(payload).decode()
     client.cookies.set("toda_session", signed)
@@ -33,23 +58,45 @@ def sign_in(client: TestClient, *, organization_id: str = "org_acme", principal_
 
 @pytest.fixture(autouse=True)
 def offline_embeddings(monkeypatch: pytest.MonkeyPatch):
-    """Tests never call configured external inference providers."""
-    monkeypatch.setenv("TODA_EMBEDDING_PROVIDER", "deterministic")
-    monkeypatch.setenv("TODA_MODEL_PROVIDER", "deterministic")
-    monkeypatch.setenv("TODA_IMAGE_PROVIDER", "disabled")
-    monkeypatch.setenv("TODA_TRANSCRIPTION_PROVIDER", "disabled")
-    monkeypatch.setenv("TODA_TTS_PROVIDER", "disabled")
-    monkeypatch.setenv("TODA_SLACK_BOT_TOKEN", "")
-    monkeypatch.setenv("TODA_SLACK_APP_TOKEN", "")
-    monkeypatch.setenv("TODA_BRAVE_SEARCH_API_KEY", "")
-    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "")
-    monkeypatch.setenv("TODA_FIRECRAWL_API_KEY", "")
-    monkeypatch.setenv("FIRECRAWL_API_KEY", "")
+    """Tests never call configured external inference providers.
+
+    The developer's real config.json is loaded at import time, so without
+    this every test that builds the container would make live billable calls
+    against whatever credentials that file holds. Replacing whole sections
+    with their defaults is what makes this airtight: the credential settings
+    are dicts, so clearing individual keys leaves the configured connections
+    in place.
+
+    This also covers ``enforce_tenant`` and the ingest guard, which read the
+    module-level singleton directly -- previously a developer with
+    dashboard auth disabled in their own environment ran the entire HTTP
+    suite with tenant enforcement silently switched off.
+    """
+    from toda.config import (
+        ComposioConfig,
+        MediaConfig,
+        ModelsConfig,
+        ServerConfig,
+        SlackConfig,
+        ToolsConfig,
+        settings as _settings,
+    )
+
+    monkeypatch.setattr(_settings, "models", ModelsConfig())
+    monkeypatch.setattr(_settings, "slack", SlackConfig())
+    monkeypatch.setattr(_settings, "composio", ComposioConfig())
+    monkeypatch.setattr(_settings, "tools", ToolsConfig())
+    monkeypatch.setattr(_settings, "media", MediaConfig())
+    monkeypatch.setattr(
+        _settings, "server", ServerConfig(host="127.0.0.1", port=8080)
+    )
+    # Tenant enforcement and write approval must stay on for the tests that
+    # exercise them, whatever the developer's own config says.
+    monkeypatch.setattr(_settings.dashboard, "auth_disabled", False)
+    monkeypatch.setattr(_settings.dashboard, "auto_approve_writes", False)
     # Pin the cookie-signing key so sign_in() can forge the real session
     # cookie (create_app would otherwise generate a random per-process one).
-    from toda.config import settings as _settings
-
-    monkeypatch.setattr(_settings, "dashboard_session_secret", DASHBOARD_SESSION_SECRET)
+    monkeypatch.setattr(_settings.dashboard, "session_secret", DASHBOARD_SESSION_SECRET)
 
 
 @pytest.fixture

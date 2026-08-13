@@ -122,6 +122,78 @@ class BrainStore:
                     payload TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS dashboard_users (
+                    id TEXT PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS organization_members (
+                    organization_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (organization_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS dashboard_invitations (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    token_hash TEXT NOT NULL,
+                    invited_by TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    accepted_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS dashboard_access_requests (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    decided_by TEXT,
+                    decided_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS dashboard_sessions (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS dashboard_login_attempts (
+                    id TEXT PRIMARY KEY,
+                    attempt_key TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_dashboard_members_org_status
+                    ON organization_members(organization_id, status, role);
+                CREATE INDEX IF NOT EXISTS idx_dashboard_invites_org_email
+                    ON dashboard_invitations(organization_id, email, accepted_at);
+                CREATE INDEX IF NOT EXISTS idx_dashboard_requests_org_status
+                    ON dashboard_access_requests(organization_id, status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_dashboard_sessions_user
+                    ON dashboard_sessions(user_id, revoked_at, expires_at);
+                CREATE INDEX IF NOT EXISTS idx_dashboard_login_attempts_key
+                    ON dashboard_login_attempts(attempt_key, occurred_at);
+
                 CREATE TABLE IF NOT EXISTS sources (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
@@ -2082,6 +2154,255 @@ class BrainStore:
         with self.cursor() as cur:
             cur.execute("SELECT payload FROM organizations")
             return [_de(row["payload"]) for row in cur.fetchall()]
+
+    # ---- dashboard identities / organization membership ----
+
+    def dashboard_user_count(self) -> int:
+        with self.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS count FROM dashboard_users")
+            return int(cur.fetchone()["count"])
+
+    def dashboard_owner_count(self) -> int:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS count FROM organization_members
+                WHERE role = 'owner' AND status = 'active'"""
+            )
+            return int(cur.fetchone()["count"])
+
+    def create_dashboard_user(self, user: dict[str, Any]) -> dict[str, Any]:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """INSERT INTO dashboard_users
+                (id, email, name, password_hash, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    user["id"], user["email"], user["name"], user["password_hash"],
+                    user["status"], user["created_at"], user["updated_at"],
+                ),
+            )
+        return user
+
+    def dashboard_user_by_email(self, email: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM dashboard_users WHERE email = ?", (email,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def dashboard_user(self, user_id: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM dashboard_users WHERE id = ?", (user_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def upsert_organization_member(self, member: dict[str, Any]) -> None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """INSERT INTO organization_members
+                (organization_id, user_id, principal_id, role, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(organization_id, user_id) DO UPDATE SET
+                    principal_id=excluded.principal_id, role=excluded.role,
+                    status=excluded.status, updated_at=excluded.updated_at""",
+                (
+                    member["organization_id"], member["user_id"], member["principal_id"],
+                    member["role"], member["status"], member["created_at"], member["updated_at"],
+                ),
+            )
+
+    def organization_member(self, organization_id: str, user_id: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT m.*, u.email, u.name FROM organization_members m
+                JOIN dashboard_users u ON u.id = m.user_id
+                WHERE m.organization_id = ? AND m.user_id = ?""",
+                (organization_id, user_id),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def list_organization_members(self, organization_id: str) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT m.*, u.email, u.name FROM organization_members m
+                JOIN dashboard_users u ON u.id = m.user_id
+                WHERE m.organization_id = ? ORDER BY u.name, u.email""",
+                (organization_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def update_organization_member(
+        self,
+        organization_id: str,
+        user_id: str,
+        *,
+        role: str,
+        status: str,
+        updated_at: str,
+    ) -> dict[str, Any] | None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """UPDATE organization_members SET role = ?, status = ?, updated_at = ?
+                WHERE organization_id = ? AND user_id = ?""",
+                (role, status, updated_at, organization_id, user_id),
+            )
+        return self.organization_member(organization_id, user_id)
+
+    def active_owner_count(self, organization_id: str) -> int:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS count FROM organization_members
+                WHERE organization_id = ? AND role = 'owner' AND status = 'active'""",
+                (organization_id,),
+            )
+            return int(cur.fetchone()["count"])
+
+    def create_dashboard_invitation(self, invitation: dict[str, Any]) -> None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """UPDATE dashboard_invitations SET accepted_at = ?
+                WHERE organization_id = ? AND email = ? AND accepted_at IS NULL""",
+                (invitation["created_at"], invitation["organization_id"], invitation["email"]),
+            )
+            cur.execute(
+                """INSERT INTO dashboard_invitations
+                (id, organization_id, email, role, token_hash, invited_by,
+                 expires_at, accepted_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
+                (
+                    invitation["id"], invitation["organization_id"], invitation["email"],
+                    invitation["role"], invitation["token_hash"], invitation["invited_by"],
+                    invitation["expires_at"], invitation["created_at"],
+                ),
+            )
+
+    def dashboard_invitation_by_hash(self, token_hash: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM dashboard_invitations WHERE token_hash = ? AND accepted_at IS NULL",
+                (token_hash,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def list_dashboard_invitations(self, organization_id: str) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT id, organization_id, email, role, invited_by,
+                expires_at, accepted_at, created_at FROM dashboard_invitations
+                WHERE organization_id = ? ORDER BY created_at DESC""",
+                (organization_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def accept_dashboard_invitation(self, invitation_id: str, accepted_at: str) -> None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                "UPDATE dashboard_invitations SET accepted_at = ? WHERE id = ? AND accepted_at IS NULL",
+                (accepted_at, invitation_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Invitation was already used")
+
+    def upsert_access_request(self, request: dict[str, Any]) -> None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """INSERT INTO dashboard_access_requests
+                (id, organization_id, user_id, status, decided_by, decided_at,
+                 created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(organization_id, user_id) DO UPDATE SET
+                    status=excluded.status, decided_by=NULL, decided_at=NULL,
+                    updated_at=excluded.updated_at""",
+                (
+                    request["id"], request["organization_id"], request["user_id"],
+                    request["status"], request.get("decided_by"), request.get("decided_at"),
+                    request["created_at"], request["updated_at"],
+                ),
+            )
+
+    def list_access_requests(self, organization_id: str, status: str = "pending") -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT r.*, u.email, u.name FROM dashboard_access_requests r
+                JOIN dashboard_users u ON u.id = r.user_id
+                WHERE r.organization_id = ? AND r.status = ? ORDER BY r.created_at""",
+                (organization_id, status),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def dashboard_access_request(self, request_id: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM dashboard_access_requests WHERE id = ?", (request_id,)
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def decide_access_request(
+        self, request_id: str, *, status: str, decided_by: str, decided_at: str
+    ) -> dict[str, Any] | None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """UPDATE dashboard_access_requests SET status = ?, decided_by = ?,
+                decided_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'""",
+                (status, decided_by, decided_at, decided_at, request_id),
+            )
+            cur.execute("SELECT * FROM dashboard_access_requests WHERE id = ?", (request_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def create_dashboard_session(self, session: dict[str, Any]) -> None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                """INSERT INTO dashboard_sessions
+                (id, organization_id, user_id, expires_at, revoked_at, created_at, last_seen_at)
+                VALUES (?, ?, ?, ?, NULL, ?, ?)""",
+                (
+                    session["id"], session["organization_id"], session["user_id"],
+                    session["expires_at"], session["created_at"], session["last_seen_at"],
+                ),
+            )
+
+    def dashboard_session(self, session_id: str, now: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT * FROM dashboard_sessions WHERE id = ? AND revoked_at IS NULL
+                AND expires_at > ?""",
+                (session_id, now),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def revoke_dashboard_session(self, session_id: str, revoked_at: str) -> None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                "UPDATE dashboard_sessions SET revoked_at = ? WHERE id = ?",
+                (revoked_at, session_id),
+            )
+
+    def dashboard_login_failure_count(self, attempt_key: str, since: str) -> int:
+        with self.cursor(immediate=True) as cur:
+            cur.execute("DELETE FROM dashboard_login_attempts WHERE occurred_at < ?", (since,))
+            cur.execute(
+                "SELECT COUNT(*) AS count FROM dashboard_login_attempts WHERE attempt_key = ?",
+                (attempt_key,),
+            )
+            return int(cur.fetchone()["count"])
+
+    def record_dashboard_login_failure(
+        self, attempt_id: str, attempt_key: str, occurred_at: str
+    ) -> None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                "INSERT INTO dashboard_login_attempts(id, attempt_key, occurred_at) VALUES (?, ?, ?)",
+                (attempt_id, attempt_key, occurred_at),
+            )
+
+    def clear_dashboard_login_failures(self, attempt_key: str) -> None:
+        with self.cursor(immediate=True) as cur:
+            cur.execute(
+                "DELETE FROM dashboard_login_attempts WHERE attempt_key = ?", (attempt_key,)
+            )
 
     # ---- ingestion jobs, events, idempotency ----
 

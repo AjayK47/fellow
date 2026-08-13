@@ -9,13 +9,13 @@ from toda.storage.db import BrainStore
 
 
 def test_reindex_rebuilds_vec_tables_from_stored_embeddings(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "data_dir", tmp_path)
-    monkeypatch.setattr(settings, "db_name", "brain.db")
+    monkeypatch.setattr(settings.storage, "data_dir", tmp_path)
+    monkeypatch.setattr(settings.storage, "db_name", "brain.db")
     # get_app() caches one TodaApp globally -- give this test a clean
     # slate (and don't leak it forward into other tests).
     monkeypatch.setattr(container_module, "_app", None)
 
-    brain = container_module.get_app(settings.db_path)
+    brain = container_module.get_app(settings.storage.db_path)
     result = brain.ingestion.ingest(
         organization_id="org_acme",
         source_system="test",
@@ -36,7 +36,7 @@ def test_reindex_rebuilds_vec_tables_from_stored_embeddings(tmp_path, monkeypatc
     # reopen the store fresh to verify, rather than reusing the closed one.
     reindex_cli(argparse.Namespace(force=False))
 
-    reopened = BrainStore(settings.db_path)
+    reopened = BrainStore(settings.storage.db_path)
     try:
         with reopened.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM vec_chunks WHERE id LIKE ?", (f"chunk_{source_id}_%",))

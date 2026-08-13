@@ -1,91 +1,79 @@
-import { useEffect, useState } from "react";
-import { KeyRound, Slack } from "lucide-react";
-import { fetchAuthMethods, localLogin } from "../api";
+import { useState } from "react";
+import { ArrowRight } from "lucide-react";
+import { ApiError, login } from "../api";
 
 export default function Login({ error }: { error?: string | null }) {
-  const [methods, setMethods] = useState({ local_token: false, slack: false });
-  const [token, setToken] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [localError, setLocalError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  useEffect(() => {
-    fetchAuthMethods().then(setMethods).catch(() => undefined);
-  }, []);
 
-  async function signInWithToken(event: React.FormEvent) {
+  async function signIn(event: React.FormEvent) {
     event.preventDefault();
     setSubmitting(true);
     setLocalError(null);
     try {
-      await localLogin(token);
+      await login(email, password);
       window.location.assign("/");
-    } catch {
-      setLocalError("That administrator token was not accepted.");
+    } catch (cause) {
+      setLocalError(cause instanceof ApiError && cause.status === 403
+        ? "This account is still waiting for access."
+        : "That email and password were not accepted.");
     } finally {
       setSubmitting(false);
     }
   }
+
   const message =
     error === "invalid_state"
-      ? "That sign-in link expired or was already used — try again."
-      : error === "token_exchange_failed" || error === "incomplete_userinfo"
-      ? "Slack didn't return what we needed to sign you in. Try again."
+      ? "That link expired or was already used. Sign in again."
       : error === "session_expired"
-      ? "You were signed out — sign in again to continue."
+      ? "You were signed out. Sign in again to continue."
       : error
-      ? "Sign-in was cancelled or failed."
+      ? "Sign-in did not complete. Try again."
       : null;
 
   return (
-    <div className="flex h-screen items-center justify-center bg-paper">
-      <div className="card w-full max-w-[380px] p-8 text-center">
-        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-brand-soft text-brand">
-          <KeyRound size={22} />
-        </div>
-        <h1 className="mt-4 text-[20px] font-semibold tracking-tight text-ink">
-          Sign in to Toda
-        </h1>
-        <p className="mt-2 text-[13px] leading-relaxed text-muted">
-          Use the administrator credential created by this self-hosted installation.
-        </p>
-        {message && (
-          <p className="mt-3 rounded-lg bg-bad-soft px-3 py-2 text-[12.5px] text-bad">
-            {message}
-          </p>
-        )}
-        {methods.local_token && (
-          <form onSubmit={signInWithToken} className="mt-6 space-y-3 text-left">
-            <label className="block text-[12px] font-medium text-muted" htmlFor="admin-token">
-              Administrator token
-            </label>
+    <main className="ob ob--auth">
+      <section className="ob__card">
+        <a href="/" className="ob__mark" aria-label="Toda home">toda</a>
+        <h1>Sign in</h1>
+        <p>Use your organization account. Slack connects your data — it does not control who gets in here.</p>
+
+        {message && <div className="ob__note is-bad">{message}</div>}
+
+        <form onSubmit={signIn} className="ob__form">
+          <label className="ob__field">
+            <span>Work email</span>
             <input
-              id="admin-token"
-              type="password"
-              autoComplete="current-password"
-              value={token}
-              onChange={(event) => setToken(event.target.value)}
-              className="w-full rounded-lg border border-line bg-white px-3 py-2 text-[13px] text-ink outline-none focus:border-brand"
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              placeholder="you@company.com"
               required
             />
-            {localError && <p className="text-[12px] text-bad">{localError}</p>}
-            <button disabled={submitting} className="btn flex w-full items-center justify-center gap-2">
-              <KeyRound size={15} /> {submitting ? "Signing in…" : "Sign in locally"}
-            </button>
-          </form>
-        )}
-        {!methods.local_token && !methods.slack && (
-          <div className="mt-6 border-l-2 border-brand bg-brand-soft px-4 py-3 text-left text-[12px] leading-relaxed text-ink">
-            Run <code className="font-mono">toda setup</code> on the host machine to establish local administrator access.
-          </div>
-        )}
-        {methods.slack && (
-          <a
-            href="/slack/login"
-            className="btn mt-3 flex w-full items-center justify-center gap-2"
-          >
-            <Slack size={15} /> Sign in with Slack
-          </a>
-        )}
-      </div>
-    </div>
+          </label>
+          <label className="ob__field">
+            <span>Password</span>
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              required
+            />
+          </label>
+          {localError && <span className="ob__feedback is-bad">{localError}</span>}
+          <button className="ob__primary" disabled={submitting}>
+            {submitting ? "Signing in…" : "Sign in"}
+          </button>
+        </form>
+
+        <a href="/request-access" className="ob__link">
+          Request access <ArrowRight size={13} />
+        </a>
+      </section>
+    </main>
   );
 }

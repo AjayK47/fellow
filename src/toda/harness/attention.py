@@ -356,7 +356,7 @@ class AttentionPipeline:
             return evaluation
         since = (
             utcnow()
-            - timedelta(seconds=self.config.proactive_cooldown_seconds)
+            - timedelta(seconds=self.config.worker.proactive_cooldown_seconds)
         ).isoformat()
         recent = self.store.recent_intervention(
             event.organization_id,
@@ -371,7 +371,7 @@ class AttentionPipeline:
             evaluation.reason = "Suppressed by proactive intervention cooldown."
             return evaluation
         if (
-            evaluation.confidence < self.config.attention_minimum_confidence
+            evaluation.confidence < self.config.worker.attention_minimum_confidence
             and evaluation.decision
             in {
                 AttentionDecision.WAKE_MAIN_AGENT,

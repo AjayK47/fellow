@@ -7,8 +7,10 @@ from typing import Any
 
 from toda.harness.prompt_library import load
 from toda.domain.models import (
+    EXTRACTABLE_EDGE_TYPES,
     CanonicalClaim,
     Memory,
+    MemoryRelation,
     MemoryType,
     utcnow,
 )
@@ -100,6 +102,30 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                         "type": "array",
                         "items": {"type": "string"},
                     },
+                    "relation": {
+                        "type": ["object", "null"],
+                        "description": (
+                            "A typed entity-to-entity edge this claim asserts, or null. "
+                            "Direction matters and is not symmetric -- emit exactly: "
+                            "MEMBER_OF person->team; WORKS_ON person->project; "
+                            "OWNS owner->thing; DEPENDS_ON dependent->dependency; "
+                            "ACCOUNT_OWNED_BY customer->person; "
+                            "ON_CALL_FOR person->service_or_team; "
+                            "AFFECTS cause->affected; COMMITTED_TO person->commitment; "
+                            "PARTICIPATED_IN person->thing; RELATED_TO either. "
+                            "Use ids from known entities or the new: refs you proposed."
+                        ),
+                        "properties": {
+                            "edge_type": {
+                                "type": "string",
+                                "enum": list(EXTRACTABLE_EDGE_TYPES),
+                            },
+                            "from": {"type": "string"},
+                            "to": {"type": "string"},
+                        },
+                        "required": ["edge_type", "from", "to"],
+                        "additionalProperties": False,
+                    },
                     "canonical_claim": {
                         "type": ["object", "null"],
                         "properties": {
@@ -119,6 +145,7 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                     "entity_ids",
                     "participant_ids",
                     "canonical_claim",
+                    "relation",
                 ],
                 "additionalProperties": False,
             },
@@ -280,11 +307,25 @@ class ModelMemoryExtractor:
             participant_ids = _resolve_ids(item.get("participant_ids") or [])
             claim_data = item.get("canonical_claim")
             claim = CanonicalClaim(**claim_data) if claim_data else None
+            # Only keep the edge when BOTH ends resolve to entities that exist
+            # (or were proposed in this same pass). A half-resolved edge would
+            # point at a name string and be unqueryable.
+            relation = None
+            raw_relation = item.get("relation") or {}
+            if raw_relation.get("edge_type") in EXTRACTABLE_EDGE_TYPES:
+                ends = _resolve_ids([raw_relation.get("from"), raw_relation.get("to")])
+                if len(ends) == 2 and ends[0] != ends[1]:
+                    relation = MemoryRelation(
+                        edge_type=str(raw_relation["edge_type"]),
+                        from_id=ends[0],
+                        to_id=ends[1],
+                    )
             memory = Memory(
                 organization_id=source["organization_id"],
                 memory_type=MemoryType(item["memory_type"]),
                 content=content,
                 canonical_claim=claim,
+                relation=relation,
                 confidence=float(item.get("confidence", 0.75)),
                 authority=float(item.get("authority", 0.7)),
                 scope_id=source["scope_id"],

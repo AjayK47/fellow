@@ -65,7 +65,7 @@ after reviewing their policies and isolation model.
 
 ## Secrets
 
-Never commit `.env`, database files, task workspaces, logs, or connector
+Never commit `config.json`, database files, task workspaces, logs, or connector
 payloads. Run the repository's release verifier and secret scanner before
 every release. Rotating a leaked credential is mandatory even if Git history
 is later rewritten.

@@ -11,7 +11,7 @@ def test_profile_refresh_and_safe_read(api_client):
     assert refreshed.json()["profile_type"] == "project"
 
     public = api_client.get(
-        "/v1/profiles/projects/project_toda",
+        "/v1/profiles/project_toda",
         params={
             "organization_id": "org_acme", "acting_principal_id": "person_ajay",
             "destination_type": "slack_channel", "destination_id": "channel_eng",
@@ -25,7 +25,7 @@ def test_profile_refresh_and_safe_read(api_client):
 
 def test_customer_profile_hides_private_memories_in_public_destination(api_client):
     response = api_client.get(
-        "/v1/profiles/people/person_ajay",
+        "/v1/profiles/person_ajay",
         params={
             "organization_id": "org_acme", "acting_principal_id": "person_ajay",
             "destination_type": "slack_channel", "destination_id": "channel_eng",

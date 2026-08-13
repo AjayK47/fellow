@@ -220,6 +220,34 @@ class CanonicalClaim(BaseModel):
     object: str
 
 
+# Edge types extraction is allowed to assert from free text. Deliberately a
+# subset of OrgEdgeType: permission edges (CAN_VIEW, VISIBLE_TO, ACTS_AS,
+# AUTHORIZED_FOR, INHERITS_ACL_FROM) must never be writable by anything a
+# message can say, or a Slack post could widen its own audience. Provenance
+# edges (ABOUT, MENTIONED_IN, GENERATED_BY) stay owned by the harness, which
+# knows them as fact rather than inferring them.
+EXTRACTABLE_EDGE_TYPES: tuple[str, ...] = (
+    "MEMBER_OF",
+    "WORKS_ON",
+    "OWNS",
+    "DEPENDS_ON",
+    "ACCOUNT_OWNED_BY",
+    "ON_CALL_FOR",
+    "AFFECTS",
+    "COMMITTED_TO",
+    "PARTICIPATED_IN",
+    "RELATED_TO",
+)
+
+
+class MemoryRelation(BaseModel):
+    """A typed entity-to-entity edge asserted by an extracted memory."""
+
+    edge_type: str
+    from_id: str
+    to_id: str
+
+
 class Memory(BaseModel):
     id: str = Field(default_factory=lambda: new_id("mem"))
     organization_id: str
@@ -248,6 +276,10 @@ class Memory(BaseModel):
     participant_ids: list[str] = Field(default_factory=list)
     source_spans: list[dict[str, Any]] = Field(default_factory=list)
     is_private: bool = False
+    # Set when the extractor resolved this claim to two real entities. It is
+    # what turns "Ana owns the Acme account" into a queryable OWNS edge rather
+    # than only prose that has to be found by similarity search.
+    relation: MemoryRelation | None = None
 
 
 class Scope(BaseModel):

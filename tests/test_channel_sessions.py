@@ -106,7 +106,7 @@ def _signal_kinds(brain, task_id: str) -> list[str]:
 
 
 def test_two_addressed_channel_messages_resolve_to_one_session(brain):
-    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    brain.slack_gateway.config.slack.bot_user_id = "UBOT"
 
     first = brain.slack_gateway.normalize(
         _slack_event(
@@ -130,7 +130,7 @@ def test_two_addressed_channel_messages_resolve_to_one_session(brain):
 
 
 def test_threads_are_routing_metadata_inside_the_channel_session(brain):
-    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    brain.slack_gateway.config.slack.bot_user_id = "UBOT"
 
     root = brain.slack_gateway.normalize(
         _slack_event(

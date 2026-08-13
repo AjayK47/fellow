@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from toda.domain.models import Memory, MemoryEdgeType, MemoryStatus, utcnow
+from toda.domain.models import (
+    EXTRACTABLE_EDGE_TYPES,
+    Memory,
+    MemoryEdgeType,
+    MemoryStatus,
+    utcnow,
+)
 from toda.extractors.deterministic import DeterministicExtractor
 from toda.services.audit import AuditService
 from toda.services.graph import GraphService
@@ -73,6 +79,32 @@ class MemoryService:
         )
         return committed
 
+    # Below this the extraction is a guess, and a guess written as a typed edge
+    # becomes indistinguishable from a fact anyone confirmed.
+    RELATION_CONFIDENCE_FLOOR = 0.8
+
+    def _record_relation(self, memory: Memory, data: dict[str, Any]) -> None:
+        """Promote an extracted claim into a queryable entity-to-entity edge.
+
+        The model already resolves "Ana owns the Acme account" into a triple
+        with both entities identified, but that only ever fed supersession
+        matching -- so resolve_owners(), on_call_for() and the WORKS_ON lookups
+        in context building queried a graph nothing populated, and ownership
+        questions fell back to similarity search over prose.
+        """
+        relation = memory.relation
+        if relation is None or memory.confidence < self.RELATION_CONFIDENCE_FLOOR:
+            return
+        if relation.edge_type not in EXTRACTABLE_EDGE_TYPES:
+            return
+        self.graph.add_edge(
+            memory.organization_id,
+            relation.edge_type,
+            relation.from_id,
+            relation.to_id,
+            source_ids=data.get("source_ids") or memory.source_ids,
+        )
+
     def _consolidate(self, memory: Memory) -> dict[str, Any]:
         """If a current memory shares the same canonical claim subject+predicate, supersede it."""
         org = memory.organization_id
@@ -81,7 +113,11 @@ class MemoryService:
         match = self._find_supersede_target(memory, existing)
         if match:
             # new memory updates old
-            return self.graph.supersede_memory(match["id"], memory, MemoryEdgeType.UPDATES)
+            superseded = self.graph.supersede_memory(
+                match["id"], memory, MemoryEdgeType.UPDATES
+            )
+            self._record_relation(memory, superseded)
+            return superseded
 
         # check extends (same subject, different predicate detail)
         extend_target = self._find_extend_target(memory, existing)
@@ -94,6 +130,7 @@ class MemoryService:
                 extend_target["id"],
                 source_ids=data.get("source_ids"),
             )
+        self._record_relation(memory, data)
         return data
 
     # Predicates that represent a single current value (supersede on object change).

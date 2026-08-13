@@ -9,9 +9,9 @@ from toda.main import reset_cli
 
 
 def test_reset_requires_explicit_yes_and_removes_database_sidecars(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "data_dir", tmp_path)
-    monkeypatch.setattr(settings, "db_name", "brain.db")
-    db_path = settings.db_path
+    monkeypatch.setattr(settings.storage, "data_dir", tmp_path)
+    monkeypatch.setattr(settings.storage, "db_name", "brain.db")
+    db_path = settings.storage.db_path
     for suffix in ("", "-wal", "-shm", "-journal"):
         db_path.with_name(db_path.name + suffix).write_text("data")
 
@@ -32,11 +32,11 @@ def test_reset_also_clears_task_workspaces(tmp_path, monkeypatch):
     from the database, so leaving them behind means a "fresh start" isn't
     one. A live install had 4,191 stale workspace directories survive
     every reset, all from an architecture that no longer exists."""
-    monkeypatch.setattr(settings, "data_dir", tmp_path)
-    monkeypatch.setattr(settings, "db_name", "brain.db")
+    monkeypatch.setattr(settings.storage, "data_dir", tmp_path)
+    monkeypatch.setattr(settings.storage, "db_name", "brain.db")
     workspace_root = tmp_path / "workspaces"
-    monkeypatch.setattr(settings, "workspace_root", workspace_root)
-    settings.db_path.write_text("data")
+    monkeypatch.setattr(settings.storage, "workspace_root", workspace_root)
+    settings.storage.db_path.write_text("data")
     stale = workspace_root / "task_old"
     stale.mkdir(parents=True)
     (stale / "report.md").write_text("leftover work")
@@ -54,15 +54,15 @@ def test_reset_also_clears_task_workspaces(tmp_path, monkeypatch):
 def test_reset_refuses_a_workspace_root_that_is_not_toda_owned(tmp_path, monkeypatch):
     """Guard against a misconfigured workspace_root (pointed at a home
     directory, say) turning a reset into an unrecoverable wipe."""
-    monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
-    monkeypatch.setattr(settings, "db_name", "brain.db")
+    monkeypatch.setattr(settings.storage, "data_dir", tmp_path / "data")
+    monkeypatch.setattr(settings.storage, "db_name", "brain.db")
     (tmp_path / "data").mkdir()
-    settings.db_path.write_text("data")
+    settings.storage.db_path.write_text("data")
     unrelated = tmp_path / "my_documents"
     unrelated.mkdir()
     precious = unrelated / "taxes.pdf"
     precious.write_text("do not delete")
-    monkeypatch.setattr(settings, "workspace_root", unrelated)
+    monkeypatch.setattr(settings.storage, "workspace_root", unrelated)
 
     reset_cli(argparse.Namespace(yes=True))
 

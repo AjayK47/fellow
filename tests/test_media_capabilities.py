@@ -6,7 +6,7 @@ import io
 import httpx
 from PIL import Image
 
-from toda.config import Settings
+from toda.config import MediaConfig, ModelsConfig, Settings
 from toda.harness.media_ingestion import SlackMediaIngestion
 from toda.harness.media_providers import GeneratedMedia, build_image_provider, build_speech_provider, build_transcription_provider, image_providers
 from toda.harness.model_client import DeterministicHarnessModel, ScriptedModelClient, build_vision_model
@@ -57,14 +57,16 @@ def _runtime(brain, tool_name: str) -> dict:
 
 def test_media_backends_are_independently_configured():
     config = Settings(
-        provider_connections={
-            "image": {"provider": "openai", "api_key": "image-key"},
-            "speech": {"provider": "openai", "api_key": "speech-key"},
-        },
-        model_assignments={
-            "image": {"connection": "image", "model": "image-model"},
-            "tts": {"connection": "speech", "model": "speech-model"},
-        },
+        models=ModelsConfig(
+            providers={
+                "image": {"provider": "openai", "api_key": "image-key"},
+                "speech": {"provider": "openai", "api_key": "speech-key"},
+            },
+            assignments={
+                "image": {"connection": "image", "model": "image-model"},
+                "tts": {"connection": "speech", "model": "speech-model"},
+            },
+        )
     )
     assert build_image_provider(config).model == "image-model"
     assert build_transcription_provider(config) is None
@@ -89,15 +91,17 @@ def test_openrouter_media_backends_reuse_main_key_and_use_native_contracts(monke
 
     monkeypatch.setattr("toda.harness.media_providers.httpx.post", fake_post)
     config = Settings(
-        provider_connections={
-            "openrouter-company": {"provider": "openrouter", "api_key": "shared-openrouter-key"}
-        },
-        model_assignments={
-            "image": {"connection": "openrouter-company", "model": "google/gemini-3.1-flash-lite-image"},
-            "transcription": {"connection": "openrouter-company", "model": "x-ai/grok-stt-1.0"},
-            "tts": {"connection": "openrouter-company", "model": "fish-audio/s2.1-pro-free:free"},
-        },
-        tts_voice="default",
+        models=ModelsConfig(
+            providers={
+                "openrouter-company": {"provider": "openrouter", "api_key": "shared-openrouter-key"}
+            },
+            assignments={
+                "image": {"connection": "openrouter-company", "model": "google/gemini-3.1-flash-lite-image"},
+                "transcription": {"connection": "openrouter-company", "model": "x-ai/grok-stt-1.0"},
+                "tts": {"connection": "openrouter-company", "model": "fish-audio/s2.1-pro-free:free"},
+            },
+        ),
+        media=MediaConfig(tts_voice="default"),
     )
 
     image = build_image_provider(config).generate(
@@ -130,8 +134,10 @@ def test_openrouter_media_backends_reuse_main_key_and_use_native_contracts(monke
 def test_image_backend_can_be_registered_without_changing_the_tool():
     image_providers.register("custom", lambda config: FakeImageProvider())
     provider = build_image_provider(Settings(
-        provider_connections={"local": {"provider": "custom", "base_url": "http://localhost:11434/v1"}},
-        model_assignments={"image": {"connection": "local", "model": "local-image"}},
+        models=ModelsConfig(
+            providers={"local": {"provider": "custom", "base_url": "http://localhost:11434/v1"}},
+            assignments={"image": {"connection": "local", "model": "local-image"}},
+        )
     ))
     assert provider is not None
     assert provider.name == "fake-image"
@@ -139,12 +145,14 @@ def test_image_backend_can_be_registered_without_changing_the_tool():
 
 def test_vision_prefers_main_only_when_declared_capable():
     main = DeterministicHarnessModel()
-    assert build_vision_model(Settings(main_model_supports_vision=False), main) is None
-    assert build_vision_model(Settings(main_model_supports_vision=True), main) is main
+    assert build_vision_model(Settings(models=ModelsConfig(main_supports_vision=False)), main) is None
+    assert build_vision_model(Settings(models=ModelsConfig(main_supports_vision=True)), main) is main
     auxiliary = build_vision_model(
         Settings(
-            provider_connections={"vision": {"provider": "openai", "api_key": "vision-key"}},
-            model_assignments={"vision": {"connection": "vision", "model": "vision-model"}},
+            models=ModelsConfig(
+                providers={"vision": {"provider": "openai", "api_key": "vision-key"}},
+                assignments={"vision": {"connection": "vision", "model": "vision-model"}},
+            )
         ), main
     )
     assert auxiliary is not None

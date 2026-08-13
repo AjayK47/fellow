@@ -152,11 +152,11 @@ class EventRouter:
                     "group_kind": policy.group_kind,
                     "source_system": event.source,
                     "scope_id": event.scope.scope_id,
-                    "quiet_seconds": self.config.episode_quiet_seconds,
+                    "quiet_seconds": self.config.worker.episode_quiet_seconds,
                 },
                 idempotency_key=f"episode:{policy.group_key}:{event.id}",
                 available_at=(
-                    event.occurred_at + timedelta(seconds=self.config.episode_quiet_seconds)
+                    event.occurred_at + timedelta(seconds=self.config.worker.episode_quiet_seconds)
                 ).isoformat(),
             )
 

@@ -240,7 +240,7 @@ def test_auto_approve_writes_flag_still_creates_an_approved_record(
     just already resolved rather than pending."""
     from toda.harness import tools as tools_module
 
-    monkeypatch.setattr(tools_module.settings, "auto_approve_writes", True)
+    monkeypatch.setattr(tools_module.settings.dashboard, "auto_approve_writes", True)
     # No Composio API key is configured for this test org, so execution
     # after auto-approval fails locally without a real network call.
     brain.composio.api_key = None
@@ -1302,8 +1302,8 @@ def test_status_checkpoint_tracking_and_live_update_message(brain):
 def test_signed_slack_mention_routes_through_full_harness(brain):
     brain.session_manager.conversation_agent = None
     secret = "test-signing-secret"
-    brain.slack_gateway.config.slack_signing_secret = secret
-    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    brain.slack_gateway.config.slack.signing_secret = secret
+    brain.slack_gateway.config.slack.bot_user_id = "UBOT"
     brain.store.upsert_simple_harness_record(
         "identity_mappings",
         {
@@ -1351,7 +1351,7 @@ def test_signed_slack_mention_routes_through_full_harness(brain):
 
 def test_message_and_app_mention_callbacks_for_one_slack_message_are_deduped(brain):
     brain.session_manager.conversation_agent = None
-    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    brain.slack_gateway.config.slack.bot_user_id = "UBOT"
     common_event = {
         "user": "UAJAY",
         "channel": "CGENERAL",
@@ -1404,7 +1404,7 @@ def test_message_and_app_mention_callbacks_for_one_slack_message_are_deduped(bra
 
 
 def test_slack_channels_are_proactive_by_default_with_explicit_opt_out(brain):
-    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    brain.slack_gateway.config.slack.bot_user_id = "UBOT"
     payload = {
         "type": "event_callback",
         "team_id": "TACME",
@@ -1440,7 +1440,7 @@ def test_slack_channels_are_proactive_by_default_with_explicit_opt_out(brain):
 
 
 def test_slack_has_only_public_private_and_dm_conversation_types(brain):
-    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    brain.slack_gateway.config.slack.bot_user_id = "UBOT"
 
     def normalized(channel: str, channel_type: str, *, private: bool = False):
         return brain.slack_gateway.normalize(
@@ -1530,7 +1530,7 @@ def test_agent_can_change_current_slack_channel_proactivity(brain, monkeypatch):
 
 
 def test_ambient_slack_uses_contextual_attention_before_waking(brain):
-    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    brain.slack_gateway.config.slack.bot_user_id = "UBOT"
     brain.store.upsert_simple_harness_record(
         "identity_mappings",
         {
@@ -1594,7 +1594,7 @@ def test_ambient_slack_uses_contextual_attention_before_waking(brain):
 
 def test_attention_and_main_agent_use_the_same_slack_conversation(brain):
     brain.session_manager.conversation_agent = None
-    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    brain.slack_gateway.config.slack.bot_user_id = "UBOT"
     first_payload = {
         "type": "event_callback",
         "team_id": "TACME",
@@ -2010,7 +2010,7 @@ def test_role_api_create_and_list(api_client):
 
 
 def test_ambient_channel_without_policy_is_proactive_by_default(brain):
-    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    brain.slack_gateway.config.slack.bot_user_id = "UBOT"
     payload = {
         "type": "event_callback",
         "team_id": "TACME",
@@ -2152,7 +2152,7 @@ def test_feedback_updates_attention_precision_metrics(brain):
 
 
 def test_invalid_slack_signature_is_rejected(brain):
-    brain.slack_gateway.config.slack_signing_secret = "correct-secret"
+    brain.slack_gateway.config.slack.signing_secret = "correct-secret"
     payload = {
         "type": "event_callback",
         "team_id": "TACME",
@@ -2258,11 +2258,18 @@ def test_tenant_deletion_requires_exact_confirmation(api_client):
         },
     )
     assert deleted.status_code == 200
-    assert deleted.json()["deleted"]["organizations"] == 1
+    body = deleted.json()
+    assert body["deleted"]["organizations"] == 1
+    assert body["deleted"]["sources"] >= 0
+    # Deleting the only organization also removes the dashboard accounts that
+    # existed to administer it, so the caller's own session dies with it. That
+    # sign-out is the observable proof the accounts were purged rather than
+    # left able to authenticate against a tenant that no longer exists.
+    assert body["deleted"]["dashboard_users"] >= 1
     metrics = api_client.get(
         "/v1/metrics", params={"organization_id": "org_acme"}
     )
-    assert metrics.json()["sources"] == 0
+    assert metrics.status_code == 401
 
 
 def test_deferred_profile_refresh_and_reindex_jobs(api_client):

@@ -308,3 +308,71 @@ def test_known_entity_catalog_keeps_the_most_recent_entities_when_capped(
         "project_cap_4",
         "project_cap_3",
     ]
+
+
+def _relation_memory(org, from_id, to_id, *, edge_type="ACCOUNT_OWNED_BY", confidence=0.9):
+    from toda.domain.models import CanonicalClaim, Memory, MemoryRelation, MemoryType
+
+    return Memory(
+        organization_id=org,
+        memory_type=MemoryType.RELATIONSHIP,
+        content="Ana owns the Acme account.",
+        canonical_claim=CanonicalClaim(subject=from_id, predicate="owns account for", object=to_id),
+        confidence=confidence,
+        scope_id="scope_org_public",
+        source_ids=["src_test"],
+        entity_ids=[from_id, to_id],
+        relation=MemoryRelation(edge_type=edge_type, from_id=from_id, to_id=to_id),
+    )
+
+
+def test_extracted_relation_becomes_a_queryable_owner_edge(empty_brain):
+    """brain_resolve_owner queries OWNS / ACCOUNT_OWNED_BY edges.
+
+    The extractor already resolved claims to (subject, predicate, object) with
+    both entities identified, but that only fed supersession matching -- so the
+    owner lookup queried a graph nothing populated and ownership questions fell
+    back to similarity search over prose.
+    """
+    org = "org_rel"
+    brain = empty_brain
+    brain.store.put_organization({"id": org, "name": "Rel"})
+    for eid, etype, name in (
+        ("person_ana", "person", "Ana"),
+        ("customer_acme", "customer", "Acme"),
+    ):
+        brain.graph.upsert_entity(
+            {"id": eid, "organization_id": org, "entity_type": etype, "name": name}
+        )
+
+    assert brain.graph.resolve_owners(org, ["customer_acme"]) == []
+
+    brain.memory._consolidate(_relation_memory(org, "customer_acme", "person_ana"))
+
+    owners = brain.graph.resolve_owners(org, ["customer_acme"])
+    assert [o["owner_id"] for o in owners] == ["person_ana"], "owner lookup should resolve by edge"
+
+
+def test_low_confidence_extraction_does_not_become_a_graph_fact(empty_brain):
+    org = "org_rel_low"
+    brain = empty_brain
+    brain.store.put_organization({"id": org, "name": "RelLow"})
+    for eid, etype in (("person_ana", "person"), ("customer_acme", "customer")):
+        brain.graph.upsert_entity(
+            {"id": eid, "organization_id": org, "entity_type": etype, "name": eid}
+        )
+
+    brain.memory._consolidate(
+        _relation_memory(org, "customer_acme", "person_ana", confidence=0.5)
+    )
+
+    assert brain.graph.resolve_owners(org, ["customer_acme"]) == []
+
+
+def test_extraction_cannot_assert_permission_edges():
+    """A Slack message must not be able to widen its own audience."""
+    from toda.domain.models import EXTRACTABLE_EDGE_TYPES
+
+    for blocked in ("CAN_VIEW", "CAN_EDIT", "VISIBLE_TO", "ACTS_AS", "AUTHORIZED_FOR",
+                    "INHERITS_ACL_FROM"):
+        assert blocked not in EXTRACTABLE_EDGE_TYPES, f"{blocked} is writable from free text"

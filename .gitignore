@@ -1,7 +1,7 @@
-# Environment and secrets
-.env
-.env.*
-!.env.example
+# Configuration and secrets. config.json is the only config file Toda
+# reads; config.example.json is the tracked, redacted template.
+config.json
+!config.example.json
 
 # Python tooling caches and build artifacts
 .venv/
@@ -31,7 +31,6 @@ data/
 *.db-wal
 *.sqlite
 *.sqlite3
-.env.bak*
 
 # Private research/reference worktrees and generated product experiments
 harnesses/

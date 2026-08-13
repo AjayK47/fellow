@@ -9,10 +9,10 @@ import pytest
 @pytest.fixture(autouse=True)
 def _no_quiet_window(brain):
     # Router-enqueued knowledge.consolidate_episode jobs are delayed by
-    # config.episode_quiet_seconds (available_at = occurred_at + quiet);
+    # config.worker.episode_quiet_seconds (available_at = occurred_at + quiet);
     # tests that want the router's own enqueue (not a direct
     # consolidate_episode() call) need that delay at 0 to drain promptly.
-    brain.event_router.config.episode_quiet_seconds = 0
+    brain.event_router.config.worker.episode_quiet_seconds = 0
 
 
 def _ambient_message(*, event_id: str, channel_id: str, text: str, occurred_at=None) -> dict:

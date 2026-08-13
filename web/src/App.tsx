@@ -21,10 +21,10 @@ import {
   Share2,
   ShieldCheck,
   Sparkles,
+  Users,
   Wrench,
   X,
 } from "lucide-react";
-import Setup from "./pages/Setup";
 import Login from "./pages/Login";
 import { api, ORG, fetchSession, logout, onUnauthorized, DashboardSession } from "./api";
 import { useVisibleInterval } from "./components";
@@ -84,7 +84,6 @@ const GROUPS: NavGroup[] = [
   {
     title: "Settings",
     items: [
-      { to: "/setup", label: "Configuration", icon: Settings2 },
       { to: "/tools", label: "Tools", icon: Wrench },
       { to: "/channels", label: "Slack", icon: MessageSquare },
       { to: "/mcp", label: "MCP servers", icon: Server },
@@ -131,12 +130,14 @@ function Sidebar({
   showSignOut,
   onSignOut,
   onNavigate,
+  isAdmin,
 }: {
   pendingApprovals: number;
   workspaceName?: string | null;
   showSignOut: boolean;
   onSignOut: () => void;
   onNavigate?: () => void;
+  isAdmin: boolean;
 }) {
   return (
     <aside className="flex h-screen flex-col overflow-y-auto border-r border-line bg-panel px-4 py-5">
@@ -303,12 +304,10 @@ function Topbar({ pendingApprovals, onOpenNavigation }: { pendingApprovals: numb
 }
 
 type SessionState = "pending" | DashboardSession | null;
-type SetupState = "pending" | boolean;
 
 export default function App() {
   const [pendingApprovals, setPendingApprovals] = useState(0);
   const [session, setSession] = useState<SessionState>("pending");
-  const [setupComplete, setSetupComplete] = useState<SetupState>("pending");
   const [loginError, setLoginError] = useState<string | null>(null);
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
 
@@ -328,9 +327,6 @@ export default function App() {
       setSession(null);
     });
     fetchSession().then(setSession).catch(() => setSession(null));
-    api.get<{ setup?: { complete?: boolean } }>("/v1/gateway/setup/status")
-      .then((status) => setSetupComplete(Boolean(status.setup?.complete)))
-      .catch(() => setSetupComplete(true));
   }, []);
 
   const pollApprovals = useCallback(async () => {
@@ -350,15 +346,10 @@ export default function App() {
   // 20s (and paused entirely while the tab isn't visible) is plenty.
   useVisibleInterval(pollApprovals, 20_000);
 
-  // First-run setup must work before Slack or an organization login exists.
-  // Its write endpoints still require the one-time bootstrap token issued by
-  // the local Toda daemon; this only changes the visual shell.
-  if (window.location.pathname === "/setup") {
-    return <Setup />;
-  }
-
-  if (session === "pending" || setupComplete === "pending") return null;
-  if (!setupComplete) return <Setup />;
+  // Configuration lives in config.json and the organization is created by
+  // `toda init`, so there is no first-run state for the console to be in:
+  // it either has a session or shows the login screen.
+  if (session === "pending") return null;
   if (!session) return <Login error={loginError} />;
 
   async function handleSignOut() {
@@ -374,6 +365,7 @@ export default function App() {
           workspaceName={session.workspace_name}
           showSignOut={!session.auth_disabled}
           onSignOut={handleSignOut}
+          isAdmin={session.role === "owner" || session.role === "admin"}
         />
       </div>
 
@@ -391,6 +383,7 @@ export default function App() {
               workspaceName={session.workspace_name}
               showSignOut={!session.auth_disabled}
               onSignOut={handleSignOut}
+              isAdmin={session.role === "owner" || session.role === "admin"}
               onNavigate={() => setMobileNavigationOpen(false)}
             />
             <button
@@ -417,7 +410,6 @@ export default function App() {
               <Route path="/policies" element={<Policies />} />
               <Route path="/tools" element={<Tools />} />
               <Route path="/skills" element={<Skills />} />
-              <Route path="/setup" element={<Setup />} />
               <Route path="/connections" element={<Connections />} />
               <Route path="/channels" element={<Channels />} />
               <Route path="/automations" element={<Automations />} />

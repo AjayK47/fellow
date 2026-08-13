@@ -86,3 +86,86 @@ def test_anthropic_transport_maps_tools_and_tool_calls(monkeypatch):
     assert captured["json"]["system"] == "Be useful."
     assert captured["json"]["tools"][0]["input_schema"] == {"type": "object"}
     assert result.tool_calls[0].arguments == {"id": 7}
+
+
+def test_reasoning_exhaustion_retries_once_with_reasoning_disabled(monkeypatch):
+    """A reasoning model can burn its whole output budget thinking.
+
+    finish_reason "length" with no content and no tool call is a dead turn that
+    reached the user as "model returned neither answer nor tool call". The same
+    request usually answers, so it is retried once with reasoning off.
+    """
+    from toda.harness.model_client import OpenAICompatibleModelClient
+
+    sent: list[dict] = []
+
+    class Response:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    exhausted = {
+        "choices": [{"message": {"content": "", "tool_calls": []}, "finish_reason": "length"}],
+        "usage": {"completion_tokens_details": {"reasoning_tokens": 40000}},
+    }
+    answered = {
+        "choices": [{"message": {"content": "Here is the answer."}, "finish_reason": "stop"}],
+        "usage": {},
+    }
+
+    def fake_post(url, **kwargs):
+        sent.append(kwargs["json"])
+        return Response(exhausted if len(sent) == 1 else answered)
+
+    monkeypatch.setattr("toda.harness.model_client.httpx.post", fake_post)
+    client = OpenAICompatibleModelClient(
+        api_key="k", model="deepseek/deepseek-v4-flash-0731",
+        base_url="https://example.test/v1", reasoning_effort="medium",
+    )
+    result = client.generate(messages=[{"role": "user", "content": "hi"}])
+
+    assert len(sent) == 2, "should retry exactly once"
+    assert sent[0]["reasoning"] == {"effort": "medium"}
+    assert sent[1]["reasoning"] == {"enabled": False}
+    assert result.content == "Here is the answer."
+
+
+def test_reasoning_retry_does_not_loop(monkeypatch):
+    """The retry never retries itself, so a persistently silent model fails fast."""
+    from toda.harness.model_client import OpenAICompatibleModelClient
+
+    sent: list[dict] = []
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": "", "tool_calls": []}, "finish_reason": "length"}
+                ],
+                "usage": {"completion_tokens_details": {"reasoning_tokens": 40000}},
+            }
+
+    def fake_post(url, **kwargs):
+        sent.append(kwargs["json"])
+        return Response()
+
+    monkeypatch.setattr("toda.harness.model_client.httpx.post", fake_post)
+    client = OpenAICompatibleModelClient(
+        api_key="k", model="m", base_url="https://example.test/v1", reasoning_effort="high",
+    )
+    result = client.generate(messages=[{"role": "user", "content": "hi"}])
+
+    assert len(sent) == 2
+    assert result.content == ""
+    assert result.finish_reason == "length"

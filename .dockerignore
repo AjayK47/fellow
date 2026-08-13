@@ -1,8 +1,7 @@
 .git
 .github
-.env
-.env.*
-!.env.example
+config.json
+!config.example.json
 .venv
 .pytest_cache
 __pycache__
@@ -14,7 +13,6 @@ data
 harnesses
 old
 imgs
-landing
 site
 web/node_modules
 web/dist

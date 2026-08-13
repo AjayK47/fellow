@@ -7,7 +7,7 @@ uv sync --extra dev
 python scripts/bootstrap.py
 ```
 
-No external key is required to run the full stack — `.env.example` defaults
+No external key is required to run the full stack — `config.example.json` defaults
 to deterministic model and embedding providers, which exercise the complete
 ingestion, permission, memory, graph, policy, job, and runtime machinery
 without paid inference.
@@ -76,7 +76,7 @@ uv run ruff check src tests scripts
 - If you touched an API response shape, check the console pages that read
   it — several past bugs here were exactly this: a frontend field name that
   no longer matched what the backend actually returned.
-- If you touched anything that writes to `.env` or handles a credential,
+- If you touched anything that reads `config.json` or handles a credential,
   double-check it still only writes to the local, gitignored file and never
   logs or echoes a secret value.
 - If you touched a built-in skill, keep its reviewed `license` and `origin`

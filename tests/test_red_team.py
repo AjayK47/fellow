@@ -28,7 +28,9 @@ from toda.harness.prompts import STABLE_SYSTEM_PROMPT, frame_untrusted_tool_resu
 @pytest.fixture(autouse=True)
 def enable_run_code_for_red_team(monkeypatch):
     """Exercise approval controls with the optional code tool enabled."""
-    monkeypatch.setenv("TODA_RUN_CODE_ENABLED", "true")
+    from toda.config import settings
+
+    monkeypatch.setattr(settings.tools, "run_code_enabled", True)
 
 
 def _envelope(brain, *, conversation: str, destination: dict | None = None) -> InvocationEnvelope:

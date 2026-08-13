@@ -20,10 +20,10 @@ class ArtifactService:
         public URL (an ngrok tunnel, most likely) can rotate between
         restarts, and a stale absolute URL baked into old artifacts would
         silently 404 instead of reflecting whatever tunnel is live now."""
-        if settings.public_url:
+        if settings.server.public_url:
             artifact = dict(artifact)
             artifact["download_url"] = (
-                f"{settings.public_url.rstrip('/')}/v1/artifacts/{artifact['id']}/download"
+                f"{settings.server.public_url.rstrip('/')}/v1/artifacts/{artifact['id']}/download"
             )
         return artifact
 

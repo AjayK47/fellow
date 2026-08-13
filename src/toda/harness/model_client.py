@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from toda.config import Settings
+from toda.config import Settings, settings as _loaded_settings
 from toda.domain.models import new_id
 from toda.harness.models import ModelResponse, ModelToolCall
 from toda.providers import ProviderResolver, ResolvedModel
@@ -124,6 +124,11 @@ class OpenAICompatibleModelClient:
             }
         if self.reasoning_effort:
             body["reasoning"] = {"effort": self.reasoning_effort}
+        return self._send(body, allow_reasoning_retry=bool(self.reasoning_effort))
+
+    def _send(
+        self, body: dict[str, Any], *, allow_reasoning_retry: bool = False
+    ) -> ModelResponse:
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={
@@ -152,6 +157,29 @@ class OpenAICompatibleModelClient:
             raise RuntimeError("model returned no choices")
         choice = choices[0]
         message = choice.get("message") or {}
+
+        # A reasoning model can spend its entire completion budget thinking and
+        # return no content and no tool call at all -- finish_reason "length"
+        # with every completion token counted as reasoning. It is intermittent:
+        # the identical request often answers fine. Retrying once with
+        # reasoning off turns a dead turn into an answer instead of surfacing
+        # "model returned neither answer nor tool call" to whoever asked.
+        if (
+            allow_reasoning_retry
+            and choice.get("finish_reason") == "length"
+            and not (message.get("content") or "").strip()
+            and not message.get("tool_calls")
+        ):
+            reasoning_tokens = (
+                ((payload.get("usage") or {}).get("completion_tokens_details") or {})
+                .get("reasoning_tokens")
+                or 0
+            )
+            if reasoning_tokens:
+                retry = dict(body)
+                retry["reasoning"] = {"enabled": False}
+                return self._send(retry, allow_reasoning_retry=False)
+
         calls: list[ModelToolCall] = []
         for call in message.get("tool_calls") or []:
             function = call.get("function") or {}
@@ -481,8 +509,8 @@ class DeterministicHarnessModel:
 def build_model_clients(
     config: Settings | None = None,
 ) -> tuple[ModelClient, ModelClient, ModelClient, ModelClient]:
-    config = config or Settings()
-    resolver = ProviderResolver(config.provider_connections, config.model_assignments)
+    config = config or _loaded_settings
+    resolver = ProviderResolver(config.models.providers, config.models.assignments)
     main_resolved = resolver.resolve("main")
     if main_resolved is None:
         deterministic = DeterministicHarnessModel()
@@ -494,7 +522,7 @@ def build_model_clients(
         return _build_resolved_model(
             resolved,
             config,
-            reasoning_effort=config.main_model_reasoning_effort if role == "main" else None,
+            reasoning_effort=config.models.main_reasoning_effort if role == "main" else None,
         )
 
     return build("main"), build("attention"), build("extraction"), build("tool_summary")
@@ -514,14 +542,14 @@ def _build_resolved_model(
             api_key=api_key,
             model=resolved.assignment.model,
             base_url=base_url,
-            timeout_seconds=config.model_timeout_seconds,
+            timeout_seconds=config.models.timeout_seconds,
             headers=headers,
         )
     return OpenAICompatibleModelClient(
         api_key=api_key,
         model=resolved.assignment.model,
         base_url=base_url,
-        timeout_seconds=config.model_timeout_seconds,
+        timeout_seconds=config.models.timeout_seconds,
         reasoning_effort=reasoning_effort,
         headers=headers,
         provider_name=resolved.profile.display_name,
@@ -530,8 +558,8 @@ def _build_resolved_model(
 
 def build_vision_model(config: Settings, main_model: ModelClient) -> ModelClient | None:
     """Resolve the optional vision role, falling back to capable main model."""
-    resolver = ProviderResolver(config.provider_connections, config.model_assignments)
+    resolver = ProviderResolver(config.models.providers, config.models.assignments)
     resolved = resolver.resolve("vision")
     if resolved:
         return _build_resolved_model(resolved, config)
-    return main_model if config.main_model_supports_vision else None
+    return main_model if config.models.main_supports_vision else None

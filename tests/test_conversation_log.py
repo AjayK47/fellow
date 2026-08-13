@@ -30,7 +30,7 @@ def _timeline(brain, *, workspace_id: str = "TACME", channel_id: str = "CSOCIAL"
 
 
 def test_inbound_and_outbound_share_one_ordered_timeline(brain):
-    brain.slack_gateway.config.slack_bot_user_id = "UBOT"
+    brain.slack_gateway.config.slack.bot_user_id = "UBOT"
     payload = {
         "type": "event_callback",
         "team_id": "TACME",

@@ -44,7 +44,7 @@ def test_deleting_an_organization_purges_its_vector_index(brain):
 
 def test_deleting_an_organization_purges_episode_sources(brain):
     org = "org_acme"
-    brain.event_router.config.episode_quiet_seconds = 0
+    brain.event_router.config.worker.episode_quiet_seconds = 0
     brain.event_router.route(
         {
             "id": "ev_retention_episode",
@@ -72,3 +72,43 @@ def test_deleting_an_organization_purges_episode_sources(brain):
     with brain.store.cursor() as cur:
         cur.execute("SELECT COUNT(*) AS n FROM episode_sources WHERE organization_id = ?", (org,))
         assert cur.fetchone()["n"] == 0
+
+
+def test_deleting_an_organization_removes_its_dashboard_accounts(empty_brain):
+    """A dashboard account must not outlive the only organization it belonged to.
+
+    The dashboard auth tables were added after this list was written, so tenant
+    deletion left the owner account and its live sessions behind: those sessions
+    still authenticated against a deleted organization, and setup could never
+    run again because "the installation owner already exists".
+    """
+    from toda.services.dashboard_auth import DashboardAuthService
+
+    store = empty_brain.store
+    store.put_organization({"id": "org_gone", "name": "Gone"})
+    auth = DashboardAuthService(store)
+    owner = auth.create_owner(
+        organization_id="org_gone",
+        email="owner@example.com",
+        name="Owner",
+        password="a-sufficiently-long-password",
+    )
+    session = auth.create_session("org_gone", owner["id"])
+    token = session["token"]
+    assert auth.resolve_session(token) is not None
+    assert auth.needs_owner is False
+
+    empty_brain.retention.delete_organization("org_gone", confirmation="org_gone")
+
+    assert auth.resolve_session(token) is None
+    assert auth.needs_owner is True, "setup must be able to run again after tenant deletion"
+
+
+def test_dashboard_tables_are_covered_by_tenant_deletion():
+    for table in (
+        "dashboard_sessions",
+        "dashboard_invitations",
+        "dashboard_access_requests",
+        "organization_members",
+    ):
+        assert table in _TENANT_TABLES, f"{table} is organization-scoped but survives tenant removal"

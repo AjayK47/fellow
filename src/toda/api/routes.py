@@ -4,19 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlencode
 
 import base64
+import hashlib
 import hmac
 import ipaddress
 import json
 import mimetypes
-import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-import httpx
 from fastapi import APIRouter, Header, HTTPException, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -25,14 +23,12 @@ from toda.adapters import (
     normalize_composio_harness_event,
 )
 from toda.services.container import TodaApp
-from toda.config import Settings
 from toda.domain.models import new_id, utcnow
 from toda.harness.slack import (
     UnauthorizedApprover,
     _slack_identity_key,
-    resolve_slack_principal,
 )
-from toda.services.gateway_setup import GatewaySetupService, SetupBootstrapToken, SLACK_MANIFEST
+from toda.services.dashboard_auth import DashboardAuthService
 
 router = APIRouter()
 
@@ -60,30 +56,27 @@ _TENANT_EXEMPT_PATHS = frozenset(
     {
         "/v1/session",
         "/v1/session/logout",
-        "/v1/session/local",
-        "/v1/auth/methods",
+        "/v1/auth/status",
+        "/v1/auth/login",
         "/v1/slack/events",
         "/v1/slack/interactions",
-        "/v1/slack/oauth/callback",
-        "/v1/slack/oidc/callback",
         "/v1/mcp/oauth/callback",
         "/v1/composio/webhooks",
-        "/v1/gateway/setup/status",
-        "/v1/gateway/setup/bootstrap",
-        "/v1/gateway/setup/slack-manifest",
-        # First-run wizard: names the organization it is creating, so there
-        # is by definition no workspace to be signed into yet. These write
-        # local gateway config (.env, Slack credentials) with no credential
-        # of their own -- safe for the local single-tenant install they
-        # exist for, NOT safe to expose on a public deployment.
-        "/v1/gateway/setup/providers",
-        "/v1/gateway/setup/model-catalog",
-        "/v1/gateway/setup/tools",
-        "/v1/gateway/setup/slack",
-        "/v1/gateway/setup/verify",
         "/v1/events",
         "/v1/events:batch",
     }
+)
+
+_ADMIN_WRITE_PREFIXES = (
+    "/v1/organizations",
+    "/v1/policies",
+    "/v1/scopes",
+    "/v1/memberships",
+    "/v1/tools",
+    "/v1/skills",
+    "/v1/mcp",
+    "/v1/channel-policies",
+    "/v1/connectors",
 )
 
 
@@ -111,12 +104,23 @@ async def enforce_tenant(request: Request) -> None:
         return
     from toda.config import settings as _settings
 
-    if _settings.dashboard_auth_disabled:
+    if _settings.dashboard.auth_disabled:
         return
 
-    session_org = request.session.get("organization_id")
-    if not session_org:
+    session_id = request.session.get("dashboard_session_id")
+    resolved = DashboardAuthService(_app(request).store).resolve_session(session_id or "")
+    if not resolved:
         raise HTTPException(401, "Not signed in")
+    user, member = resolved
+    request.state.dashboard_user = user
+    request.state.dashboard_member = member
+    session_org = member["organization_id"]
+    if (
+        request.method not in {"GET", "HEAD", "OPTIONS"}
+        and path.startswith(_ADMIN_WRITE_PREFIXES)
+        and member["role"] not in {"owner", "admin"}
+    ):
+        raise HTTPException(403, "Organization administrator access is required")
 
     requested = request.query_params.get("organization_id")
     if requested is None and request.method in {"POST", "PUT", "PATCH"}:
@@ -147,7 +151,7 @@ def _enforce_ingest_auth(request: Request) -> None:
         return
     from toda.config import settings as _settings
 
-    configured = [item.strip() for item in _settings.api_keys.split(",") if item.strip()]
+    configured = _settings.server.api_keys
     authorization = request.headers.get("authorization", "")
     scheme, _, credential = authorization.partition(" ")
     accepted = scheme.lower() == "bearer" and any(
@@ -668,12 +672,14 @@ class GatewayProviderSetupRequest(BaseModel):
     api_key: str
     base_url: str | None = None
     assignments: dict[str, str] = Field(default_factory=dict)
+    supports_vision: bool | None = None
 
 
 class GatewayModelCatalogRequest(BaseModel):
     provider: str
     api_key: str | None = None
     base_url: str | None = None
+    capability: Literal["chat", "embedding", "image", "transcription", "tts"] = "chat"
 
 
 class GatewaySlackSetupRequest(BaseModel):
@@ -682,10 +688,41 @@ class GatewaySlackSetupRequest(BaseModel):
     bot_token: str
     app_token: str
     signing_secret: str
+    # Resolved to a Slack member ID server-side via users.lookupByEmail, so
+    # nobody has to go hunting for their own ID in Slack's UI.
+    admin_email: str | None = None
     admin_slack_user_id: str | None = None
     admin_name: str | None = None
     channel_id: str | None = None
     proactive: bool = True
+
+
+class GatewayComposioSetupRequest(BaseModel):
+    api_key: str
+    webhook_secret: str | None = None
+
+
+class GatewayResetRequest(BaseModel):
+    confirm: str
+
+
+class GatewayProbeModelRequest(BaseModel):
+    provider: str
+    model: str
+    api_key: str | None = None
+    base_url: str | None = None
+    capability: Literal["chat", "embedding"] = "chat"
+
+
+class GatewayProbeSearchRequest(BaseModel):
+    provider: str
+    api_key: str | None = None
+    base_url: str | None = None
+
+
+class GatewayFetchSetupRequest(BaseModel):
+    use_firecrawl: bool = False
+    api_key: str | None = None
 
 
 class GatewayToolsSetupRequest(BaseModel):
@@ -698,8 +735,42 @@ class GatewayToolsSetupRequest(BaseModel):
     web_fetch_enabled: bool = True
 
 
-class LocalLoginRequest(BaseModel):
-    token: str
+class OwnerBootstrapRequest(BaseModel):
+    organization_name: str = Field(min_length=1, max_length=120)
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=12, max_length=1024)
+
+
+class DashboardLoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class AccessRequestBody(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=12, max_length=1024)
+
+
+class InvitationAcceptRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=512)
+    name: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=12, max_length=1024)
+
+
+class InvitationCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    role: Literal["admin", "member"] = "member"
+
+
+class AccessDecisionRequest(BaseModel):
+    decision: Literal["approved", "denied"]
+
+
+class MemberUpdateRequest(BaseModel):
+    role: Literal["owner", "admin", "member"]
+    status: Literal["active", "suspended"]
 
 
 class SetupBootstrapRequest(BaseModel):
@@ -714,111 +785,17 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "toda"}
 
 
-def _local_gateway_setup(request: Request, *, write: bool = False) -> GatewaySetupService:
-    """Token-writing setup is intentionally limited to a local operator."""
-    host = (request.client.host if request.client else "").lower()
-    if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
-        raise HTTPException(403, "Gateway setup is only available from localhost")
-    if write and not (
-        request.session.get("setup_authorized")
-        or request.session.get("organization_id")
-    ):
-        raise HTTPException(401, "Exchange the temporary setup bootstrap token first")
-    brain = _app(request)
-    return GatewaySetupService(
-        brain.store, brain.graph, brain.audit, skills=brain.skills
-    )
-
-
-@router.get("/v1/gateway/setup/status")
-def gateway_setup_status(request: Request) -> dict[str, Any]:
-    status = _local_gateway_setup(request).status()
-    status["write_authorized"] = bool(
-        request.session.get("setup_authorized")
-        or request.session.get("organization_id")
-    )
-    return status
-
-
-@router.post("/v1/gateway/setup/bootstrap")
-def gateway_setup_bootstrap(body: SetupBootstrapRequest, request: Request) -> dict[str, bool]:
-    _local_gateway_setup(request)
-    if not SetupBootstrapToken(Settings().data_dir).consume(body.token):
-        raise HTTPException(401, "Bootstrap token is invalid or expired")
-    request.session["setup_authorized"] = True
-    organizations = _app(request).store.list_organizations()
-    if len(organizations) == 1:
-        organization = organizations[0]
-        request.session["organization_id"] = organization["id"]
-        request.session["principal_id"] = "person_local_admin"
-        request.session["workspace_name"] = organization.get("name") or "Toda Self-hosted"
-    return {"authorized": True}
-
-
-@router.get("/v1/gateway/setup/slack-manifest")
-def gateway_slack_manifest(request: Request) -> dict[str, str]:
-    _local_gateway_setup(request)
-    return {"manifest": SLACK_MANIFEST}
-
-
-@router.post("/v1/gateway/setup/providers")
-def gateway_setup_provider(
-    body: GatewayProviderSetupRequest, request: Request
-) -> dict[str, Any]:
-    try:
-        return _local_gateway_setup(request, write=True).configure_provider(**body.model_dump())
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-
-@router.post("/v1/gateway/setup/model-catalog")
-def gateway_model_catalog(
-    body: GatewayModelCatalogRequest, request: Request
-) -> dict[str, Any]:
-    try:
-        return _local_gateway_setup(request).model_catalog(**body.model_dump())
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-
-@router.post("/v1/gateway/setup/tools")
-def gateway_setup_tools(
-    body: GatewayToolsSetupRequest, request: Request
-) -> dict[str, Any]:
-    try:
-        return _local_gateway_setup(request, write=True).configure_tools(**body.model_dump())
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-
-@router.post("/v1/gateway/setup/slack")
-def gateway_setup_slack(
-    body: GatewaySlackSetupRequest, request: Request
-) -> dict[str, Any]:
-    try:
-        result = _local_gateway_setup(request, write=True).connect_slack(**body.model_dump())
-        request.session["organization_id"] = body.organization_id
-        request.session["principal_id"] = "person_local_admin"
-        request.session["workspace_name"] = body.organization_name
-        return result
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, "Unable to validate Slack credentials") from exc
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-
-@router.post("/v1/gateway/setup/verify")
-def gateway_setup_verify(request: Request) -> dict[str, Any]:
-    return _local_gateway_setup(request, write=True).verify_installation()
-
-
 @router.post("/v1/organizations")
 def create_organization(
     body: OrganizationRequest, request: Request
 ) -> dict[str, Any]:
     brain = _app(request)
-    if brain.store.get_organization(body.id):
-        raise HTTPException(409, "organization already exists")
+    # One gateway serves exactly one tenant: `toda init` creates it, and the
+    # authorization, retention and scope paths all assume a single
+    # organization. Reject a second one outright rather than only rejecting
+    # a duplicate id.
+    if brain.store.list_organizations():
+        raise HTTPException(409, "This Toda installation already has an organization")
     organization = body.model_dump(exclude_none=True)
     brain.store.put_organization(organization)
     brain.audit.record(
@@ -1286,9 +1263,10 @@ def harness_dashboard(
 @router.get("/v1/harness/status")
 def harness_status(request: Request) -> dict[str, Any]:
     brain = _app(request)
-    config = Settings()
+    from toda.config import settings as config
+
     capability_ids = brain.tool_executor.available_capabilities_for_organization(
-        config.default_org_id
+        config.organization.id
     )
     return {
         "database": {
@@ -1299,42 +1277,42 @@ def harness_status(request: Request) -> dict[str, Any]:
         "models": {
             "assignments": {
                 role: assignment.model
-                for role, assignment in config.model_assignments.items()
+                for role, assignment in config.models.assignments.items()
             },
             "main": getattr(brain.main_model, "model", ""),
             "attention": getattr(brain.attention_model, "model", ""),
             "extraction": getattr(brain.extraction_model, "model", ""),
-            "connections_configured": len(config.provider_connections),
+            "connections_configured": len(config.models.providers),
         },
         "embeddings": {
             "provider": type(brain.embeddings).__name__,
             "model": brain.embeddings.model,
-            "assigned": "embedding" in config.model_assignments,
+            "assigned": "embedding" in config.models.assignments,
         },
         "slack": {
             "events_ready": bool(
-                config.slack_signing_secret and config.slack_bot_token
+                config.slack.signing_secret and config.slack.bot_token
             ),
             "socket_mode_ready": bool(
-                config.slack_app_token and config.slack_bot_token
+                config.slack.app_token and config.slack.bot_token
             ),
-            "bot_user_id_configured": bool(config.slack_bot_user_id),
+            "bot_user_id_configured": bool(config.slack.bot_user_id),
         },
         "composio": {
             "api_ready": brain.composio.configured,
             "connected_account_configured": bool(
-                config.composio_connected_account_id
+                config.composio.connected_account_id
             ),
         },
         "worker": {
-            "enabled_in_api": config.worker_enabled,
-            "concurrency": config.worker_concurrency,
-            "batch_size": config.worker_batch_size,
+            "enabled_in_api": config.worker.enabled,
+            "concurrency": config.worker.concurrency,
+            "batch_size": config.worker.batch_size,
         },
         "child_tasks": {
             "enabled": True,
-            "max_parallel": config.child_task_max_parallel,
-            "max_depth": config.child_task_max_depth,
+            "max_parallel": config.agent.child_max_parallel,
+            "max_depth": config.agent.child_max_depth,
             "write_tools_allowed": False,
         },
         "capabilities": {
@@ -1706,6 +1684,16 @@ def list_composio_auth_configs(
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(502, f"Composio auth-config listing failed: {exc}") from exc
+
+
+@router.get("/v1/composio/status")
+def composio_status(request: Request) -> dict[str, Any]:
+    """Whether a Composio credential is configured.
+
+    Read-only: the key lives in config.json like every other credential, so
+    the console reports readiness rather than offering to write it.
+    """
+    return {"api_key_configured": _app(request).composio.configured}
 
 
 @router.get("/v1/composio/toolkits")
@@ -2289,7 +2277,9 @@ def delete_mcp_server(
 async def start_mcp_oauth(
     server_id: str, body: OrganizationScopeRequest, request: Request
 ) -> dict[str, Any]:
-    public_url = (Settings().public_url or str(request.base_url)).rstrip("/")
+    from toda.config import settings as _settings
+
+    public_url = (_settings.server.public_url or str(request.base_url)).rstrip("/")
     redirect_uri = f"{public_url}/v1/mcp/oauth/callback"
     try:
         return await _app(request).mcp.start_oauth(
@@ -2355,285 +2345,135 @@ async def slack_interactions(request: Request) -> dict[str, Any]:
         raise HTTPException(404, str(exc)) from exc
 
 
-@router.get("/slack/install", include_in_schema=False)
-def slack_install() -> RedirectResponse:
-    """Public entry point for "Add to Slack" — redirects to Slack's own
-    authorize screen. Requires TODA_SLACK_CLIENT_ID and a reachable
-    TODA_PUBLIC_URL for the redirect_uri; distinct from the
-    slack_bot_token/slack_app_token pair that configures this operator's own
-    primary workspace directly."""
-    from toda.config import settings as _settings
+# ---- self-hosted organization identity ----
 
-    if not _settings.slack_client_id or not _settings.public_url:
-        raise HTTPException(
-            503,
-            "Slack app installation is not configured "
-            "(TODA_SLACK_CLIENT_ID and TODA_PUBLIC_URL are required)",
-        )
-    redirect_uri = f"{_settings.public_url.rstrip('/')}/v1/slack/oauth/callback"
-    params = {
-        "client_id": _settings.slack_client_id,
-        "scope": _settings.slack_oauth_scopes,
-        "redirect_uri": redirect_uri,
+
+def _auth(request: Request) -> DashboardAuthService:
+    return DashboardAuthService(_app(request).store)
+
+
+def _single_organization(request: Request) -> dict[str, Any]:
+    organizations = _app(request).store.list_organizations()
+    if len(organizations) != 1:
+        raise HTTPException(409, "This installation must contain exactly one organization")
+    return organizations[0]
+
+
+def _dashboard_session_response(
+    request: Request, user: dict[str, Any], member: dict[str, Any]
+) -> dict[str, Any]:
+    """The console's view of who is signed in.
+
+    Mirrors the shape returned by the auth-disabled branch of GET
+    /v1/session, so the frontend reads one contract either way.
+    """
+    organization = _app(request).store.get_organization(member["organization_id"]) or {}
+    return {
+        "organization_id": member["organization_id"],
+        "principal_id": member["principal_id"],
+        "workspace_name": organization.get("name") or member["organization_id"],
+        "user_id": user["id"],
+        "email": user["email"],
+        "name": user["name"],
+        "role": member["role"],
+        "auth_disabled": False,
     }
-    return RedirectResponse(f"https://slack.com/oauth/v2/authorize?{urlencode(params)}")
 
 
-@router.get("/v1/slack/oauth/callback", include_in_schema=False)
-def slack_oauth_callback(request: Request, code: str | None = None, error: str | None = None) -> HTMLResponse:
-    """Slack redirects here after the installer approves (or denies) the
-    authorize screen. Exchanges the one-time code for that workspace's own
-    bot token, bootstraps its tenant, and stores the installation — never
-    touches .env, since this can run for any number of different installers'
-    workspaces, each needing its own stored token."""
-    from toda.config import settings as _settings
+def _start_dashboard_session(
+    request: Request, user: dict[str, Any], member: dict[str, Any]
+) -> dict[str, Any]:
+    """Issue a dashboard session and bind it to the signed cookie.
 
-    def _page(title: str, body: str, ok: bool) -> HTMLResponse:
-        color = "#1c7a4d" if ok else "#c23b2c"
-        return HTMLResponse(
-            f"<!doctype html><html><head><meta charset=utf-8>"
-            f"<title>{title}</title></head>"
-            f"<body style=\"font-family:system-ui,sans-serif;max-width:480px;"
-            f"margin:80px auto;text-align:center;color:#141a15\">"
-            f"<h1 style=\"color:{color};font-size:20px\">{title}</h1>"
-            f"<p style=\"color:#6b7268;font-size:14px\">{body}</p>"
-            f"</body></html>"
-        )
+    The cookie carries the opaque token; only its SHA-256 digest is stored,
+    so ``resolve_session`` hashes what it is given. Putting the already
+    hashed id in the cookie would never resolve.
+    """
+    session = _auth(request).create_session(member["organization_id"], user["id"])
+    request.session["dashboard_session_id"] = session["token"]
+    return _dashboard_session_response(request, user, member)
 
-    if error:
-        return _page("Installation cancelled", f"Slack reported: {error}", ok=False)
-    if not code:
-        raise HTTPException(400, "Missing OAuth code")
-    if not _settings.slack_client_id or not _settings.slack_client_secret:
-        raise HTTPException(503, "Slack OAuth is not configured on this gateway")
 
-    redirect_uri = f"{(_settings.public_url or '').rstrip('/')}/v1/slack/oauth/callback"
-    response = httpx.post(
-        "https://slack.com/api/oauth.v2.access",
-        data={
-            "client_id": _settings.slack_client_id,
-            "client_secret": _settings.slack_client_secret,
-            "code": code,
-            "redirect_uri": redirect_uri,
-        },
-        timeout=20.0,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not payload.get("ok"):
-        return _page(
-            "Installation failed",
-            f"Slack error: {payload.get('error', 'unknown error')}",
-            ok=False,
-        )
+def _require_admin(request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
+    session_id = request.session.get("dashboard_session_id")
+    resolved = _auth(request).resolve_session(session_id or "")
+    if not resolved:
+        raise HTTPException(401, "Not signed in")
+    user, member = resolved
+    if member["role"] not in {"owner", "admin"}:
+        raise HTTPException(403, "Organization administrator access is required")
+    return user, member
 
-    team = payload.get("team") or {}
-    brain = _app(request)
-    setup = GatewaySetupService(brain.store, brain.graph, brain.audit, skills=brain.skills)
+
+@router.get("/v1/auth/status")
+def dashboard_auth_status(request: Request) -> dict[str, Any]:
+    organizations = _app(request).store.list_organizations()
+    return {
+        "owner_required": _auth(request).needs_owner,
+        "organization": (
+            {"id": organizations[0]["id"], "name": organizations[0].get("name")}
+            if len(organizations) == 1
+            else None
+        ),
+        "access_requests_enabled": len(organizations) == 1 and not _auth(request).needs_owner,
+    }
+
+
+@router.post("/v1/auth/login")
+def login_dashboard(body: DashboardLoginRequest, request: Request) -> dict[str, Any]:
+    store = _app(request).store
+    remote = request.client.host if request.client else "unknown"
+    attempt_key = hashlib.sha256(
+        f"{remote}:{body.email.strip().casefold()}".encode()
+    ).hexdigest()
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(minutes=15)).isoformat()
+    if store.dashboard_login_failure_count(attempt_key, since) >= 5:
+        raise HTTPException(429, "Too many sign-in attempts. Try again in 15 minutes")
     try:
-        setup.install_via_oauth(
-            workspace_id=str(team.get("id") or ""),
-            workspace_name=str(team.get("name") or ""),
-            bot_token=str(payload.get("access_token") or ""),
-            bot_user_id=str(payload.get("bot_user_id") or ""),
-        )
+        user, member = _auth(request).authenticate(body.email, body.password)
     except ValueError as exc:
-        return _page("Installation failed", str(exc), ok=False)
-
-    return _page(
-        f"Toda is connected to {team.get('name') or 'your workspace'}",
-        "You can close this tab and go back to Slack. "
-        "Mention @Toda in a channel or send it a DM to get started.",
-        ok=True,
+        store.record_dashboard_login_failure(new_id("login"), attempt_key, now.isoformat())
+        raise HTTPException(401, str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    store.clear_dashboard_login_failures(attempt_key)
+    _app(request).audit.record(
+        member["organization_id"], "dashboard.session.login", {"user_id": user["id"]}
     )
-
-
-# ---- console dashboard login (Sign in with Slack) ----
-#
-# Distinct from the /slack/install <-> /v1/slack/oauth/callback pair above:
-# that flow provisions a *tenant* (a workspace's bot install) and never sets
-# up anything a human logs into. This flow authenticates one *person* — any
-# member of an already-installed workspace — against the tenant that
-# install already created, using Slack's lighter OpenID Connect scopes
-# rather than re-requesting bot permissions.
-
-
-@router.get("/slack/login", include_in_schema=False)
-def slack_login(request: Request) -> RedirectResponse:
-    from toda.config import settings as _settings
-
-    if not _settings.slack_dashboard_login_enabled:
-        raise HTTPException(404, "Slack dashboard login is not enabled")
-    if not _settings.slack_client_id or not _settings.public_url:
-        raise HTTPException(
-            503,
-            "Slack sign-in is not configured "
-            "(TODA_SLACK_CLIENT_ID and TODA_PUBLIC_URL are required)",
-        )
-    state = secrets.token_urlsafe(24)
-    request.session["oauth_state"] = state
-    redirect_uri = f"{_settings.public_url.rstrip('/')}/v1/slack/oidc/callback"
-    params = {
-        "response_type": "code",
-        "client_id": _settings.slack_client_id,
-        "scope": "openid email profile",
-        "redirect_uri": redirect_uri,
-        "state": state,
-    }
-    return RedirectResponse(
-        f"https://slack.com/openid/connect/authorize?{urlencode(params)}"
-    )
-
-
-@router.get("/v1/slack/oidc/callback", include_in_schema=False)
-def slack_oidc_callback(
-    request: Request,
-    code: str | None = None,
-    state: str | None = None,
-    error: str | None = None,
-) -> RedirectResponse:
-    """Slack redirects here after a person approves the Sign in with Slack
-    consent screen. Resolves them to the organization that workspace's bot
-    install already created (never creates a new tenant here — if nobody
-    has run /slack/install for this workspace yet, there is no dashboard to
-    log into), maps them to a principal, and starts a browser session."""
-    from toda.config import settings as _settings
-
-    if error:
-        return RedirectResponse(f"/login?error={urlencode({'reason': error})}")
-    expected_state = request.session.pop("oauth_state", None)
-    if not code or not state or not expected_state or not secrets.compare_digest(state, expected_state):
-        return RedirectResponse("/login?error=invalid_state")
-    if not _settings.slack_client_id or not _settings.slack_client_secret:
-        raise HTTPException(503, "Slack sign-in is not configured on this gateway")
-
-    redirect_uri = f"{(_settings.public_url or '').rstrip('/')}/v1/slack/oidc/callback"
-    token_response = httpx.post(
-        "https://slack.com/api/openid.connect.token",
-        data={
-            "client_id": _settings.slack_client_id,
-            "client_secret": _settings.slack_client_secret,
-            "code": code,
-            "redirect_uri": redirect_uri,
-        },
-        timeout=20.0,
-    )
-    token_response.raise_for_status()
-    token_payload = token_response.json()
-    if not token_payload.get("ok", True) or not token_payload.get("access_token"):
-        return RedirectResponse("/login?error=token_exchange_failed")
-
-    userinfo_response = httpx.get(
-        "https://slack.com/api/openid.connect.userInfo",
-        headers={"Authorization": f"Bearer {token_payload['access_token']}"},
-        timeout=20.0,
-    )
-    userinfo_response.raise_for_status()
-    userinfo = userinfo_response.json()
-    workspace_id = str(userinfo.get("https://slack.com/team_id") or "")
-    workspace_name = str(userinfo.get("https://slack.com/team_name") or "")
-    slack_user_id = str(userinfo.get("https://slack.com/user_id") or userinfo.get("sub") or "")
-    if not workspace_id or not slack_user_id:
-        return RedirectResponse("/login?error=incomplete_userinfo")
-
-    brain = _app(request)
-    installation = brain.store.slack_installation_by_workspace(workspace_id)
-    if not installation:
-        # Nobody has installed the bot into this workspace yet — there is no
-        # tenant to log into. Send them through "Add to Slack" first.
-        return RedirectResponse("/slack/install")
-
-    organization_id = installation["organization_id"]
-    principal_id = resolve_slack_principal(
-        brain.store,
-        brain.graph,
-        organization_id,
-        workspace_id,
-        slack_user_id,
-        user_profile={
-            "display_name": userinfo.get("name"),
-            "real_name": userinfo.get("name"),
-            "email": userinfo.get("email"),
-        },
-        reality=brain.reality,
-    )
-    request.session["organization_id"] = organization_id
-    request.session["principal_id"] = principal_id
-    request.session["workspace_name"] = workspace_name or installation.get("workspace_name") or workspace_id
-    brain.audit.record(
-        organization_id, "dashboard.session.login", {"principal_id": principal_id, "workspace_id": workspace_id}
-    )
-    return RedirectResponse("/")
+    return _start_dashboard_session(request, user, member)
 
 
 @router.get("/v1/session")
 def get_dashboard_session(request: Request) -> dict[str, Any]:
     from toda.config import settings as _settings
 
-    if _settings.dashboard_auth_disabled:
+    if _settings.dashboard.auth_disabled:
         return {
-            "organization_id": _settings.default_org_id,
+            "organization_id": _settings.organization.id,
             "principal_id": "person_ajay",
             "workspace_name": "Local Dev",
+            "user_id": "dev",
+            "email": "dev@localhost",
+            "name": "Local developer",
+            "role": "owner",
             "auth_disabled": True,
         }
-    organization_id = request.session.get("organization_id")
-    principal_id = request.session.get("principal_id")
-    if not organization_id or not principal_id:
+    resolved = _auth(request).resolve_session(
+        request.session.get("dashboard_session_id") or ""
+    )
+    if not resolved:
         raise HTTPException(401, "Not signed in")
-    return {
-        "organization_id": organization_id,
-        "principal_id": principal_id,
-        "workspace_name": request.session.get("workspace_name"),
-        "auth_disabled": False,
-    }
-
-
-@router.get("/v1/auth/methods")
-def dashboard_auth_methods() -> dict[str, bool]:
-    from toda.config import settings as _settings
-
-    return {
-        "local_token": bool(_settings.local_admin_token),
-        "slack": bool(
-            _settings.slack_dashboard_login_enabled
-            and _settings.slack_client_id
-            and _settings.public_url
-        ),
-    }
-
-
-@router.post("/v1/session/local")
-def local_dashboard_login(body: LocalLoginRequest, request: Request) -> dict[str, Any]:
-    from toda.config import settings as _settings
-
-    configured = _settings.local_admin_token or ""
-    if not configured or not hmac.compare_digest(body.token, configured):
-        raise HTTPException(401, "Invalid local administrator token")
-    organizations = _app(request).store.list_organizations()
-    if len(organizations) != 1:
-        raise HTTPException(409, "Local administrator login requires exactly one organization")
-    organization = organizations[0]
-    organization_id = organization["id"]
-    workspace_name = organization.get("name") or "Toda Self-hosted"
-    request.session["organization_id"] = organization_id
-    request.session["principal_id"] = "person_local_admin"
-    request.session["workspace_name"] = workspace_name
-    return {
-        "organization_id": organization_id,
-        "principal_id": "person_local_admin",
-        "workspace_name": workspace_name,
-        "auth_disabled": False,
-    }
+    return _dashboard_session_response(request, *resolved)
 
 
 @router.post("/v1/session/logout")
 def logout_dashboard_session(request: Request) -> dict[str, Any]:
+    session_id = request.session.get("dashboard_session_id")
+    if session_id:
+        _auth(request).revoke_session(session_id)
     request.session.clear()
     return {"ok": True}
-
-
-# ---- company reality engine ----
 
 
 @router.post("/v1/connectors/backfill")
@@ -3039,11 +2879,6 @@ def get_artifact(
     }
 
 
-# The id itself is the unguessable capability (new_id()'s 16 hex chars) --
-# same trust model as a Slack file link or "anyone with the link" sharing.
-# No separate auth check here: this route exists specifically so a link
-# posted into an already-permission-checked Slack channel actually works
-# when clicked, which an authenticated-only JSON endpoint cannot do.
 _INLINE_MIME_TYPES = {
     "text/html",
     "application/pdf",
@@ -3216,9 +3051,6 @@ def get_source(
     return out
 
 
-# ---- graph admin ----
-
-
 @router.post("/v1/entities")
 def upsert_entity(body: EntityRequest, request: Request) -> dict[str, Any]:
     return _app(request).graph.upsert_entity(body.model_dump())
@@ -3274,27 +3106,6 @@ def graph_explorer_data(
     )
     view["permission_decision_id"] = decision.id
     return view
-
-
-@router.get("/explorer", include_in_schema=False)
-def graph_explorer_page() -> FileResponse:
-    if not _CONSOLE_DIST.is_dir():
-        raise HTTPException(503, "Toda Console is not included in this build")
-    return FileResponse(_CONSOLE_DIST / "index.html")
-
-
-@router.get("/admin", include_in_schema=False)
-def harness_admin_page() -> FileResponse:
-    if not _CONSOLE_DIST.is_dir():
-        raise HTTPException(503, "Toda Console is not included in this build")
-    return FileResponse(_CONSOLE_DIST / "index.html")
-
-
-@router.get("/setup", include_in_schema=False)
-def gateway_setup_page() -> FileResponse:
-    if not _CONSOLE_DIST.is_dir():
-        raise HTTPException(503, "Toda Console is not included in this build")
-    return FileResponse(_CONSOLE_DIST / "index.html")
 
 
 @router.post("/v1/scopes")
@@ -3401,31 +3212,10 @@ def _profile_response(
     return profile
 
 
-@router.get("/v1/profiles/people/{entity_id}")
-def person_profile(entity_id: str, request: Request, organization_id: str, acting_principal_id: str,
+@router.get("/v1/profiles/{entity_id}")
+def entity_profile(entity_id: str, request: Request, organization_id: str, acting_principal_id: str,
                    destination_type: str = "internal_agent_session", destination_id: str = "default",
                    destination_is_private: bool = True, purpose: str | None = None) -> dict[str, Any]:
-    return _profile_response(entity_id, request, organization_id, acting_principal_id, destination_type, destination_id, destination_is_private, purpose)
-
-
-@router.get("/v1/profiles/projects/{entity_id}")
-def project_profile(entity_id: str, request: Request, organization_id: str, acting_principal_id: str,
-                    destination_type: str = "internal_agent_session", destination_id: str = "default",
-                    destination_is_private: bool = True, purpose: str | None = None) -> dict[str, Any]:
-    return _profile_response(entity_id, request, organization_id, acting_principal_id, destination_type, destination_id, destination_is_private, purpose)
-
-
-@router.get("/v1/profiles/services/{entity_id}")
-def service_profile(entity_id: str, request: Request, organization_id: str, acting_principal_id: str,
-                    destination_type: str = "internal_agent_session", destination_id: str = "default",
-                    destination_is_private: bool = True, purpose: str | None = None) -> dict[str, Any]:
-    return _profile_response(entity_id, request, organization_id, acting_principal_id, destination_type, destination_id, destination_is_private, purpose)
-
-
-@router.get("/v1/profiles/customers/{entity_id}")
-def customer_profile(entity_id: str, request: Request, organization_id: str, acting_principal_id: str,
-                     destination_type: str = "internal_agent_session", destination_id: str = "default",
-                     destination_is_private: bool = True, purpose: str | None = None) -> dict[str, Any]:
     return _profile_response(entity_id, request, organization_id, acting_principal_id, destination_type, destination_id, destination_is_private, purpose)
 
 
@@ -3562,12 +3352,6 @@ def create_skill(body: SkillCreateRequest, request: Request) -> dict[str, Any]:
         raise HTTPException(400, str(exc)) from exc
 
 
-@router.post("/v1/company-skills")
-def create_company_skill(body: SkillCreateRequest, request: Request) -> dict[str, Any]:
-    """Tenant-owned skill creation alias; immutable packages never use it."""
-    return create_skill(body, request)
-
-
 @router.get("/v1/skills/catalog")
 def skill_catalog(request: Request, organization_id: str = "org_acme") -> dict[str, Any]:
     brain = _app(request)
@@ -3659,15 +3443,6 @@ def list_skills(
     return {"skills": records, "count": len(records)}
 
 
-@router.get("/v1/company-skills")
-def list_company_skills(request: Request, organization_id: str) -> dict[str, Any]:
-    records = [
-        skill for skill in _app(request).skills.list(organization_id)
-        if skill.get("kind", "company") == "company" and not skill.get("immutable")
-    ]
-    return {"skills": records, "count": len(records)}
-
-
 @router.post("/v1/skills:search")
 def search_skills(body: SkillSearchRequest, request: Request) -> dict[str, Any]:
     return {
@@ -3702,11 +3477,6 @@ def propose_skill_update(skill_id: str, body: dict[str, Any], request: Request) 
     return proposal
 
 
-@router.post("/v1/company-skills/{skill_id}:propose-update")
-def propose_company_skill_update(skill_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
-    return propose_skill_update(skill_id, body, request)
-
-
 @router.get("/v1/skills/{skill_id}/versions")
 def skill_versions(skill_id: str, request: Request) -> dict[str, Any]:
     versions = _app(request).skills.versions(skill_id)
@@ -3726,11 +3496,6 @@ def approve_skill_version(skill_id: str, version: int, request: Request) -> dict
     return skill
 
 
-@router.post("/v1/company-skills/{skill_id}/versions/{version}:approve")
-def approve_company_skill_version(skill_id: str, version: int, request: Request) -> dict[str, Any]:
-    return approve_skill_version(skill_id, version, request)
-
-
 @router.post("/v1/skills/{skill_id}:deprecate")
 def deprecate_skill(skill_id: str, request: Request) -> dict[str, Any]:
     try:
@@ -3740,11 +3505,6 @@ def deprecate_skill(skill_id: str, request: Request) -> dict[str, Any]:
     if not skill:
         raise HTTPException(404, "skill not found")
     return skill
-
-
-@router.post("/v1/company-skills/{skill_id}:deprecate")
-def deprecate_company_skill(skill_id: str, request: Request) -> dict[str, Any]:
-    return deprecate_skill(skill_id, request)
 
 
 @router.get("/v1/workspaces")

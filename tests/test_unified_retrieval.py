@@ -23,7 +23,7 @@ def _ambient_message(*, event_id: str, channel_id: str, text: str) -> dict:
 
 
 def _seed_episode(brain, *, channel_id: str, text: str) -> str:
-    brain.event_router.config.episode_quiet_seconds = 0
+    brain.event_router.config.worker.episode_quiet_seconds = 0
     brain.event_router.route(
         _ambient_message(event_id=f"ev_{channel_id}", channel_id=channel_id, text=text)
     )

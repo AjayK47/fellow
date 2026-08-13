@@ -87,7 +87,18 @@ class JsonSearchProvider:
             )
             key = "results"
         response.raise_for_status()
-        items = response.json().get(key) or []
+        payload = response.json().get(key) or []
+        if isinstance(payload, dict):
+            # Firecrawl v2 groups results by source instead of returning a flat
+            # list: {"web": [...], "news": [...], "images": [...]}. Slicing that
+            # dict raised `unhashable type: slice` on every Firecrawl search.
+            items = [
+                entry
+                for group in ("web", "news", "results")
+                for entry in (payload.get(group) or [])
+            ]
+        else:
+            items = list(payload)
         return [
             {
                 "title": str(item.get("title") or ""),
@@ -239,13 +250,13 @@ class WebTools:
 
 def build_web_tools(config: Settings) -> WebTools:
     search_connection = (
-        config.tool_connections.get(config.web_search_connection)
-        if config.web_search_connection
+        config.tools.connections.get(config.tools.web_search_connection)
+        if config.tools.web_search_connection
         else None
     )
     extract_connection = (
-        config.tool_connections.get(config.web_extract_connection)
-        if config.web_extract_connection
+        config.tools.connections.get(config.tools.web_extract_connection)
+        if config.tools.web_extract_connection
         else None
     )
     search_provider: WebSearchProvider | None = None
@@ -261,6 +272,6 @@ def build_web_tools(config: Settings) -> WebTools:
     return WebTools(
         search_provider=search_provider,
         extract_connection=extract_connection,
-        fetch_enabled=config.web_fetch_enabled,
-        max_chars=config.web_fetch_max_chars,
+        fetch_enabled=config.tools.web_fetch_enabled,
+        max_chars=config.tools.web_fetch_max_chars,
     )

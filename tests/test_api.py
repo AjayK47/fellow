@@ -104,32 +104,22 @@ def test_task_api_invocation_uses_session_dispatch_and_exposes_task_tree(client)
     ).status_code == 200
 
 
-def test_organization_bootstrap_api(client):
+def test_installation_rejects_a_second_organization(client):
     created = client.post(
         "/v1/organizations",
         json={"id": "org_newco", "name": "NewCo", "region": "ap-south-1"},
     )
-    assert created.status_code == 200
-    assert created.json()["id"] == "org_newco"
-    duplicate = client.post(
-        "/v1/organizations",
-        json={"id": "org_newco", "name": "NewCo"},
-    )
-    assert duplicate.status_code == 409
+    assert created.status_code == 409
     listed = client.get("/v1/organizations")
     assert listed.status_code == 200
-    assert "org_newco" in {
+    assert {"org_acme"} == {
         item["id"] for item in listed.json()["organizations"]
     }
 
 
 def test_organization_about_can_be_set_and_is_surfaced_in_context(client):
-    client.post(
-        "/v1/organizations",
-        json={"id": "org_newco", "name": "NewCo"},
-    )
     updated = client.patch(
-        "/v1/organizations/org_newco", json={"about": "NewCo sells widgets."}
+        "/v1/organizations/org_acme", json={"about": "NewCo sells widgets."}
     )
     assert updated.status_code == 200
     assert updated.json()["about"] == "NewCo sells widgets."
@@ -140,79 +130,11 @@ def test_organization_about_can_be_set_and_is_surfaced_in_context(client):
     assert missing.status_code == 404
 
     fetched = client.get("/v1/organizations").json()["organizations"]
-    assert next(o for o in fetched if o["id"] == "org_newco")["about"] == (
+    assert next(o for o in fetched if o["id"] == "org_acme")["about"] == (
         "NewCo sells widgets."
     )
 
 
-def test_local_gateway_setup_configures_models_and_slack(
-    client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    env_file = tmp_path / ".env"
-    monkeypatch.setenv("TODA_ENV_FILE", str(env_file))
-
-    class SlackResponse:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {
-                "ok": True,
-                "team_id": "T_SETUP",
-                "team": "Setup Workspace",
-                "user_id": "U_SALLY",
-                "user": "toda",
-            }
-
-    monkeypatch.setattr(
-        "toda.services.gateway_setup.httpx.post",
-        lambda *args, **kwargs: SlackResponse(),
-    )
-    initial = client.get("/v1/gateway/setup/status")
-    assert initial.status_code == 200
-    assert initial.json()["providers"] == []
-    # A signed-in operator may reconfigure setup without a first-run token.
-    model = client.post(
-        "/v1/gateway/setup/providers",
-        json={
-            "connection_id": "openrouter-company",
-            "provider": "openrouter",
-            "api_key": "test-openrouter-key",
-            "assignments": {"main": "openai/gpt-5.4"},
-        },
-    )
-    assert model.status_code == 200
-    assert model.json()["restart_required"] is True
-    assert "openai/gpt-5.4" in env_file.read_text()
-    assert "test-openrouter-key" in env_file.read_text()
-    connected = client.post(
-        "/v1/gateway/setup/slack",
-        json={
-            "organization_id": "org_setup",
-            "organization_name": "Setup Co",
-            "bot_token": "xoxb-test",
-            "app_token": "xapp-test",
-            "signing_secret": "test-secret",
-            "admin_slack_user_id": "U_ADMIN",
-            "admin_name": "Setup Admin",
-            "channel_id": "C_SETUP",
-            "proactive": True,
-        },
-    )
-    assert connected.status_code == 200
-    body = connected.json()
-    assert body["workspace"]["id"] == "T_SETUP"
-    assert body["bot"]["user_id"] == "U_SALLY"
-    assert "xoxb-test" not in body.__str__()
-    status = client.get("/v1/gateway/setup/status").json()
-    assert status["slack"]["bot_token_configured"] is True
-    assert any(
-        item["workspace_id"] == "T_SETUP"
-        for item in status["slack"]["installations"]
-    )
-    manifest = client.get("/v1/gateway/setup/slack-manifest")
-    assert manifest.status_code == 200
-    assert "socket_mode_enabled: true" in manifest.json()["manifest"]
 
 
 def test_five_reactive_operations(client):
@@ -371,9 +293,9 @@ def test_network_runtime_rejects_disabled_auth(monkeypatch):
     from toda.config import settings
     from toda.main import validate_runtime_exposure
 
-    monkeypatch.setattr(settings, "host", "0.0.0.0")
-    monkeypatch.setattr(settings, "dashboard_auth_disabled", True)
-    monkeypatch.setattr(settings, "auto_approve_writes", False)
+    monkeypatch.setattr(settings.server, "host", "0.0.0.0")
+    monkeypatch.setattr(settings.dashboard, "auth_disabled", True)
+    monkeypatch.setattr(settings.dashboard, "auto_approve_writes", False)
     with pytest.raises(RuntimeError, match="DASHBOARD_AUTH_DISABLED"):
         validate_runtime_exposure()
 
@@ -382,8 +304,8 @@ def test_network_runtime_rejects_auto_approved_writes(monkeypatch):
     from toda.config import settings
     from toda.main import validate_runtime_exposure
 
-    monkeypatch.setattr(settings, "host", "0.0.0.0")
-    monkeypatch.setattr(settings, "dashboard_auth_disabled", False)
-    monkeypatch.setattr(settings, "auto_approve_writes", True)
+    monkeypatch.setattr(settings.server, "host", "0.0.0.0")
+    monkeypatch.setattr(settings.dashboard, "auth_disabled", False)
+    monkeypatch.setattr(settings.dashboard, "auto_approve_writes", True)
     with pytest.raises(RuntimeError, match="AUTO_APPROVE_WRITES"):
         validate_runtime_exposure()

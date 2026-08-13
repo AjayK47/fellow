@@ -662,6 +662,21 @@ class CompanyAgent:
             if not response.tool_calls:
                 draft = response.content.strip()
                 if not draft:
+                    # "neither answer nor tool call" alone hides the usual
+                    # cause: a reasoning model that spent every output token
+                    # thinking and stopped before writing anything.
+                    if response.finish_reason == "length":
+                        reasoning_tokens = (
+                            (response.usage.get("completion_tokens_details") or {})
+                            .get("reasoning_tokens")
+                            or 0
+                        )
+                        raise RuntimeError(
+                            f"{response.model} used its entire {self.completion_max_tokens}-token "
+                            f"output budget without answering "
+                            f"({reasoning_tokens} of it on reasoning). Lower "
+                            f"TODA_MAIN_MODEL_REASONING_EFFORT or choose a different model."
+                        )
                     raise RuntimeError("model returned neither answer nor tool call")
                 skill_validation = self._validate_user_response(
                     run=run,

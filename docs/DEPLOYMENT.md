@@ -16,9 +16,9 @@ The Compose port is deliberately bound to loopback. Data is stored in the
 
 ## Connecting a model and Slack
 
-Edit `.env` and restart the container after setting the desired provider and
+Edit `config.json` and restart the container after setting the desired provider and
 Slack credentials. Use Socket Mode for a local installation; it does not
-require a public webhook endpoint. See `.env.example` and the console Setup
+require a public webhook endpoint. See `config.example.json` and the console
 page for the complete configuration surface.
 
 ## Network deployment

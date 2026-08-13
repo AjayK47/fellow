@@ -274,7 +274,7 @@ class OpenAICompatibleSpeechProvider(_OpenAICompatible):
 
 
 def _resolve(config: Settings, role: str) -> ResolvedModel:
-    resolved = ProviderResolver(config.provider_connections, config.model_assignments).resolve(role)
+    resolved = ProviderResolver(config.models.providers, config.models.assignments).resolve(role)
     if not resolved:
         raise ValueError(f"model role {role!r} is not configured")
     return resolved
@@ -285,7 +285,7 @@ def _openai_image(config: Settings) -> ImageGenerationProvider:
     return OpenAICompatibleImageProvider(
         name=resolved.profile.name, api_key=resolved.connection.api_key or "local",
         model=resolved.assignment.model, base_url=resolved.profile.endpoint(resolved.connection),
-        timeout=config.model_timeout_seconds,
+        timeout=config.models.timeout_seconds,
     )
 
 
@@ -294,7 +294,7 @@ def _openai_transcription(config: Settings) -> TranscriptionProvider:
     return OpenAICompatibleTranscriptionProvider(
         name=resolved.profile.name, api_key=resolved.connection.api_key or "local",
         model=resolved.assignment.model, base_url=resolved.profile.endpoint(resolved.connection),
-        timeout=config.model_timeout_seconds,
+        timeout=config.models.timeout_seconds,
     )
 
 
@@ -303,8 +303,8 @@ def _openai_speech(config: Settings) -> SpeechProvider:
     return OpenAICompatibleSpeechProvider(
         name=resolved.profile.name, api_key=resolved.connection.api_key or "local",
         model=resolved.assignment.model, base_url=resolved.profile.endpoint(resolved.connection),
-        timeout=config.model_timeout_seconds,
-        voice=config.tts_voice, output_format=config.tts_format,
+        timeout=config.models.timeout_seconds,
+        voice=config.media.tts_voice, output_format=config.media.tts_format,
     )
 
 
@@ -313,7 +313,7 @@ def _openrouter_image(config: Settings) -> ImageGenerationProvider:
     return OpenRouterImageProvider(
         name="openrouter", api_key=resolved.connection.api_key or "",
         model=resolved.assignment.model, base_url=resolved.profile.endpoint(resolved.connection),
-        timeout=config.model_timeout_seconds,
+        timeout=config.models.timeout_seconds,
     )
 
 
@@ -322,7 +322,7 @@ def _openrouter_transcription(config: Settings) -> TranscriptionProvider:
     return OpenRouterTranscriptionProvider(
         name="openrouter", api_key=resolved.connection.api_key or "",
         model=resolved.assignment.model, base_url=resolved.profile.endpoint(resolved.connection),
-        timeout=config.model_timeout_seconds,
+        timeout=config.models.timeout_seconds,
     )
 
 
@@ -331,8 +331,8 @@ def _openrouter_speech(config: Settings) -> SpeechProvider:
     return OpenAICompatibleSpeechProvider(
         name="openrouter", api_key=resolved.connection.api_key or "",
         model=resolved.assignment.model, base_url=resolved.profile.endpoint(resolved.connection),
-        timeout=config.model_timeout_seconds, voice=config.tts_voice,
-        output_format=config.tts_format,
+        timeout=config.models.timeout_seconds, voice=config.media.tts_voice,
+        output_format=config.media.tts_format,
     )
 
 
@@ -349,7 +349,7 @@ speech_providers.register("openrouter", _openrouter_speech)
 
 
 def build_image_provider(config: Settings) -> ImageGenerationProvider | None:
-    resolved = ProviderResolver(config.provider_connections, config.model_assignments).resolve("image")
+    resolved = ProviderResolver(config.models.providers, config.models.assignments).resolve("image")
     if not resolved:
         return None
     try:
@@ -359,7 +359,7 @@ def build_image_provider(config: Settings) -> ImageGenerationProvider | None:
 
 
 def build_transcription_provider(config: Settings) -> TranscriptionProvider | None:
-    resolved = ProviderResolver(config.provider_connections, config.model_assignments).resolve("transcription")
+    resolved = ProviderResolver(config.models.providers, config.models.assignments).resolve("transcription")
     if not resolved:
         return None
     try:
@@ -369,7 +369,7 @@ def build_transcription_provider(config: Settings) -> TranscriptionProvider | No
 
 
 def build_speech_provider(config: Settings) -> SpeechProvider | None:
-    resolved = ProviderResolver(config.provider_connections, config.model_assignments).resolve("tts")
+    resolved = ProviderResolver(config.models.providers, config.models.assignments).resolve("tts")
     if not resolved:
         return None
     try:

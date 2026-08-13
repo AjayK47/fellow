@@ -12,7 +12,7 @@ from websockets.asyncio.client import connect
 
 from toda.config import settings
 from toda.services.container import TodaApp
-from toda.services.gateway_setup import GatewaySetupService
+from toda.services.bootstrap import register_slack_installation
 
 log = logging.getLogger("toda.slack_socket")
 
@@ -25,19 +25,18 @@ async def _ensure_installation(brain: TodaApp) -> None:
 
     Socket Mode itself only needs the app token to open a connection —
     without a matching ``slack_installations`` row, organization resolution
-    for every incoming event silently falls back to ``default_org_id``
-    instead of a real per-workspace mapping, and no admin identity or
-    channel policy ever gets created. This mirrors exactly what
-    ``GatewaySetupService.connect_slack`` does, so a workspace connected via
-    the setup wizard is unaffected (already registered, so this is a no-op).
+    for every incoming event silently falls back to the configured
+    organization instead of a real per-workspace mapping. Credentials come
+    from config.json; this only records the mapping, and is a no-op once the
+    workspace is already registered.
     """
-    if not settings.slack_bot_token:
+    if not settings.slack.bot_token:
         return
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
                 "https://slack.com/api/auth.test",
-                headers={"Authorization": f"Bearer {settings.slack_bot_token}"},
+                headers={"Authorization": f"Bearer {settings.slack.bot_token}"},
             )
         response.raise_for_status()
         payload = response.json()
@@ -48,6 +47,8 @@ async def _ensure_installation(brain: TodaApp) -> None:
             )
             return
         team_id = str(payload["team_id"])
+        bot_user_id = str(payload["user_id"])
+        workspace_name = str(payload.get("team") or team_id)
     except Exception as exc:
         log.warning(
             "Could not verify Slack bot identity for installation bootstrap: %s", exc
@@ -55,22 +56,24 @@ async def _ensure_installation(brain: TodaApp) -> None:
         return
     if brain.store.slack_installation_by_workspace(team_id):
         return
-    setup = GatewaySetupService(
-        brain.store, brain.graph, brain.audit, skills=brain.skills
-    )
     try:
         await asyncio.to_thread(
-            setup.connect_slack,
-            organization_id=settings.default_org_id,
-            organization_name=settings.default_org_id,
-            bot_token=settings.slack_bot_token,
-            app_token=settings.slack_app_token or "",
-            signing_secret=settings.slack_signing_secret or "",
+            register_slack_installation,
+            brain.store,
+            organization_id=settings.organization.id,
+            workspace_id=team_id,
+            workspace_name=workspace_name,
+            bot_user_id=bot_user_id,
+            bot_token=settings.slack.bot_token,
         )
+        if brain.skills:
+            await asyncio.to_thread(
+                brain.skills.ensure_platform_skills, settings.organization.id
+            )
         log.info(
             "Slack installation bootstrapped: workspace=%s organization=%s",
             team_id,
-            settings.default_org_id,
+            settings.organization.id,
         )
     except Exception as exc:
         log.warning("Slack installation bootstrap failed: %s", exc)
@@ -97,15 +100,15 @@ async def run_socket_mode(
     stop_event: threading.Event | None = None,
 ) -> None:
     """Run Slack Socket Mode as a transport of the owning Toda daemon."""
-    if not settings.slack_app_token:
+    if not settings.slack.app_token:
         raise RuntimeError("TODA_SLACK_APP_TOKEN is required")
     await _ensure_installation(brain)
 
     stop_event = stop_event or threading.Event()
     try:
         while not stop_event.is_set():
-            url = await _socket_url(settings.slack_app_token)
-            log.info("Slack Socket Mode connected to %s", settings.slack_app_token[:24] + "...")
+            url = await _socket_url(settings.slack.app_token)
+            log.info("Slack Socket Mode connected to %s", settings.slack.app_token[:24] + "...")
             try:
                 async with connect(url, ping_interval=20, ping_timeout=20) as socket:
                     while not stop_event.is_set():

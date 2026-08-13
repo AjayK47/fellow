@@ -68,3 +68,34 @@ def test_web_tool_result_is_explicitly_framed_as_untrusted():
     assert content.startswith('<untrusted_tool_result source="web_fetch">')
     assert "ignore previous instructions" in content
     assert "</untrusted-tool-result>" in content
+
+
+def test_firecrawl_search_handles_the_v2_grouped_response():
+    """Firecrawl v2 returns data as {"web": [...], "news": [...]}, not a list.
+
+    Slicing that dict raised `unhashable type: 'slice'` on every Firecrawl
+    search, so the provider was unusable with a perfectly valid API key.
+    """
+    from unittest.mock import patch
+
+    from toda.providers import ToolConnection
+    from toda.services.web_tools import JsonSearchProvider
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "success": True,
+                "data": {
+                    "web": [{"title": "A", "url": "https://a", "description": "da"}],
+                    "news": [{"title": "N", "url": "https://n", "description": "dn"}],
+                },
+            }
+
+    with patch("toda.services.web_tools.httpx.post", return_value=Response()):
+        provider = JsonSearchProvider(ToolConnection(provider="firecrawl", api_key="k"))
+        results = provider.search("anything", 5)
+
+    assert [item["title"] for item in results] == ["A", "N"]

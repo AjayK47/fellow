@@ -9,12 +9,8 @@ import time
 import argparse
 import logging
 import shutil
-import subprocess
 import sys
 import threading
-import webbrowser
-import plistlib
-import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Callable
@@ -24,296 +20,56 @@ from fastapi import Depends, FastAPI, Request
 from starlette.middleware.sessions import SessionMiddleware
 
 from toda.api.routes import enforce_tenant, router
-from toda.config import settings
+from toda.config import config_path, settings
 from toda.runtime_owner import DatabaseOwner
+from toda.services.bootstrap import initialize, is_initialized
 from toda.services.container import TodaApp, get_app, reset_app
-from toda.services.gateway_setup import GatewaySetupService, SetupBootstrapToken
 
 log = logging.getLogger("toda")
 
 
-def _toda_executable() -> str:
-    return shutil.which("toda") or str(Path(sys.executable).with_name("toda"))
-
-
-def _wait_for_gateway(timeout_seconds: float = 30) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    url = f"http://127.0.0.1:{settings.port}/health"
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=1) as response:
-                if response.status == 200:
-                    return
-        except OSError:
-            time.sleep(0.25)
-    raise RuntimeError(f"Toda service did not become healthy within {timeout_seconds:g}s")
-
-
-def _gateway_healthy() -> bool:
+def init_cli(args: argparse.Namespace) -> None:
+    """Create the organization and owner account described by config.json."""
+    owner_email = settings.organization.owner_email
+    if not owner_email:
+        raise ValueError(
+            f"Set organization.owner_email in {config_path()} before running toda init"
+        )
+    owner = DatabaseOwner(settings.storage.db_path)
+    owner.acquire()
     try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{settings.port}/health", timeout=1
-        ) as response:
-            return response.status == 200
-    except OSError:
-        return False
-
-
-def _ensure_session_secret(env_path: Path) -> None:
-    existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    has_session_secret = any(
-        line.strip().startswith("TODA_DASHBOARD_SESSION_SECRET=")
-        and line.partition("=")[2].strip()
-        for line in existing.splitlines()
-    )
-    has_admin_token = any(
-        line.strip().startswith("TODA_LOCAL_ADMIN_TOKEN=")
-        and line.partition("=")[2].strip()
-        for line in existing.splitlines()
-    )
-    if has_session_secret and has_admin_token:
-        return
-    separator = "" if not existing or existing.endswith("\n") else "\n"
-    additions: list[str] = []
-    if not has_session_secret:
-        additions.append(
-            f"TODA_DASHBOARD_SESSION_SECRET={secrets.token_urlsafe(32)}"
+        brain = reset_app(settings.storage.db_path)
+        result = initialize(
+            brain.store,
+            organization_id=settings.organization.id,
+            organization_name=settings.organization.name,
+            owner_email=owner_email,
+            owner_name=owner_email.split("@")[0],
+            password=args.password,
         )
-    if not has_admin_token:
-        additions.append(f"TODA_LOCAL_ADMIN_TOKEN={secrets.token_urlsafe(32)}")
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text(
-        f"{existing}{separator}{chr(10).join(additions)}\n",
-        encoding="utf-8",
-    )
-    env_path.chmod(0o600)
+        brain.close()
+    finally:
+        owner.release()
 
-
-def _command(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, check=False, capture_output=True, text=True)
-
-
-def _service_error(action: str, result: subprocess.CompletedProcess[str]) -> RuntimeError:
-    detail = (result.stderr or result.stdout or "operating system rejected the request").strip()
-    return RuntimeError(f"Could not {action} Toda: {detail.splitlines()[0]}")
-
-
-def _print_status(*, running: bool, installed: bool, data_dir: Path, log_path: Path) -> None:
-    state = "running" if running else "stopped"
-    print(f"Toda is {state}.")
-    print(f"  Console: http://127.0.0.1:{settings.port}")
-    print(f"  Starts at login: {'yes' if installed else 'no'}")
-    print(f"  Data: {data_dir}")
-    if not running:
-        print("  Next: toda start")
-    else:
-        print(f"  Logs: {log_path}")
-
-
-def setup_cli(args: argparse.Namespace) -> None:
-    """Issue a fresh local setup link for this installation."""
-    if not _gateway_healthy():
-        raise RuntimeError("Toda is not running. Run `toda start`, then `toda setup`.")
-    data_dir = settings.data_dir.expanduser().resolve()
-    _ensure_session_secret(data_dir / ".env")
-    token = SetupBootstrapToken(data_dir).issue()
-    url = f"http://127.0.0.1:{settings.port}/setup?bootstrap={token}"
-    print("Toda setup is ready:")
-    print(url)
-    if not args.no_open:
-        webbrowser.open(url)
-
-
-def service_cli(args: argparse.Namespace) -> None:
-    """Manage the one Toda gateway as a per-user login service."""
-    data_dir = settings.data_dir.expanduser().resolve()
-    data_dir.mkdir(parents=True, exist_ok=True)
-    log_path = data_dir / "toda.log"
-    env_path = data_dir / ".env"
-    executable = _toda_executable()
-    environment = {
-        "TODA_DATA_DIR": str(data_dir),
-        "TODA_ENV_FILE": str(env_path),
-        "PYTHONUNBUFFERED": "1",
-    }
-
-    if args.action == "update":
-        uv = shutil.which("uv")
-        if not uv:
-            raise RuntimeError("uv is required to update Toda")
-        result = _command([uv, "tool", "upgrade", "toda-ai"])
-        if result.returncode:
-            raise _service_error("update", result)
-        print("Toda was updated.")
-        args.action = "restart"
-
-    if sys.platform == "darwin":
-        service_path = Path.home() / "Library" / "LaunchAgents" / "ai.toda.gateway.plist"
-        domain = f"gui/{os.getuid()}"
-        service_name = f"{domain}/ai.toda.gateway"
-        loaded = _command(["launchctl", "print", service_name]).returncode == 0
-
-        if args.action == "status":
-            _print_status(
-                running=loaded and _gateway_healthy(),
-                installed=service_path.exists(),
-                data_dir=data_dir,
-                log_path=log_path,
-            )
-            return
-
-        if args.action == "stop":
-            if not loaded:
-                print("Toda is already stopped.")
-                return
-            result = _command(["launchctl", "bootout", service_name])
-            if result.returncode:
-                raise _service_error("stop", result)
-            print("Toda stopped.")
-            return
-
-        if args.action == "start" and service_path.exists():
-            if loaded and _gateway_healthy():
-                print("Toda is already running.")
-                return
-            if not loaded:
-                result = _command(["launchctl", "bootstrap", domain, str(service_path)])
-                if result.returncode:
-                    raise _service_error("start", result)
-            _wait_for_gateway()
-            print(f"Toda started. Open http://127.0.0.1:{settings.port}")
-            return
-
-        if args.action == "restart" and service_path.exists():
-            if loaded:
-                result = _command(["launchctl", "kickstart", "-k", service_name])
-            else:
-                result = _command(["launchctl", "bootstrap", domain, str(service_path)])
-            if result.returncode:
-                raise _service_error("restart", result)
-            _wait_for_gateway()
-            print(f"Toda restarted. Open http://127.0.0.1:{settings.port}")
-            return
-
-        _ensure_session_secret(env_path)
-        service_path.parent.mkdir(parents=True, exist_ok=True)
-        service_path.write_bytes(
-            plistlib.dumps(
-                {
-                    "Label": "ai.toda.gateway",
-                    "ProgramArguments": [executable, "gateway"],
-                    "EnvironmentVariables": environment,
-                    "RunAtLoad": True,
-                    "KeepAlive": True,
-                    "StandardOutPath": str(log_path),
-                    "StandardErrorPath": str(log_path),
-                }
-            )
-        )
-        result = (
-            _command(["launchctl", "kickstart", "-k", service_name])
-            if loaded
-            else _command(["launchctl", "bootstrap", domain, str(service_path)])
-        )
-        if result.returncode:
-            raise _service_error("install", result)
-    elif os.name == "nt":
-        installed = _command(["schtasks", "/Query", "/TN", "Toda"]).returncode == 0
-        if args.action == "status":
-            _print_status(
-                running=_gateway_healthy(), installed=installed, data_dir=data_dir, log_path=log_path
-            )
-            return
-        if args.action in {"stop", "restart"}:
-            _command(["schtasks", "/End", "/TN", "Toda"])
-            if args.action == "stop":
-                print("Toda stopped.")
-                return
-        if args.action == "start":
-            result = _command(["schtasks", "/Run", "/TN", "Toda"])
-            if result.returncode:
-                raise _service_error("start", result)
-            _wait_for_gateway()
-            print(f"Toda started. Open http://127.0.0.1:{settings.port}")
-            return
-        _ensure_session_secret(env_path)
-        command = f'"{executable}" gateway'
-        result = _command(
-            [
-                "schtasks", "/Create", "/F", "/SC", "ONLOGON", "/TN", "Toda",
-                "/TR", command,
-            ]
-        )
-        if result.returncode:
-            raise _service_error("install", result)
-        result = _command(["schtasks", "/Run", "/TN", "Toda"])
-        if result.returncode:
-            raise _service_error("start", result)
-    else:
-        service_path = Path.home() / ".config" / "systemd" / "user" / "toda.service"
-        active = _command(["systemctl", "--user", "is-active", "toda.service"]).returncode == 0
-        if args.action == "status":
-            _print_status(
-                running=active and _gateway_healthy(),
-                installed=service_path.exists(), data_dir=data_dir, log_path=log_path,
-            )
-            return
-        if args.action in {"stop", "restart"}:
-            _command(["systemctl", "--user", "stop", "toda.service"])
-            if args.action == "stop":
-                print("Toda stopped.")
-                return
-        if args.action == "start":
-            result = _command(["systemctl", "--user", "start", "toda.service"])
-            if result.returncode:
-                raise _service_error("start", result)
-            _wait_for_gateway()
-            print(f"Toda started. Open http://127.0.0.1:{settings.port}")
-            return
-        _ensure_session_secret(env_path)
-        service_path.parent.mkdir(parents=True, exist_ok=True)
-        service_path.write_text(
-            "\n".join(
-                [
-                    "[Unit]", "Description=Toda organizational coworker", "After=network-online.target", "",
-                    "[Service]", f'ExecStart="{executable.replace(chr(34), chr(92) + chr(34))}" gateway', "Restart=on-failure", "RestartSec=3",
-                    *(f'Environment=\"{key}={value}\"' for key, value in environment.items()),
-                    f"StandardOutput=append:{log_path}", f"StandardError=append:{log_path}", "",
-                    "[Install]", "WantedBy=default.target", "",
-                ]
-            ),
-            encoding="utf-8",
-        )
-        result = _command(["systemctl", "--user", "daemon-reload"])
-        if result.returncode:
-            raise _service_error("reload the service definition", result)
-        result = _command(["systemctl", "--user", "enable", "--now", "toda.service"])
-        if result.returncode:
-            raise _service_error("install", result)
-
-    print("Toda installed and running in the background.")
-    # The installer is already a trusted local process. Issuing the token here
-    # works identically on launchd, systemd, and Windows Task Scheduler and
-    # avoids scraping platform-specific service logs.
-    _wait_for_gateway()
-    bootstrap = SetupBootstrapToken(data_dir).issue()
-    setup_url = f"http://127.0.0.1:{settings.port}/setup?bootstrap={bootstrap}"
-    print(f"Continue setup: {setup_url}")
-    print("Manage it with: toda status | toda restart | toda stop")
-    if not args.no_open:
-        webbrowser.open(setup_url)
+    print(f"Organization : {result['organization_id']}")
+    print(f"Public scope : {result['scope_id']}")
+    print(f"Owner        : {result['owner']['email']}")
+    if result["generated"]:
+        print(f"Password     : {result['password']}   (shown once)")
+    print("\nStart the gateway with: toda gateway")
+    print(f"Then sign in at http://127.0.0.1:{settings.server.port}")
 
 
 def validate_runtime_exposure() -> None:
     """Refuse explicitly unsafe combinations on a network-bound server."""
-    host = settings.host.strip().lower()
+    host = settings.server.host.strip().lower()
     local_only = host in {"127.0.0.1", "::1", "localhost"}
-    if not local_only and settings.dashboard_auth_disabled:
+    if not local_only and settings.dashboard.auth_disabled:
         raise RuntimeError(
             "TODA_DASHBOARD_AUTH_DISABLED cannot be used when TODA_HOST is "
             "network-accessible"
         )
-    if not local_only and settings.auto_approve_writes:
+    if not local_only and settings.dashboard.auto_approve_writes:
         raise RuntimeError(
             "TODA_AUTO_APPROVE_WRITES cannot be used when TODA_HOST is "
             "network-accessible"
@@ -322,13 +78,10 @@ def validate_runtime_exposure() -> None:
 
 def _dashboard_session_secret() -> str:
     """Resolve the key SessionMiddleware signs the console login cookie
-    with. Falls back through the Slack OAuth app secret before generating a
-    random per-process key, so a bare local run still works — just without
-    sessions surviving a restart."""
-    if settings.dashboard_session_secret:
-        return settings.dashboard_session_secret
-    if settings.slack_client_secret:
-        return settings.slack_client_secret
+    with. The installer persists a dedicated key; a generated fallback keeps
+    a bare developer run usable without coupling login to Slack."""
+    if settings.dashboard.session_secret:
+        return settings.dashboard.session_secret
     return secrets.token_urlsafe(32)
 
 
@@ -341,7 +94,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owner_path = (
             prebuilt_brain.store.db_path
             if prebuilt_brain is not None
-            else Path(db) if db else settings.db_path
+            else Path(db) if db else settings.storage.db_path
         )
         owner = DatabaseOwner(owner_path)
         app.state.database_owner = owner
@@ -354,10 +107,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             brain = prebuilt_brain
         else:
             db = os.environ.get("TODA_DB")
-            brain = reset_app(Path(db) if db else settings.db_path)
+            brain = reset_app(Path(db) if db else settings.storage.db_path)
         app.state.brain = brain
         brain.indexing.backfill()
-        if settings.worker_enabled:
+        if settings.worker.enabled:
             # Independent lanes keep long agent work and ingestion from
             # delaying infrastructure jobs, while all lanes remain inside
             # the single database-owning process.
@@ -367,7 +120,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 while True:
                     if tick_automations and (
                         time.monotonic() - last_dispatcher_tick
-                        >= settings.dispatcher_tick_interval_seconds
+                        >= settings.worker.dispatcher_tick_interval_seconds
                     ):
                         await asyncio.to_thread(brain.automations.tick)
                         last_dispatcher_tick = time.monotonic()
@@ -389,7 +142,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                         brain.harness_worker.pump, kinds=kinds
                     )
                     if result["leased"] == 0:
-                        await asyncio.sleep(settings.worker_poll_interval_seconds)
+                        await asyncio.sleep(settings.worker.poll_interval_seconds)
                     else:
                         await asyncio.sleep(0)
 
@@ -457,6 +210,8 @@ def create_app(
         secret_key=_dashboard_session_secret(),
         session_cookie="toda_session",
         same_site="lax",
+        max_age=14 * 24 * 60 * 60,
+        https_only=settings.dashboard.cookie_secure,
     )
 
     @app.middleware("http")
@@ -469,12 +224,12 @@ def create_app(
         except Exception:
             brain = getattr(request.app.state, "brain", None)
             if brain and not suppress_audit:
-                brain.audit.record(settings.default_org_id, "http.request", {"request_id": request_id, "path": request.url.path, "method": request.method, "status_code": 500, "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
+                brain.audit.record(settings.organization.id, "http.request", {"request_id": request_id, "path": request.url.path, "method": request.method, "status_code": 500, "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
             raise
         response.headers["X-Request-ID"] = request_id
         brain = getattr(request.app.state, "brain", None)
         if brain and not suppress_audit:
-            brain.audit.record(settings.default_org_id, "http.request", {"request_id": request_id, "path": request.url.path, "method": request.method, "status_code": response.status_code, "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
+            brain.audit.record(settings.organization.id, "http.request", {"request_id": request_id, "path": request.url.path, "method": request.method, "status_code": response.status_code, "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
         return response
     return app
 
@@ -486,10 +241,10 @@ def serve(target_app: FastAPI | str | None = None) -> None:
     validate_runtime_exposure()
     uvicorn.run(
         target_app or "toda.main:app",
-        host=settings.host,
-        port=settings.port,
+        host=settings.server.host,
+        port=settings.server.port,
         reload=False,
-        log_level=settings.log_level,
+        log_level=settings.server.log_level,
         # Every request is already recorded as an `http.request` audit event
         # (request_telemetry above) — uvicorn's own access-log line for it is
         # pure duplication, and it's mostly the console's own 8s polling
@@ -507,9 +262,9 @@ def _register_composio_webhook(brain: TodaApp) -> None:
     Also captures the signing secret Composio returns so no manual .env
     copy step is needed.
     """
-    if not (brain.composio.configured and settings.public_url):
+    if not (brain.composio.configured and settings.server.public_url):
         return
-    webhook_url = f"{settings.public_url.rstrip('/')}/v1/composio/webhooks"
+    webhook_url = f"{settings.server.public_url.rstrip('/')}/v1/composio/webhooks"
     try:
         existing = brain.composio.list_webhook_subscriptions().get("items") or []
         if existing:
@@ -540,23 +295,20 @@ def gateway() -> None:
     Slack Socket Mode, so the process runs one service container and one
     worker loop rather than two independent copies of each.
     """
-    owner = DatabaseOwner(settings.db_path)
+    owner = DatabaseOwner(settings.storage.db_path)
     owner.acquire()
-    brain = reset_app(settings.db_path)
+    brain = reset_app(settings.storage.db_path)
     brain.indexing.backfill()
     _register_composio_webhook(brain)
-    setup_status = GatewaySetupService(
-        brain.store, brain.graph, brain.audit, skills=brain.skills
-    ).status()
-    if not (setup_status.get("setup") or {}).get("complete"):
-        bootstrap = SetupBootstrapToken(settings.data_dir).issue()
-        print(
-            "Toda setup: "
-            f"http://127.0.0.1:{settings.port}/setup?bootstrap={bootstrap}"
-        , flush=True)
+    if not is_initialized(brain.store, organization_id=settings.organization.id):
+        owner.release()
+        raise SystemExit(
+            "This installation has not been initialised.\n"
+            f"Edit {config_path()}, then run: toda init"
+        )
 
     slack_stopper: Callable[[], None] | None = None
-    if settings.slack_app_token:
+    if settings.slack.app_token:
         from toda.slack_socket import run_socket_mode
 
         stop_event = threading.Event()
@@ -598,9 +350,9 @@ def gateway() -> None:
 
 def retention_cli(args: argparse.Namespace) -> None:
     """Preview or apply retention cleanup, or delete an organization entirely."""
-    owner = DatabaseOwner(settings.db_path)
+    owner = DatabaseOwner(settings.storage.db_path)
     owner.acquire()
-    brain = get_app(settings.db_path)
+    brain = get_app(settings.storage.db_path)
     try:
         if args.delete_organization:
             if not args.confirm:
@@ -667,8 +419,8 @@ def reset_cli(args: argparse.Namespace) -> None:
     directories in it (a live install had 4,191 left over, all from an
     architecture that no longer exists).
     """
-    db_path = settings.db_path.resolve()
-    workspace_root = settings.workspace_root.resolve()
+    db_path = settings.storage.db_path.resolve()
+    workspace_root = settings.storage.workspaces.resolve()
     if not args.yes:
         print(
             f"This permanently deletes all Toda data in {db_path} "
@@ -703,7 +455,7 @@ def reset_cli(args: argparse.Namespace) -> None:
     # delete a directory that actually looks like Toda's own workspace
     # tree, and only its contents.
     if workspace_root.exists() and workspace_root.is_dir():
-        if workspace_root.parent == settings.data_dir.resolve() or workspace_root.name in {
+        if workspace_root.parent == settings.storage.data_dir.resolve() or workspace_root.name in {
             "workspaces",
             ".toda-workspaces",
         }:
@@ -728,9 +480,9 @@ def reindex_cli(args: argparse.Namespace) -> None:
     remain the source of truth (storage/db.py:reindex_vectors). Needed
     after a bulk backfill, or to repopulate the indexes after an embedding
     model change rebuilt them empty."""
-    owner = DatabaseOwner(settings.db_path)
+    owner = DatabaseOwner(settings.storage.db_path)
     owner.acquire()
-    brain = get_app(settings.db_path)
+    brain = get_app(settings.storage.db_path)
     try:
         counts = brain.store.reindex_vectors(force=args.force)
         print(
@@ -750,7 +502,7 @@ def reindex_cli(args: argparse.Namespace) -> None:
 
 def main() -> None:
     logging.basicConfig(
-        level=settings.log_level.upper(),
+        level=settings.server.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     parser = argparse.ArgumentParser(
@@ -804,22 +556,15 @@ def main() -> None:
         action="store_true",
         help="drop and fully rebuild the vec0 tables (needed after an embedding dimension/provider change)",
     )
-    for action, help_text in (
-        ("install", "install Toda and start it at login"),
-        ("start", "start Toda in the background"),
-        ("stop", "stop Toda"),
-        ("restart", "restart Toda"),
-        ("status", "show whether Toda is running"),
-        ("update", "update and restart Toda"),
-    ):
-        command = sub.add_parser(action, help=help_text)
-        command.set_defaults(service_action=action)
-        if action == "install":
-            command.add_argument(
-                "--no-open", action="store_true", help="do not open the setup browser"
-            )
-    setup = sub.add_parser("setup", help="open the installation setup flow")
-    setup.add_argument("--no-open", action="store_true", help="print the setup link without opening it")
+    init = sub.add_parser(
+        "init",
+        help="create the organization and owner account described by config.json",
+    )
+    init.add_argument(
+        "--password",
+        default=None,
+        help="owner password (a strong one is generated and printed when omitted)",
+    )
     args = parser.parse_args()
     if args.command == "gateway":
         gateway()
@@ -829,20 +574,11 @@ def main() -> None:
         retention_cli(args)
     elif args.command == "reindex":
         reindex_cli(args)
-    elif args.command == "setup":
+    elif args.command == "init":
         try:
-            setup_cli(args)
-        except RuntimeError as exc:
+            init_cli(args)
+        except ValueError as exc:
             print(str(exc), file=sys.stderr)
-            raise SystemExit(1) from None
-    elif hasattr(args, "service_action"):
-        args.action = args.service_action
-        args.no_open = getattr(args, "no_open", False)
-        try:
-            service_cli(args)
-        except (RuntimeError, OSError) as exc:
-            print(f"Toda could not {args.action}: {exc}", file=sys.stderr)
-            print(f"Logs: {settings.data_dir.expanduser().resolve() / 'toda.log'}", file=sys.stderr)
             raise SystemExit(1) from None
     else:
         serve()

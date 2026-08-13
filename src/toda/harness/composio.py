@@ -30,6 +30,18 @@ class ComposioClient:
         self.webhook_secret = webhook_secret
         self.webhook_tolerance_seconds = webhook_tolerance_seconds
 
+    def reconfigure(self, *, api_key: str, webhook_secret: str | None = None) -> None:
+        """Apply a newly saved credential to the live client.
+
+        Credentials are read from the env file once, when the container is
+        built, so a key saved from the console would otherwise sit on disk
+        doing nothing until the process restarted -- the integrations page kept
+        reporting "not configured" immediately after a successful save.
+        """
+        self.api_key = api_key
+        if webhook_secret:
+            self.webhook_secret = webhook_secret
+
     @property
     def configured(self) -> bool:
         return bool(self.api_key)

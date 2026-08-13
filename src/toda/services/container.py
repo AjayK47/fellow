@@ -69,7 +69,7 @@ from toda.harness.task_run_store import TaskRunStore
 
 class TodaApp:
     def __init__(self, db_path: Path | str | None = None) -> None:
-        path = Path(db_path) if db_path else settings.db_path
+        path = Path(db_path) if db_path else settings.storage.db_path
         path.parent.mkdir(parents=True, exist_ok=True)
         self.store = BrainStore(path)
         self.audit = AuditService(self.store)
@@ -99,10 +99,15 @@ class TodaApp:
         )
         self.context = ContextService(self.store, self.retrieval, self.graph, self.audit)
         self.profiles = ProfilesService(self.store, self.retrieval, self.graph, self.audit)
-        runtime_settings = type(settings)()
+        # The one loaded configuration, not a fresh instance. This used to
+        # construct a second Settings so it would re-read the environment
+        # after the setup wizard rewrote .env mid-process; config.json is
+        # read once at import and never written at runtime, and rebuilding
+        # here would silently discard every configured value.
+        runtime_settings = settings
         self.skill_packages = SkillPackageCatalog()
         self.workspaces = WorkspaceService(
-            self.store, self.audit, runtime_settings.workspace_root
+            self.store, self.audit, runtime_settings.storage.workspaces
         )
         self.skills = SkillsService(
             self.store,
@@ -124,16 +129,16 @@ class TodaApp:
         ) = build_model_clients(runtime_settings)
         self.vision_model = build_vision_model(runtime_settings, self.main_model)
         self.harness_jobs = JobQueue(
-            self.store, lease_seconds=runtime_settings.worker_lease_seconds
+            self.store, lease_seconds=runtime_settings.worker.lease_seconds
         )
         self.composio = ComposioClient(
-            api_key=runtime_settings.composio_api_key,
-            base_url=runtime_settings.composio_base_url,
-            connected_account_id=runtime_settings.composio_connected_account_id,
-            toolkit_versions=runtime_settings.composio_toolkit_versions,
-            webhook_secret=runtime_settings.composio_webhook_secret,
+            api_key=runtime_settings.composio.api_key,
+            base_url=runtime_settings.composio.base_url,
+            connected_account_id=runtime_settings.composio.connected_account_id,
+            toolkit_versions=runtime_settings.composio.toolkit_versions,
+            webhook_secret=runtime_settings.composio.webhook_secret,
             webhook_tolerance_seconds=(
-                runtime_settings.composio_webhook_tolerance_seconds
+                runtime_settings.composio.webhook_tolerance_seconds
             ),
         )
         self.web_tools = build_web_tools(runtime_settings)
@@ -147,14 +152,14 @@ class TodaApp:
         )
         self.browser_tools = BrowserTools(
             self.artifacts,
-            enabled=runtime_settings.browser_enabled,
+            enabled=runtime_settings.tools.browser_enabled,
             allowed_domains=[
                 item.strip().lower()
-                for item in runtime_settings.browser_allowed_domains.split(",")
+                for item in runtime_settings.tools.browser_allowed_domains
                 if item.strip()
             ],
             vision_tools=self.vision_tools,
-            cdp_enabled=runtime_settings.browser_cdp_enabled,
+            cdp_enabled=runtime_settings.tools.browser_cdp_enabled,
         )
         self.visual_tools = VisualTools(self.artifacts)
         self.sessions = SessionService(
@@ -165,13 +170,13 @@ class TodaApp:
             self.audit,
             external_reader=self._composio_precondition_reader,
         )
-        self.slack_sender = SlackSender(bot_token=runtime_settings.slack_bot_token, store=self.store)
+        self.slack_sender = SlackSender(bot_token=runtime_settings.slack.bot_token, store=self.store)
         self.slack_media = SlackMediaIngestion(
             store=self.store,
             artifacts=self.artifacts,
-            bot_token=runtime_settings.slack_bot_token,
+            bot_token=runtime_settings.slack.bot_token,
             transcription_provider=self.vision_tools.transcription_provider,
-            max_bytes=runtime_settings.media_max_bytes,
+            max_bytes=runtime_settings.media.max_bytes,
         )
         self.tool_registry = build_tool_registry(
             store=self.store,
@@ -183,10 +188,10 @@ class TodaApp:
             artifacts=self.artifacts,
             web_tools=self.web_tools,
             slack_sender=self.slack_sender,
-            run_code_enabled=runtime_settings.run_code_enabled,
-            run_code_timeout_seconds=runtime_settings.run_code_timeout_seconds,
-            run_code_max_tool_calls=runtime_settings.run_code_max_tool_calls,
-            workspace_root=runtime_settings.workspace_root,
+            run_code_enabled=runtime_settings.tools.run_code_enabled,
+            run_code_timeout_seconds=runtime_settings.tools.run_code_timeout_seconds,
+            run_code_max_tool_calls=runtime_settings.tools.run_code_max_tool_calls,
+            workspace_root=runtime_settings.storage.workspaces,
             workspace_service=self.workspaces,
             document_tools=self.document_tools,
             browser_tools=self.browser_tools,
@@ -237,11 +242,11 @@ class TodaApp:
                 graph=self.graph,
                 history_compactor=self.history_compactor,
                 workspaces=self.workspaces,
-                max_iterations=runtime_settings.agent_max_iterations,
-                max_tool_calls=runtime_settings.agent_max_tool_calls,
-                context_token_budget=runtime_settings.agent_context_token_budget,
-                max_total_tokens=runtime_settings.agent_max_total_tokens,
-                completion_max_tokens=runtime_settings.agent_completion_max_tokens,
+                max_iterations=runtime_settings.agent.max_iterations,
+                max_tool_calls=runtime_settings.agent.max_tool_calls,
+                context_token_budget=runtime_settings.agent.context_token_budget,
+                max_total_tokens=runtime_settings.agent.max_total_tokens,
+                completion_max_tokens=runtime_settings.agent.completion_max_tokens,
                 embeddings=self.embeddings,
             )
 
@@ -249,7 +254,7 @@ class TodaApp:
             TaskRunStore(
                 self.store,
                 owner=new_id("agent"),
-                lease_seconds=runtime_settings.worker_lease_seconds,
+                lease_seconds=runtime_settings.worker.lease_seconds,
             )
         )
 
@@ -267,8 +272,8 @@ class TodaApp:
             sessions=self.sessions,
             agent_factory=_task_agent_factory,
             conversation_agent=self.conversation_agent,
-            lease_seconds=runtime_settings.session_manager_lease_seconds,
-            task_lease_seconds=runtime_settings.task_execution_lease_seconds,
+            lease_seconds=runtime_settings.agent.session_manager_lease_seconds,
+            task_lease_seconds=runtime_settings.agent.task_execution_lease_seconds,
         )
         self.child_tasks = ChildTaskService(
             store=self.store,
@@ -276,10 +281,10 @@ class TodaApp:
             audit=self.audit,
             artifacts=self.artifacts,
             workspaces=self.workspaces,
-            max_parallel=runtime_settings.child_task_max_parallel,
-            max_depth=runtime_settings.child_task_max_depth,
-            max_iterations=runtime_settings.child_agent_max_iterations,
-            max_tool_calls=runtime_settings.child_agent_max_tool_calls,
+            max_parallel=runtime_settings.agent.child_max_parallel,
+            max_depth=runtime_settings.agent.child_max_depth,
+            max_iterations=runtime_settings.agent.child_max_iterations,
+            max_tool_calls=runtime_settings.agent.child_max_tool_calls,
         )
         self.tool_registry.register(
             self.child_tasks.tool_definition(), self.child_tasks.execute
@@ -299,10 +304,10 @@ class TodaApp:
             workspaces=self.workspaces,
             artifacts=self.artifacts,
             audit=self.audit,
-            checkpoint_interval_seconds=runtime_settings.pi_checkpoint_interval_seconds,
-            stale_heartbeat_seconds=runtime_settings.pi_stale_heartbeat_seconds,
-            poll_interval_seconds=runtime_settings.pi_poll_interval_seconds,
-            cancel_grace_seconds=runtime_settings.pi_cancel_grace_seconds,
+            checkpoint_interval_seconds=runtime_settings.agent.pi_checkpoint_interval_seconds,
+            stale_heartbeat_seconds=runtime_settings.agent.pi_stale_heartbeat_seconds,
+            poll_interval_seconds=runtime_settings.agent.pi_poll_interval_seconds,
+            cancel_grace_seconds=runtime_settings.agent.pi_cancel_grace_seconds,
         )
         self.child_task_executor = ChildTaskExecutor(
             store=self.store,
@@ -312,7 +317,7 @@ class TodaApp:
             # Only wire Pi when the actual `pi` CLI is expected to be present.
             # worker_type="pi" children fail closed with a clear error
             # otherwise (ChildTaskExecutor.run), never silently no-op.
-            pi_executor=self.pi_task_executor if runtime_settings.pi_coding_enabled else None,
+            pi_executor=self.pi_task_executor if runtime_settings.agent.pi_coding_enabled else None,
         )
         # Back-references for code built before pi_task_executor existed --
         # same circular-ish ordering already worked around for
@@ -386,9 +391,9 @@ class TodaApp:
             ingestion=self.ingestion,
             indexing=self.indexing,
             profiles=self.profiles,
-            batch_size=runtime_settings.worker_batch_size,
-            concurrency=runtime_settings.worker_concurrency,
-            knowledge_concurrency=runtime_settings.worker_knowledge_concurrency,
+            batch_size=runtime_settings.worker.batch_size,
+            concurrency=runtime_settings.worker.concurrency,
+            knowledge_concurrency=runtime_settings.worker.knowledge_concurrency,
             store=self.store,
             task_agent_factory=_task_agent_factory,
             session_manager=self.session_manager,
@@ -511,7 +516,7 @@ class TodaApp:
         # tenant.  These are projections only; package files and registry
         # definitions remain authoritative and can recreate them after reset.
         try:
-            self.skills.ensure_platform_skills(runtime_settings.default_org_id)
+            self.skills.ensure_platform_skills(runtime_settings.organization.id)
         except RuntimeError:
             # A developer may intentionally run a stripped package checkout;
             # readiness endpoints will report the missing mandatory package.
@@ -527,7 +532,7 @@ class TodaApp:
                 "capabilities",
                 {
                     "id": f"capability:{capability}",
-                    "organization_id": runtime_settings.default_org_id,
+                    "organization_id": runtime_settings.organization.id,
                     "status": "registered",
                     "capability_id": capability,
                     "tool_names": [

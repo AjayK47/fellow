@@ -35,22 +35,24 @@ The core differences from a desktop automation agent are organizational:
 
 ## Five-minute local start
 
-Requirements: Python 3.11+ and Docker with Compose.
+Requirements: Python 3.11+ and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
 git clone REPOSITORY_URL toda
 cd toda
-python3 scripts/bootstrap.py
-docker compose up --build -d
-docker compose exec toda toda-seed
+uv sync --extra dev
+cp config.example.json config.json   # set organization.owner_email
+uv run toda init                     # prints the owner password once
+uv run toda gateway
 ```
 
-Open <http://127.0.0.1:8080> and use the administrator token printed by the
-bootstrap command. This starts the deterministic provider, so the complete
-runtime can be evaluated without an API key or paid inference.
+Open <http://127.0.0.1:8080> and sign in with the owner account `toda init`
+created. With no model configured this runs the deterministic provider, so the
+complete runtime can be evaluated without an API key or paid inference.
 
-To use a real model or connect Slack, edit `.env` and restart with
-`docker compose up -d`.
+To use a real model or connect Slack, edit `config.json` and restart the
+gateway. That file is the only configuration Toda reads, and nothing writes
+to it at runtime.
 
 See [the deployment guide](docs/DEPLOYMENT.md) and
 [security policy](SECURITY.md) before changing the loopback-only port binding.
@@ -185,6 +187,20 @@ or a direct `curl` invocation would use. Toggling a tool's policy, approving a
 skill draft, or creating an automation from the console produces the exact
 same schema-validated, policy-checked, audit-logged call as any other client.
 
+Each self-hosted installation belongs to one organization and supports many
+dashboard users. The first local setup link creates the organization owner.
+After that, people sign in with email and password; owners and administrators
+can invite them or approve access requests from **People**. Slack is a data
+connection, not a dashboard identity provider. Password hashes use the Python
+standard library's memory-hard scrypt implementation, and browser sessions are
+opaque, server-side, expiring, and revocable.
+
+Toda binds to localhost by default. For a team deployment, expose the port only
+through the organization's VPN or a TLS reverse proxy, set a persistent
+`TODA_DASHBOARD_SESSION_SECRET`, and set `TODA_DASHBOARD_COOKIE_SECURE=true`
+when the browser reaches Toda over HTTPS. Do not expose the raw HTTP port to the
+public internet.
+
 Pages are organized by what they let an operator do, not by data source:
 
 - **Dashboard** — active Tasks, pending approvals, and a permission-scoped
@@ -208,10 +224,10 @@ Pages are organized by what they let an operator do, not by data source:
   model at all.
 - **Skills** — approve or deprecate versioned procedures, with agent-proposed
   drafts surfaced separately from the immutable platform catalog.
-- **Setup / Integrations / Channels** — configure the model provider, web
-  tools, and Slack directly from the console (writing only to the local,
-  gitignored `.env`), and connect Composio-backed tools through the same
-  hosted OAuth flow Composio's API drives everywhere else.
+- **Integrations / Channels** — review Slack and provider readiness, and
+  connect Composio-backed tools through the same hosted OAuth flow Composio's
+  API drives everywhere else. Credentials themselves come from `config.json`;
+  the console reports what is configured rather than writing it.
 - **Automations** — interval or cron-scheduled goals that re-enter the same
   main-agent runtime as any reactive request.
 - **Graph** — a force-directed, permission-filtered view of the company graph
@@ -349,32 +365,23 @@ Requirements:
 - [`uv`](https://docs.astral.sh/uv/)
 - Node.js, only to build the console (`web/`)
 
-For a released build, install and open the local setup UI in one command:
-
-```bash
-curl -fsSL https://toda.ai/install.sh | sh
-```
-
-On Windows PowerShell:
-
-```powershell
-irm https://toda.ai/install.ps1 | iex
-```
-
-The installer uses `uv` to verify and install the published Python package,
-creates a per-user background process, starts the single Toda gateway, and opens the
-short-lived local bootstrap link. Set `TODA_VERSION=X.Y.Z` before running it to
-pin a release. The source-checkout workflow below is for contributors.
-
-Manage the installed process with `toda status`, `toda start`, `toda stop`,
-`toda restart`, and `toda update`.
-
 Install and create the local configuration:
 
 ```bash
 uv sync --extra dev
-cp .env.example .env
+cp config.example.json config.json
 ```
+
+Edit `config.json` — at minimum set `organization.owner_email` — then create
+the organization and owner account:
+
+```bash
+uv run toda init
+```
+
+This prints the generated owner password once. Pass `--password` to choose
+your own. Running it against an initialised database is refused rather than
+silently reset.
 
 Build the console once (the gateway serves `web/dist` as static files; skip
 this and the API still works, just without the UI):
@@ -390,13 +397,12 @@ Start the local gateway:
 uv run toda gateway
 ```
 
-Open the onboarding UI at <http://127.0.0.1:8080/setup>. It configures
-OpenRouter, generates the Slack app manifest, validates local Slack credentials,
-maps the workspace to a Toda tenant, and writes only to the local
-ignored `.env`. Restart the same command after saving a connection; configured
-Slack Socket Mode starts alongside the API and durable worker.
+Set the provider, Slack, and tool credentials in `config.json`, then restart
+the gateway; configured Slack Socket Mode starts alongside the API and durable
+worker.
 
-The same local UI optionally accepts Brave Search and Firecrawl keys. Brave
+`config.json` optionally holds Brave Search and Firecrawl keys under
+`tools.connections`. Brave
 finds public sources; Firecrawl converts public pages and URL-addressable PDFs
 to clean markdown. Without Firecrawl, `web_fetch` uses a safe, read-only direct
 fetch fallback; without Brave, the agent does not get web search. Browser
@@ -419,7 +425,7 @@ uv run toda reset --yes
 ```
 
 This deletes the configured SQLite database and its sidecar files, but does not
-touch `.env` or source code.
+touch `config.json` or source code.
 
 Open:
 
@@ -440,7 +446,8 @@ uv run toda-worker
 
 ## Configuration
 
-Settings are loaded from `.env`. See `.env.example` for the complete template.
+Settings are loaded from `config.json`. See `config.example.json` for the
+complete template. Unknown keys are rejected rather than silently ignored.
 
 ### Minimal offline configuration
 
@@ -467,6 +474,10 @@ TODA_MODEL_ASSIGNMENTS={"main":{"connection":"openrouter-company","model":"opena
 
 Omitted auxiliary roles fall back to `main`. Credentials belong to the named
 provider connection and are not repeated for embeddings or media models.
+
+The `embedding` role is the one exception to that fallback: it resolves on its
+own, and when it is unset retrieval quietly drops to a deterministic local
+embedder whose similarity scores are meaningless. Assign it explicitly.
 
 ### Browser and media providers
 
@@ -577,34 +588,13 @@ default: ambient messages are evaluated by attention and may be delivered in
 context; a user or policy must explicitly disable proactive delivery for a
 channel.
 
-### Public multi-workspace install (OAuth)
+### Single workspace
 
-Everything above configures *this operator's own* Slack workspace directly
-through `.env`. A distributed Slack app also needs a standard OAuth "Add to
-Slack" flow so any other workspace can install it without the operator
-touching their config or restarting the process. That flow is a separate,
-additive path:
-
-```dotenv
-TODA_SLACK_CLIENT_ID=...
-TODA_SLACK_CLIENT_SECRET=...
-TODA_PUBLIC_URL=https://your-host
-```
-
-```text
-GET  /slack/install               # redirects to Slack's own authorize screen
-GET  /v1/slack/oauth/callback     # Slack redirects back here with a code
-```
-
-Each installing workspace gets its own tenant (`organization_id` derived
-deterministically from the Slack team id) and its own bot token, stored in the
-`slack_installations` table rather than `.env` — a public app has as many bot
-tokens as it has installs, and routing the right token to the right workspace
-happens per-request (`SlackSender._token_for`, `SlackGateway._fetch_user_profile`)
-rather than through a single global `TODA_SLACK_BOT_TOKEN`. Reinstalling
-(revoke and re-authorize) updates the same tenant rather than creating a
-duplicate. The single-workspace `.env` flow above still works unmodified and
-takes priority as a fallback wherever a workspace has no stored installation.
+One gateway serves one Slack workspace, configured directly through
+`config.json`. There is no "Add to Slack" OAuth distribution flow: the
+credentials in that file are the workspace this gateway talks to, and the
+`slack_installations` row mapping workspace to tenant is created automatically
+on first connect.
 
 ## Optional typed runtimes
 
@@ -773,11 +763,8 @@ capture, job processing, and deduplication.
 
 Current release validation:
 
-- 199 of 200 automated tests passing (one pre-existing, unrelated gap: a
-  red-team fixture missing dummy arguments for a newly added document tool)
+- 598 automated tests passing, 1 skipped
 - 18/18 deterministic organization simulation checks
-- 18/18 live OpenRouter embedding simulation checks using
-  `qwen/qwen3-embedding-8b`
 - 109 generated API paths
 
 ## Data retention
