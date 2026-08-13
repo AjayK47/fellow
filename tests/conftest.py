@@ -76,12 +76,19 @@ def offline_embeddings(monkeypatch: pytest.MonkeyPatch):
         ComposioConfig,
         MediaConfig,
         ModelsConfig,
+        OrganizationConfig,
         ServerConfig,
         SlackConfig,
         ToolsConfig,
         settings as _settings,
     )
 
+    # The fixtures seed "org_acme", and SlackGateway falls back to the
+    # configured organization for any workspace with no stored installation
+    # (harness/slack.py). Without pinning this, every ambient-Slack test
+    # silently files its evidence under whatever organization the developer
+    # happens to have in config.json and then fails looking for it.
+    monkeypatch.setattr(_settings, "organization", OrganizationConfig())
     monkeypatch.setattr(_settings, "models", ModelsConfig())
     monkeypatch.setattr(_settings, "slack", SlackConfig())
     monkeypatch.setattr(_settings, "composio", ComposioConfig())

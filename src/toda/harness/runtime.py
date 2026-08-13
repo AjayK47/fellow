@@ -677,7 +677,26 @@ class CompanyAgent:
                             f"({reasoning_tokens} of it on reasoning). Lower "
                             f"TODA_MAIN_MODEL_REASONING_EFFORT or choose a different model."
                         )
-                    raise RuntimeError("model returned neither answer nor tool call")
+                    # Everything needed to tell the causes apart, because the
+                    # turn is only persisted below -- raising bare here threw
+                    # away the one response that explains the failure.
+                    details = (response.usage.get("completion_tokens_details") or {})
+                    raw_message = (
+                        ((response.raw.get("choices") or [{}])[0].get("message") or {})
+                        if isinstance(response.raw, dict)
+                        else {}
+                    )
+                    reasoning_text = str(raw_message.get("reasoning") or "")
+                    raise RuntimeError(
+                        f"{response.model} returned neither answer nor tool call "
+                        f"(finish_reason={response.finish_reason!r}, "
+                        f"completion_tokens={response.usage.get('completion_tokens')}, "
+                        f"reasoning_tokens={details.get('reasoning_tokens') or 0}, "
+                        f"reasoning_chars={len(reasoning_text)}). "
+                        f"A reasoning model that answers only in its reasoning "
+                        f"channel produces this; the retry with reasoning "
+                        f"disabled already ran and returned empty too."
+                    )
                 skill_validation = self._validate_user_response(
                     run=run,
                     response=draft,

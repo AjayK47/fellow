@@ -158,27 +158,27 @@ class OpenAICompatibleModelClient:
         choice = choices[0]
         message = choice.get("message") or {}
 
-        # A reasoning model can spend its entire completion budget thinking and
-        # return no content and no tool call at all -- finish_reason "length"
-        # with every completion token counted as reasoning. It is intermittent:
-        # the identical request often answers fine. Retrying once with
-        # reasoning off turns a dead turn into an answer instead of surfacing
-        # "model returned neither answer nor tool call" to whoever asked.
+        # A reasoning model can end its turn having produced only thinking:
+        # no content and no tool call, with the output living in the separate
+        # `reasoning` field this contract deliberately does not surface (it is
+        # deliberation, not an answer). It is intermittent -- the identical
+        # request often answers fine -- so retrying once with reasoning off
+        # turns a dead turn into an answer instead of surfacing "model
+        # returned neither answer nor tool call" to whoever asked.
+        #
+        # This is deliberately not conditioned on finish_reason. The budget
+        # case ("length", every completion token spent reasoning) is only the
+        # loudest version; DeepSeek-class models also return an empty turn
+        # with finish_reason "stop" after reasoning normally, which the
+        # earlier "length"-only guard let straight through to a failed Task.
         if (
             allow_reasoning_retry
-            and choice.get("finish_reason") == "length"
             and not (message.get("content") or "").strip()
             and not message.get("tool_calls")
         ):
-            reasoning_tokens = (
-                ((payload.get("usage") or {}).get("completion_tokens_details") or {})
-                .get("reasoning_tokens")
-                or 0
-            )
-            if reasoning_tokens:
-                retry = dict(body)
-                retry["reasoning"] = {"enabled": False}
-                return self._send(retry, allow_reasoning_retry=False)
+            retry = dict(body)
+            retry["reasoning"] = {"enabled": False}
+            return self._send(retry, allow_reasoning_retry=False)
 
         calls: list[ModelToolCall] = []
         for call in message.get("tool_calls") or []:

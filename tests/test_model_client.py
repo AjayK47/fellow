@@ -169,3 +169,75 @@ def test_reasoning_retry_does_not_loop(monkeypatch):
     assert len(sent) == 2
     assert result.content == ""
     assert result.finish_reason == "length"
+
+
+def test_empty_reasoning_turn_is_retried_with_reasoning_disabled(monkeypatch):
+    """A reasoning model can end its turn having produced only thinking:
+    no content, no tool call, the output living in the `reasoning` field
+    this contract does not surface. Observed in production against
+    DeepSeek with finish_reason "stop", which an earlier "length"-only
+    guard let straight through to a failed Task."""
+    bodies: list[dict] = []
+
+    class Response:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    def post(*_args, **kwargs):
+        bodies.append(kwargs["json"])
+        if len(bodies) == 1:
+            return Response(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": "", "reasoning": "thought hard"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
+        return Response(
+            {"choices": [{"message": {"content": "the answer"}, "finish_reason": "stop"}]}
+        )
+
+    monkeypatch.setattr("toda.harness.model_client.httpx.post", post)
+    result = OpenAICompatibleModelClient(
+        api_key="test",
+        model="model",
+        base_url="https://example.test",
+        reasoning_effort="medium",
+    ).generate(messages=[{"role": "user", "content": "hello"}])
+
+    assert len(bodies) == 2, "an empty reasoning turn must be retried once"
+    assert bodies[0]["reasoning"] == {"effort": "medium"}
+    assert bodies[1]["reasoning"] == {"enabled": False}
+    assert result.content == "the answer"
+
+
+def test_the_retry_happens_only_once(monkeypatch):
+    """Two empty turns in a row surface the failure rather than looping."""
+    calls = {"n": 0}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            calls["n"] += 1
+            return {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr("toda.harness.model_client.httpx.post", lambda *a, **k: Response())
+    result = OpenAICompatibleModelClient(
+        api_key="test",
+        model="model",
+        base_url="https://example.test",
+        reasoning_effort="medium",
+    ).generate(messages=[{"role": "user", "content": "hello"}])
+    assert calls["n"] == 2
+    assert result.content == ""
