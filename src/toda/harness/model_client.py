@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import deque
 from typing import Any, Protocol
@@ -14,6 +15,8 @@ from toda.domain.models import new_id
 from toda.harness.models import ModelResponse, ModelToolCall
 from toda.providers import ProviderResolver, ResolvedModel
 
+
+log = logging.getLogger("toda.model")
 
 _DEFAULT_CONTEXT_LENGTH = 128_000
 
@@ -124,11 +127,121 @@ class OpenAICompatibleModelClient:
             }
         if self.reasoning_effort:
             body["reasoning"] = {"effort": self.reasoning_effort}
-        return self._send(body, allow_reasoning_retry=bool(self.reasoning_effort))
+        return self._generate_with_recovery(body)
 
-    def _send(
-        self, body: dict[str, Any], *, allow_reasoning_retry: bool = False
-    ) -> ModelResponse:
+    # How many times a thinking-only turn may be continued by replaying the
+    # model's own reasoning, and how many times a turn with nothing at all in
+    # it may simply be re-sent. Both are per `generate()` call.
+    _MAX_THINKING_CONTINUATIONS = 2
+    _MAX_EMPTY_RESENDS = 2
+
+    def _generate_with_recovery(self, body: dict[str, Any]) -> ModelResponse:
+        """Recover the turns where a reasoning model produces no answer.
+
+        A reasoning model can end its turn having produced only deliberation:
+        no content, no tool call, everything in the separate `reasoning`
+        field. Treating that as a failure loses a Task over a model quirk,
+        and it is intermittent — the identical request usually answers.
+
+        Ported from Hermes's conversation loop, which distinguishes two cases
+        and handles them differently rather than blanket-retrying:
+
+        * **thinking-only** — reasoning came back but no text. Replay the
+          assistant turn *carrying that reasoning* and let the model continue
+          from its own thinking. This is the important one: it neither throws
+          the deliberation away nor turns reasoning off, so the turn keeps the
+          quality the setting was enabled for.
+        * **truly empty** — nothing at all came back. Nothing to continue
+          from, so re-send the identical request.
+
+        Only when both are exhausted does it fall back to disabling reasoning
+        outright, which does degrade the turn but beats failing the Task.
+
+        The continuation messages live entirely inside this call. Hermes has
+        to flag its equivalents ephemeral so an append-only flush cannot
+        commit them to the session store; here the durable transcript is
+        written by the caller from the returned response, so scaffolding can
+        never reach it by construction.
+        """
+        response = self._send(body)
+        if self._is_usable(response):
+            return response
+
+        attempt_messages = list(body["messages"])
+        continuations = 0
+        resends = 0
+        while (
+            not self._is_budget_exhaustion(response)
+            and (
+                continuations < self._MAX_THINKING_CONTINUATIONS
+                or resends < self._MAX_EMPTY_RESENDS
+            )
+        ):
+            thinking_only = bool(response.reasoning or response.reasoning_details)
+            if thinking_only and continuations < self._MAX_THINKING_CONTINUATIONS:
+                continuations += 1
+                assistant: dict[str, Any] = {"role": "assistant", "content": ""}
+                # Prefer the structured form: Anthropic signs its thinking
+                # blocks, so replaying the plain text is not a valid item.
+                if response.reasoning_details:
+                    assistant["reasoning_details"] = response.reasoning_details
+                else:
+                    assistant["reasoning"] = response.reasoning
+                attempt_messages = [*attempt_messages, assistant]
+                log.info(
+                    "Thinking-only turn from %s — continuing from its own "
+                    "reasoning (%d/%d)",
+                    self.model, continuations, self._MAX_THINKING_CONTINUATIONS,
+                )
+            elif resends < self._MAX_EMPTY_RESENDS:
+                resends += 1
+                log.warning(
+                    "Empty turn from %s with no reasoning to continue from — "
+                    "resending (%d/%d)",
+                    self.model, resends, self._MAX_EMPTY_RESENDS,
+                )
+            else:
+                break
+            response = self._send({**body, "messages": attempt_messages})
+            if self._is_usable(response):
+                return response
+
+        if self.reasoning_effort:
+            log.warning(
+                "%s still produced no answer after %d continuation(s) and %d "
+                "resend(s) — retrying once with reasoning disabled",
+                self.model, continuations, resends,
+            )
+            final = dict(body)
+            final["reasoning"] = {"enabled": False}
+            return self._send(final)
+        return response
+
+    @staticmethod
+    def _is_usable(response: ModelResponse) -> bool:
+        """A turn the agent loop can actually act on."""
+        return bool(response.content.strip() or response.tool_calls)
+
+    @staticmethod
+    def _is_budget_exhaustion(response: ModelResponse) -> bool:
+        """The model spent its whole output budget thinking.
+
+        Worth separating from an ordinary empty turn because the recovery is
+        different *and* the cost is real: re-sending an identical request
+        that just consumed tens of thousands of reasoning tokens buys another
+        bill and, most likely, the same outcome. There is also nothing to
+        continue from -- the deliberation was spent, not returned. Skip
+        straight to the reasoning-disabled attempt.
+        """
+        if response.finish_reason != "length":
+            return False
+        reasoning_tokens = (
+            (response.usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+            or 0
+        )
+        return bool(reasoning_tokens)
+
+    def _send(self, body: dict[str, Any]) -> ModelResponse:
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={
@@ -158,28 +271,6 @@ class OpenAICompatibleModelClient:
         choice = choices[0]
         message = choice.get("message") or {}
 
-        # A reasoning model can end its turn having produced only thinking:
-        # no content and no tool call, with the output living in the separate
-        # `reasoning` field this contract deliberately does not surface (it is
-        # deliberation, not an answer). It is intermittent -- the identical
-        # request often answers fine -- so retrying once with reasoning off
-        # turns a dead turn into an answer instead of surfacing "model
-        # returned neither answer nor tool call" to whoever asked.
-        #
-        # This is deliberately not conditioned on finish_reason. The budget
-        # case ("length", every completion token spent reasoning) is only the
-        # loudest version; DeepSeek-class models also return an empty turn
-        # with finish_reason "stop" after reasoning normally, which the
-        # earlier "length"-only guard let straight through to a failed Task.
-        if (
-            allow_reasoning_retry
-            and not (message.get("content") or "").strip()
-            and not message.get("tool_calls")
-        ):
-            retry = dict(body)
-            retry["reasoning"] = {"enabled": False}
-            return self._send(retry, allow_reasoning_retry=False)
-
         calls: list[ModelToolCall] = []
         for call in message.get("tool_calls") or []:
             function = call.get("function") or {}
@@ -208,6 +299,7 @@ class OpenAICompatibleModelClient:
                     arguments=arguments or {},
                 )
             )
+        details = message.get("reasoning_details")
         return ModelResponse(
             content=message.get("content") or "",
             tool_calls=calls,
@@ -215,6 +307,12 @@ class OpenAICompatibleModelClient:
             model=payload.get("model") or self.model,
             usage=payload.get("usage") or {},
             raw=payload,
+            # Providers disagree on the name; OpenRouter forwards whichever
+            # the upstream used.
+            reasoning=str(
+                message.get("reasoning") or message.get("reasoning_content") or ""
+            ),
+            reasoning_details=list(details) if isinstance(details, list) else [],
         )
 
 

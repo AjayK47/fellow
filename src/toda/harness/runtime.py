@@ -679,23 +679,21 @@ class CompanyAgent:
                         )
                     # Everything needed to tell the causes apart, because the
                     # turn is only persisted below -- raising bare here threw
-                    # away the one response that explains the failure.
+                    # away the one response that explains the failure. By this
+                    # point the transport has already tried continuing the
+                    # model from its own reasoning, re-sending, and disabling
+                    # reasoning outright, so this is a model that will not
+                    # answer rather than a one-off empty turn.
                     details = (response.usage.get("completion_tokens_details") or {})
-                    raw_message = (
-                        ((response.raw.get("choices") or [{}])[0].get("message") or {})
-                        if isinstance(response.raw, dict)
-                        else {}
-                    )
-                    reasoning_text = str(raw_message.get("reasoning") or "")
                     raise RuntimeError(
                         f"{response.model} returned neither answer nor tool call "
+                        f"after thinking-only recovery "
                         f"(finish_reason={response.finish_reason!r}, "
                         f"completion_tokens={response.usage.get('completion_tokens')}, "
                         f"reasoning_tokens={details.get('reasoning_tokens') or 0}, "
-                        f"reasoning_chars={len(reasoning_text)}). "
-                        f"A reasoning model that answers only in its reasoning "
-                        f"channel produces this; the retry with reasoning "
-                        f"disabled already ran and returned empty too."
+                        f"reasoning_chars={len(response.reasoning)}). "
+                        f"Consider a different model for the main role, or set "
+                        f"models.main_reasoning_effort to null in config.json."
                     )
                 skill_validation = self._validate_user_response(
                     run=run,

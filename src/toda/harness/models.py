@@ -118,6 +118,17 @@ class ModelResponse(BaseModel):
     model: str = ""
     usage: dict[str, Any] = Field(default_factory=dict)
     raw: dict[str, Any] = Field(default_factory=dict)
+    # A reasoning model's deliberation, kept separate from `content` because
+    # it is thinking, not an answer: nothing may surface it to a human or
+    # fold it into assistant content. It is carried so the transport can
+    # replay a thinking-only turn back to the model (see
+    # OpenAICompatibleModelClient.generate) and so a failure can say how much
+    # thinking came back instead of just "empty".
+    reasoning: str = ""
+    # OpenRouter's structured, provider-signed form of the same thing. This
+    # is the field to replay when present: Anthropic signs its thinking
+    # blocks, so the plain text alone is not a valid continuation item.
+    reasoning_details: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ToolDefinition(BaseModel):
