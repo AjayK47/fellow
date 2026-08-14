@@ -93,3 +93,23 @@ def test_document_tools_are_delegated_not_carried(brain):
         assert specialist not in names(manager), specialist
         assert specialist in names(child), specialist
     assert len(manager) < len(child)
+
+
+def test_conversion_is_idempotent():
+    """The prompt now asks the model to write Slack mrkdwn directly, so the
+    converter must leave already-correct output alone rather than mangling
+    the single asterisks and <url|label> links it just asked for."""
+    already_slack = (
+        "*Terafab summary*\n\n"
+        "• Scale: _enormous_\n"
+        "• Source: <https://x.com/elonmusk|the announcement>\n"
+        "• Status: ~cancelled~ ongoing\n\n"
+        "```\nkeep **this** as-is\n```"
+    )
+    assert md(already_slack) == already_slack
+    assert md(md(already_slack)) == already_slack
+
+
+def test_a_bold_line_at_the_start_is_not_read_as_a_bullet():
+    """"*Heading*" begins with an asterisk; the bullet rule must not eat it."""
+    assert md("*Summary*\nbody") == "*Summary*\nbody"
