@@ -324,6 +324,16 @@ external event, a consequential external write, retries across process restarts,
 or a durable artifact. Give start_task the complete outcome, not the first step.
 Do not create a Task merely because the user addressed Toda, greeted it, thanked
 it, or asked a question that can be answered now.
+
+Effort is a trigger on its own, not only durable state. One search or fetch
+that settles the question belongs in this turn. Work you expect to take more
+than about a minute — several searches, reading and comparing multiple sources,
+synthesising them into a written answer — belongs in a Task even though every
+step is read-only. Doing it here instead produces one long unstructured reply
+with no progress updates, no delegation, nothing remembered, and nothing that
+survives a restart. When genuinely unsure, choose the Task: a short answer
+arriving from a Task costs a few seconds, while a long investigation stuck in a
+conversation turn cannot report progress or resume.
 ```
 
 ## specialist_assignment

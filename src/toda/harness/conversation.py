@@ -26,9 +26,25 @@ from toda.harness.prompt_library import load
 _START_TASK = ToolDefinition(
     name="start_task",
     description=(
-        "Promote the user's request to one durable root Task. Use this only "
-        "when the work must survive this turn, has consequential actions, "
-        "needs delegation/approval/waiting, or produces a durable artifact."
+        "Promote the user's request to one durable root Task, which you own "
+        "end to end: it can delegate to specialist workers, post progress, "
+        "survive a restart, and is remembered.\n\n"
+        "WHEN TO USE start_task:\n"
+        "- Work you expect to take more than about a minute\n"
+        "- Research or synthesis: several searches or sources to read, "
+        "compare, and write up\n"
+        "- Anything needing delegation, approval, waiting, or a timer\n"
+        "- A consequential external write, or a durable artifact "
+        "(document, chart, report)\n"
+        "- Work that would flood this turn with intermediate data\n\n"
+        "WHEN NOT TO USE (answer here instead):\n"
+        "- A greeting, a thank-you, or a question you can already answer\n"
+        "- One lookup that settles it — a single web_search, web_fetch, or "
+        "brain_search, then a reply\n"
+        "- A clarifying question back to the person\n\n"
+        "Prefer a Task when genuinely unsure: a short answer arriving from a "
+        "Task costs a few seconds, whereas a long investigation stuck in a "
+        "conversation turn cannot report progress, delegate, or resume."
     ),
     input_schema={
         "type": "object",

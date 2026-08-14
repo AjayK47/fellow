@@ -10,6 +10,7 @@ from typing import Any
 
 from toda.domain.models import new_id, utcnow
 from toda.harness.router import _ACK_REACTION
+from toda.harness.slack_markdown import to_slack_mrkdwn
 from toda.services.scope_resolution import resolve_scope
 
 log = logging.getLogger("toda.delivery")
@@ -127,7 +128,7 @@ class DeliveryService:
             return {"session_id": session_id, "delivered": False, "reason": "already_delivered"}
         result = self.slack.send(
             channel_id=slack.get("channel_id") or destination.get("id") or "",
-            text=str(message.get("content") or ""),
+            text=to_slack_mrkdwn(str(message.get("content") or "")),
             workspace_id=slack.get("workspace_id"),
             organization_id=session["organization_id"],
             idempotency_key=idempotency_key,
@@ -242,7 +243,10 @@ class DeliveryService:
         try:
             result = self.slack.send(
                 channel_id=channel_id,
-                text=task["final_answer"],
+                # The model writes Markdown; Slack speaks mrkdwn. Blocks here
+                # have always declared "mrkdwn" while carrying raw Markdown,
+                # so "### Heading" and "**bold**" rendered literally.
+                text=to_slack_mrkdwn(task["final_answer"]),
                 workspace_id=slack.get("workspace_id"),
                 organization_id=task["organization_id"],
                 idempotency_key=idempotency_key,

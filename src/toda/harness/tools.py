@@ -14,6 +14,7 @@ from toda.domain.models import new_id, utcnow
 from toda.harness.child_tasks import AwaitingChildren
 from toda.harness.composio import ComposioClient
 from toda.harness.models import ModelToolCall, ToolDefinition, ToolResult
+from toda.harness.slack_markdown import to_slack_mrkdwn
 from toda.harness.calculator import calculate
 from toda.harness.typed_tools import BrowserTools, DocumentTools, VisionMediaTools
 from toda.harness.visual_tools import VisualTools
@@ -579,7 +580,10 @@ def build_tool_registry(
             workspace_id = (runtime.get("task_metadata") or {}).get("slack", {}).get("workspace_id")
             result = slack_sender.send(
                 channel_id=str(destination["id"]),
-                text=args["text"],
+                # Same Markdown -> mrkdwn translation the automatic delivery
+                # paths do. The model reaches for Markdown by default even
+                # when it is composing the message itself.
+                text=to_slack_mrkdwn(args["text"]),
                 blocks=args.get("blocks"),
                 workspace_id=workspace_id,
                 # Without this the send is not recorded in the conversation

@@ -353,6 +353,18 @@ class DocumentTools(ArtifactToolBase):
                     runtime_ready=ready,
                     setup_needed=missing,
                     max_result_chars=12_000,
+                    # Creating a document is a common direct request ("make
+                    # me a report"), so those five stay on the main agent.
+                    # The other eighteen all operate on an existing
+                    # artifact_id -- inspect, extract, render, edit, merge,
+                    # split, fill_form, read, validate, ocr -- which a
+                    # Session Manager deciding whether to answer or delegate
+                    # almost never holds. Carrying them cost ~4,300 tokens on
+                    # every turn, including "how are you doing?". The child
+                    # Task that actually does document work still gets the
+                    # full set: allowed_definitions only applies this filter
+                    # to non-worker Tasks.
+                    main_agent_visible=name.endswith("_create"),
                 )
             )
         return definitions
