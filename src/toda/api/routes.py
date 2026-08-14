@@ -1074,14 +1074,14 @@ def list_sessions(
             organization_id, session_id=session["id"], limit=500
         )
         latest_task = tasks[-1] if tasks else None
-        messages = brain.store.session_messages(session["id"], limit=1)
+        messages = brain.store.list_session_messages(session["id"], limit=1)
         results.append(
             {
                 "session": session,
                 "task_count": len(tasks),
                 "latest_task": latest_task,
                 "message_count": len(
-                    brain.store.session_messages(session["id"], limit=10_000)
+                    brain.store.list_session_messages(session["id"], limit=10_000)
                 ),
                 "last_message_preview": (messages[-1] if messages else None),
             }
@@ -1101,7 +1101,7 @@ def get_session(session_id: str, request: Request) -> dict[str, Any]:
     return {
         "session": session,
         "tasks": tasks,
-        "messages": brain.store.session_messages(session_id, limit=1000),
+        "messages": brain.store.list_session_messages(session_id, limit=1000),
     }
 
 
