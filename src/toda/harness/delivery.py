@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from datetime import timedelta
@@ -53,10 +54,12 @@ def _approval_preview_text(prefix: str, arguments: dict[str, Any]) -> str:
     )
 
 
-# The acknowledgement is one line, so a small budget is plenty and caps
-# what a runaway model can spend on saying hello. Deliberation is disabled
-# for the call, so the whole budget is available for the sentence itself.
-_ACK_MAX_TOKENS = 200
+# One line of output, but the budget has to cover the model's own thinking
+# too: reasoning cannot be switched off on every provider (ai-studio rejects
+# effort "none"), so a tight cap gets spent deliberating and the sentence
+# comes back truncated mid-word. The text is clipped to 300 characters after
+# the fact, so the real cost stays bounded by what the model actually thinks.
+_ACK_MAX_TOKENS = 1_500
 
 _ACK_SYSTEM_PROMPT = """You are Toda, a colleague at this company, replying \
 in Slack the instant a request arrives — before you have started work.
@@ -73,6 +76,25 @@ Examples of the register:
 "Let me pull the Japanese rail and GDP figures and put a report together."
 "Digging into what's blocking the Acme renewal now."
 "I'll check the deploy history and see what changed last week."
+"""
+
+
+
+_APPROVAL_MAX_TOKENS = 1_500
+
+_APPROVAL_SYSTEM_PROMPT = """You are Toda, asking a colleague in Slack to \
+approve one action before you take it.
+
+Write ONE short sentence saying plainly what you are about to do and to
+what, so they can decide without knowing anything about how you work.
+
+- Name the real subject: the file, the document, the channel, the record.
+- No tool names, no function names, no JSON, no field names, no IDs.
+- Present tense, first person, what you will do: "Post the finished
+  report to #social", "Create a PDF of the Q3 revenue summary".
+- No greeting, no please, no explanation of why, no question mark.
+- If you genuinely cannot tell what the action does, say so in plain
+  words rather than guessing.
 """
 
 
@@ -522,6 +544,48 @@ class DeliveryService:
             )
         return {"task_id": task_id, "delivered": True, "delivery": delivery}
 
+    def _approval_sentence(self, task: dict[str, Any], preview: dict[str, Any]) -> str:
+        """Plain language for the approval card, or "" to fall back.
+
+        The card used to read "Approval required: <tool description>" over
+        "Action: `tool_name`" and then the whole arguments dict in a code
+        fence. Nobody approving anything needs a function name and a JSON
+        blob -- they need to know what is about to happen, in their own
+        terms. An approval that cannot be read is not a control.
+
+        Never raises: a courtesy that breaks the approval it introduces is
+        worse than a plainly-worded fallback.
+        """
+        if self.model is None:
+            return ""
+        request = json.dumps(
+            {
+                "what_the_person_asked_for": str(task.get("goal") or "")[:400],
+                "action": preview.get("action"),
+                "action_description": preview.get("description"),
+                "details": preview.get("arguments") or {},
+            },
+            default=str,
+        )[:4_000]
+        try:
+            response = self.model.generate(
+                messages=[
+                    {"role": "system", "content": _APPROVAL_SYSTEM_PROMPT},
+                    {"role": "user", "content": request},
+                ],
+                temperature=0.2,
+                max_tokens=_APPROVAL_MAX_TOKENS,
+                reasoning=False,
+            )
+        except Exception:
+            log.warning(
+                "Approval summary model call failed for task_id=%s",
+                task.get("id"), exc_info=True,
+            )
+            return ""
+        line = " ".join(str(response.content or "").split()).strip('"').strip()
+        return line[:300]
+
     def deliver_approval(self, approval_id: str) -> dict[str, Any]:
         approval = self.store.get_harness_record("approvals", approval_id)
         if not approval:
@@ -533,17 +597,17 @@ class DeliveryService:
         envelope = task["envelope"]
         slack = (task.get("metadata") or {}).get("slack") or {}
         preview = approval["preview"]
+        sentence = self._approval_sentence(task, preview)
         text = (
-            f"Approval required: {preview['description']}\n"
-            f"Action: `{preview['action']}`"
+            f"*{sentence}*"
+            if sentence
+            else f"Approval required: {preview['description']}\n"
+                 f"Action: `{preview['action']}`"
         )
         blocks = [
             {
                 "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": _approval_preview_text(text, preview.get("arguments") or {}),
-                },
+                "text": {"type": "mrkdwn", "text": text},
             },
             {
                 "type": "actions",

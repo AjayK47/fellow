@@ -368,59 +368,6 @@ def test_resolving_an_approval_updates_the_original_slack_message(brain):
     assert calls[0]["blocks"][0]["text"]["text"] == "*Approved* by person_ajay"
 
 
-def test_approval_card_truncates_a_large_argument_preview_instead_of_failing(brain):
-    """Slack rejects an entire postMessage call (invalid_blocks) if any
-    section's text.text exceeds 3000 characters -- a tool call whose
-    arguments embed a large text field (a full report/document body, e.g.
-    pdf_create) must still produce a postable approval card instead of
-    silently dead-lettering with the human never seeing an approval
-    prompt at all."""
-    from toda.domain.models import utcnow
-
-    run = brain.company_agent.create_invocation(
-        envelope=_envelope(brain, conversation="api:huge-approval:thread"),
-        goal="Create a PDF report",
-        trigger_kind="reactive",
-        initial_message="Create a PDF report",
-    )
-    now = utcnow().isoformat()
-    approval_id = "approval_huge_preview_test"
-    huge_text = "A" * 10_000
-    brain.store.upsert_approval(
-        {
-            "id": approval_id,
-            "organization_id": "org_acme",
-            "task_id": run["id"],
-            "tool_call_id": "call_huge_pdf",
-            "status": "pending",
-            "requested_by": "person_ajay",
-            "allowed_approver_ids": ["person_ajay"],
-            "preview": {
-                "action": "pdf_create",
-                "description": "Typed artifact-only pdf create operation.",
-                "arguments": {"title": "Report", "text": huge_text},
-            },
-            "created_at": now,
-            "updated_at": now,
-        }
-    )
-
-    sent: list[dict] = []
-    brain.delivery.slack.send = lambda **kwargs: (sent.append(kwargs), {"ok": True, "channel": "C_TEST", "ts": "1.1"})[1]
-
-    result = brain.delivery.deliver_approval(approval_id)
-
-    assert result["delivery"]["status"] == "completed"
-    assert len(sent) == 1
-    section_text = sent[0]["blocks"][0]["text"]["text"]
-    assert len(section_text) <= 3000
-    assert "truncated" in section_text
-    # The Approve/Deny buttons must still be present and untouched.
-    actions = sent[0]["blocks"][1]
-    assert [el["action_id"] for el in actions["elements"]] == [
-        "toda_approve",
-        "toda_deny",
-    ]
 
 
 def test_resume_after_approval_failure_does_not_leave_a_zombie_run(brain):

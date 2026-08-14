@@ -609,9 +609,14 @@ class ConcentrateResponsesModelClient:
                     "schema": response_schema,
                 }
             }
-        if reasoning is False:
-            body["reasoning"] = {"effort": "none"}
-        elif self.reasoning_effort:
+        # reasoning=False means "do not spend the budget thinking", but it
+        # cannot be expressed as effort "none" here: Concentrate maps that to
+        # MINIMAL and ai-studio rejects it outright --
+        #   400 Thinking level MINIMAL is not supported for this model.
+        # Omitting the field asks for the model's default instead, which is
+        # the closest honest approximation; a model that then spends its whole
+        # budget thinking is handled by the caller's recovery path.
+        if reasoning is not False and self.reasoning_effort:
             body["reasoning"] = {"effort": self.reasoning_effort}
         return self._send(body)
 

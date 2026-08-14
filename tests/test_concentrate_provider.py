@@ -149,11 +149,14 @@ def test_reasoning_effort_and_suppression(monkeypatch):
     _client(reasoning_effort="medium").generate(messages=[{"role": "user", "content": "hi"}])
     assert sent[0]["json"]["reasoning"] == {"effort": "medium"}
 
+    # reasoning=False omits the field rather than sending effort "none":
+    # Concentrate maps that to MINIMAL and ai-studio rejects it with
+    # "Thinking level MINIMAL is not supported for this model."
     sent2 = _capture(monkeypatch, _OK)
     _client(reasoning_effort="medium").generate(
         messages=[{"role": "user", "content": "hi"}], reasoning=False
     )
-    assert sent2[0]["json"]["reasoning"] == {"effort": "none"}
+    assert "reasoning" not in sent2[0]["json"]
 
 
 def test_max_tokens_uses_the_responses_field(monkeypatch):

@@ -15,6 +15,7 @@ from toda.harness.child_tasks import AwaitingChildren
 from toda.harness.composio import ComposioClient
 from toda.harness.models import ModelToolCall, ToolDefinition, ToolResult
 from toda.harness.slack_markdown import to_slack_mrkdwn
+from toda.services.artifacts import artifact_payload
 from toda.harness.calculator import calculate
 from toda.harness.typed_tools import BrowserTools, DocumentTools, VisionMediaTools
 from toda.harness.visual_tools import VisualTools
@@ -254,12 +255,36 @@ def _requires_dynamic_high_stakes_approval(
 # An explicit per-tool execution override in tool_policies still wins, so an
 # organization that wants these gated can say so; only the mode default and
 # the approval_required floor are bypassed.
+# Tools that never pause for a human. Everything here is either scoped to
+# Toda's own state or writes only into the conversation the request came
+# from -- nothing reaches a third party, spends money, or changes a system
+# outside Toda, which is what the approval gate exists to guard.
+#
+# Producing a document and handing it over is the deliverable, not a
+# consequential action: being asked to approve "create the report you just
+# asked me for", twice, is friction with no decision in it. Approvals lose
+# their meaning when they fire on the obvious, because the one that matters
+# then arrives looking like the four that did not.
 NATIVE_ALLOW_TOOL_NAMES = frozenset(
     {
         "automation_create",
         "automation_set_enabled",
         "automation_run_now",
         "automation_delete",
+        # Authoring a document into Toda's own artifact store.
+        "pdf_create",
+        "docx_create",
+        "xlsx_create",
+        "pptx_create",
+        "html_create",
+        "chart_create",
+        "diagram_render",
+        "infographic_create",
+        "brain_create_artifact",
+        # Handing the result to the person who asked, in the channel they
+        # asked in. Both are bounded to the current Slack destination.
+        "slack_send_artifact",
+        "slack_send_message",
     }
 )
 
@@ -1168,17 +1193,16 @@ def build_tool_registry(
                     raise PermissionError(
                         "artifact is outside the acting principal's allowed scopes"
                     )
-                content = artifact["content"]
-                is_text = isinstance(content, str)
-                body = content if is_text else json.dumps(content, indent=2, default=str)
-                safe_title = "".join(
-                    c if c.isalnum() or c in " ._-" else "_" for c in artifact["title"]
-                ).strip() or artifact["id"]
+                # Binary artifacts are stored as {"base64": ..., "mime_type":
+                # ...}. Treating "not a string" as "therefore JSON" uploaded
+                # that wrapper verbatim -- a .json file whose whole body was
+                # {"base64": "JVBERi0x..."} instead of a readable PDF.
+                body, _mime, filename = artifact_payload(artifact)
                 slack_meta = (runtime.get("task_metadata") or {}).get("slack") or {}
                 result = slack_sender.upload_file(
                     channel_id=slack_meta.get("channel_id") or runtime["destination"]["id"],
-                    filename=f"{safe_title}.{'txt' if is_text else 'json'}",
-                    content=body.encode("utf-8"),
+                    filename=filename,
+                    content=body,
                     title=artifact["title"],
                     initial_comment=args.get("initial_comment"),
                     workspace_id=slack_meta.get("workspace_id"),

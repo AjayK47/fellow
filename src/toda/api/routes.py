@@ -5,12 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-import base64
 import hashlib
 import hmac
 import ipaddress
 import json
-import mimetypes
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
@@ -22,6 +20,7 @@ from toda.adapters import (
     composio_connected_account_id,
     normalize_composio_harness_event,
 )
+from toda.services.artifacts import artifact_payload
 from toda.services.container import TodaApp
 from toda.domain.models import new_id, utcnow
 from toda.harness.slack import (
@@ -2885,18 +2884,6 @@ _INLINE_MIME_TYPES = {
     "image/jpeg",
     "image/svg+xml",
 }
-_EXTENSION_BY_MIME = {
-    "application/pdf": ".pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-    "text/html": ".html",
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/svg+xml": ".svg",
-    "application/json": ".json",
-    "text/plain": ".txt",
-}
 
 # An SVG served inline from the console's own origin is an active document:
 # it may carry <script> and same-origin fetches. chart_create/diagram_render
@@ -2913,25 +2900,12 @@ def download_artifact(artifact_id: str, request: Request) -> Response:
     artifact = brain.artifacts.get(artifact_id)
     if not artifact:
         raise HTTPException(404, "artifact not found")
-    content = artifact.get("content")
-    if isinstance(content, dict) and isinstance(content.get("base64"), str):
-        body = base64.b64decode(content["base64"])
-        mime_type = str(content.get("mime_type") or "application/octet-stream")
-    elif isinstance(content, dict) and isinstance(content.get("text"), str):
-        body = content["text"].encode("utf-8")
-        mime_type = str(content.get("mime_type") or "text/plain")
-    elif isinstance(content, str):
-        body = content.encode("utf-8")
-        mime_type = "text/plain"
-    else:
-        body = json.dumps(content, indent=2, default=str).encode("utf-8")
-        mime_type = "application/json"
-    safe_title = "".join(
-        c if c.isalnum() or c in " ._-" else "_" for c in str(artifact.get("title") or artifact_id)
-    ).strip() or artifact_id
-    extension = _EXTENSION_BY_MIME.get(mime_type) or mimetypes.guess_extension(mime_type) or ""
+    # One implementation, shared with the Slack upload tool -- two copies is
+    # how they diverged, and the tool's half-version shipped a base64
+    # wrapper into a channel as a .json file.
+    body, mime_type, safe_name = artifact_payload(artifact)
     disposition = "inline" if mime_type in _INLINE_MIME_TYPES else "attachment"
-    headers = {"Content-Disposition": f'{disposition}; filename="{safe_title}{extension}"'}
+    headers = {"Content-Disposition": f'{disposition}; filename="{safe_name}"'}
     if mime_type == "image/svg+xml":
         headers["Content-Security-Policy"] = _SVG_CSP
     return Response(

@@ -60,10 +60,17 @@ def test_tools_api_exposes_real_readiness_and_autonomous_defaults(api_client):
     assert body["setup_needed_count"] > 0
 
     read_tool = next(tool for tool in body["tools"] if tool["risk"] == "read")
+    # An *ordinary* write tool. Authoring a document and replying in the
+    # current channel sit on the native allow-list and run direct, so
+    # picking whichever write tool sorts first no longer tests the mode.
+    from toda.harness.tools import NATIVE_ALLOW_TOOL_NAMES
+
     write_tool = next(
         tool
         for tool in body["tools"]
-        if tool["risk"] == "write" and not tool["approval_required"]
+        if tool["risk"] == "write"
+        and not tool["approval_required"]
+        and tool["name"] not in NATIVE_ALLOW_TOOL_NAMES
     )
     assert read_tool["policy"]["execution"] == "direct"
     assert write_tool["policy"]["execution"] == "ai_review"

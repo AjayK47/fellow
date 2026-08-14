@@ -10,6 +10,7 @@ model.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Callable
 
 from toda.domain.models import new_id
@@ -21,6 +22,8 @@ from toda.harness.models import (
     TriggerKind,
 )
 from toda.harness.prompt_library import load
+
+log = logging.getLogger("toda.conversation")
 
 
 _START_TASK = ToolDefinition(
@@ -104,6 +107,30 @@ class ConversationAgent:
         self.max_iterations = max_iterations
         self.max_tokens = max_tokens
 
+
+    def _acknowledge(self, task: dict[str, Any]) -> None:
+        """Say we heard them, before the Task's first reasoning turn.
+
+        Hooked here rather than only in SessionManagerScheduler because in
+        practice this is where root Tasks are born: the ConversationAgent
+        runs first for any session without one, so every Task promoted by
+        start_task or by tool selection is created on these paths. Wiring
+        the acknowledgement only into the scheduler meant it never fired
+        once -- no delivery.acknowledge job was ever enqueued.
+        """
+        try:
+            self.delivery_enqueue(
+                organization_id=task["organization_id"],
+                kind="delivery.acknowledge",
+                payload={"task_id": task["id"]},
+                idempotency_key=f"delivery.acknowledge:{task['id']}",
+            )
+        except Exception:
+            log.warning(
+                "Could not enqueue acknowledgement for task_id=%s",
+                task.get("id"), exc_info=True,
+            )
+
     def run(
         self,
         *,
@@ -134,6 +161,7 @@ class ConversationAgent:
                 max_tool_calls=task_agent.max_tool_calls,
                 metadata=task_metadata,
             )
+            self._acknowledge(root)
             return task_agent.execute_task(root["id"])
         context = self.context_service.prepare_context(
             organization_id=session["organization_id"],
@@ -254,6 +282,7 @@ class ConversationAgent:
                         max_tool_calls=task_agent.max_tool_calls,
                         metadata=task_metadata,
                     )
+                    self._acknowledge(root)
                     return task_agent.execute_task(root["id"])
                 if call.name not in _CONVERSATION_READ_TOOLS:
                     # The model selected a capability that requires durable
@@ -275,6 +304,7 @@ class ConversationAgent:
                         max_tool_calls=task_agent.max_tool_calls,
                         metadata=metadata,
                     )
+                    self._acknowledge(root)
                     return task_agent.execute_task(root["id"])
                 else:
                     result = self.tools.execute(run=pseudo_run, call=call)
