@@ -1400,7 +1400,10 @@ def test_message_and_app_mention_callbacks_for_one_slack_message_are_deduped(bra
     deliveries = brain.store.list_harness_records(
         "deliveries", "org_acme", where={"task_id": matching_runs[0]["id"]}
     )
-    assert len(deliveries) == 1
+    # One answer for the duplicated callback -- which is what dedupe means
+    # here. A Task also records its acknowledgement, so count the kind
+    # under test rather than every delivery row.
+    assert len([d for d in deliveries if d.get("kind") == "final_answer"]) == 1
 
 
 def test_slack_channels_are_proactive_by_default_with_explicit_opt_out(brain):

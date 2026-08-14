@@ -8,6 +8,7 @@ concurrently" scheduler described in the Session/Task architecture plan.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from toda.domain.models import new_id, utcnow
@@ -20,6 +21,8 @@ from toda.harness.models import (
 )
 from toda.harness.retry import is_retryable_task_error
 from toda.harness.task_run_store import TaskRunStore
+
+log = logging.getLogger("toda.session_manager")
 
 # An approval wait is deliberately not resumable from here -- resolving
 # an approval wakes the parent Task directly (Phase 7), not through a new
@@ -166,6 +169,7 @@ class SessionManagerScheduler:
                 max_tool_calls=agent.max_tool_calls,
                 metadata=self._root_task_metadata(session),
             )
+            self._acknowledge(agent, root_task)
             outcome = agent.execute_task(root_task["id"])
         elif root_task["state"] == AgentRunState.QUEUED.value:
             outcome = agent.execute_task(root_task["id"])
@@ -209,6 +213,7 @@ class SessionManagerScheduler:
                 max_iterations=agent.max_iterations, max_tool_calls=agent.max_tool_calls,
                 metadata=self._root_task_metadata(session),
             )
+            self._acknowledge(agent, root_task)
             outcome = agent.execute_task(root_task["id"])
         else:
             # queued/running/approval waits -- not
@@ -234,6 +239,32 @@ class SessionManagerScheduler:
         if not transient:
             self.sessions.mark_processed(session_id, revision_at_start)
         return outcome
+
+    @staticmethod
+    def _acknowledge(agent: Any, task: dict[str, Any]) -> None:
+        """Tell the person we heard them, before the first reasoning turn.
+
+        Enqueued rather than sent inline because dispatch runs on the agent
+        lane and goes straight into ``execute_task``: sending from here
+        would land the acknowledgement *after* the work it is meant to
+        precede. The delivery lane picks it up within a poll interval and
+        posts while this thread is still on its first model call.
+
+        Never allowed to affect the Task -- a courtesy that breaks the work
+        it introduces is worse than no courtesy at all.
+        """
+        try:
+            agent.enqueue_job(
+                organization_id=task["organization_id"],
+                kind="delivery.acknowledge",
+                payload={"task_id": task["id"]},
+                idempotency_key=f"delivery.acknowledge:{task['id']}",
+            )
+        except Exception:
+            log.warning(
+                "Could not enqueue acknowledgement for task_id=%s",
+                task.get("id"), exc_info=True,
+            )
 
     @staticmethod
     def _root_task_metadata(session: dict[str, Any]) -> dict[str, Any]:

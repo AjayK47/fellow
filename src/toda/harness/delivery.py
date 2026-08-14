@@ -9,7 +9,6 @@ from datetime import timedelta
 from typing import Any
 
 from toda.domain.models import new_id, utcnow
-from toda.harness.router import _ACK_REACTION
 from toda.services.scope_resolution import resolve_scope
 
 log = logging.getLogger("toda.delivery")
@@ -52,6 +51,29 @@ def _approval_preview_text(prefix: str, arguments: dict[str, Any]) -> str:
     )
 
 
+# The acknowledgement is one line, so a small budget is plenty and caps
+# what a runaway model can spend on saying hello. Deliberation is disabled
+# for the call, so the whole budget is available for the sentence itself.
+_ACK_MAX_TOKENS = 200
+
+_ACK_SYSTEM_PROMPT = """You are Toda, a colleague at this company, replying \
+in Slack the instant a request arrives — before you have started work.
+
+Write ONE short sentence acknowledging what was asked, in your own voice.
+
+- Name the specific thing, so it is clear you actually read it.
+- Say what you are about to do, not what you have found. You have done
+  nothing yet and know nothing yet.
+- Never promise a time, never invent findings, never ask a question.
+- No greeting, no sign-off, no emoji, no preamble. Just the sentence.
+
+Examples of the register:
+"Let me pull the Japanese rail and GDP figures and put a report together."
+"Digging into what's blocking the Acme renewal now."
+"I'll check the deploy history and see what changed last week."
+"""
+
+
 class DeliveryService:
     def __init__(
         self,
@@ -60,11 +82,17 @@ class DeliveryService:
         authz: Any,
         slack_sender: Any,
         audit: Any,
+        model: Any | None = None,
     ) -> None:
         self.store = store
         self.authz = authz
         self.slack = slack_sender
         self.audit = audit
+        # Deliberately the small auxiliary model, not the main one. The
+        # acknowledgement exists so a person is not left in silence while
+        # the real model spins up; paying main-model latency to produce it
+        # would defeat its whole purpose.
+        self.model = model
 
     def deliver_conversation(self, session_id: str, message_id: str) -> dict[str, Any]:
         session = self.store.get_session(session_id)
@@ -126,24 +154,6 @@ class DeliveryService:
         )
         return {"session_id": session_id, "delivered": True, "delivery": delivery}
 
-    def _clear_ack(self, task: dict[str, Any], slack: dict[str, Any]) -> None:
-        """Remove the "still working on it" reaction router.py added to the
-        triggering message the moment this Task started. Best-effort and
-        never allowed to fail delivery -- the real answer having posted is
-        what matters; a stray hourglass left behind is cosmetic."""
-        message_ts = slack.get("message_ts")
-        channel_id = slack.get("channel_id")
-        if not message_ts or not channel_id:
-            return
-        try:
-            self.slack.unreact(
-                channel_id=channel_id,
-                timestamp=message_ts,
-                name=_ACK_REACTION,
-                workspace_id=slack.get("workspace_id"),
-            )
-        except Exception:
-            log.warning("Failed to clear ack reaction for task_id=%s", task.get("id"), exc_info=True)
 
     def deliver_task(self, task_id: str) -> dict[str, Any]:
         task = self.store.get_task(task_id)
@@ -215,7 +225,6 @@ class DeliveryService:
             payload={"provider_result": result, "text": task["final_answer"]},
             idempotency_key=idempotency_key,
         )
-        self._clear_ack(task, slack)
         if task["trigger_kind"] == "proactive":
             intervention = {
                 "id": new_id("intervention"),
@@ -299,8 +308,99 @@ class DeliveryService:
             payload={"provider_result": result, "text": text},
             idempotency_key=idempotency_key,
         )
-        self._clear_ack(task, slack)
         return {"task_id": task_id, "delivered": True, "delivery": delivery}
+
+    def deliver_acknowledgement(self, task_id: str) -> dict[str, Any]:
+        """Say one personalized line the moment a Task is created.
+
+        A request used to sit in silence for the whole first reasoning turn
+        — retrieval, a full main-model call, then tool calls — which on a
+        real request is upwards of ten seconds with nothing to show that
+        anything was heard.
+
+        Written by the small auxiliary model rather than a fixed string so
+        it names the actual request; a canned "working on it" reads like an
+        autoresponder and tells the person nothing about whether Toda
+        understood them. It runs on the infrastructure lane, so it posts
+        while the agent lane is still on its first turn.
+
+        Best-effort throughout: this is a courtesy, and no failure to
+        produce it may affect the Task. It is sent exactly once per Task.
+        """
+        task = self.store.get_task(task_id)
+        if not task:
+            raise KeyError(task_id)
+        metadata = task.get("metadata") or {}
+        if metadata.get("suppress_delivery"):
+            return {"task_id": task_id, "delivered": False, "reason": "suppressed"}
+        # A child Task is private specialist evidence; only the root
+        # conversation ever speaks (mirrors _enqueue_post_run_jobs).
+        if task.get("parent_task_id"):
+            return {"task_id": task_id, "delivered": False, "reason": "child_task"}
+        if self.model is None:
+            return {"task_id": task_id, "delivered": False, "reason": "no_model"}
+
+        self._recheck(task)
+        text = self._acknowledgement_text(task)
+        if not text:
+            return {"task_id": task_id, "delivered": False, "reason": "no_text"}
+
+        envelope = task["envelope"]
+        slack = metadata.get("slack") or {}
+        channel_id = slack.get("channel_id") or envelope["destination"]["id"]
+        result = self.slack.send(
+            channel_id=channel_id,
+            text=text,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
+            workspace_id=slack.get("workspace_id"),
+            organization_id=task["organization_id"],
+        )
+        delivery = self._record(
+            task=task,
+            kind="acknowledgement",
+            status="completed" if result.get("ok") else "dry_run",
+            payload={"provider_result": result, "text": text},
+            # One per Task, whatever else re-enqueues: the queue's own
+            # idempotency is what makes "exactly once" true here.
+            idempotency_key=f"slack.acknowledgement:{task_id}",
+        )
+        return {"task_id": task_id, "delivered": True, "delivery": delivery}
+
+    def _acknowledgement_text(self, task: dict[str, Any]) -> str:
+        """One sentence in Toda's voice, or "" if the model gives nothing.
+
+        Never raises: an acknowledgement is a courtesy, and a model hiccup
+        must not fail the Task that is about to do the real work.
+        """
+        goal = str(task.get("goal") or "").strip()
+        if not goal:
+            return ""
+        try:
+            response = self.model.generate(
+                messages=[
+                    {"role": "system", "content": _ACK_SYSTEM_PROMPT},
+                    {"role": "user", "content": goal},
+                ],
+                temperature=0.4,
+                max_tokens=_ACK_MAX_TOKENS,
+                # No deliberation for one sentence. A reasoning model given
+                # this budget spends all of it thinking and returns nothing,
+                # and the whole point is to land before the main model has
+                # finished starting.
+                reasoning=False,
+            )
+        except Exception:
+            log.warning(
+                "Acknowledgement model call failed for task_id=%s",
+                task.get("id"), exc_info=True,
+            )
+            return ""
+        # One line: a model that ignores the instruction and writes a
+        # paragraph must not turn a courtesy into a wall of text.
+        # Strip whitespace again after the quotes: a model that wraps its
+        # sentence in quotes leaves the padding behind otherwise.
+        line = " ".join(str(response.content or "").split()).strip('"').strip()
+        return line[:300]
 
     def deliver_status_update(self, task_id: str) -> dict[str, Any]:
         """Edit a single live status message in place as a Task crosses

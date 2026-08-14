@@ -381,6 +381,10 @@ class TodaApp:
             authz=self.authz,
             slack_sender=self.slack_sender,
             audit=self.audit,
+            # The small auxiliary model writes the Task acknowledgement --
+            # it has to land while the main model is still on its first
+            # turn, so it cannot be the main model itself.
+            model=self.extraction_model,
         )
         self.harness_worker = HarnessWorker(
             queue=self.harness_jobs,

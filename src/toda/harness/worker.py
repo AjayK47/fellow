@@ -137,6 +137,9 @@ class HarnessWorker:
             "delivery.status_update": lambda payload: self.delivery.deliver_status_update(
                 payload["task_id"]
             ),
+            "delivery.acknowledge": lambda payload: self.delivery.deliver_acknowledgement(
+                payload["task_id"]
+            ),
             "approval.resolve": self._resolve_approval,
         }
         if self.ingestion:

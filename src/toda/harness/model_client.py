@@ -32,6 +32,7 @@ class ModelClient(Protocol):
         response_schema: dict[str, Any] | None = None,
         temperature: float = 0.1,
         max_tokens: int = 1500,
+        reasoning: bool | None = None,
     ) -> ModelResponse: ...
 
     def context_length(self) -> int: ...
@@ -101,7 +102,15 @@ class OpenAICompatibleModelClient:
         response_schema: dict[str, Any] | None = None,
         temperature: float = 0.1,
         max_tokens: int = 1500,
+        reasoning: bool | None = None,
     ) -> ModelResponse:
+        """``reasoning=False`` suppresses deliberation for this call.
+
+        Some work wants an answer, not thought: a one-line acknowledgement
+        has to land while the main model is still starting, and a reasoning
+        model given a small output budget spends the whole thing thinking
+        and returns nothing at all.
+        """
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -125,7 +134,9 @@ class OpenAICompatibleModelClient:
                     "schema": response_schema,
                 },
             }
-        if self.reasoning_effort:
+        if reasoning is False:
+            body["reasoning"] = {"enabled": False}
+        elif self.reasoning_effort:
             body["reasoning"] = {"effort": self.reasoning_effort}
         return self._generate_with_recovery(body)
 
