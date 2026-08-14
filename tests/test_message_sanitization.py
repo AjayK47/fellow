@@ -70,15 +70,31 @@ def test_reasoning_is_promoted_to_reasoning_content_for_echo_targets():
     assert "reasoning" not in out[-1]
 
 
-def test_an_echo_target_pads_rather_than_omitting():
-    """DeepSeek V4 Pro rejects the empty string; a space satisfies the
-    non-empty check without fabricating reasoning."""
+def test_only_tool_call_messages_are_padded():
+    """The requirement is reasoning_content on assistant TOOL-CALL messages.
+    DeepSeek V4 Pro rejects the empty string, so those pad with a space."""
     out = sanitize_api_messages(
         [{"role": "user", "content": "hi"},
-         {"role": "assistant", "content": "answer"}],
+         {"role": "assistant", "content": "", "tool_calls": [{"id": "c"}]}],
         provider="deepseek", model="deepseek-chat", base_url="https://api.deepseek.com",
     )
     assert out[-1]["reasoning_content"] == " "
+
+
+def test_a_plain_assistant_turn_is_never_padded():
+    """Padding one describes a thinking turn whose thinking was blank.
+    deepseek-v4-flash answers that with a single token and finish_reason
+    "stop", which every layer above reads as "the model returned nothing"
+    and fails the Task -- observed in production on a follow-up message
+    where history held one ordinary assistant reply."""
+    out = sanitize_api_messages(
+        [{"role": "user", "content": "hey"},
+         {"role": "assistant", "content": "Hey! What can I help you with today?"},
+         {"role": "user", "content": "look up the latest news"}],
+        provider="openrouter", model="deepseek/deepseek-v4-flash-0731",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    assert "reasoning_content" not in out[1]
 
 
 def test_empty_non_final_messages_are_repaired():

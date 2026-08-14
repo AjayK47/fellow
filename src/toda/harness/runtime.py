@@ -685,15 +685,50 @@ class CompanyAgent:
                     # reasoning outright, so this is a model that will not
                     # answer rather than a one-off empty turn.
                     details = (response.usage.get("completion_tokens_details") or {})
+                    # Persist the turn BEFORE raising. A failed turn used to
+                    # be recorded nowhere at all -- the append below is only
+                    # reached on success -- so the one request that explains
+                    # the failure was discarded and every investigation had
+                    # to guess at what was sent. Roles, sizes and structure
+                    # are what identify a malformed sequence; message text is
+                    # deliberately not stored.
+                    self.runs.append_turn(
+                        run,
+                        request={
+                            "message_count": len(messages),
+                            "model": getattr(self.model, "model", ""),
+                            "tools": [definition.name for definition in allowed],
+                            "message_shape": [
+                                {
+                                    "role": message.get("role"),
+                                    "content_chars": len(str(message.get("content") or "")),
+                                    "tool_calls": len(message.get("tool_calls") or []),
+                                    "has_tool_call_id": bool(message.get("tool_call_id")),
+                                    "reasoning_content_chars": len(
+                                        str(message.get("reasoning_content") or "")
+                                    ),
+                                }
+                                for message in messages
+                            ],
+                        },
+                        response={
+                            "finish_reason": response.finish_reason,
+                            "usage": response.usage,
+                            "content_chars": len(response.content),
+                            "reasoning_chars": len(response.reasoning),
+                            "unusable": True,
+                        },
+                    )
                     raise RuntimeError(
                         f"{response.model} returned neither answer nor tool call "
-                        f"after thinking-only recovery "
+                        f"after recovery "
                         f"(finish_reason={response.finish_reason!r}, "
                         f"completion_tokens={response.usage.get('completion_tokens')}, "
                         f"reasoning_tokens={details.get('reasoning_tokens') or 0}, "
-                        f"reasoning_chars={len(response.reasoning)}). "
-                        f"Consider a different model for the main role, or set "
-                        f"models.main_reasoning_effort to null in config.json."
+                        f"reasoning_chars={len(response.reasoning)}, "
+                        f"messages={len(messages)}). "
+                        f"The failing request's shape is recorded on this Task's "
+                        f"last turn."
                     )
                 skill_validation = self._validate_user_response(
                     run=run,

@@ -119,11 +119,18 @@ def apply_reasoning_policy(
 ) -> list[dict[str, Any]]:
     """Add or strip ``reasoning_content`` on assistant turns for this target.
 
-    On the require side an assistant turn that carries reasoning replays it,
-    and one that carries none is padded with a single space -- DeepSeek V4
-    Pro rejects the empty string, and a space satisfies the non-empty check
-    without fabricating reasoning. On the strict side every reasoning field
-    is removed, since those providers reject the key outright.
+    The requirement is narrow and the narrowness matters: these modes want
+    reasoning_content on assistant **tool-call** messages, because replaying
+    one without it answers HTTP 400. An ordinary assistant text turn is not
+    covered, and padding one anyway describes a thinking turn whose thinking
+    was blank -- deepseek-v4-flash answers that with a single token and
+    finish_reason "stop", which reads at every layer above as "the model
+    returned nothing" and fails the Task.
+
+    So: reasoning the provider actually returned is always replayed; the
+    single-space pad is only ever applied to a tool-call message, matching
+    Hermes exactly. On the strict side every reasoning field is removed,
+    since those providers reject the key outright.
     """
     out: list[dict[str, Any]] = []
     for message in messages:
@@ -132,17 +139,21 @@ def apply_reasoning_policy(
             continue
         updated = dict(message)
         reasoning_text = updated.pop("reasoning", None)
-        if echo_required:
-            existing = updated.get("reasoning_content")
-            if isinstance(existing, str) and existing:
-                pass
-            elif isinstance(reasoning_text, str) and reasoning_text.strip():
-                updated["reasoning_content"] = reasoning_text
-            else:
-                updated["reasoning_content"] = " "
-        else:
+        if not echo_required:
             updated.pop("reasoning_content", None)
             updated.pop("reasoning_details", None)
+            out.append(updated)
+            continue
+        existing = updated.get("reasoning_content")
+        if isinstance(existing, str) and existing:
+            pass
+        elif isinstance(reasoning_text, str) and reasoning_text.strip():
+            updated["reasoning_content"] = reasoning_text
+        elif updated.get("tool_calls"):
+            # Pad only here. DeepSeek V4 Pro rejects the empty string, and a
+            # space satisfies the non-empty check without fabricating
+            # reasoning.
+            updated["reasoning_content"] = " "
         out.append(updated)
     return out
 
