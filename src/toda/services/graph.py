@@ -273,7 +273,12 @@ class GraphService:
     ) -> dict[str, Any]:
         """Create new memory that UPDATES old; keep history."""
         now = utcnow().isoformat()
-        self.store.mark_superseded(old_memory_id, now)
+        # The old claim stopped being true when the new one started being
+        # true, not when we happened to hear about it.
+        replaced_at = new_memory.get("valid_from") if isinstance(new_memory, dict) else getattr(new_memory, "valid_from", None)
+        if hasattr(replaced_at, "isoformat"):
+            replaced_at = replaced_at.isoformat()
+        self.store.mark_superseded(old_memory_id, now, valid_until=replaced_at or now)
         data = self.commit_memory(new_memory)
         org = data["organization_id"]
         self.add_edge(org, edge_type, data["id"], old_memory_id, source_ids=data.get("source_ids"))

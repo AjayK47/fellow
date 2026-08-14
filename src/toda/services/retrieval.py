@@ -3,13 +3,58 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any
 
-from toda.domain.models import AuthorizationDecision, Destination, SearchResult
+from toda.domain.models import AuthorizationDecision, Destination, SearchResult, utcnow
 from toda.services.authorization import AuthorizationService
 from toda.services.graph import GraphService
 from toda.services.embeddings import EmbeddingProvider
 from toda.storage.db import BrainStore
+
+
+# A year, in days. Claims older than this get no recency credit at all
+# rather than going negative -- age is a tiebreaker, not a disqualifier.
+_FRESHNESS_HORIZON_DAYS = 365.0
+
+
+def _freshness(memory: dict[str, Any]) -> float:
+    """1.0 for a claim true right now, decaying to 0 over a year.
+
+    Ranking had no notion of time at all: a claim from 2024 and one from
+    2026 about the same subject scored identically, so a stale answer won
+    on a coin flip. This is deliberately a small term -- relevance still
+    dominates, because the newest memory about the wrong subject is worse
+    than an older one about the right subject.
+
+    A claim whose validity has already ended scores 0. It is still
+    retrievable, and should be: "Ajay was on leave 1-10 August" is exactly
+    what answers "was he around on the 3rd". It just should not outrank
+    what is true now.
+    """
+    now = utcnow()
+    valid_until = _as_datetime(memory.get("valid_until"))
+    if valid_until is not None and valid_until <= now:
+        return 0.0
+    anchor = _as_datetime(memory.get("valid_from")) or _as_datetime(memory.get("observed_at"))
+    if anchor is None:
+        return 0.5
+    age_days = (now - anchor).total_seconds() / 86_400.0
+    if age_days <= 0:
+        return 1.0
+    return max(0.0, 1.0 - age_days / _FRESHNESS_HORIZON_DAYS)
+
+
+def _as_datetime(value: Any) -> "datetime | None":
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 class RetrievalService:
@@ -573,4 +618,14 @@ class RetrievalService:
         confidence = float(memory.get("confidence") or 0.5) * 0.1
         latest_bonus = 0.05 if memory.get("is_latest") else -0.1
         fts_bonus = min(max(fts_rank, 0.0), 1.0) * 0.12
-        return overlap * 0.55 + max(semantic_score, 0.0) * 0.33 + fts_bonus + phrase_bonus + type_bonus + authority + confidence + latest_bonus
+        return (
+            overlap * 0.55
+            + max(semantic_score, 0.0) * 0.33
+            + fts_bonus
+            + phrase_bonus
+            + type_bonus
+            + authority
+            + confidence
+            + latest_bonus
+            + _freshness(memory) * 0.12
+        )

@@ -129,6 +129,12 @@ class ContextService:
                 "source_ids": mem.get("source_ids"),
                 "entity_ids": mem.get("entity_ids"),
                 "valid_from": mem.get("valid_from"),
+                # Carried so the agent can judge currency itself. valid_from
+                # alone says when a claim started and implies it still holds;
+                # a closed interval is the difference between "Ajay is on
+                # leave" and "Ajay was on leave 1-10 August", and only the
+                # second answers "was he around on the 3rd" correctly.
+                "valid_until": mem.get("valid_until"),
                 "score": r["score"],
             }
             mtype = mem.get("memory_type")

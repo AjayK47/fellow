@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 from toda.harness.prompt_library import load
@@ -139,6 +140,19 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                         "required": ["edge_type", "from", "to"],
                         "additionalProperties": False,
                     },
+                    "valid_until": {
+                        "type": ["string", "null"],
+                        "description": (
+                            "ISO 8601 timestamp for when this claim STOPPED being "
+                            "true, if the content states or clearly implies an end "
+                            "-- a leave that runs to a date, a contract that "
+                            "expires, a role someone left, a deadline that passes. "
+                            "Null when no end is stated, which is the normal case. "
+                            "Never guess a lifetime and never infer a date from "
+                            "unrelated events: a claim with no stated end is open, "
+                            "not short-lived."
+                        ),
+                    },
                     "canonical_claim": {
                         "type": ["object", "null"],
                         "properties": {
@@ -159,6 +173,7 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                     "participant_ids",
                     "canonical_claim",
                     "relation",
+                    "valid_until",
                 ],
                 "additionalProperties": False,
             },
@@ -167,6 +182,21 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
     "required": ["proposed_entities", "memories"],
     "additionalProperties": False,
 }
+
+
+def _parse_timestamp(value: Any) -> "datetime | None":
+    """An ISO timestamp the model supplied, or None.
+
+    Anything unparseable is dropped rather than defaulted: a bad date here
+    would close a fact's validity interval at the wrong moment, which is
+    worse than leaving it open.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 class ModelMemoryExtractor:
@@ -370,6 +400,10 @@ class ModelMemoryExtractor:
                 ],
                 is_private=bool(source.get("is_private_channel")),
                 valid_from=source.get("occurred_at") or utcnow(),
+                # Only ever what the content stated. A claim with no stated
+                # end is open, not short-lived, and guessing a lifetime here
+                # would quietly retire facts that are still true.
+                valid_until=_parse_timestamp(item.get("valid_until")),
                 observed_at=source.get("ingested_at") or utcnow(),
             )
             data = self.memory._consolidate(memory)

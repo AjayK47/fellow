@@ -1718,14 +1718,28 @@ class BrainStore:
             )
             return [_de(row["payload"]) for row in cur.fetchall()]
 
-    def mark_superseded(self, memory_id: str, superseded_at: str) -> None:
+    def mark_superseded(
+        self, memory_id: str, superseded_at: str, valid_until: str | None = None
+    ) -> None:
+        """Close a claim that a newer one replaced.
+
+        Two different timestamps, and conflating them loses history.
+        ``superseded_at`` is belief time -- when Toda learned the claim was
+        no longer current. ``valid_until`` is world time -- when it actually
+        stopped being true, which is when the replacing claim began.
+
+        Told today that "we moved to ClickUp last March", the Linear claim
+        stopped being true in March even though we only found out now.
+        Defaulting both to now answers "what do we believe" but makes
+        "what were we using in April" unanswerable.
+        """
         mem = self.get_memory(memory_id)
         if not mem:
             return
         mem["status"] = "superseded"
         mem["is_latest"] = False
         mem["superseded_at"] = superseded_at
-        mem["valid_until"] = superseded_at
+        mem["valid_until"] = valid_until or superseded_at
         self.upsert_memory(mem)
 
     # ---- search indexes ----

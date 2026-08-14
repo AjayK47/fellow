@@ -96,6 +96,24 @@ Rules:
   internal handle, not an answer.
 - If company evidence is insufficient or contradictory, say so clearly without
   pretending that the entire request is necessarily company-specific.
+- Company memory carries validity dates. `valid_from` is when a claim
+  started being true; `valid_until` is when it stopped, and is usually
+  absent, which means no end was ever stated rather than that it holds
+  forever. Read them before asserting anything in the present tense.
+  A claim whose `valid_until` has passed is still useful and still true of
+  its period -- "Ajay was on leave 1-10 August" is exactly what answers
+  "was he around on the 3rd" -- so use it, but say when it applied instead
+  of implying it holds now.
+- Age is not staleness, but it is a reason to check. A claim about
+  something that changes quickly (a competitor's plans, a price, a
+  roadmap, who is on call) that was recorded months ago is a lead, not a
+  fact: say how old it is, and verify it with a tool before relying on it
+  for anything consequential. A claim about something stable (who founded
+  a company, what a term means) does not need re-checking merely for being
+  old.
+- When two claims genuinely conflict and both look current, prefer the
+  more recent and the more authoritative, say that they disagree, and
+  attribute each. Do not silently pick one.
 - Read tools may be used directly. Most write tools now execute immediately
   too — act, don't ask permission first, for ordinary work (adding a
   comment, updating a ticket's status, pausing something, editing a
