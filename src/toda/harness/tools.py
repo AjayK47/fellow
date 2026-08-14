@@ -255,38 +255,94 @@ def _requires_dynamic_high_stakes_approval(
 # An explicit per-tool execution override in tool_policies still wins, so an
 # organization that wants these gated can say so; only the mode default and
 # the approval_required floor are bypassed.
-# Tools that never pause for a human. Everything here is either scoped to
-# Toda's own state or writes only into the conversation the request came
-# from -- nothing reaches a third party, spends money, or changes a system
-# outside Toda, which is what the approval gate exists to guard.
+# Which tools may run without pausing for a human.
 #
-# Producing a document and handing it over is the deliverable, not a
-# consequential action: being asked to approve "create the report you just
-# asked me for", twice, is friction with no decision in it. Approvals lose
-# their meaning when they fire on the obvious, because the one that matters
-# then arrives looking like the four that did not.
-NATIVE_ALLOW_TOOL_NAMES = frozenset(
+# A rule rather than a list, because the list drifted. It began as four
+# automation tools, and grew by hand each time an obvious case surfaced --
+# authoring a document, replying in the channel someone asked in, editing
+# the artifact just created -- while everything unlisted kept pausing.
+# Being asked to approve "create the report you just asked me for", twice,
+# is friction with no decision in it, and approvals lose their meaning when
+# they fire on the obvious: the one that matters then arrives looking like
+# the four that did not.
+#
+# The line that actually matters is whether an action leaves Toda. Writing
+# a PDF into Toda's artifact store, editing Toda's own workspace, updating
+# Toda's memory, cancelling Toda's own Task -- all contained, all
+# reversible, and none of them something a person can meaningfully consent
+# to without reading the entire task anyway. Sending an action to a
+# customer's CRM is a different kind of act.
+#
+# So these capability families run directly. Named positively, so that a
+# tool carrying an unrecognised capability -- or none at all -- is gated
+# rather than waived: the cost of wrongly pausing a contained action is a
+# moment of friction, while the cost of wrongly waiving an uncontained one
+# is an action nobody agreed to. Deliberately excluded are connector.* and
+# connectors.* (someone else's CRM, inbox, calendar), browser.* (live
+# external sites, carrying credentials, with effects Toda can neither see
+# nor undo), and code.* (arbitrary execution, where approval is not a
+# substitute for a sandbox and so must not be waived).
+_CONTAINED_CAPABILITY_PREFIXES = (
+    "artifact.",
+    "automation.",
+    "chart.",
+    "compute.",
+    "diagram.",
+    "document.",
+    "image.",
+    "infographic.",
+    "media.",
+    "memory.",
+    "plan.",
+    "session.",
+    "skill.",
+    "slack.",
+    "task.",
+    "vision.",
+    "web.",
+    "workspace.",
+)
+
+# "tool." is deliberately absent above: _infer_capability_id falls back to
+# f"tool.{name}" for anything it does not recognise, so treating it as a
+# family would waive approval for every unclassified tool -- exactly the
+# hole this rule exists to close. Toda's own orchestration primitives are
+# named individually instead.
+_CONTAINED_TOOL_NAMES = frozenset(
     {
-        "automation_create",
-        "automation_set_enabled",
-        "automation_run_now",
-        "automation_delete",
-        # Authoring a document into Toda's own artifact store.
-        "pdf_create",
-        "docx_create",
-        "xlsx_create",
-        "pptx_create",
-        "html_create",
-        "chart_create",
-        "diagram_render",
-        "infographic_create",
-        "brain_create_artifact",
-        # Handing the result to the person who asked, in the channel they
-        # asked in. Both are bounded to the current Slack destination.
-        "slack_send_artifact",
-        "slack_send_message",
+        "request_human_input",
+        "start_parallel_task",
+        "manage_child_task",
+        "wait_for_children",
     }
 )
+
+# Native tools that stay gated anyway, because they change what Toda will
+# do in future rather than doing something now. A skill is durable
+# instruction applied to every later run, so approving one is a real
+# decision a person can actually make.
+_APPROVAL_TOOL_NAMES = frozenset(
+    {
+        "skill_propose_create",
+        "skill_propose_update",
+        "run_code",
+        # Grants Toda an OAuth connection to an external account.
+        "request_app_connection",
+        # This IS the approval mechanism; waiving it would be circular.
+        "request_batch_approval",
+    }
+)
+
+
+def runs_without_approval(definition: ToolDefinition) -> bool:
+    """True when a tool's effects stay inside Toda and it may run directly."""
+    if definition.name in _APPROVAL_TOOL_NAMES:
+        return False
+    if definition.name in _CONTAINED_TOOL_NAMES:
+        return True
+    return (definition.capability_id or "").startswith(
+        _CONTAINED_CAPABILITY_PREFIXES
+    )
 
 
 def build_tool_registry(
@@ -2936,7 +2992,7 @@ class ToolExecutor:
         override = str((records[0] if records else {}).get("execution") or "inherit")
         if override not in _TOOL_EXECUTIONS:
             override = "inherit"
-        native_allow = definition.name in NATIVE_ALLOW_TOOL_NAMES
+        native_allow = runs_without_approval(definition)
         execution = (
             ("direct" if native_allow else _mode_default_execution(mode, definition.risk))
             if override == "inherit"

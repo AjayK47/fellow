@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 
-from toda.harness.tools import NATIVE_ALLOW_TOOL_NAMES
+from toda.harness.tools import runs_without_approval
 from toda.services.artifacts import artifact_payload
 
 _PDF_BYTES = b"%PDF-1.4\nfake pdf body\n%%EOF"
@@ -110,4 +110,4 @@ def test_reaching_an_external_system_is_still_gated(brain):
         return
     policy = brain.tool_executor.effective_policy("org_acme", registered.definition)
     assert policy["execution"] != "direct"
-    assert "COMPOSIO_EXECUTE" not in NATIVE_ALLOW_TOOL_NAMES
+    assert not runs_without_approval(registered.definition)

@@ -1,7 +1,6 @@
 """Organization tool modes and immediate per-tool policy overrides."""
 
 from toda.harness.models import InvocationEnvelope, ModelToolCall, ToolDefinition
-from toda.harness.tools import NATIVE_ALLOW_TOOL_NAMES
 
 
 def _task(brain, conversation: str = "policy:test") -> dict:
@@ -60,17 +59,11 @@ def test_tools_api_exposes_real_readiness_and_autonomous_defaults(api_client):
     assert body["setup_needed_count"] > 0
 
     read_tool = next(tool for tool in body["tools"] if tool["risk"] == "read")
-    # An *ordinary* write tool. Authoring a document and replying in the
-    # current channel sit on the native allow-list and run direct, so
-    # picking whichever write tool sorts first no longer tests the mode.
-    from toda.harness.tools import NATIVE_ALLOW_TOOL_NAMES
-
+    # A write tool that leaves Toda. Work that stays inside Toda runs
+    # direct, so picking whichever write tool sorts first would test the
+    # rule rather than the mode.
     write_tool = next(
-        tool
-        for tool in body["tools"]
-        if tool["risk"] == "write"
-        and not tool["approval_required"]
-        and tool["name"] not in NATIVE_ALLOW_TOOL_NAMES
+        tool for tool in body["tools"] if tool["name"] == "COMPOSIO_EXECUTE"
     )
     assert read_tool["policy"]["execution"] == "direct"
     assert write_tool["policy"]["execution"] == "ai_review"
@@ -86,18 +79,16 @@ def test_mode_and_tool_override_updates_are_visible_immediately(api_client):
         "/v1/tools", params={"organization_id": "org_acme"}
     ).json()
     assert tools["policy_mode"] == "restricted"
-    # Native-allow tools (the automation family) stay direct in every mode --
-    # see NATIVE_ALLOW_TOOL_NAMES in harness/tools.py.
-    assert {
-        tool["policy"]["execution"]
-        for tool in tools["tools"]
-        if tool["name"] not in NATIVE_ALLOW_TOOL_NAMES
-    } <= {"ask", "deny"}
-    assert {
-        tool["policy"]["execution"]
-        for tool in tools["tools"]
-        if tool["name"] in NATIVE_ALLOW_TOOL_NAMES
-    } == {"direct"}
+    # Work contained inside Toda stays direct in every mode, including
+    # restricted -- see the approval rule in harness/tools.py. Work that
+    # leaves Toda is gated by the mode like everything else.
+    by_name = {tool["name"]: tool["policy"]["execution"] for tool in tools["tools"]}
+    for contained in ("automation_create", "pdf_create", "workspace_write"):
+        if contained in by_name:
+            assert by_name[contained] == "direct", contained
+    for external in ("COMPOSIO_EXECUTE", "skill_propose_create"):
+        if external in by_name:
+            assert by_name[external] in {"ask", "deny"}, external
 
     tool_name = tools["tools"][0]["name"]
     response = api_client.post(
