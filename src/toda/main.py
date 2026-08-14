@@ -24,6 +24,7 @@ from toda.config import config_path, settings
 from toda.runtime_owner import DatabaseOwner
 from toda.services.bootstrap import initialize, is_initialized
 from toda.services.container import TodaApp, get_app, reset_app
+from toda.services.knowledge_reset import clear_knowledge
 
 log = logging.getLogger("toda")
 
@@ -408,6 +409,40 @@ def retention_cli(args: argparse.Namespace) -> None:
         owner.release()
 
 
+def _reset_knowledge(db_path: Path, *, confirmed: bool) -> None:
+    """Forget everything learned, stay signed in and connected."""
+    if not confirmed:
+        print(
+            f"This permanently deletes everything Toda has learned in {db_path} "
+            "— memories, entities, the graph, sources, facts, conversations, "
+            "sessions, tasks, and audit history.\n"
+            "Your organization, login, Slack connection, and skills are kept. "
+            "Pass --yes to continue."
+        )
+        raise SystemExit(2)
+
+    owner = DatabaseOwner(db_path)
+    owner.acquire()
+    try:
+        brain = reset_app(db_path)
+        try:
+            result = clear_knowledge(brain.store)
+        finally:
+            brain.close()
+    finally:
+        owner.release()
+
+    for name, count in sorted(result["cleared"].items(), key=lambda i: -i[1]):
+        print(f"  {count:8d}  {name}")
+    print(f"\nCleared {result['rows']} row(s) across {len(result['cleared'])} table(s).")
+    print(f"Kept {len(result['kept'])} table(s): organization, login, "
+          f"connections, skills, policies.")
+    if result["failed"]:
+        print("\nCould not clear:")
+        for name, error in result["failed"].items():
+            print(f"  {name}: {error}")
+
+
 def reset_cli(args: argparse.Namespace) -> None:
     """Delete every piece of local Toda state: the database (memories,
     sessions, tasks, automations, artifacts all live there) and the
@@ -421,6 +456,11 @@ def reset_cli(args: argparse.Namespace) -> None:
     """
     db_path = settings.storage.db_path.resolve()
     workspace_root = settings.storage.workspaces.resolve()
+
+    if getattr(args, "knowledge", False):
+        _reset_knowledge(db_path, confirmed=args.yes)
+        return
+
     if not args.yes:
         print(
             f"This permanently deletes all Toda data in {db_path} "
@@ -522,6 +562,13 @@ def main() -> None:
         "--yes",
         action="store_true",
         help="confirm deletion of the configured SQLite database",
+    )
+    reset.add_argument(
+        "--knowledge",
+        action="store_true",
+        help="clear only what Toda has learned (memories, graph, sources, "
+             "facts, sessions, tasks, audit) and keep the organization, "
+             "login, Slack connection, and skills",
     )
     retention = sub.add_parser(
         "retention",
