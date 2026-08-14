@@ -369,28 +369,97 @@ class GraphService:
         *,
         valid_at: str | None = None,
     ) -> dict[str, Any]:
-        """Return stable organization graph edges, respecting evidence visibility.
+        """Return the organization graph, respecting evidence visibility.
 
         Pass `valid_at` to view the graph as it stood at a point in time
-        instead of its current state — a closed OWNS edge still appears if
+        instead of its current state -- a closed OWNS edge still appears if
         `valid_at` falls before it was superseded.
+
+        Three things this used to get wrong, each of which made the picture
+        claim less than the store actually holds:
+
+        * Memory edges were skipped wholesale, and MemoryEdgeType covers
+          SUPPORTED_BY, INVOLVES and ABOUT -- the edges that connect what
+          Toda learned to who and what it is about. Hiding them left a graph
+          of Slack plumbing with the knowledge removed.
+        * Visibility used ``issubset``, requiring *every* cited source to be
+          visible, while AuthorizationService.can_read_edge uses ``any``.
+          Two answers to one question, and the stricter one silently won
+          here.
+        * An edge to something that is not an entity -- an artifact, a
+          skill, a scope -- was returned with no node for its endpoint, so
+          the renderer dropped it. That is why a Task that had PRODUCED a
+          report drew as an isolated dot.
         """
-        nodes = self.store.list_entities(organization_id)
-        edges = []
-        memory_edge_types = {edge.value for edge in MemoryEdgeType}
+        entities = {node["id"]: node for node in self.store.list_entities(organization_id)}
         candidate_edges = (
             self.edges_as_of(organization_id, valid_at=valid_at)
             if valid_at
             else self.store.list_edges(organization_id)
         )
-        for edge in candidate_edges:
-            if edge.get("edge_type") in memory_edge_types:
-                continue
-            source_ids = set(edge.get("source_ids") or [])
-            if source_ids and (allowed_source_ids is None or not source_ids.issubset(allowed_source_ids)):
-                continue
-            edges.append(edge)
-        node_ids = {node["id"] for edge in edges for node in ()}
-        node_ids.update(edge["from_id"] for edge in edges)
-        node_ids.update(edge["to_id"] for edge in edges)
-        return {"nodes": [node for node in nodes if node["id"] in node_ids], "edges": edges}
+        edges = [
+            edge
+            for edge in candidate_edges
+            if self._edge_is_visible(edge, allowed_source_ids)
+        ]
+        node_ids: set[str] = set()
+        for edge in edges:
+            node_ids.add(edge["from_id"])
+            node_ids.add(edge["to_id"])
+        nodes = [
+            entities[node_id] if node_id in entities else _placeholder_node(node_id, organization_id)
+            for node_id in sorted(node_ids)
+        ]
+        return {"nodes": nodes, "edges": edges}
+
+    @staticmethod
+    def _edge_is_visible(
+        edge: dict[str, Any], allowed_source_ids: set[str] | None
+    ) -> bool:
+        """Match AuthorizationService.can_read_edge: any cited source is enough.
+
+        An edge with no cited source carries no evidence to be gated on --
+        PRODUCED, USED_SKILL and SCOPED_TO are structural facts about Toda's
+        own state -- so it is visible.
+        """
+        source_ids = set(edge.get("source_ids") or [])
+        if not source_ids or allowed_source_ids is None:
+            return True
+        return bool(source_ids & allowed_source_ids)
+
+
+# Prefixes used to name a graph endpoint that is not an entity row.
+_NODE_KIND_BY_PREFIX = {
+    "artifact": ("artifact", "Artifact"),
+    "skill": ("skill", "Skill"),
+    "scope": ("scope", "Scope"),
+    "mem": ("memory", "Memory"),
+    "task": ("task", "Task"),
+    "src": ("source", "Source"),
+    "person": ("person", "Person"),
+    "conversation": ("conversation", "Conversation"),
+}
+
+
+def _placeholder_node(node_id: str, organization_id: str) -> dict[str, Any]:
+    """A drawable node for an edge endpoint that has no entity row.
+
+    Artifacts, skills and scopes are real things Toda links to but does not
+    store as entities. Returning the edge without its endpoint left the
+    renderer with a dangling reference, which it drops -- so the Task that
+    produced a report appeared unconnected to it.
+    """
+    prefix = node_id.split("_", 1)[0]
+    entity_type, label = _NODE_KIND_BY_PREFIX.get(prefix, ("unknown", "Node"))
+    # Show the identifier whole when it is short enough to read. Cutting it
+    # to a fixed eight characters produced labels like "Person slack_t0"
+    # and "Skill builtin_", which are neither a name nor a usable id.
+    suffix = node_id.split("_", 1)[-1]
+    shown = suffix if len(suffix) <= 24 else f"{suffix[:10]}…{suffix[-6:]}"
+    return {
+        "id": node_id,
+        "organization_id": organization_id,
+        "entity_type": entity_type,
+        "name": f"{label} {shown}",
+        "placeholder": True,
+    }
