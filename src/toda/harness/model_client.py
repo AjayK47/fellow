@@ -395,6 +395,18 @@ class OpenAICompatibleModelClient:
         )
 
 
+# Input items that count as the model having spoken last.
+_MODEL_TURNS = frozenset({"assistant", "function_call"})
+
+# Appended when the conversation would otherwise end on a model turn.
+# Deliberately worded as "respond to", not "continue": "Continue with the
+# request above" reads as resume-mid-sentence, and the model opened its
+# reply with "Sorry about that cutoff!" for a truncation that never
+# happened. This asks for the next turn without implying the last one was
+# interrupted, and adds no instruction the user did not give.
+_CONTINUE_TURN = "Respond to the most recent request above."
+
+
 class ConcentrateResponsesModelClient:
     """Transport for Concentrate's unified Responses API.
 
@@ -526,6 +538,24 @@ class ConcentrateResponsesModelClient:
                 continue
             if text.strip() or content:
                 items.append({"role": role or "user", "content": content})
+
+        # The request may not end on a model turn. Gemini via ai-studio
+        # rejects one outright:
+        #
+        #   400 invalid_prompt -- Provider 'ai-studio' rejected the request:
+        #   Requests ending with a model turn are not supported.
+        #
+        # Toda hits this because build_agent_messages replays session history
+        # verbatim and never appends the goal as a closing user turn, so the
+        # tail is simply whatever was last stored -- often Toda's own previous
+        # reply. Chat-completions providers read a trailing assistant turn as
+        # a prefill to continue; ai-studio refuses it.
+        #
+        # Append rather than trim, following Hermes: dropping the tail to
+        # satisfy the rule would delete the most recent context, which is
+        # exactly the context the model needs.
+        if items and (items[-1].get("type") or items[-1].get("role")) in _MODEL_TURNS:
+            items.append({"role": "user", "content": _CONTINUE_TURN})
         return items, "\n\n".join(instructions)
 
     @staticmethod

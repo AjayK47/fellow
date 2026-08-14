@@ -187,3 +187,61 @@ def test_embeddings_refuse_a_non_chat_provider():
     profile = providers.get("concentrate")
     assert profile.api_mode == "concentrate_responses"
     assert profile.supports_embeddings is False
+
+
+def test_a_trailing_model_turn_gets_a_synthetic_user_turn(monkeypatch):
+    """Gemini via ai-studio rejects the request outright:
+
+        400 invalid_prompt -- Requests ending with a model turn are not
+        supported.
+
+    Toda hits this because build_agent_messages replays session history
+    verbatim without appending the goal as a closing user turn, so the tail
+    is whatever was last stored -- often Toda's own previous reply.
+    """
+    sent = _capture(monkeypatch, _OK)
+    _client().generate(messages=[
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "Hey! How can I help?"},
+    ])
+    items = sent[0]["json"]["input"]
+    assert items[-1] == {"role": "user", "content": "Respond to the most recent request above."}
+    # Appended, never trimmed: the latest context is what the model needs.
+    assert items[-2] == {"role": "assistant", "content": "Hey! How can I help?"}
+
+
+def test_a_trailing_function_call_also_counts_as_a_model_turn(monkeypatch):
+    sent = _capture(monkeypatch, _OK)
+    _client().generate(messages=[
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "f", "arguments": "{}"}}]},
+    ])
+    items = sent[0]["json"]["input"]
+    assert items[-1]["role"] == "user"
+    assert items[-2]["type"] == "function_call"
+
+
+def test_a_tool_result_tail_is_left_alone(monkeypatch):
+    """function_call_output is not a model turn -- the provider accepts it,
+    and appending here would interrupt a live tool loop."""
+    sent = _capture(monkeypatch, _OK)
+    _client().generate(messages=[
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "ok", "tool_calls": [
+            {"id": "c1", "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "out"},
+    ])
+    assert sent[0]["json"]["input"][-1]["type"] == "function_call_output"
+
+
+def test_a_normal_user_tail_is_untouched(monkeypatch):
+    sent = _capture(monkeypatch, _OK)
+    _client().generate(messages=[
+        {"role": "assistant", "content": "prev"},
+        {"role": "user", "content": "new question"},
+    ])
+    items = sent[0]["json"]["input"]
+    assert len(items) == 2
+    assert items[-1] == {"role": "user", "content": "new question"}
