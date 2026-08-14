@@ -9,6 +9,7 @@ from datetime import timedelta
 from typing import Any
 
 from toda.domain.models import new_id, utcnow
+from toda.harness.router import _ACK_REACTION
 from toda.services.scope_resolution import resolve_scope
 
 log = logging.getLogger("toda.delivery")
@@ -146,6 +147,10 @@ class DeliveryService:
             "updated_at": now,
         }
         self.store.upsert_delivery(delivery)
+        # A quick reply is Toda speaking too. This path never cleared the
+        # reaction, so every greeting left an hourglass sitting on the
+        # user's message forever.
+        self._clear_ack(session_id, slack)
         self.audit.record(
             session["organization_id"],
             "conversation.delivered",
@@ -154,6 +159,38 @@ class DeliveryService:
         )
         return {"session_id": session_id, "delivered": True, "delivery": delivery}
 
+
+    def _clear_ack(self, task_or_id: Any, slack: dict[str, Any]) -> None:
+        """Remove the hourglass router.py put on the triggering message.
+
+        Cleared the moment Toda actually says something -- the reaction
+        exists to cover the gap between "your message arrived" and "Toda
+        has spoken", so once a real message is posted it is redundant.
+        For a Task that means its acknowledgement, not its final answer:
+        leaving it up through a multi-minute run after Toda has already
+        replied just reads as stuck.
+
+        Best-effort and never allowed to fail delivery -- the message
+        having posted is what matters; a stray hourglass is cosmetic.
+        Unreacting something already gone is expected, not an error.
+        """
+        message_ts = slack.get("message_ts")
+        channel_id = slack.get("channel_id")
+        if not message_ts or not channel_id:
+            return
+        try:
+            self.slack.unreact(
+                channel_id=channel_id,
+                timestamp=message_ts,
+                name=_ACK_REACTION,
+                workspace_id=slack.get("workspace_id"),
+            )
+        except Exception:
+            log.warning(
+                "Failed to clear ack reaction for %s",
+                task_or_id if isinstance(task_or_id, str) else (task_or_id or {}).get("id"),
+                exc_info=True,
+            )
 
     def deliver_task(self, task_id: str) -> dict[str, Any]:
         task = self.store.get_task(task_id)
@@ -225,6 +262,11 @@ class DeliveryService:
             payload={"provider_result": result, "text": task["final_answer"]},
             idempotency_key=idempotency_key,
         )
+        # Safety net: normally the acknowledgement already cleared this.
+        # A run whose acknowledgement never posted (model failure,
+        # suppressed delivery) would otherwise keep its hourglass
+        # forever. Unreacting an absent reaction is a no-op.
+        self._clear_ack(task, slack)
         if task["trigger_kind"] == "proactive":
             intervention = {
                 "id": new_id("intervention"),
@@ -308,6 +350,11 @@ class DeliveryService:
             payload={"provider_result": result, "text": text},
             idempotency_key=idempotency_key,
         )
+        # Safety net: normally the acknowledgement already cleared this.
+        # A run whose acknowledgement never posted (model failure,
+        # suppressed delivery) would otherwise keep its hourglass
+        # forever. Unreacting an absent reaction is a no-op.
+        self._clear_ack(task, slack)
         return {"task_id": task_id, "delivered": True, "delivery": delivery}
 
     def deliver_acknowledgement(self, task_id: str) -> dict[str, Any]:
@@ -355,6 +402,9 @@ class DeliveryService:
             workspace_id=slack.get("workspace_id"),
             organization_id=task["organization_id"],
         )
+        # Toda has now spoken, so the "heard you, not spoken yet" hourglass
+        # has done its job.
+        self._clear_ack(task, slack)
         delivery = self._record(
             task=task,
             kind="acknowledgement",

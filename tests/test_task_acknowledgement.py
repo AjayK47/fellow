@@ -152,3 +152,49 @@ def test_the_acknowledgement_asks_for_no_deliberation(brain):
     brain.delivery.deliver_acknowledgement(task["id"])
 
     assert captured["reasoning"] is False
+
+
+def test_the_hourglass_clears_when_the_acknowledgement_posts(brain):
+    """The reaction covers the gap between "your message arrived" and
+    "Toda has spoken". Once the acknowledgement posts it is redundant --
+    leaving it up through a multi-minute run reads as stuck."""
+    task = _task(brain)
+    task["metadata"] = {
+        **(task.get("metadata") or {}),
+        "slack": {"channel_id": "C_ACK", "message_ts": "111.222", "workspace_id": "TACME"},
+    }
+    brain.store.update_task(task)
+    _capture(brain)
+    cleared: list[dict[str, Any]] = []
+    brain.delivery.slack.unreact = lambda **kwargs: cleared.append(kwargs)
+    brain.delivery.model = ScriptedModelClient([ModelResponse(content="On it.")])
+
+    brain.delivery.deliver_acknowledgement(task["id"])
+
+    assert len(cleared) == 1
+    assert cleared[0]["timestamp"] == "111.222"
+    assert cleared[0]["channel_id"] == "C_ACK"
+
+
+def test_the_hourglass_survives_until_toda_speaks(brain):
+    """A failed acknowledgement must leave the reaction in place: it is
+    the only remaining signal that anything is happening."""
+    task = _task(brain)
+    task["metadata"] = {
+        **(task.get("metadata") or {}),
+        "slack": {"channel_id": "C_ACK", "message_ts": "111.222", "workspace_id": "TACME"},
+    }
+    brain.store.update_task(task)
+    _capture(brain)
+    cleared: list[dict[str, Any]] = []
+    brain.delivery.slack.unreact = lambda **kwargs: cleared.append(kwargs)
+
+    class Broken:
+        def generate(self, **_kwargs):
+            raise RuntimeError("provider down")
+
+    brain.delivery.model = Broken()
+    result = brain.delivery.deliver_acknowledgement(task["id"])
+
+    assert result["delivered"] is False
+    assert cleared == []

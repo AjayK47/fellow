@@ -12,6 +12,8 @@ from toda.harness.models import NormalizedEvent
 
 log = logging.getLogger("toda.router")
 
+_ACK_REACTION = "hourglass_flowing_sand"
+
 # Slack has no public "bot is typing" indicator for the Web API (that's an
 # RTM-only affordance), so the closest equivalent to "we're alive and
 # working on it" is reacting to the triggering message immediately -- long
@@ -160,6 +162,23 @@ class EventRouter:
             )
 
 
+    def _ack(self, event: NormalizedEvent, message_ts: str | None) -> None:
+        """Best-effort "we're alive" signal on the triggering message.
+        Never allowed to break routing/wake -- a Slack hiccup here (rate
+        limit, revoked token, message since deleted) is not a reason to
+        fail the actual request."""
+        if not self.slack_sender or event.source != "slack" or not message_ts:
+            return
+        try:
+            self.slack_sender.react(
+                channel_id=event.scope.channel_id or "",
+                timestamp=message_ts,
+                name=_ACK_REACTION,
+                workspace_id=event.scope.workspace_id,
+            )
+        except Exception:
+            log.warning("Slack ack reaction failed for event_id=%s", event.id, exc_info=True)
+
     def _route_reactive(self, event: NormalizedEvent) -> dict[str, Any]:
         """Direct events (DMs, explicit mentions, interactive answers) wake
         the relevant Session Manager directly (plan §7.1). sessions.wake()
@@ -197,6 +216,7 @@ class EventRouter:
                 "display_name": event.actor.id,
             },
         }
+        self._ack(event, message_ts)
         wake = self.sessions.wake(
             organization_id=event.organization_id,
             conversation_key=event.payload["conversation_key"],
