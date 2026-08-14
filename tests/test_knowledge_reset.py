@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from toda.services.knowledge_reset import _KEEP, _is_shadow, clear_knowledge
+from scripts.clear_knowledge import _KEEP, _is_shadow, clear_knowledge
 
 
 def _count(store, table: str) -> int:
