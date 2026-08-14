@@ -12,6 +12,10 @@ import httpx
 
 from toda.config import Settings, settings as _loaded_settings
 from toda.domain.models import new_id
+from toda.harness.message_sanitization import (
+    needs_reasoning_echo,
+    sanitize_api_messages,
+)
 from toda.harness.models import ModelResponse, ModelToolCall
 from toda.providers import ProviderResolver, ResolvedModel
 
@@ -140,9 +144,9 @@ class OpenAICompatibleModelClient:
             body["reasoning"] = {"effort": self.reasoning_effort}
         return self._generate_with_recovery(body)
 
-    # How many times a thinking-only turn may be continued by replaying the
-    # model's own reasoning, and how many times a turn with nothing at all in
-    # it may simply be re-sent. Both are per `generate()` call.
+    # Continuations replay the model's own thinking so it can finish the
+    # turn; resends are the fallback when there is nothing to continue from.
+    # Both are per `generate()` call.
     _MAX_THINKING_CONTINUATIONS = 2
     _MAX_EMPTY_RESENDS = 2
 
@@ -150,55 +154,68 @@ class OpenAICompatibleModelClient:
         """Recover the turns where a reasoning model produces no answer.
 
         A reasoning model can end its turn having produced only deliberation:
-        no content, no tool call, everything in the separate `reasoning`
-        field. Treating that as a failure loses a Task over a model quirk,
-        and it is intermittent — the identical request usually answers.
+        no content, no tool call, everything in the separate reasoning field.
+        Treating that as a failure loses a Task over a model quirk, and it is
+        intermittent -- the identical request usually answers.
 
-        Ported from Hermes's conversation loop, which distinguishes two cases
-        and handles them differently rather than blanket-retrying:
+        Ported from Hermes's conversation loop, which handles the two cases
+        differently rather than blanket-retrying:
 
-        * **thinking-only** — reasoning came back but no text. Replay the
-          assistant turn *carrying that reasoning* and let the model continue
-          from its own thinking. This is the important one: it neither throws
-          the deliberation away nor turns reasoning off, so the turn keeps the
-          quality the setting was enabled for.
-        * **truly empty** — nothing at all came back. Nothing to continue
-          from, so re-send the identical request.
+        * **thinking-only** -- reasoning came back but no text. Replay the
+          assistant turn carrying that reasoning so the model continues from
+          its own thought, keeping the quality reasoning was enabled for.
+        * **truly empty** -- nothing came back. Nothing to continue from, so
+          re-send the identical request.
 
-        Only when both are exhausted does it fall back to disabling reasoning
-        outright, which does degrade the turn but beats failing the Task.
+        The continuation is gated on the target actually supporting
+        reasoning echo-back (see message_sanitization.reasoning_echo_family).
+        This gate is the whole ballgame: replaying a trailing assistant turn
+        is an assistant *prefill*, so the model resumes mid-stream rather
+        than starting fresh. Given reasoning it resumes its own thought;
+        given a bare empty turn it resumes whatever it likes -- in
+        production, the chat template itself, which put 4,600 tokens of
+        Toda's system prompt into a Slack channel. On a strict provider the
+        reasoning field is stripped before the wire, which would leave
+        exactly that bare empty turn, so those targets resend instead.
 
-        The continuation messages live entirely inside this call. Hermes has
-        to flag its equivalents ephemeral so an append-only flush cannot
-        commit them to the session store; here the durable transcript is
-        written by the caller from the returned response, so scaffolding can
-        never reach it by construction.
+        The continuation lives inside this call. Hermes must flag its
+        equivalents ephemeral so an append-only flush cannot commit them to
+        the session store; here the caller writes the transcript from the
+        returned response, so scaffolding cannot reach it by construction.
         """
         response = self._send(body)
-        if self._is_usable(response):
+        if self._is_usable(response, body):
             return response
 
-        attempt_messages = list(body["messages"])
+        can_continue = needs_reasoning_echo(
+            self.provider_name, self.model, self.base_url
+        )
+        attempt = dict(body)
         continuations = 0
         resends = 0
-        while (
-            not self._is_budget_exhaustion(response)
-            and (
-                continuations < self._MAX_THINKING_CONTINUATIONS
-                or resends < self._MAX_EMPTY_RESENDS
-            )
+        while not self._is_budget_exhaustion(response) and (
+            continuations < self._MAX_THINKING_CONTINUATIONS
+            or resends < self._MAX_EMPTY_RESENDS
         ):
-            thinking_only = bool(response.reasoning or response.reasoning_details)
-            if thinking_only and continuations < self._MAX_THINKING_CONTINUATIONS:
+            reasoning_text = response.reasoning.strip()
+            if can_continue and reasoning_text and continuations < self._MAX_THINKING_CONTINUATIONS:
                 continuations += 1
-                assistant: dict[str, Any] = {"role": "assistant", "content": ""}
-                # Prefer the structured form: Anthropic signs its thinking
-                # blocks, so replaying the plain text is not a valid item.
-                if response.reasoning_details:
-                    assistant["reasoning_details"] = response.reasoning_details
-                else:
-                    assistant["reasoning"] = response.reasoning
-                attempt_messages = [*attempt_messages, assistant]
+                # reasoning_content, not reasoning: the former is what these
+                # thinking modes accept on the way in, the latter is only
+                # what aggregators hand back on the way out. Sending the
+                # response field as a request field is how this turned into
+                # a bare empty prefill the first time.
+                attempt = {
+                    **body,
+                    "messages": [
+                        *body["messages"],
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": reasoning_text,
+                        },
+                    ],
+                }
                 log.info(
                     "Thinking-only turn from %s — continuing from its own "
                     "reasoning (%d/%d)",
@@ -206,32 +223,70 @@ class OpenAICompatibleModelClient:
                 )
             elif resends < self._MAX_EMPTY_RESENDS:
                 resends += 1
+                attempt = dict(body)
                 log.warning(
-                    "Empty turn from %s with no reasoning to continue from — "
-                    "resending (%d/%d)",
+                    "Unusable turn from %s — resending identical request (%d/%d)",
                     self.model, resends, self._MAX_EMPTY_RESENDS,
                 )
             else:
                 break
-            response = self._send({**body, "messages": attempt_messages})
-            if self._is_usable(response):
+            response = self._send(attempt)
+            if self._is_usable(response, body):
                 return response
 
         if self.reasoning_effort:
             log.warning(
-                "%s still produced no answer after %d continuation(s) and %d "
-                "resend(s) — retrying once with reasoning disabled",
-                self.model, continuations, resends,
+                "%s still produced nothing usable after %d resend(s) — "
+                "retrying once with reasoning disabled",
+                self.model, resends,
             )
             final = dict(body)
             final["reasoning"] = {"enabled": False}
             return self._send(final)
         return response
 
-    @staticmethod
-    def _is_usable(response: ModelResponse) -> bool:
-        """A turn the agent loop can actually act on."""
-        return bool(response.content.strip() or response.tool_calls)
+    def _is_usable(self, response: ModelResponse, body: dict[str, Any]) -> bool:
+        """A turn the agent loop can actually act on.
+
+        Non-empty is necessary but not sufficient. A model that resumes the
+        chat template rather than answering emits the prompt back, and a
+        length check alone happily calls 4,600 tokens of system prompt a
+        usable answer -- which is exactly how Toda once posted its own
+        instructions into a Slack channel. Treat a prompt echo as unusable
+        so the recovery path re-sends instead of the harness delivering it.
+        """
+        if response.tool_calls:
+            return True
+        content = response.content.strip()
+        if not content:
+            return False
+        return not self._echoes_prompt(content, body)
+
+    # Chat-template control tokens. These are how a model marks turn
+    # boundaries internally; seeing one in *output* means it is reproducing
+    # the template rather than answering within it.
+    _TEMPLATE_TOKENS = ("begin▁of▁sentence", "end▁of▁sentence", "<|im_start|>",
+                        "<|begin_of_text|>", "<|start_header_id|>")
+    # Enough verbatim prompt to be unmistakable, short enough that a model
+    # legitimately quoting one instruction back does not trip it.
+    _ECHO_PROBE_CHARS = 160
+
+    @classmethod
+    def _echoes_prompt(cls, content: str, body: dict[str, Any]) -> bool:
+        if any(token in content for token in cls._TEMPLATE_TOKENS):
+            log.warning("Model output contained a chat-template control token")
+            return True
+        for message in body.get("messages") or []:
+            if message.get("role") != "system":
+                continue
+            system = " ".join(str(message.get("content") or "").split())
+            probe = system[: cls._ECHO_PROBE_CHARS]
+            if len(probe) < cls._ECHO_PROBE_CHARS:
+                continue
+            if probe in " ".join(content.split()):
+                log.warning("Model output echoed the system prompt verbatim")
+                return True
+        return False
 
     @staticmethod
     def _is_budget_exhaustion(response: ModelResponse) -> bool:
@@ -253,6 +308,19 @@ class OpenAICompatibleModelClient:
         return bool(reasoning_tokens)
 
     def _send(self, body: dict[str, Any]) -> ModelResponse:
+        # The single pre-send chokepoint. Every request -- first attempt,
+        # resend, prefill continuation, reasoning-disabled fallback -- passes
+        # through here, so message shape is fixed in exactly one place
+        # rather than at each call site (the fork Hermes explicitly rejected).
+        body = {
+            **body,
+            "messages": sanitize_api_messages(
+                body.get("messages") or [],
+                provider=self.provider_name,
+                model=self.model,
+                base_url=self.base_url,
+            ),
+        }
         response = httpx.post(
             f"{self.base_url}/chat/completions",
             headers={

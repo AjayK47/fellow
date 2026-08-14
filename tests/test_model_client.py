@@ -217,36 +217,8 @@ def _answer(text="the answer"):
     return {"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}
 
 
-def test_thinking_only_turn_continues_from_its_own_reasoning(monkeypatch):
-    """The model deliberated but wrote nothing. Replaying that reasoning
-    lets it finish the turn -- without discarding the thinking or turning
-    reasoning off, which is what the setting was enabled for."""
-    bodies = _replies(monkeypatch, [_thinking_only(), _answer()])
-    result = _client(reasoning_effort="medium").generate(
-        messages=[{"role": "user", "content": "hello"}]
-    )
-
-    assert len(bodies) == 2
-    replayed = bodies[1]["messages"][-1]
-    assert replayed["role"] == "assistant"
-    assert replayed["reasoning"] == "weighing the options"
-    # Reasoning stays ON for a continuation -- only the last-ditch fallback
-    # disables it.
-    assert bodies[1]["reasoning"] == {"effort": "medium"}
-    assert result.content == "the answer"
 
 
-def test_structured_reasoning_details_are_replayed_over_plain_text(monkeypatch):
-    """Anthropic signs its thinking blocks, so the plain text alone is not
-    a valid continuation item -- prefer the structured form."""
-    details = [{"type": "reasoning.text", "text": "step one", "signature": "sig"}]
-    bodies = _replies(monkeypatch, [_thinking_only(details), _answer()])
-    _client(reasoning_effort="medium").generate(
-        messages=[{"role": "user", "content": "hello"}]
-    )
-    replayed = bodies[1]["messages"][-1]
-    assert replayed["reasoning_details"] == details
-    assert "reasoning" not in replayed
 
 
 def test_reasoning_is_exposed_but_never_treated_as_an_answer(monkeypatch):
@@ -302,3 +274,96 @@ def test_a_tool_call_without_content_is_already_usable(monkeypatch):
     )
     assert len(bodies) == 1
     assert result.tool_calls[0].name == "search"
+
+
+
+def test_a_response_echoing_the_system_prompt_is_not_usable(monkeypatch):
+    """A length check alone calls 4,600 tokens of system prompt a fine
+    answer. This is the guard that stops the harness delivering it."""
+    system = (
+        "You are Toda, a capable general-purpose coworker embedded in a company. "
+        "Help with the full range of everyday knowledge work: questions, research, "
+        "writing, analysis, planning, brainstorming, coding, and actions through tools."
+    )
+    echo = {"choices": [{"message": {"content": "# Toda\n\n" + system}, "finish_reason": "stop"}]}
+    bodies = _replies(monkeypatch, [echo, _answer("a real answer")])
+    result = _client().generate(
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": "hi"}]
+    )
+    assert len(bodies) == 2, "the echo must trigger a resend"
+    assert result.content == "a real answer"
+
+
+def test_a_chat_template_control_token_is_not_usable(monkeypatch):
+    """Seeing a turn-boundary token in output means the model is
+    reproducing the template rather than answering within it."""
+    bad = {"choices": [{"message": {"content": "<｜begin▁of▁sentence｜># Toda"},
+                        "finish_reason": "stop"}]}
+    bodies = _replies(monkeypatch, [bad, _answer("recovered")])
+    result = _client().generate(messages=[{"role": "user", "content": "hi"}])
+    assert len(bodies) == 2
+    assert result.content == "recovered"
+
+
+def test_quoting_one_instruction_back_is_still_usable(monkeypatch):
+    """The echo guard must not fire on a model that legitimately refers to
+    part of its instructions."""
+    system = "You are Toda. " + "Follow the rules carefully. " * 20
+    ok = {"choices": [{"message": {"content": "I follow the rules carefully, as instructed."}},
+                       ]}
+    ok["choices"][0]["finish_reason"] = "stop"
+    bodies = _replies(monkeypatch, [ok])
+    result = _client().generate(
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": "hi"}]
+    )
+    assert len(bodies) == 1
+    assert result.content.startswith("I follow the rules")
+
+def _echo_client(**kw):
+    """A target whose thinking mode requires reasoning_content echo-back."""
+    from toda.harness.model_client import OpenAICompatibleModelClient
+    return OpenAICompatibleModelClient(
+        api_key="test", model="deepseek/deepseek-v4-flash-0731",
+        base_url="https://openrouter.ai/api/v1", **kw
+    )
+
+
+def test_a_thinking_only_turn_continues_from_its_own_reasoning(monkeypatch):
+    """Replaying the thinking as reasoning_content lets the model finish its
+    own thought instead of losing the turn."""
+    bodies = _replies(monkeypatch, [_thinking_only(), _answer()])
+    result = _echo_client(reasoning_effort="medium").generate(
+        messages=[{"role": "system", "content": "S"}, {"role": "user", "content": "hello"}]
+    )
+    assert len(bodies) == 2
+    replayed = bodies[1]["messages"][-1]
+    assert replayed["role"] == "assistant"
+    # The request field, not the response field. Sending `reasoning` here is
+    # what made this a bare empty prefill and leaked the system prompt.
+    assert replayed["reasoning_content"] == "weighing the options"
+    assert "reasoning" not in replayed
+    assert result.content == "the answer"
+
+
+def test_a_strict_provider_resends_instead_of_prefilling(monkeypatch):
+    """Its reasoning field is stripped before the wire, so a continuation
+    would be a bare empty trailing assistant -- the exact shape that made
+    the model resume the chat template and emit the system prompt."""
+    bodies = _replies(monkeypatch, [_thinking_only(), _answer()])
+    result = _client(reasoning_effort="medium").generate(
+        messages=[{"role": "system", "content": "S"}, {"role": "user", "content": "hello"}]
+    )
+    assert len(bodies) == 2
+    assert all(m["role"] != "assistant" for m in bodies[1]["messages"])
+    assert result.content == "the answer"
+
+
+def test_every_request_passes_through_the_sanitizer(monkeypatch):
+    """One chokepoint, not per call site -- the fork Hermes rejected."""
+    bodies = _replies(monkeypatch, [_answer()])
+    _echo_client().generate(messages=[
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "still there?"},
+    ])
+    assert bodies[0]["messages"][1]["content"] == "[response interrupted]"
