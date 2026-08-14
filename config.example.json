@@ -13,45 +13,33 @@
   },
   "models": {
     "providers": {
-      "reasoning": {
-        "provider": "openrouter",
-        "api_key": "<your-api-key>",
+      "concentrate": {
+        "provider": "concentrate",
+        "api_key": "<your-concentrate-key>",
         "base_url": null
       },
-      "embedding": {
+      "openrouter": {
         "provider": "openrouter",
-        "api_key": "<your-api-key>",
+        "api_key": "<your-openrouter-key>",
         "base_url": null
       }
     },
     "assignments": {
       "main": {
-        "connection": "reasoning",
-        "model": "deepseek/deepseek-v4-flash-0731"
+        "connection": "concentrate",
+        "model": "auto"
       },
       "attention": {
-        "connection": "reasoning",
-        "model": "deepseek/deepseek-v4-flash-0731"
+        "connection": "concentrate",
+        "model": "auto"
       },
       "extraction": {
-        "connection": "reasoning",
-        "model": "deepseek/deepseek-v4-flash-0731"
+        "connection": "concentrate",
+        "model": "auto"
       },
       "embedding": {
-        "connection": "embedding",
+        "connection": "openrouter",
         "model": "qwen/qwen3-embedding-8b"
-      },
-      "image": {
-        "connection": "reasoning",
-        "model": "google/gemini-3.1-flash-lite-image"
-      },
-      "transcription": {
-        "connection": "reasoning",
-        "model": "x-ai/grok-stt-1.0"
-      },
-      "tts": {
-        "connection": "reasoning",
-        "model": "fish-audio/s2.1-pro-free:free"
       }
     },
     "embedding_dimensions": 96,

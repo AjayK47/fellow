@@ -14,7 +14,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 
-ApiMode = Literal["chat_completions", "anthropic_messages"]
+ApiMode = Literal["chat_completions", "anthropic_messages", "concentrate_responses"]
 
 
 class ProviderConnection(BaseModel):
@@ -440,6 +440,22 @@ for _profile in (
             ("text-embedding-3-small", "lower cost"),
         ),
         recommended_embedding_model="text-embedding-3-large",
+    ),
+    ProviderProfile(
+        name="concentrate",
+        display_name="Concentrate",
+        description=(
+            "Unified Responses API across providers. Chat only -- no "
+            "embeddings endpoint, so an embedding role must point elsewhere."
+        ),
+        signup_url="https://concentrate.ai",
+        base_url="https://api.concentrate.ai/v1",
+        api_mode="concentrate_responses",
+        chat_catalog=(
+            ("auto", "let Concentrate route the request"),
+        ),
+        recommended_model="auto",
+        supports_embeddings=False,
     ),
     ProviderProfile(
         name="anthropic",

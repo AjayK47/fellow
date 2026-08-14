@@ -395,6 +395,297 @@ class OpenAICompatibleModelClient:
         )
 
 
+class ConcentrateResponsesModelClient:
+    """Transport for Concentrate's unified Responses API.
+
+    Not an OpenAI-compatible chat endpoint. The differences are structural
+    rather than cosmetic, and each one is a translation this class owns:
+
+      * the conversation is ``input`` (a flat list of items), not
+        ``messages``, and the system prompt is a separate ``instructions``
+        field rather than a message with role "system";
+      * a tool is declared flat -- ``{type, name, description, parameters}``
+        -- not nested under a ``function`` key;
+      * a tool call comes back as an output item
+        ``{type: "function_call", call_id, name, arguments}``, and its result
+        goes back as ``{type: "function_call_output", call_id, output}``
+        rather than a message with role "tool";
+      * the reply is an ``output`` array of typed items (message, reasoning,
+        function_call), not ``choices[0].message``;
+      * usage is ``input_tokens``/``output_tokens``, and completion is
+        reported as ``status`` rather than ``finish_reason``.
+
+    Everything above the transport keeps speaking Toda's chat-shaped
+    contract, so the agent loop, budgeting and recovery paths are unchanged.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        base_url: str,
+        timeout_seconds: float = 90.0,
+        reasoning_effort: str | None = None,
+        headers: dict[str, str] | None = None,
+        provider_name: str = "concentrate",
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.reasoning_effort = reasoning_effort
+        self.headers = headers or {}
+        self.provider_name = provider_name
+        self._context_length: int | None = None
+
+    def context_length(self) -> int:
+        """Resolve the input window from Concentrate's catalog.
+
+        Its field is ``max_input_tokens`` -- the input budget specifically --
+        where the OpenAI-compatible catalog reports a combined
+        ``context_length``. Compaction cares about the input side, so this
+        is the more accurate of the two.
+        """
+        if self._context_length is not None:
+            return self._context_length
+        try:
+            response = httpx.get(
+                f"{self.base_url}/models",
+                headers=self._request_headers(),
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            for entry in response.json().get("data") or []:
+                if entry.get("id") == self.model:
+                    window = entry.get("max_input_tokens")
+                    if isinstance(window, (int, float)) and window > 0:
+                        self._context_length = int(window)
+                        return self._context_length
+                    break
+        except Exception:
+            pass
+        self._context_length = _DEFAULT_CONTEXT_LENGTH
+        return self._context_length
+
+    def _request_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            **self.headers,
+        }
+
+    @staticmethod
+    def _to_input_items(
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Chat-shaped messages -> (input items, instructions).
+
+        System messages are joined into ``instructions``; an assistant turn
+        carrying tool calls expands into one ``function_call`` item per call,
+        because the Responses model has no notion of a message that also
+        holds calls.
+        """
+        items: list[dict[str, Any]] = []
+        instructions: list[str] = []
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content")
+            text = content if isinstance(content, str) else ""
+            if role == "system":
+                if text.strip():
+                    instructions.append(text)
+                continue
+            if role == "tool":
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": message.get("tool_call_id") or "",
+                        "output": text,
+                    }
+                )
+                continue
+            if role == "assistant":
+                if text.strip():
+                    items.append({"role": "assistant", "content": text})
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function") or {}
+                    arguments = function.get("arguments")
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": call.get("id") or new_id("call"),
+                            "name": function.get("name") or "",
+                            "arguments": (
+                                arguments
+                                if isinstance(arguments, str)
+                                else json.dumps(arguments or {})
+                            ),
+                        }
+                    )
+                continue
+            if text.strip() or content:
+                items.append({"role": role or "user", "content": content})
+        return items, "\n\n".join(instructions)
+
+    @staticmethod
+    def _to_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        """OpenAI's nested tool schema -> Concentrate's flat one."""
+        flattened: list[dict[str, Any]] = []
+        for tool in tools or []:
+            function = tool.get("function") or {}
+            flattened.append(
+                {
+                    "type": "function",
+                    "name": function.get("name") or tool.get("name") or "",
+                    "description": function.get("description")
+                    or tool.get("description")
+                    or "",
+                    "parameters": function.get("parameters")
+                    or tool.get("parameters")
+                    or {},
+                }
+            )
+        return flattened
+
+    def generate(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        response_schema: dict[str, Any] | None = None,
+        temperature: float = 0.1,
+        max_tokens: int = 1500,
+        reasoning: bool | None = None,
+    ) -> ModelResponse:
+        items, instructions = self._to_input_items(messages)
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input": items,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
+        if instructions:
+            body["instructions"] = instructions
+        if tools:
+            body["tools"] = self._to_tools(tools)
+            body["tool_choice"] = "auto"
+        if response_schema:
+            body["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "toda_response",
+                    "strict": True,
+                    "schema": response_schema,
+                }
+            }
+        if reasoning is False:
+            body["reasoning"] = {"effort": "none"}
+        elif self.reasoning_effort:
+            body["reasoning"] = {"effort": self.reasoning_effort}
+        return self._send(body)
+
+    def _send(self, body: dict[str, Any]) -> ModelResponse:
+        response = httpx.post(
+            f"{self.base_url}/responses",
+            headers=self._request_headers(),
+            json=body,
+            timeout=self.timeout_seconds,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"{self.provider_name} {response.status_code} for model {self.model}: "
+                f"{response.text[:2000]}"
+            ) from exc
+        return self._parse(response.json())
+
+    def _parse(self, payload: dict[str, Any]) -> ModelResponse:
+        error = payload.get("error")
+        if error:
+            raise RuntimeError(
+                f"{self.provider_name} returned an error for model {self.model}: "
+                f"{json.dumps(error)[:1000]}"
+            )
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        calls: list[ModelToolCall] = []
+        for item in payload.get("output") or []:
+            item_type = item.get("type")
+            if item_type == "function_call":
+                raw_args = item.get("arguments") or "{}"
+                try:
+                    arguments = (
+                        json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    )
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"invalid model tool arguments for tool "
+                        f"{item.get('name') or '<unknown>'!r} "
+                        f"(status={payload.get('status')!r}, "
+                        f"arguments_length={len(raw_args) if isinstance(raw_args, str) else 'n/a'}): "
+                        f"{exc}"
+                    ) from exc
+                calls.append(
+                    ModelToolCall(
+                        id=item.get("call_id") or new_id("call"),
+                        name=item.get("name") or "",
+                        arguments=arguments or {},
+                    )
+                )
+            elif item_type == "reasoning":
+                reasoning_parts.extend(_collect_text(item.get("summary")))
+                reasoning_parts.extend(_collect_text(item.get("content")))
+            elif item_type == "message" or item.get("role") == "assistant":
+                content_parts.extend(_collect_text(item.get("content")))
+        usage = payload.get("usage") or {}
+        # "incomplete" is this API's way of saying the output budget ran out,
+        # which the recovery path reads as budget exhaustion.
+        status = str(payload.get("status") or "completed")
+        finish_reason = {
+            "completed": "tool_calls" if calls else "stop",
+            "incomplete": "length",
+        }.get(status, status)
+        return ModelResponse(
+            content="\n".join(part for part in content_parts if part).strip(),
+            tool_calls=calls,
+            finish_reason=finish_reason,
+            model=str(payload.get("model") or self.model),
+            usage={
+                "prompt_tokens": usage.get("input_tokens"),
+                "completion_tokens": usage.get("output_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+                "completion_tokens_details": usage.get("output_tokens_details") or {},
+            },
+            raw=payload,
+            reasoning="\n".join(part for part in reasoning_parts if part).strip(),
+        )
+
+
+def _collect_text(node: Any) -> list[str]:
+    """Pull display text out of a Responses content node.
+
+    The field is a string, a list of typed parts, or absent, depending on
+    the item -- so this normalizes all three rather than each call site
+    guessing.
+    """
+    if node is None:
+        return []
+    if isinstance(node, str):
+        return [node]
+    parts: list[str] = []
+    if isinstance(node, list):
+        for entry in node:
+            if isinstance(entry, str):
+                parts.append(entry)
+            elif isinstance(entry, dict):
+                text = entry.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+    return parts
+
+
 class AnthropicModelClient:
     """Native Anthropic Messages transport behind Toda's stable model contract."""
 
@@ -721,6 +1012,16 @@ def _build_resolved_model(
             base_url=base_url,
             timeout_seconds=config.models.timeout_seconds,
             headers=headers,
+        )
+    if resolved.profile.api_mode == "concentrate_responses":
+        return ConcentrateResponsesModelClient(
+            api_key=api_key,
+            model=resolved.assignment.model,
+            base_url=base_url,
+            timeout_seconds=config.models.timeout_seconds,
+            reasoning_effort=reasoning_effort,
+            headers=headers,
+            provider_name=resolved.profile.name,
         )
     return OpenAICompatibleModelClient(
         api_key=api_key,
