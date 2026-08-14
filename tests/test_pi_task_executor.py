@@ -106,6 +106,39 @@ def test_pi_hardline_floor_blocks_push_when_task_says_do_not_push(tmp_path):
     ) is None
 
 
+def test_the_exit_code_decides_success_not_anything_in_the_log(brain):
+    """The exit marker is the verdict.
+
+    Success used to hinge on a `status` field in Pi's output that Pi has
+    never emitted, so a clean run finalized as `failed` while a broken one
+    that happened to print the right JSON would have passed. Neither run
+    here writes a parseable event at all, which is the point: the marker
+    alone has to separate them.
+    """
+    _provision_workspace(brain)
+    brain.pi_task_executor.poll_interval_seconds = 0
+
+    outcomes = {}
+    for name, command in (("clean", ["true"]), ("broken", ["false"])):
+        brain.pi_task_executor.command_builder = lambda prompt, c=command: c
+        task = _make_pi_task(
+            brain, session_id=_session_id(brain, f"slack:dm:person_ajay:exit-{name}")
+        )
+        brain.pi_task_executor.start(
+            task["id"], owner=f"exec_{name}", enqueue_poll=_noop_enqueue
+        )
+        for _ in range(30):
+            if brain.store.get_task(task["id"])["state"] in {"completed", "failed"}:
+                break
+            brain.pi_task_executor.poll(task["id"], enqueue_poll=_noop_enqueue)
+            time.sleep(0.02)
+        attempt = brain.store.list_task_attempts(task["id"])[-1]
+        outcomes[name] = (brain.store.get_task(task["id"])["state"], attempt["status"])
+
+    assert outcomes["clean"] == ("completed", "succeeded")
+    assert outcomes["broken"] == ("failed", "failed")
+
+
 def test_checkpoint_wake_notifies_session_without_ending_the_task(brain):
     _provision_workspace(brain)
     brain.pi_task_executor.command_builder = lambda prompt: ["sleep", "0.3"]
@@ -197,7 +230,11 @@ def test_stale_pi_owner_cannot_finalize_after_task_reclaim(brain):
             attempt,
             owner="old-pi",
             exit_code=0,
-            output='{"status":"success","summary":"stale answer"}',
+            output=(
+                '{"type":"agent_end","messages":[{"role":"assistant",'
+                '"content":[{"type":"text","text":"stale answer"}]}],'
+                '"willRetry":false}'
+            ),
         )
 
     current = brain.store.get_task(task["id"])

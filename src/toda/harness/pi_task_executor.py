@@ -46,9 +46,31 @@ _EXIT_MARKER = "__PI_EXIT__"
 CommandBuilder = Callable[[str], list[str]]
 
 
-def default_pi_command(prompt: str) -> list[str]:
-    """Build the detached Pi CLI command for one Task prompt."""
-    return ["pi", "--prompt", prompt]
+def pi_command_builder(*, provider: str, model: str) -> CommandBuilder:
+    """Build the detached Pi CLI command for one Task prompt.
+
+    `--print` is Pi's non-interactive mode and the prompt is positional --
+    there is no `--prompt` flag. `--mode json` makes the run machine-readable
+    (see parse_terminal_event); the provider and model are passed explicitly
+    so a Task never inherits whichever model the operator last selected in
+    Pi's own TUI. The credential is deliberately *not* passed as `--api-key`:
+    it goes through the child's environment, where `ps` cannot read it.
+    """
+
+    def build(prompt: str) -> list[str]:
+        return [
+            "pi",
+            "--print",
+            "--mode",
+            "json",
+            "--provider",
+            provider,
+            "--model",
+            model,
+            prompt,
+        ]
+
+    return build
 
 
 def check_hardline_floor(prompt: str, command: list[str], workspace_root: Path) -> str | None:
@@ -66,17 +88,42 @@ def check_hardline_floor(prompt: str, command: list[str], workspace_root: Path) 
 
 
 def parse_terminal_event(output: str) -> dict[str, Any] | None:
-    """Parse the final structured success event emitted by Pi, if present."""
+    """Summarize Pi's closing `agent_end` event from its JSON output stream.
+
+    Pi writes one JSON object per line and ends with `agent_end` -- carrying
+    the whole message list and its usage -- followed by a bare
+    `agent_settled`. Neither reports success: that is the exit marker's job.
+    So this extracts the part a Session Manager actually needs handed back,
+    the final assistant text and what the run cost, rather than leaving the
+    caller to slice it out of a stream that repeats the full message object
+    on every token delta.
+    """
     for line in reversed(output.splitlines()):
         line = line.strip()
-        if not line or not line.startswith("{"):
+        if not line.startswith("{"):
             continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(event, dict) and event.get("status") in {"success", "completed"}:
-            return event
+        if not isinstance(event, dict) or event.get("type") != "agent_end":
+            continue
+        messages = event.get("messages") or []
+        final = messages[-1] if isinstance(messages, list) and messages else {}
+        blocks = final.get("content") or []
+        text = "\n".join(
+            block.get("text", "")
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == "text"
+        ).strip()
+        return {
+            "type": "agent_end",
+            "text": text,
+            "model": final.get("model"),
+            "stop_reason": final.get("stopReason"),
+            "usage": final.get("usage") or {},
+            "will_retry": bool(event.get("willRetry")),
+        }
     return None
 
 
@@ -133,7 +180,11 @@ class PiTaskExecutor:
         workspaces: Any,
         artifacts: Any,
         audit: Any,
-        command_builder: CommandBuilder = default_pi_command,
+        provider: str,
+        model: str,
+        credential_env: str | None = None,
+        credential: str | None = None,
+        command_builder: CommandBuilder | None = None,
         checkpoint_interval_seconds: int = 3600,
         stale_heartbeat_seconds: int = 1800,
         poll_interval_seconds: int = 10,
@@ -145,7 +196,11 @@ class PiTaskExecutor:
         self.workspaces = workspaces
         self.artifacts = artifacts
         self.audit = audit
-        self.command_builder = command_builder
+        self.credential_env = credential_env
+        self.credential = credential
+        self.command_builder = command_builder or pi_command_builder(
+            provider=provider, model=model
+        )
         self.checkpoint_interval_seconds = checkpoint_interval_seconds
         self.stale_heartbeat_seconds = stale_heartbeat_seconds
         self.poll_interval_seconds = poll_interval_seconds
@@ -189,10 +244,20 @@ class PiTaskExecutor:
             f"{shlex.join(command)} > {shlex.quote(str(log_path))} 2>&1; "
             f'printf "\\n{_EXIT_MARKER}:%s\\n" "$?" >> {shlex.quote(str(log_path))}'
         )
+        # scrub_child_env drops every name containing KEY/TOKEN/AUTH, which
+        # is right for run_code but leaves Pi with no way to reach a model.
+        # Re-add exactly the one credential it needs, by name, rather than
+        # widening the scrub for everything.
+        child_env = scrub_child_env(dict(os.environ))
+        if self.credential_env and self.credential:
+            child_env[self.credential_env] = self.credential
         proc = subprocess.Popen(
             ["/bin/sh", "-c", shell_command],
             cwd=str(workspace_root),
-            env=scrub_child_env(dict(os.environ)),
+            env=child_env,
+            # Detached and unattended: an inherited stdin would let Pi block
+            # forever waiting on a terminal nobody is sitting at.
+            stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
         now = utcnow().isoformat()
@@ -433,7 +498,11 @@ class PiTaskExecutor:
             status = "cancelled"
         elif forced_reason:
             status = "crashed"
-        elif terminal_event is not None and terminal_event.get("status") == "success":
+        elif exit_code == 0:
+            # The exit marker is the verdict, which is the whole reason it is
+            # appended by the shell rather than inferred from the log. This
+            # used to require terminal_event["status"] == "success" -- a field
+            # Pi does not emit, so a clean run was recorded as a failure.
             status = "succeeded"
         else:
             status = "failed"
@@ -497,9 +566,12 @@ class PiTaskExecutor:
         self.store.update_task_attempt(attempt)
 
         principal_id = task["envelope"]["principal_id"]
+        # Pi's final assistant text, when the stream closed cleanly. The raw
+        # tail is only a fallback for a crashed or killed run: in JSON mode
+        # the last 4000 characters are the middle of one repeated message
+        # object, not anything a reader can use.
         answer = (
-            (terminal_event or {}).get("summary")
-            or (terminal_event or {}).get("message")
+            (terminal_event or {}).get("text")
             or output[-4000:]
             or (forced_reason or "")
         )

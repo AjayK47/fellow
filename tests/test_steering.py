@@ -370,7 +370,12 @@ def test_manage_child_task_revises_a_pi_child_and_restarts_with_new_prompt_same_
 
     def fake_command(prompt: str) -> list[str]:
         if prompt == revised_prompt:
-            return ["echo", '{"type": "result", "status": "success", "summary": "skipped it"}']
+            return [
+                "echo",
+                '{"type":"agent_end","messages":[{"role":"assistant",'
+                '"content":[{"type":"text","text":"skipped it"}]}],'
+                '"willRetry":false}',
+            ]
         return ["sleep", "5"]
 
     brain.pi_task_executor.command_builder = fake_command

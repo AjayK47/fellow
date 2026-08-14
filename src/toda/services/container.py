@@ -304,6 +304,16 @@ class TodaApp:
             workspaces=self.workspaces,
             artifacts=self.artifacts,
             audit=self.audit,
+            provider=runtime_settings.agent.pi_provider,
+            model=runtime_settings.agent.pi_model,
+            credential_env=runtime_settings.agent.pi_credential_env,
+            credential=getattr(
+                runtime_settings.models.providers.get(
+                    runtime_settings.agent.pi_credential_connection
+                ),
+                "api_key",
+                None,
+            ),
             checkpoint_interval_seconds=runtime_settings.agent.pi_checkpoint_interval_seconds,
             stale_heartbeat_seconds=runtime_settings.agent.pi_stale_heartbeat_seconds,
             poll_interval_seconds=runtime_settings.agent.pi_poll_interval_seconds,

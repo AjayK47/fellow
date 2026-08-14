@@ -217,6 +217,17 @@ class AgentConfig(_Section):
     # Full-trust `pi` coding child-worker subprocess. Unlike run_code this
     # has real network access and no approval gate, so it defaults off.
     pi_coding_enabled: bool = False
+    # Pinned here rather than left to Pi's own defaults, which come from the
+    # operator's ~/.pi/agent/settings.json -- otherwise changing the model in
+    # the Pi TUI silently changes what Toda's coding workers run on.
+    pi_provider: str = "openrouter"
+    pi_model: str = "z-ai/glm-5.2"
+    # Pi discovers its credential from an environment variable, so the key is
+    # injected into the child's env rather than passed as `--api-key`, which
+    # would expose it in argv to every process on the host. The value is read
+    # from models.providers[pi_credential_connection].api_key.
+    pi_credential_env: str = "OPENROUTER_API_KEY"
+    pi_credential_connection: str = "reasoning"
     pi_checkpoint_interval_seconds: int = 3600
     pi_stale_heartbeat_seconds: int = 1800
     pi_poll_interval_seconds: int = 10
