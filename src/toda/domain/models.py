@@ -24,6 +24,21 @@ def new_id(prefix: str) -> str:
 
 
 class EntityType(str, Enum):
+    """Common entity kinds, kept as hints rather than a closed set.
+
+    Entity.entity_type is a plain string. The world does not fit an
+    enumeration written in advance: a research task names companies,
+    technologies, places, laws and products, none of which appear below,
+    and closing the set meant a 53,000-word report on semiconductor policy
+    produced no entity for TSMC, Taiwan or the CHIPS Act.
+
+    Supermemory's graph works the same way -- "you do not define schema or
+    draw edges", with entities emerging from content while the *relations*
+    stay a small fixed vocabulary (see MemoryEdgeType, which already
+    mirrors their Updates/Extends/Derives). Constrain how facts relate,
+    not what may exist.
+    """
+
     PERSON = "person"
     TEAM = "team"
     PROJECT = "project"
@@ -185,7 +200,9 @@ class SourceEvidence(BaseModel):
 class Entity(BaseModel):
     id: str
     organization_id: str
-    entity_type: EntityType
+    # Free text. See EntityType for the common values and why this is
+    # not constrained to them.
+    entity_type: str
     name: str
     aliases: list[str] = Field(default_factory=list)
     attributes: dict[str, Any] = Field(default_factory=dict)

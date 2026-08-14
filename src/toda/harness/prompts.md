@@ -602,11 +602,15 @@ organizational memory from a source.
 Used by `extraction.MemoryExtractor.extract_source`.
 
 ```text
-Extract only durable, evidence-backed organizational facts, decisions, commitments, issues, relationships, and outcomes. Keep claims atomic and omit greetings, speculation, and agent prose.
+Extract durable, evidence-backed facts, decisions, commitments, issues, relationships, and outcomes worth remembering later. Keep claims atomic and omit greetings, speculation, and agent prose.
+
+Remember what is durable, not only what is internal. A conversation about your own team and a report about the outside world both contain things worth keeping: who owns a service, what a company announced, what a technology does, what a regulation requires. Judge by whether the claim will still be useful weeks from now, not by whether it is about this company.
+
+Do not keep transient chatter, one-off task status, restatements of the request, or descriptions of your own actions ("a report was produced"). Those are noise; the report's contents are the memory.
 
 known_entities are already-confirmed entities -- reference them directly by their real id in entity_ids/participant_ids. Never invent a bare id that isn't in that catalog.
 
-When the content names a real, specific organizational entity that is NOT in known_entities -- a named person, team, project, service, customer, incident, document, issue, decision, or commitment -- declare it once in proposed_entities with a short local ref like "new:1", and use that same ref string (not a made-up id) in entity_ids/participant_ids anywhere it's mentioned. Skip vague or generic mentions ("the team", "a customer") that don't name anything specific enough to be worth tracking as its own entity.
+When the content names a real, specific thing that is NOT in known_entities -- a person, team, project, service, customer, incident, document, issue, decision, commitment, company, technology, product, place, regulation, event, or anything else specific enough to be worth tracking -- declare it once in proposed_entities with a short local ref like "new:1", and use that same ref string (not a made-up id) in entity_ids/participant_ids anywhere it's mentioned. entity_type is a free lowercase word: use the closest ordinary one, and a new word when none of the usual fit. Skip vague or generic mentions ("the team", "a customer", "the industry") that don't name anything specific.
 ```
 
 ## skill_synthesis

@@ -16,7 +16,7 @@ import json
 
 from toda.harness import extraction as extraction_module
 from toda.harness.extraction import (
-    _PROPOSABLE_ENTITY_TYPES,
+    _STRUCTURAL_ENTITY_TYPES,
     ModelMemoryExtractor,
 )
 from toda.harness.model_client import ScriptedModelClient
@@ -273,7 +273,9 @@ def test_known_entity_catalog_excludes_structural_event_entities(brain):
     catalog = extractor._known_entity_catalog("org_acme")
 
     assert catalog, "expected real business entities to remain in the catalog"
-    assert {entry["type"] for entry in catalog} <= set(_PROPOSABLE_ENTITY_TYPES)
+    # The filter is now a deny-list of structural kinds, so an entity type
+    # nobody enumerated in advance still reaches the model.
+    assert not ({entry["type"] for entry in catalog} & _STRUCTURAL_ENTITY_TYPES)
     ids = {entry["id"] for entry in catalog}
     assert "conversation_noise" not in ids
     assert not any(entry_id.startswith("source_noise_") for entry_id in ids)
@@ -376,3 +378,37 @@ def test_extraction_cannot_assert_permission_edges():
     for blocked in ("CAN_VIEW", "CAN_EDIT", "VISIBLE_TO", "ACTS_AS", "AUTHORIZED_FOR",
                     "INHERITS_ACL_FROM"):
         assert blocked not in EXTRACTABLE_EDGE_TYPES, f"{blocked} is writable from free text"
+
+
+def test_a_kind_nobody_enumerated_survives_extraction(brain):
+    """The schema was a closed enum of ten organizational kinds, with no
+    company, technology, place or regulation. A 53,000-word report on
+    semiconductor policy produced no entity for TSMC, Taiwan or the CHIPS
+    Act, because nothing it described could be represented."""
+    import json
+
+    payload = json.dumps({
+        "proposed_entities": [
+            {"ref": "new:1", "name": "TSMC", "entity_type": "company", "aliases": []},
+            {"ref": "new:2", "name": "Taiwan", "entity_type": "place", "aliases": []},
+            {"ref": "new:3", "name": "CoWoS", "entity_type": "technology", "aliases": []},
+        ],
+        "memories": [{
+            "memory_type": "fact",
+            "content": "TSMC committed $65B across three fabs in Phoenix, Arizona.",
+            "confidence": 0.9, "authority": 0.8,
+            "entity_ids": ["new:1"], "participant_ids": [],
+            "canonical_claim": None, "relation": None,
+        }],
+    })
+    extractor = _extractor(brain, payload)
+    source = brain.store.list_sources("org_acme")[0]
+
+    memories = extractor.extract_source(source)
+
+    assert memories, "the claim must survive"
+    kinds = {
+        str(e.get("entity_type"))
+        for e in brain.store.list_entities("org_acme")
+    }
+    assert {"company", "place", "technology"} <= kinds, kinds

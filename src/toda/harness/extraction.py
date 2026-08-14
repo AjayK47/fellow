@@ -15,22 +15,30 @@ from toda.domain.models import (
     utcnow,
 )
 
-# The business entity types extraction may PROPOSE from a plain-text
-# mention. Deliberately excludes the structural types (channel, source,
-# task, skill, agent, application, conversation) that other parts of the
-# harness already create directly -- this schema is only for "a named
-# organizational thing the model noticed in conversation".
-_PROPOSABLE_ENTITY_TYPES = (
-    "person",
-    "team",
-    "project",
-    "service",
-    "customer",
-    "incident",
-    "document",
-    "issue",
-    "decision",
-    "commitment",
+# Common entity kinds, offered to the extractor as examples rather than as
+# a closed set. This was an enum in the response schema, and the omission
+# was total: no company, technology, place, product or regulation, so a
+# 53,000-word report on semiconductor policy yielded no entity for TSMC,
+# Taiwan or the CHIPS Act -- nothing it described could be represented.
+#
+# Supermemory's graph is built the same way: "you do not define schema or
+# draw edges". Entities emerge from the content while the relations stay a
+# small fixed vocabulary, which Toda already has in MemoryEdgeType.
+_COMMON_ENTITY_TYPES = (
+    "person", "team", "project", "service", "customer", "incident",
+    "document", "issue", "decision", "commitment",
+    "company", "technology", "product", "place", "regulation", "event",
+)
+
+# Kinds the harness mints per event rather than learning from content.
+# `source` ("slack event Ev0BNJ...") and `conversation` ("slack C0BP95K48V6")
+# are named from raw external ids, so nothing a person writes can refer to
+# one, and one is created for every Slack message -- left in, they become
+# the overwhelming majority of the catalog and push real subjects past the
+# cap. Excluded by name rather than by allow-listing business types, so a
+# kind nobody has thought of yet still reaches the model.
+_STRUCTURAL_ENTITY_TYPES = frozenset(
+    {"source", "conversation", "channel", "task", "agent", "application", "skill"}
 )
 
 # How many known entities the extractor is shown per source. Bounded to keep
@@ -57,7 +65,12 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                     "name": {"type": "string"},
                     "entity_type": {
                         "type": "string",
-                        "enum": list(_PROPOSABLE_ENTITY_TYPES),
+                        "description": (
+                            "What kind of thing this is, lowercase and singular. "
+                            "Common values: " + ", ".join(_COMMON_ENTITY_TYPES)
+                            + ". Use another word when none of those fit -- the "
+                            "set is deliberately open."
+                        ),
                     },
                     "aliases": {"type": "array", "items": {"type": "string"}},
                 },
@@ -186,21 +199,21 @@ class ModelMemoryExtractor:
     def _known_entities(self, organization_id: str) -> list[dict[str, Any]]:
         """Every entity a claim may legitimately be linked to.
 
-        Restricted to the referenceable business types. The structural types
-        the harness creates per event -- `source` ("slack event Ev0BNJ...")
-        and `conversation` ("slack C0BP95K48V6") -- are named from raw
-        external ids, so nothing a person writes can ever refer to one, and
-        one is minted for every single Slack message. Left unfiltered they
-        become the overwhelming majority of the catalog and push the real
-        people, projects, and services past the cap entirely.
+        Excludes only the structural kinds the harness mints per event (see
+        _STRUCTURAL_ENTITY_TYPES). Everything a person or a document could
+        actually name stays referenceable, including kinds nobody enumerated
+        in advance.
 
         Ordered newest-updated first so that when the cap does bite, it
         drops the least recently relevant entity rather than whichever row
         SQLite happened to return last.
         """
-        entities = self.store.list_entities(
-            organization_id, entity_types=_PROPOSABLE_ENTITY_TYPES
-        )
+        entities = [
+            entity
+            for entity in self.store.list_entities(organization_id)
+            if str(entity.get("entity_type") or "").lower()
+            not in _STRUCTURAL_ENTITY_TYPES
+        ]
         entities.sort(
             key=lambda entity: (
                 entity.get("updated_at") or entity.get("created_at") or "",
@@ -269,8 +282,12 @@ class ModelMemoryExtractor:
             for proposal in payload.get("proposed_entities") or []:
                 ref = str(proposal.get("ref") or "").strip()
                 name = str(proposal.get("name") or "").strip()
-                entity_type = str(proposal.get("entity_type") or "").strip()
-                if not ref or not name or entity_type not in _PROPOSABLE_ENTITY_TYPES:
+                # Normalized, not validated against a list: rejecting an
+                # unfamiliar kind here would discard exactly the entities
+                # the open schema exists to capture. A proposal still needs
+                # a ref, a name, and some stated kind.
+                entity_type = str(proposal.get("entity_type") or "").strip().lower()
+                if not ref or not name or not entity_type:
                     continue
                 entity_id, _decision = self.reality.propose_entity_mention(
                     source["organization_id"],
