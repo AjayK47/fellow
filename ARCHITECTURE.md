@@ -7,11 +7,6 @@
 > **Naming:** the product is **Toda**. The Python package, CLI, database
 > and environment variables are still `toda` / `TODA_*`; renaming the
 > internals is deliberately not part of the external rename.
->
-> Superseded planning documents (kept for history, not accurate as-built):
-> `final_company_wide_agent_harness_architecture.md`,
-> `SESSION_MANAGER_TASK_ARCHITECTURE_PLAN.md`,
-> `SESSION_MANAGER_TASK_ARCHITECTURE_HANDOFF.md`.
 
 ---
 

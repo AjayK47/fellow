@@ -47,17 +47,42 @@ landing/
 site/
 --help
 
-# Private implementation notes are not part of the community distribution
+# Working notes are not part of the community distribution. These are the
+# documents written while building a change -- plans, handoffs, audits, the
+# running understanding of a subsystem. They go stale the moment the code
+# lands, and a reader who trusts one is worse off than a reader who had
+# nothing. What ships is the as-built set: README, ARCHITECTURE, SECURITY,
+# CONTRIBUTING and the guides under docs/.
+#
+# Suffix patterns rather than a list of filenames, because the list only
+# ever caught the notes that already existed. All of these are also
+# deliberately safe against the docs that DO ship: `*_REVIEW.md` cannot
+# match SECURITY.md, `*_ARCHITECTURE.md` cannot match ARCHITECTURE.md.
 *_PLAN.md
 *_HANDOFF.md
 *_TODO.md
+*_REVIEW.md
+*_AUDIT.md
+*_FINDINGS.md
+*_STATUS.md
+*_NOTES.md
+*_ADOPTION.md
+*_UNDERSTANDING.md
+*_ARCHITECTURE.md
+*_architecture.md
 *ANALYSIS*.md
 HARNESS_*.md
-*_HARNESS_UNDERSTANDING.md
-IMPLEMENTATION_STATUS.md
+notes/
+scratch/
+
+# Agent and tool state, none of it portable to another machine
 CLAUDE.md
 .claude/
 .commandcode/
+
+# Other harnesses cloned for reference (OpenMausBot and friends). Whole
+# third-party repositories, with their own git history and licences.
+harnesses/
 
 # Eval corpora and results. The generator, cases and scorers are tracked;
 # the generated organization and every run's scores are not -- corpora are
