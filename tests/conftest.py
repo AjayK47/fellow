@@ -22,8 +22,19 @@ from toda.services.container import TodaApp
 DASHBOARD_SESSION_SECRET = "test-dashboard-session-secret"
 
 
-def sign_in(client: TestClient, *, organization_id: str = "org_acme", principal_id: str = "person_ajay") -> None:
-    """Create a revocable dashboard session and sign its opaque cookie."""
+def sign_in(
+    client: TestClient,
+    *,
+    organization_id: str = "org_acme",
+    principal_id: str = "person_ajay",
+    role: str = "owner",
+) -> None:
+    """Create a revocable dashboard session and sign its opaque cookie.
+
+    `role` matters: owner/admin bypasses the Session participation boundary
+    and may perform any mutation, so a test that signs in with the default
+    exercises none of that. Pass role="member" to test as an ordinary user.
+    """
     from toda.services.dashboard_auth import DashboardAuthService
 
     store = client.app.state.brain.store
@@ -42,12 +53,14 @@ def sign_in(client: TestClient, *, organization_id: str = "org_acme", principal_
             "organization_id": organization_id,
             "user_id": user["id"],
             "principal_id": principal_id,
-            "role": "owner",
+            "role": role,
             "status": "active",
             "created_at": "2026-01-01T00:00:00+00:00",
             "updated_at": "2026-01-01T00:00:00+00:00",
         }
-    store.upsert_organization_member({**member, "principal_id": principal_id})
+    store.upsert_organization_member(
+        {**member, "principal_id": principal_id, "role": role}
+    )
     session = auth.create_session(organization_id, user["id"])
     payload = base64.b64encode(
         json.dumps({"dashboard_session_id": session["token"]}).encode()

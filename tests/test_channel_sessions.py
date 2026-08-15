@@ -177,6 +177,7 @@ def test_a_second_speaker_wakes_the_same_session_not_a_new_one(brain):
         role="user",
         content="check the export pipeline",
         principal_id="person_ajay",
+        may_join=True,
     )
     second = brain.sessions.wake(
         organization_id="org_acme",
@@ -185,6 +186,7 @@ def test_a_second_speaker_wakes_the_same_session_not_a_new_one(brain):
         role="user",
         content="same thing here",
         principal_id="person_sanjay",
+        may_join=True,
     )
 
     assert second["session_id"] == first["session_id"]
@@ -212,6 +214,7 @@ def test_stop_addressed_in_a_channel_cancels_the_running_root(brain):
         role="user",
         content="check the export pipeline",
         principal_id="person_ajay",
+        may_join=True,
     )
     root = _root_task(
         brain,
@@ -227,6 +230,7 @@ def test_stop_addressed_in_a_channel_cancels_the_running_root(brain):
         role="user",
         content="stop",
         principal_id="person_ajay",
+        may_join=True,
     )
 
     assert stop["steer_signal"] == "abort"
@@ -243,6 +247,7 @@ def test_a_second_speaker_in_a_channel_steers_instead_of_pausing(brain):
         role="user",
         content="check the export pipeline",
         principal_id="person_ajay",
+        may_join=True,
     )
     root = _root_task(
         brain,
@@ -258,6 +263,7 @@ def test_a_second_speaker_in_a_channel_steers_instead_of_pausing(brain):
         role="user",
         content="same thing here, it started around 10am",
         principal_id="person_sanjay",
+        may_join=True,
     )
 
     assert followup["steer_signal"] == "steer"
@@ -277,6 +283,7 @@ def test_a_second_speaker_in_a_dm_still_forces_reauthorization(brain):
         role="user",
         content="check the export pipeline",
         principal_id="person_ajay",
+        may_join=True,
     )
     root = _root_task(
         brain,
@@ -292,6 +299,7 @@ def test_a_second_speaker_in_a_dm_still_forces_reauthorization(brain):
         role="user",
         content="what did it say?",
         principal_id="person_sanjay",
+        may_join=True,
     )
 
     assert followup["steer_signal"] == "reauthorize"
@@ -306,6 +314,7 @@ def test_the_same_speaker_never_triggers_reauthorization(brain):
         role="user",
         content="check the export pipeline",
         principal_id="person_ajay",
+        may_join=True,
     )
     root = _root_task(
         brain,
@@ -321,6 +330,7 @@ def test_the_same_speaker_never_triggers_reauthorization(brain):
         role="user",
         content="also check the retry queue",
         principal_id="person_ajay",
+        may_join=True,
     )
 
     assert followup["steer_signal"] == "steer"
@@ -345,6 +355,7 @@ def test_user_turns_carry_their_speaker_into_the_prompt(brain):
         content="check the export pipeline",
         principal_id="person_ajay",
         message_metadata={"author_name": "Ajay"},
+        may_join=True,
     )
     brain.sessions.wake(
         organization_id="org_acme",
@@ -354,6 +365,7 @@ def test_user_turns_carry_their_speaker_into_the_prompt(brain):
         content="same thing here",
         principal_id="person_sanjay",
         message_metadata={"author_name": "Sanjay"},
+        may_join=True,
     )
     root = _root_task(
         brain,

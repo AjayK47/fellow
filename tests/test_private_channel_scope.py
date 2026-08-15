@@ -310,3 +310,73 @@ def test_an_operator_policy_can_declare_a_channel_public_without_slack(brain):
 
     assert event.scope.visibility == "organization_public"
     assert brain.store.get_scope(event.scope.scope_id)["is_public"] is True
+
+
+def test_leaving_a_channel_revokes_its_membership_and_participation(brain):
+    """Membership was add-only: `add_membership` INSERT OR IGNOREs and
+    nothing ever deleted a row, so speaking once in a private channel
+    granted permanent read access and leaving revoked nothing. Since
+    Session reads became participant-scoped, the same grant also gated the
+    transcript."""
+    gateway = brain.slack_gateway
+    workspace, channel = "T_REVOKE", "C_SECRET"
+    scope_id = f"scope_slack_{workspace}_{channel}"
+    brain.store.upsert_scope(
+        {
+            "id": scope_id,
+            "organization_id": "org_acme",
+            "kind": "private_channel",
+            "label": "#secret",
+            "channel_id": channel,
+            "is_public": False,
+            "principal_ids": [],
+        }
+    )
+    principal = gateway._principal_for_user("org_acme", workspace, "U_LEAVER")
+    brain.store.add_membership("org_acme", principal, scope_id)
+    brain.sessions.wake(
+        organization_id="org_acme",
+        conversation_key=f"slack:{workspace}:{channel}",
+        destination={"type": "private_channel", "id": channel, "is_private": True},
+        role="user",
+        content="something confidential",
+        principal_id=principal,
+        may_join=True,
+    )
+    assert scope_id in brain.store.memberships_for("org_acme", principal)
+
+    result = gateway.revoke_channel_membership(
+        {"type": "member_left_channel", "user": "U_LEAVER", "channel": channel},
+        workspace,
+    )
+
+    assert result["revoked"] is True
+    assert result["session_participant_removed"] is True
+    assert scope_id not in brain.store.memberships_for("org_acme", principal)
+    session = brain.store.find_session_by_conversation(
+        "org_acme", f"slack:{workspace}:{channel}"
+    )
+    assert principal not in set(session["participants"])
+    # The room's own content is now unreachable for them.
+    decision = brain.authz.resolve(
+        "org_acme",
+        principal,
+        {"type": "private_channel", "id": channel, "is_private": True},
+        "reactive_agent",
+    )
+    assert scope_id not in decision.allowed_scope_ids
+    assert any(
+        event["event_type"] == "membership.revoked"
+        for event in brain.store.list_audit("org_acme", "membership.revoked")
+    )
+
+
+def test_both_slack_leave_shapes_are_recognised(brain):
+    """Being removed by someone else emits only `member_left_channel`;
+    leaving voluntarily can arrive as a message subtype instead."""
+    gateway = brain.slack_gateway
+    assert gateway._is_leave_event({"type": "member_left_channel"})
+    assert gateway._is_leave_event({"type": "message", "subtype": "channel_leave"})
+    assert gateway._is_leave_event({"type": "message", "subtype": "group_leave"})
+    assert not gateway._is_leave_event({"type": "message", "subtype": "channel_join"})
+    assert not gateway._is_leave_event({"type": "message"})

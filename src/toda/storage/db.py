@@ -1998,6 +1998,29 @@ class BrainStore:
                 (organization_id, principal_id, scope_id),
             )
 
+    def remove_membership(
+        self, organization_id: str, principal_id: str, scope_id: str
+    ) -> bool:
+        """Revoke a principal's membership of one scope.
+
+        Membership was add-only: `add_membership` INSERT OR IGNOREs and
+        nothing ever deleted a row. So speaking once in a private channel
+        granted permanent read access to everything that channel ever
+        produced, and leaving revoked nothing -- authorization stayed
+        correct only for people who never left. Retrieval, delivery
+        rechecks and Session participation all read this table, so the gap
+        was as wide as the permission model itself.
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM principal_memberships
+                WHERE organization_id = ? AND principal_id = ? AND scope_id = ?
+                """,
+                (organization_id, principal_id, scope_id),
+            )
+            return cur.rowcount > 0
+
     def memberships_for(self, organization_id: str, principal_id: str) -> list[str]:
         with self.cursor() as cur:
             cur.execute(
@@ -3902,6 +3925,76 @@ class BrainStore:
                 )
                 row = cur.fetchone()
                 return _de(row["payload"]) if row else job
+
+    def model_call_stats(self, organization_id: str, *, hours: int = 1) -> dict[str, Any]:
+        """Model calls and tokens in a recent window.
+
+        Reads what the runtime already records -- Task turns carry provider
+        usage, attention evaluations are one call each -- rather than adding
+        new accounting. The point is a number an operator can look at before
+        the invoice does the telling.
+        """
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        stats = {"window_hours": hours, "agent_turns": 0, "prompt_tokens": 0,
+                 "completion_tokens": 0, "cached_prompt_tokens": 0,
+                 "attention_calls": 0}
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM task_turns
+                WHERE organization_id = ? AND created_at >= ?""",
+                (organization_id, since),
+            )
+            for row in cur.fetchall():
+                usage = ((_de(row["payload"]) or {}).get("response") or {}).get("usage") or {}
+                stats["agent_turns"] += 1
+                stats["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
+                stats["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+                stats["cached_prompt_tokens"] += int(
+                    (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+                )
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM attention_evaluations
+                WHERE organization_id = ? AND created_at >= ?""",
+                (organization_id, since),
+            )
+            row = cur.fetchone()
+            stats["attention_calls"] = int(row["n"]) if row else 0
+        stats["total_model_calls"] = stats["agent_turns"] + stats["attention_calls"]
+        billed = stats["prompt_tokens"] - stats["cached_prompt_tokens"]
+        stats["uncached_prompt_tokens"] = max(0, billed)
+        return stats
+
+    def count_pending_jobs(self, organization_id: str, kind: str) -> int:
+        """How much of one job kind is waiting. Backs the queue ceiling."""
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM harness_jobs
+                WHERE organization_id = ? AND kind = ?
+                  AND status IN ('queued', 'leased')""",
+                (organization_id, kind),
+            )
+            row = cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    def count_jobs_with_key_prefix(self, organization_id: str, prefix: str) -> int:
+        """How many jobs have already been enqueued under this key prefix.
+
+        Used by the recovery sweep to number its retry attempts, which is
+        what lets it enqueue a real job instead of colliding with the
+        original delivery job's terminal row and silently doing nothing.
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM harness_jobs
+                WHERE organization_id = ? AND idempotency_key LIKE ? ESCAPE '\\'""",
+                (
+                    organization_id,
+                    prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    + "%",
+                ),
+            )
+            row = cur.fetchone()
+            return int(row["n"]) if row else 0
 
     def get_harness_job(self, job_id: str) -> dict[str, Any] | None:
         with self.cursor() as cur:

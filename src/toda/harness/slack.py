@@ -413,7 +413,17 @@ class SlackGateway:
         if payload.get("type") != "event_callback":
             return {"accepted": False, "reason": "unsupported_slack_payload"}
         inner = payload.get("event") or {}
-        if self._ignore_event(inner, str(payload.get("team_id") or "")):
+        workspace_id = str(payload.get("team_id") or "")
+        # Handled before _ignore_event, which drops both shapes of this as
+        # "not a message". They are not messages -- they are permission
+        # changes, and ignoring them is what made membership add-only.
+        if self._is_leave_event(inner):
+            return {
+                "accepted": True,
+                "reason": "membership_revoked",
+                **self.revoke_channel_membership(inner, workspace_id),
+            }
+        if self._ignore_event(inner, workspace_id):
             return {"accepted": False, "reason": "ignored_event"}
         event = self.normalize(payload)
         if not event.payload.get("channel_enabled", True):
@@ -1058,6 +1068,82 @@ class SlackGateway:
             existing["principal_ids"] = []
             self.store.upsert_scope(existing)
         self.store.add_membership(organization_id, principal_id, scope_id)
+
+    # Slack signals a departure two ways: the top-level `member_left_channel`
+    # event, and a `message` with subtype `channel_leave`. Being removed by
+    # someone else produces the former only, so both are handled.
+    _LEAVE_EVENT_TYPES = frozenset({"member_left_channel"})
+    _LEAVE_SUBTYPES = frozenset({"channel_leave", "group_leave"})
+
+    def _is_leave_event(self, event: dict[str, Any]) -> bool:
+        return (
+            event.get("type") in self._LEAVE_EVENT_TYPES
+            or event.get("subtype") in self._LEAVE_SUBTYPES
+        )
+
+    def revoke_channel_membership(
+        self, event: dict[str, Any], workspace_id: str
+    ) -> dict[str, Any]:
+        """Drop a departing member's access to the room they left.
+
+        Membership is what authorizes retrieval, the delivery recheck and
+        (since Session reads became participant-scoped) the transcript
+        itself. It was add-only, so leaving a private channel revoked
+        nothing and the grant outlived the relationship it was based on.
+
+        Deliberately not the inverse of joining: joining a channel does not
+        grant membership here -- speaking does -- but leaving revokes
+        regardless, because the conservative direction is different at each
+        end.
+        """
+        source_user_id = str(event.get("user") or "")
+        channel_id = str(event.get("channel") or "")
+        if not source_user_id or not channel_id:
+            return {"revoked": False, "reason": "incomplete_leave_event"}
+        organization_id = self._organization_for_workspace(workspace_id)
+        principal_id = self._principal_for_user(
+            organization_id, workspace_id, source_user_id
+        )
+        scope_id = f"scope_slack_{workspace_id}_{channel_id}"
+        removed = self.store.remove_membership(
+            organization_id, principal_id, scope_id
+        )
+        # The room's Session records participants independently, and that is
+        # what gates reading its transcript back through the API.
+        session = self.store.find_session_by_conversation(
+            organization_id, f"slack:{workspace_id}:{channel_id}"
+        )
+        dropped_participant = False
+        if session and principal_id in set(session.get("participants") or []):
+            session["participants"] = sorted(
+                set(session["participants"]) - {principal_id}
+            )
+            session["updated_at"] = utcnow().isoformat()
+            self.store.update_session(session)
+            dropped_participant = True
+        self.audit.record(
+            organization_id,
+            "membership.revoked",
+            {
+                "scope_id": scope_id,
+                "channel_id": channel_id,
+                "session_participant_removed": dropped_participant,
+                "had_membership": removed,
+            },
+            principal_id=principal_id,
+        )
+        log.info(
+            "Channel membership revoked: principal=%s scope=%s session_participant=%s",
+            principal_id,
+            scope_id,
+            dropped_participant,
+        )
+        return {
+            "revoked": removed,
+            "principal_id": principal_id,
+            "scope_id": scope_id,
+            "session_participant_removed": dropped_participant,
+        }
 
     def _ignore_event(
         self, event: dict[str, Any], workspace_id: str = ""

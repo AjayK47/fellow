@@ -28,6 +28,26 @@ from toda.harness.router import _looks_like_stop
 _DEFAULT_MANAGER_LEASE_SECONDS = 3600
 _TERMINAL_TASK_STATES = {"completed", "failed", "cancelled"}
 
+
+class SessionJoinDenied(PermissionError):
+    """Raised when a caller tries to wake a conversation it has no claim to.
+
+    Participation is what the API uses to decide who may read a transcript,
+    and `resolve()` merges the waking actor into `participants`. That makes
+    the write path a grant of the read permission, so it may only be walked
+    by a caller whose access to the conversation was established somewhere
+    Toda can actually trust.
+
+    A Slack event qualifies: Slack itself enforced that the actor can post
+    in that channel before it ever reached us. A caller naming a
+    `conversation_id` does not -- and the key is
+    `f"slack:{workspace_id}:{channel_id}"`, so it is trivially
+    constructible. Without this, `POST /v1/tasks/invoke` naming a private
+    channel's key added you to its participants, appended your message to
+    its transcript, and woke its Session Manager. Confirmed by exploit
+    before it was closed.
+    """
+
 # Destinations where the acting principal -- not the room -- decides what is
 # readable. Mirrors AuthorizationService._destination_allows_private(), which
 # grants these the principal's full membership set instead of narrowing to a
@@ -167,6 +187,7 @@ class SessionService:
         message_metadata: dict[str, Any] | None = None,
         trigger_kind: str = "reactive",
         purpose: str = "reactive_agent",
+        may_join: bool = False,
     ) -> dict[str, Any]:
         """The single entrypoint for "new input arrived for this
         conversation": resolve the Session, append the message, and bump
@@ -174,12 +195,48 @@ class SessionService:
         currently-running one just sees the higher revision at its next
         iteration boundary). Coalesces any number of rapid messages into
         one Session with a growing transcript and a monotonically
-        increasing revision, never a second concurrent Manager."""
+        increasing revision, never a second concurrent Manager.
+
+        ``may_join`` says whether this caller is entitled to enter a
+        conversation it is not already part of. It defaults to False so a
+        new call site has to think about it: the platform gateways pass
+        True because the platform verified the actor's access to the room,
+        and everything else -- the API, automations -- may only wake a
+        conversation the acting principal already participates in, or
+        start a fresh one. See SessionJoinDenied.
+        """
+        if not may_join:
+            existing = self.store.find_session_by_conversation(
+                organization_id, conversation_key
+            )
+            if existing and principal_id not in set(
+                existing.get("participants") or []
+            ):
+                self.audit.record(
+                    organization_id,
+                    "session.join_denied",
+                    {
+                        "session_id": existing["id"],
+                        "conversation_key": conversation_key,
+                        "trigger_kind": trigger_kind,
+                    },
+                    principal_id=principal_id,
+                )
+                raise SessionJoinDenied(conversation_key)
         session = self.resolve(
             organization_id=organization_id,
             conversation_key=conversation_key,
             destination=destination,
-            participants=participants,
+            # Speaking in a conversation is what makes you a participant.
+            # Recorded here rather than at each call site because every wake
+            # path already has the actor and none of them were passing it --
+            # EventRouter._route_reactive in particular, which is every
+            # Slack message, so `participants` was empty on essentially
+            # every real Session. That list is what the API uses to decide
+            # who may read a transcript back, and an empty one denies
+            # everybody, including the person who spoke.
+            participants=participants
+            or ([principal_id] if principal_id else None),
             metadata=metadata,
         )
         if principal_id and session.get("last_actor_principal_id") != principal_id:

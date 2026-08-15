@@ -43,6 +43,7 @@ def _session_id(brain, key: str) -> str:
         role="user",
         content="start the work",
         principal_id="person_ajay",
+        may_join=True,
     )
     return wake["session_id"]
 
@@ -148,6 +149,7 @@ def test_explicit_stop_cancels_root_and_active_children_without_a_model_call(bra
         role="user",
         content="stop",
         principal_id="person_ajay",
+        may_join=True,
     )
     assert result["steer_signal"] == "abort"
 
@@ -184,6 +186,7 @@ def test_ordinary_steer_message_is_injected_into_the_active_roots_next_iteration
         role="user",
         content="also check the billing channel while you're at it",
         principal_id="person_ajay",
+        may_join=True,
     )
     assert result["steer_signal"] == "steer"
 
@@ -212,6 +215,7 @@ def test_wake_with_no_active_root_task_does_not_signal_anything(brain):
         role="user",
         content="stop",
         principal_id="person_ajay",
+        may_join=True,
     )
     assert result["steer_signal"] is None
 
@@ -232,6 +236,7 @@ def test_actor_change_interrupts_active_root_for_fresh_authorization(brain):
         role="user",
         content="now check my request",
         principal_id="person_maya",
+        may_join=True,
     )
 
     assert result["steer_signal"] == "reauthorize"
@@ -256,6 +261,7 @@ def test_actor_change_on_waiting_root_does_not_leave_a_stale_pause_signal(brain)
         role="user",
         content="use my permissions for this update",
         principal_id="person_maya",
+        may_join=True,
     )
 
     assert result["steer_signal"] == "reauthorize"
@@ -281,6 +287,7 @@ def test_waiting_root_resumes_under_current_actor_envelope(brain):
         role="user",
         content="continue as me",
         principal_id="person_maya",
+        may_join=True,
     )
 
     outcome = brain.session_manager.dispatch(session_id)

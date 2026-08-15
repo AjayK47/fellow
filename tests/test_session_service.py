@@ -23,6 +23,7 @@ def test_first_message_creates_one_session(brain):
         destination=_destination(),
         role="user",
         content="hello",
+        may_join=True,
     )
     session = svc.get(result["session_id"])
     assert session["manager_state"] == "queued"
@@ -39,6 +40,7 @@ def test_later_messages_reuse_the_same_session_and_coalesce_revisions(brain):
         destination=_destination(),
         role="user",
         content="hello",
+        may_join=True,
     )
     second = svc.wake(
         organization_id="org_acme",
@@ -46,6 +48,7 @@ def test_later_messages_reuse_the_same_session_and_coalesce_revisions(brain):
         destination=_destination(),
         role="user",
         content="are you there",
+        may_join=True,
     )
     assert first["session_id"] == second["session_id"]
     assert second["revision"] == 2
@@ -63,6 +66,7 @@ def test_ten_rapid_messages_produce_one_session_and_a_complete_transcript(brain)
             destination=_destination(),
             role="user",
             content=f"message {i}",
+            may_join=True,
         )
         session_id = result["session_id"]
     session = svc.get(session_id)
@@ -78,6 +82,7 @@ def test_claim_then_release_idle_lets_a_fresh_wake_requeue(brain):
         destination=_destination(),
         role="user",
         content="hi",
+        may_join=True,
     )
     session_id = result["session_id"]
     assert svc.claim(session_id, owner="executor-a")
@@ -93,6 +98,7 @@ def test_claim_then_release_idle_lets_a_fresh_wake_requeue(brain):
         destination=_destination(),
         role="user",
         content="still there?",
+        may_join=True,
     )
     assert svc.get(session_id)["manager_state"] == "queued"
     assert svc.claim(session_id, owner="executor-c")
@@ -106,6 +112,7 @@ def test_message_arriving_mid_claim_bumps_revision_without_a_second_claim(brain)
         destination=_destination(),
         role="user",
         content="start the task",
+        may_join=True,
     )
     session_id = result["session_id"]
     assert svc.claim(session_id, owner="executor-a")
@@ -117,6 +124,7 @@ def test_message_arriving_mid_claim_bumps_revision_without_a_second_claim(brain)
         destination=_destination(),
         role="user",
         content="actually also check billing",
+        may_join=True,
     )
     session = svc.get(session_id)
     assert session["manager_state"] == "running"
@@ -134,6 +142,7 @@ def test_release_cannot_go_idle_when_a_revision_was_not_processed(brain):
         destination=_destination(),
         role="user",
         content="do not lose this",
+        may_join=True,
     )
     assert svc.claim(result["session_id"], owner="executor-a")
 
@@ -155,6 +164,7 @@ def test_event_is_untrusted_transcript_evidence_not_user_steering(brain):
         principal_id="person_ajay",
         trigger_kind="proactive",
         purpose="proactive_attention",
+        may_join=True,
     )
 
     assert result["steer_signal"] is None

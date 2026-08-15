@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tests.conftest import sign_in
 from toda.harness.models import (
     DestinationEnvelope,
     InvocationEnvelope,
@@ -498,25 +499,37 @@ def test_reality_api_exposes_permission_filtered_facts_and_artifacts(api_client)
             "created_by": "person_ajay",
         },
     ).json()
+    # Who is asking comes from the signed-in session, never from a request
+    # parameter -- so seeing the API as a different person means signing in
+    # as them, exactly as a real second user would.
+    sign_in(api_client, principal_id="person_ravi")
     ravi_facts = api_client.get(
-        "/v1/facts",
-        params={
-            "organization_id": "org_acme",
-            "acting_principal_id": "person_ravi",
-        },
+        "/v1/facts", params={"organization_id": "org_acme"}
     ).json()["facts"]
     ravi_artifacts = api_client.get(
-        "/v1/artifacts",
-        params={
-            "organization_id": "org_acme",
-            "acting_principal_id": "person_ravi",
-        },
+        "/v1/artifacts", params={"organization_id": "org_acme"}
     ).json()["artifacts"]
     assert private_fact["id"] not in {item["id"] for item in ravi_facts}
     assert private_artifact["id"] not in {item["id"] for item in ravi_artifacts}
     assert api_client.get(
+        f"/v1/artifacts/{private_artifact['id']}"
+    ).status_code == 404
+
+    # The parameter this route used to take is now inert. Ravi naming the
+    # principal who CAN see the private scope must change nothing -- that
+    # self-assertion was readable-as-anyone, since a DM destination unlocks
+    # the named actor's entire membership set.
+    still_hidden = api_client.get(
+        "/v1/facts",
+        params={
+            "organization_id": "org_acme",
+            "acting_principal_id": "person_ajay",
+        },
+    ).json()["facts"]
+    assert private_fact["id"] not in {item["id"] for item in still_hidden}
+    assert api_client.get(
         f"/v1/artifacts/{private_artifact['id']}",
-        params={"acting_principal_id": "person_ravi"},
+        params={"acting_principal_id": "person_ajay"},
     ).status_code == 404
 
 

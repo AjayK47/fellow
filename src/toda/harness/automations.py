@@ -149,6 +149,19 @@ class AutomationService:
         overlap_policy: str = "skip_if_running",
         enabled: bool = True,
     ) -> dict[str, Any]:
+        if not self._owner_participates(
+            {
+                "organization_id": organization_id,
+                "conversation_id": conversation_id,
+                "principal_id": principal_id,
+            }
+        ):
+            # Fail at creation, where the model gets a usable error, rather
+            # than storing a schedule that would grant its owner access to
+            # someone else's conversation the first time it fires.
+            raise ValueError(
+                "conversation_id names a conversation you are not part of"
+            )
         if misfire_policy not in {"skip", "fire_once"}:
             raise ValueError("misfire_policy must be 'skip' or 'fire_once'")
         if overlap_policy not in {"skip_if_running", "queue"}:
@@ -193,6 +206,20 @@ class AutomationService:
         return self.store.list_harness_records(
             "automations", organization_id, order_by="updated_at"
         )
+
+    def _owner_participates(self, automation: dict[str, Any]) -> bool:
+        """True when the automation's owner may use its conversation.
+
+        A conversation that does not exist yet is fine -- firing creates it,
+        with the owner as its first participant. An existing one is only
+        usable by someone already in it.
+        """
+        existing = self.store.find_session_by_conversation(
+            automation["organization_id"], automation["conversation_id"]
+        )
+        if not existing:
+            return True
+        return automation["principal_id"] in set(existing.get("participants") or [])
 
     def tick(
         self,
@@ -241,6 +268,32 @@ class AutomationService:
                     automation["organization_id"],
                     "automation.misfire_skipped",
                     {"automation_id": automation["id"], "overdue_seconds": overdue_seconds},
+                    principal_id=automation["principal_id"],
+                )
+                continue
+
+            # An automation carries a conversation_id the model supplied and
+            # a principal_id from the creating Task's envelope. Firing it
+            # resolves that conversation with the principal as a participant
+            # -- and participation is what the API reads to decide who may
+            # see a transcript. So an automation naming a conversation its
+            # owner is not part of would quietly grant them access to it on
+            # a schedule. Checked at creation too; re-checked here because
+            # the Session may not have existed then.
+            if not self._owner_participates(automation):
+                automation["enabled"] = False
+                automation["updated_at"] = now.isoformat()
+                self._upsert(automation)
+                skipped.append(
+                    {"automation_id": automation["id"], "reason": "conversation_not_permitted"}
+                )
+                self.audit.record(
+                    automation["organization_id"],
+                    "automation.conversation_denied",
+                    {
+                        "automation_id": automation["id"],
+                        "conversation_id": automation["conversation_id"],
+                    },
                     principal_id=automation["principal_id"],
                 )
                 continue

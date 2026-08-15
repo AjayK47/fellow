@@ -23,6 +23,7 @@ from toda.adapters import (
 from toda.services.artifacts import artifact_payload
 from toda.services.container import TodaApp
 from toda.domain.models import new_id, utcnow
+from toda.harness.sessions import SessionJoinDenied
 from toda.harness.slack import (
     UnauthorizedApprover,
     _slack_identity_key,
@@ -34,6 +35,58 @@ router = APIRouter()
 
 def _app(request: Request) -> TodaApp:
     return request.app.state.brain
+
+
+# The principal every permission-scoped read is resolved against. It is
+# derived from the signed-in session, never accepted from the caller.
+#
+# It used to be a plain request parameter on ~14 routes, exactly like
+# `organization_id` was before `enforce_tenant` existed -- and with exactly
+# the same consequence, one layer down: `acting_principal_id` is what
+# AuthorizationService.resolve() expands into allowed scopes, so a member
+# could name a colleague's principal and, with `destination={"type":"dm"}`
+# (which _destination_allows_private grants the actor's ENTIRE membership
+# set, having no single room to narrow to), read back memories from every
+# private channel that person belongs to. Binding the parameter was not
+# enough: a parameter the server must ignore should not be in the schema at
+# all, or the next route to be added will read it again.
+def _acting_principal(request: Request) -> str:
+    member = getattr(request.state, "dashboard_member", None)
+    if member and member.get("principal_id"):
+        return str(member["principal_id"])
+    from toda.config import settings as _settings
+
+    if _settings.dashboard.auth_disabled:
+        # Matches the identity GET /v1/session reports in this mode, so the
+        # console and the API agree about who is asking.
+        return _DEV_PRINCIPAL_ID
+    raise HTTPException(401, "Not signed in")
+
+
+_DEV_PRINCIPAL_ID = "person_ajay"
+_ADMIN_ROLES = frozenset({"owner", "admin"})
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _api_conversation_key(principal_id: str, conversation_id: str) -> str:
+    """Namespace an API-supplied conversation id.
+
+    Platform conversation keys are constructible from public identifiers
+    (`slack:{workspace_id}:{channel_id}`), so an API caller naming one used
+    to land in that Session. Prefixing by source *and* acting principal
+    makes the two namespaces disjoint, and keeps one member's API
+    conversations out of another's.
+    """
+    return f"api:{principal_id}:{conversation_id}"
+
+
+def _is_org_admin(request: Request) -> bool:
+    member = getattr(request.state, "dashboard_member", None)
+    if member:
+        return str(member.get("role") or "") in _ADMIN_ROLES
+    from toda.config import settings as _settings
+
+    return bool(_settings.dashboard.auth_disabled)
 
 
 # ---- tenant enforcement ----
@@ -66,17 +119,27 @@ _TENANT_EXEMPT_PATHS = frozenset(
     }
 )
 
-_ADMIN_WRITE_PREFIXES = (
-    "/v1/organizations",
-    "/v1/policies",
-    "/v1/scopes",
-    "/v1/memberships",
-    "/v1/tools",
-    "/v1/skills",
-    "/v1/mcp",
-    "/v1/channel-policies",
-    "/v1/connectors",
-)
+# Mutations require an administrator UNLESS the route says otherwise.
+#
+# This used to be the other way round: a tuple of path prefixes that needed
+# admin, so every route not listed was member-writable by default. Invoking
+# a Task, deciding an approval, cancelling or retrying someone else's Task,
+# draining the worker and creating automations were all open to any member,
+# not by decision but by omission -- and the next route added would have
+# been too.
+#
+# Declaring it per route puts the permission next to the handler, and makes
+# the failure mode of forgetting to declare one "too strict" instead of
+# "wide open".
+def member_writable(func):
+    """Mark a mutating route as available to ordinary members."""
+    func.__toda_member_writable__ = True
+    return func
+
+
+def _route_is_member_writable(request: Request) -> bool:
+    endpoint = request.scope.get("endpoint")
+    return bool(getattr(endpoint, "__toda_member_writable__", False))
 
 
 async def enforce_tenant(request: Request) -> None:
@@ -90,6 +153,12 @@ async def enforce_tenant(request: Request) -> None:
     caller could do the same. The console already resolves the real
     organization server-side from the login cookie (`GET /v1/session`), so
     binding the parameter to that value costs the frontend nothing.
+
+    The *principal* is handled one step further, by removal rather than by
+    binding: see `_acting_principal` above. Which member of the workspace is
+    asking decides which scopes a read may touch, so leaving it as a
+    parameter meant the tenant boundary held while the boundary inside the
+    tenant did not.
     """
     path = request.url.path
     if path in {"/v1/events", "/v1/events:batch"}:
@@ -115,9 +184,9 @@ async def enforce_tenant(request: Request) -> None:
     request.state.dashboard_member = member
     session_org = member["organization_id"]
     if (
-        request.method not in {"GET", "HEAD", "OPTIONS"}
-        and path.startswith(_ADMIN_WRITE_PREFIXES)
-        and member["role"] not in {"owner", "admin"}
+        request.method not in _READ_METHODS
+        and member["role"] not in _ADMIN_ROLES
+        and not _route_is_member_writable(request)
     ):
         raise HTTPException(403, "Organization administrator access is required")
 
@@ -143,7 +212,7 @@ def _enforce_ingest_auth(request: Request) -> None:
 
     Local SDK/demo calls remain zero-setup. Anything arriving over a network
     must use ``Authorization: Bearer <token>`` where the token is one of the
-    comma-separated ``TODA_API_KEYS`` values. Comparison is constant-time.
+    ``server.api_keys`` entries in config.json. Comparison is constant-time.
     """
     host = request.client.host if request.client else ""
     if _is_loopback_host(host):
@@ -229,7 +298,6 @@ class CloudEventRequest(BaseModel):
 class SearchRequest(BaseModel):
     organization_id: str
     query: str
-    acting_principal_id: str
     destination: dict[str, Any] | None = None
     purpose: str | None = None
     entity_ids: list[str] = Field(default_factory=list)
@@ -241,7 +309,6 @@ class SearchRequest(BaseModel):
 class ContextRequest(BaseModel):
     organization_id: str
     task: str
-    acting_principal_id: str
     agent_id: str | None = None
     purpose: str | None = None
     destination: dict[str, Any] | None = None
@@ -255,7 +322,6 @@ class RelationshipRequest(BaseModel):
     organization_id: str
     from_entity_id: str
     to_entity_id: str
-    acting_principal_id: str
     destination: dict[str, Any] | None = None
     purpose: str | None = None
     relationship_types: list[str] = Field(default_factory=list)
@@ -264,7 +330,6 @@ class RelationshipRequest(BaseModel):
 class OwnerRequest(BaseModel):
     organization_id: str
     issue_text: str
-    acting_principal_id: str
     entity_ids: list[str] = Field(default_factory=list)
     include_on_call: bool = True
     destination: dict[str, Any] | None = None
@@ -274,7 +339,6 @@ class OwnerRequest(BaseModel):
 class ProjectContextRequest(BaseModel):
     organization_id: str
     project_id: str
-    acting_principal_id: str
     destination: dict[str, Any] | None = None
     purpose: str | None = None
 
@@ -328,7 +392,6 @@ class SkillSearchRequest(BaseModel):
 class ProactiveRequest(BaseModel):
     organization_id: str
     trigger: dict[str, Any]
-    acting_principal_id: str
     destination: dict[str, Any] | None = None
     mode: str = "dry_run"
     candidate: dict[str, Any] | None = None
@@ -359,8 +422,12 @@ class MembershipRequest(BaseModel):
 
 
 class TaskInvokeRequest(BaseModel):
+    # No `principal_id`. It was passed straight into `sessions.wake()`, which
+    # makes it the Session's `last_actor_principal_id` -- and that is what
+    # SessionManagerScheduler._build_envelope resolves authorization against
+    # on every wake. So a member could not merely read as a colleague, they
+    # could make Toda *act* as one, choosing the destination too.
     organization_id: str
-    principal_id: str
     conversation_id: str
     destination: dict[str, Any]
     prompt: str
@@ -372,8 +439,12 @@ class TaskInvokeRequest(BaseModel):
 
 
 class ApprovalDecisionRequest(BaseModel):
+    # No `decided_by`. Who is deciding comes from the session -- it used to
+    # be a body field, checked against `allowed_approver_ids` but never
+    # against the signed-in member, and `GET /v1/approvals` hands every
+    # member that exact list. So the check told an attacker which identity
+    # to claim, and then accepted the claim.
     approved: bool
-    decided_by: str
     edited_arguments: dict[str, Any] | None = None
     run_now: bool = False
 
@@ -599,8 +670,8 @@ class ExternalIdentifierRequest(BaseModel):
 
 
 class ResolutionDecisionRequest(BaseModel):
+    # Attribution comes from the session, like every other decision.
     approved: bool
-    decided_by: str
 
 
 class FactAssertionRequest(BaseModel):
@@ -619,8 +690,8 @@ class FactAssertionRequest(BaseModel):
 
 
 class ConflictResolutionRequest(BaseModel):
+    # Attribution comes from the session, like every other decision.
     winner_fact_id: str
-    decided_by: str
 
 
 class JudgmentRequest(BaseModel):
@@ -857,6 +928,12 @@ def metrics(request: Request, organization_id: str | None = None) -> dict[str, A
         "tasks": len(brain.store.list_tasks(org, limit=100_000)),
         "harness_jobs": brain.store.harness_job_counts(org),
         "harness_job_queue_age_seconds": brain.store.harness_job_queue_age_seconds(org),
+        # What the last hour actually cost. Every model call was already
+        # recorded; nothing summarised it, so a runaway connector trigger
+        # billed ~6,500 embeddings and ~330 classifications before the only
+        # signal arrived -- the invoice. Cheap to compute, and the number
+        # that would have caught it in minutes.
+        "model_spend_last_hour": brain.store.model_call_stats(org, hours=1),
         "episodes": brain.store.episode_size_stats(org),
         "connector_objects": len(
             brain.reality.list_connector_objects(org, latest_only=True)
@@ -874,21 +951,39 @@ def metrics(request: Request, organization_id: str | None = None) -> dict[str, A
 
 
 @router.post("/v1/tasks/invoke")
+@member_writable
 def invoke_task(body: TaskInvokeRequest, request: Request) -> dict[str, Any]:
     """Wake the one Session Manager responsible for this conversation."""
     brain = _app(request)
-    wake = brain.sessions.wake(
-        organization_id=body.organization_id,
-        conversation_key=body.conversation_id,
-        destination=body.destination,
-        role="user",
-        content=body.prompt,
-        principal_id=body.principal_id,
-        metadata={**body.metadata, "force_task": True},
-        message_metadata={"application_id": body.application_id},
-        trigger_kind=body.trigger_kind,
-        purpose=body.purpose,
-    )
+    actor = _acting_principal(request)
+    try:
+        wake = brain.sessions.wake(
+            organization_id=body.organization_id,
+            # Namespaced, so an API caller cannot address a platform
+            # conversation's key at all. Slack's is
+            # `slack:{workspace_id}:{channel_id}` -- constructible by anyone
+            # who knows a channel id -- and naming it here used to merge the
+            # caller into that Session's participants, which is what the API
+            # then reads to decide who may see the transcript. Keying by the
+            # acting principal also means two members cannot collide into one
+            # another's API conversations.
+            #
+            # `may_join=False` (the default) is the second, independent
+            # barrier: even within this namespace a caller may only wake a
+            # conversation it already participates in, or start a new one.
+            conversation_key=_api_conversation_key(actor, body.conversation_id),
+            destination=body.destination,
+            role="user",
+            content=body.prompt,
+            principal_id=actor,
+            metadata={**body.metadata, "force_task": True},
+            message_metadata={"application_id": body.application_id},
+            trigger_kind=body.trigger_kind,
+            purpose=body.purpose,
+        )
+    except SessionJoinDenied as exc:
+        # 404, not 403: whether a conversation exists is itself disclosure.
+        raise HTTPException(404, "conversation not found") from exc
     job = brain.harness_jobs.enqueue(
         organization_id=body.organization_id,
         kind="session.dispatch",
@@ -907,6 +1002,75 @@ def invoke_task(body: TaskInvokeRequest, request: Request) -> dict[str, Any]:
         )
         response["session"] = brain.sessions.get(wake["session_id"])
     return response
+
+
+# ---- Session participation boundary ----
+#
+# Retrieval is permission-filtered at query time, but the Task that consumed
+# that retrieval was not: its transcript, prompts, tool arguments, tool
+# results, checkpoints and workspace were readable by any signed-in member.
+# So a private-channel answer was protected on the way in and disclosed on
+# the way out, through a different route.
+#
+# The rule: you can read a conversation you took part in. Owner/admin may
+# read anything -- an operator console that cannot inspect a failed Task is
+# not one -- and every such cross-participant read is audited, so the power
+# leaves a trace rather than being indistinguishable from ordinary use.
+
+
+def _can_read_session(request: Request, session: dict[str, Any]) -> bool:
+    if _is_org_admin(request):
+        return True
+    return _acting_principal(request) in set(session.get("participants") or [])
+
+
+def _audit_admin_session_read(
+    request: Request, session: dict[str, Any], *, what: str
+) -> None:
+    if _is_org_admin(request) and _acting_principal(request) not in set(
+        session.get("participants") or []
+    ):
+        _app(request).audit.record(
+            session["organization_id"],
+            "session.admin_read",
+            {"session_id": session["id"], "resource": what},
+            principal_id=_acting_principal(request),
+        )
+
+
+def _authorized_session(session_id: str, request: Request, *, what: str) -> dict[str, Any]:
+    """Load a Session the caller took part in (or is an admin of)."""
+    session = _app(request).store.get_session(session_id)
+    if not session or not _can_read_session(request, session):
+        # 404 rather than 403: that a Session exists is itself disclosure.
+        raise HTTPException(404, "session not found")
+    _audit_admin_session_read(request, session, what=what)
+    return session
+
+
+def _authorized_task(task_id: str, request: Request, *, what: str) -> dict[str, Any]:
+    """Load a Task whose Session the caller took part in."""
+    brain = _app(request)
+    task = brain.store.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "task not found")
+    session = brain.store.get_session(task["session_id"])
+    if not session or not _can_read_session(request, session):
+        raise HTTPException(404, "task not found")
+    _audit_admin_session_read(request, session, what=what)
+    return task
+
+
+def _readable_session_ids(request: Request, organization_id: str) -> set[str] | None:
+    """Session ids the caller may read, or None meaning "no restriction"."""
+    if _is_org_admin(request):
+        return None
+    actor = _acting_principal(request)
+    return {
+        session["id"]
+        for session in _app(request).store.list_sessions(organization_id, limit=1000)
+        if actor in set(session.get("participants") or [])
+    }
 
 
 def _task_detail(brain: TodaApp, task: dict[str, Any]) -> dict[str, Any]:
@@ -969,14 +1133,17 @@ def list_tasks(
         worker_type=worker_type,
         limit=min(limit, 500),
     )
+    readable = _readable_session_ids(request, organization_id)
+    if readable is not None:
+        records = [item for item in records if item.get("session_id") in readable]
     return {"tasks": records, "count": len(records)}
 
 
 @router.get("/v1/tasks/{task_id}")
 def get_task(task_id: str, request: Request, organization_id: str) -> dict[str, Any]:
     brain = _app(request)
-    task = brain.store.get_task(task_id)
-    if not task or task["organization_id"] != organization_id:
+    task = _authorized_task(task_id, request, what="task_detail")
+    if task["organization_id"] != organization_id:
         raise HTTPException(404, "task not found")
     return _task_detail(brain, task)
 
@@ -986,8 +1153,8 @@ def list_task_attempts(
     task_id: str, request: Request, organization_id: str
 ) -> dict[str, Any]:
     brain = _app(request)
-    task = brain.store.get_task(task_id)
-    if not task or task["organization_id"] != organization_id:
+    task = _authorized_task(task_id, request, what="task_attempts")
+    if task["organization_id"] != organization_id:
         raise HTTPException(404, "task not found")
     attempts = brain.store.list_task_attempts(task_id)
     return {"attempts": attempts, "count": len(attempts)}
@@ -998,8 +1165,8 @@ def list_task_children(
     task_id: str, request: Request, organization_id: str
 ) -> dict[str, Any]:
     brain = _app(request)
-    task = brain.store.get_task(task_id)
-    if not task or task["organization_id"] != organization_id:
+    task = _authorized_task(task_id, request, what="task_children")
+    if task["organization_id"] != organization_id:
         raise HTTPException(404, "task not found")
     children = brain.store.list_tasks(
         organization_id, parent_task_id=task_id, limit=500
@@ -1012,18 +1179,19 @@ def list_task_artifacts(
     task_id: str, request: Request, organization_id: str
 ) -> dict[str, Any]:
     brain = _app(request)
-    task = brain.store.get_task(task_id)
-    if not task or task["organization_id"] != organization_id:
+    task = _authorized_task(task_id, request, what="task_artifacts")
+    if task["organization_id"] != organization_id:
         raise HTTPException(404, "task not found")
     artifacts = brain.artifacts.list(organization_id, task_id=task_id)
     return {"artifacts": artifacts, "count": len(artifacts)}
 
 
 @router.post("/v1/tasks/{task_id}:cancel")
+@member_writable
 def cancel_task(task_id: str, request: Request, organization_id: str) -> dict[str, Any]:
     brain = _app(request)
-    task = brain.store.get_task(task_id)
-    if not task or task["organization_id"] != organization_id:
+    task = _authorized_task(task_id, request, what="task_cancel")
+    if task["organization_id"] != organization_id:
         raise HTTPException(404, "task not found")
     if task.get("worker_type") == "pi" and brain.child_task_executor.pi_executor:
         brain.child_task_executor.pi_executor.cancel(task_id, reason="operator cancel")
@@ -1034,10 +1202,11 @@ def cancel_task(task_id: str, request: Request, organization_id: str) -> dict[st
 
 
 @router.post("/v1/tasks/{task_id}:retry")
+@member_writable
 def retry_task(task_id: str, request: Request, organization_id: str) -> dict[str, Any]:
     brain = _app(request)
-    task = brain.store.get_task(task_id)
-    if not task or task["organization_id"] != organization_id:
+    task = _authorized_task(task_id, request, what="task_retry")
+    if task["organization_id"] != organization_id:
         raise HTTPException(404, "task not found")
     if not brain.store.retry_task(task_id):
         raise HTTPException(409, "only failed or cancelled tasks can be retried")
@@ -1068,6 +1237,13 @@ def list_sessions(
     """List the durable Session Manager conversations and their Task preview."""
     brain = _app(request)
     sessions = brain.store.list_sessions(organization_id, limit=min(limit, 500))
+    if not _is_org_admin(request):
+        actor = _acting_principal(request)
+        sessions = [
+            item
+            for item in sessions
+            if actor in set(item.get("participants") or [])
+        ]
     results = []
     for session in sessions:
         tasks = brain.store.list_tasks(
@@ -1092,9 +1268,7 @@ def list_sessions(
 @router.get("/v1/sessions/{session_id}")
 def get_session(session_id: str, request: Request) -> dict[str, Any]:
     brain = _app(request)
-    session = brain.store.get_session(session_id)
-    if not session:
-        raise HTTPException(404, "session not found")
+    session = _authorized_session(session_id, request, what="session_detail")
     tasks = brain.store.list_tasks(
         session["organization_id"], session_id=session_id, limit=1000
     )
@@ -1114,8 +1288,8 @@ def list_session_tasks(
     limit: int = 500,
 ) -> dict[str, Any]:
     brain = _app(request)
-    session = brain.store.get_session(session_id)
-    if not session or session["organization_id"] != organization_id:
+    session = _authorized_session(session_id, request, what="session_tasks")
+    if session["organization_id"] != organization_id:
         raise HTTPException(404, "session not found")
     tasks = brain.store.list_tasks(
         organization_id, session_id=session_id, state=state, limit=min(limit, 1000)
@@ -1124,6 +1298,7 @@ def list_session_tasks(
 
 
 @router.post("/v1/approvals/{approval_id}:decide")
+@member_writable
 def decide_approval(
     approval_id: str, body: ApprovalDecisionRequest, request: Request
 ) -> dict[str, Any]:
@@ -1131,10 +1306,16 @@ def decide_approval(
     approval = brain.store.get_harness_record("approvals", approval_id)
     if not approval:
         raise HTTPException(404, "approval not found")
-    if body.decided_by not in set(
-        approval.get("allowed_approver_ids")
-        or [approval.get("requested_by")]
-    ):
+    decided_by = _acting_principal(request)
+    if decided_by not in _approval_deciders(approval):
+        # Worth an audit event rather than a bare 403: an approval gate is
+        # exactly the place where a rejected attempt is the signal.
+        brain.audit.record(
+            approval["organization_id"],
+            "approval.decision_rejected",
+            {"approval_id": approval_id, "attempted_by": decided_by},
+            principal_id=decided_by,
+        )
         raise HTTPException(403, "principal cannot decide this approval")
     job = brain.harness_jobs.enqueue(
         organization_id=approval["organization_id"],
@@ -1142,7 +1323,7 @@ def decide_approval(
         payload={
             "approval_id": approval_id,
             "approved": body.approved,
-            "decided_by": body.decided_by,
+            "decided_by": decided_by,
             "edited_arguments": body.edited_arguments,
         },
         idempotency_key=f"approval.resolve:{approval_id}:{body.approved}",
@@ -1154,6 +1335,12 @@ def decide_approval(
             "approvals", approval_id
         )
     return response
+
+
+def _approval_deciders(approval: dict[str, Any]) -> set[str]:
+    return set(
+        approval.get("allowed_approver_ids") or [approval.get("requested_by")]
+    )
 
 
 @router.get("/v1/approvals")
@@ -1168,6 +1355,14 @@ def list_approvals(
         where={"status": status} if status else None,
         descending=True,
     )
+    # A member sees the approvals they may actually decide. The full list
+    # published every approval's `allowed_approver_ids` to everyone, which
+    # is how the forged-identity decision above knew whose name to use --
+    # and it remains an unnecessary disclosure of what Toda is being asked
+    # to do in rooms the reader isn't in.
+    if not _is_org_admin(request):
+        actor = _acting_principal(request)
+        records = [item for item in records if actor in _approval_deciders(item)]
     return {"approvals": records, "count": len(records)}
 
 
@@ -1202,6 +1397,7 @@ def harness_jobs(
 
 
 @router.post("/v1/harness/feedback")
+@member_writable
 def record_harness_feedback(
     body: HarnessFeedbackRequest, request: Request
 ) -> dict[str, Any]:
@@ -1304,7 +1500,9 @@ def harness_status(request: Request) -> dict[str, Any]:
             ),
         },
         "worker": {
-            "enabled_in_api": config.worker.enabled,
+            # Always in-process: the worker lanes are part of the gateway,
+            # not a separately-runnable service.
+            "enabled_in_api": True,
             "concurrency": config.worker.concurrency,
             "batch_size": config.worker.batch_size,
         },
@@ -1602,10 +1800,28 @@ def upsert_connector_account(
     brain.store.add_membership(
         data["organization_id"], data["principal_id"], data["scope_id"]
     )
+    became_active = (
+        data.get("status") == "active" and (existing or {}).get("status") != "active"
+    )
     brain.store.upsert_connector_account(data)
     if data.get("status") == "active":
         _supersede_other_active_connector_accounts(
             brain, data["organization_id"], data["toolkit"], data["connected_account_id"]
+        )
+    if became_active and brain.composio.configured:
+        # Trigger lifecycle follows connection lifecycle: connecting an app
+        # subscribes it to everything its toolkit can push, disconnecting
+        # tears those down. Previously the two were unrelated, so an
+        # organization could connect HubSpot and never learn that it would
+        # not hear about a new contact. Enqueued rather than inline --
+        # GitHub alone has 46 trigger types.
+        brain.harness_jobs.enqueue(
+            organization_id=data["organization_id"],
+            kind="connector.subscribe_triggers",
+            payload={"connected_account_id": data["connected_account_id"]},
+            idempotency_key=(
+                f"connector.subscribe_triggers:{data['connected_account_id']}"
+            ),
         )
     return data
 
@@ -1801,14 +2017,7 @@ def start_composio_connect(
     toolkit = body.toolkit.strip().lower()
     user_id = f"toda:{body.organization_id}"
     try:
-        existing = brain.composio.list_auth_configs(toolkit=toolkit)
-        items = existing.get("items") or []
-        auth_config_id = items[0]["id"] if items else None
-        if not auth_config_id:
-            created = brain.composio.create_auth_config(toolkit=toolkit)
-            auth_config_id = created.get("id") or created.get("auth_config_id")
-        if not auth_config_id:
-            raise RuntimeError("Composio did not return an auth config id")
+        auth_config_id = brain.composio.ensure_auth_config(toolkit=toolkit)
         link = brain.composio.create_connect_link(
             user_id=user_id, auth_config_id=auth_config_id
         )
@@ -1950,6 +2159,21 @@ def disconnect_composio_account(
         raise HTTPException(502, f"Composio disconnect failed: {exc}") from exc
     account["status"] = "disconnected"
     brain.store.upsert_connector_account(account)
+    # Leaving the triggers live would keep Composio delivering events for a
+    # connection the organization believes it removed. The webhook path
+    # already rejects them (connector_account_by_external_id is
+    # active-only), but stopping them at the source is the actual revocation.
+    brain.harness_jobs.enqueue(
+        organization_id=organization_id,
+        kind="connector.unsubscribe_triggers",
+        payload={
+            "connected_account_id": connected_account_id,
+            "organization_id": organization_id,
+        },
+        idempotency_key=(
+            f"connector.unsubscribe_triggers:{connected_account_id}"
+        ),
+    )
     return {"account": account, "composio": remote}
 
 
@@ -2528,7 +2752,6 @@ def list_connector_sync_runs(
 def list_connector_objects(
     request: Request,
     organization_id: str,
-    acting_principal_id: str,
     provider: str | None = None,
     object_type: str | None = None,
     external_id: str | None = None,
@@ -2537,7 +2760,7 @@ def list_connector_objects(
     brain = _app(request)
     decision = brain.authz.resolve(
         organization_id=organization_id,
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         purpose="connector_object_query",
     )
     values = brain.reality.list_connector_objects(
@@ -2599,7 +2822,7 @@ def decide_entity_resolution_candidate(
         return _app(request).reality.decide_resolution_candidate(
             candidate_id,
             approved=body.approved,
-            decided_by=body.decided_by,
+            decided_by=_acting_principal(request),
         )
     except KeyError as exc:
         raise HTTPException(404, "resolution candidate not found") from exc
@@ -2622,7 +2845,6 @@ def assert_reality_fact(
 def list_reality_facts(
     request: Request,
     organization_id: str,
-    acting_principal_id: str,
     subject_id: str | None = None,
     predicate: str | None = None,
     valid_at: str | None = None,
@@ -2631,7 +2853,7 @@ def list_reality_facts(
     brain = _app(request)
     decision = brain.authz.resolve(
         organization_id=organization_id,
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         purpose="fact_query",
     )
     facts = brain.reality.current_facts(
@@ -2653,13 +2875,12 @@ def list_reality_facts(
 def list_fact_conflicts(
     request: Request,
     organization_id: str,
-    acting_principal_id: str,
     status: str | None = None,
 ) -> dict[str, Any]:
     brain = _app(request)
     decision = brain.authz.resolve(
         organization_id=organization_id,
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         purpose="fact_conflict_query",
     )
     conflicts = brain.reality.list_conflicts(
@@ -2684,7 +2905,7 @@ def resolve_fact_conflict(
         return _app(request).reality.resolve_conflict(
             conflict_id,
             winner_fact_id=body.winner_fact_id,
-            decided_by=body.decided_by,
+            decided_by=_acting_principal(request),
         )
     except KeyError as exc:
         raise HTTPException(404, "fact conflict not found") from exc
@@ -2696,13 +2917,12 @@ def resolve_fact_conflict(
 def list_reality_cases(
     request: Request,
     organization_id: str,
-    acting_principal_id: str,
     status: str | None = None,
 ) -> dict[str, Any]:
     brain = _app(request)
     decision = brain.authz.resolve(
         organization_id=organization_id,
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         purpose="case_query",
     )
     cases = brain.reality.list_cases(
@@ -2722,12 +2942,11 @@ def get_case_timeline(
     case_id: str,
     request: Request,
     organization_id: str,
-    acting_principal_id: str,
 ) -> dict[str, Any]:
     brain = _app(request)
     decision = brain.authz.resolve(
         organization_id=organization_id,
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         purpose="case_query",
     )
     visible = {
@@ -2767,7 +2986,6 @@ def record_judgment(
 def list_judgments(
     request: Request,
     organization_id: str,
-    acting_principal_id: str,
     principal_id: str | None = None,
     judgment_type: str | None = None,
 ) -> dict[str, Any]:
@@ -2776,10 +2994,9 @@ def list_judgments(
         principal_id=principal_id,
         judgment_type=judgment_type,
     )
+    actor = _acting_principal(request)
     values = [
-        item
-        for item in values
-        if item.get("principal_id") in {None, acting_principal_id}
+        item for item in values if item.get("principal_id") in {None, actor}
     ]
     return {"judgments": values, "count": len(values)}
 
@@ -2831,14 +3048,13 @@ def create_artifact(
 def list_artifacts(
     request: Request,
     organization_id: str,
-    acting_principal_id: str,
     artifact_type: str | None = None,
     task_id: str | None = None,
 ) -> dict[str, Any]:
     brain = _app(request)
     decision = brain.authz.resolve(
         organization_id=organization_id,
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         purpose="artifact_query",
     )
     values = brain.artifacts.list(
@@ -2854,23 +3070,37 @@ def list_artifacts(
     }
 
 
-@router.get("/v1/artifacts/{artifact_id}")
-def get_artifact(
-    artifact_id: str,
-    request: Request,
-    acting_principal_id: str,
-) -> dict[str, Any]:
+def _authorized_artifact(
+    artifact_id: str, request: Request
+) -> tuple[dict[str, Any], Any]:
+    """Load an artifact the signed-in principal is allowed to see.
+
+    One implementation for both the metadata route and the download route.
+    They had a copy each, and only one of the copies checked -- so the
+    bytes were readable by any signed-in member who knew an ID, which task
+    detail hands out freely. 404 rather than 403 throughout: whether an
+    artifact exists is itself disclosure.
+    """
     brain = _app(request)
     artifact = brain.artifacts.get(artifact_id)
     if not artifact:
         raise HTTPException(404, "artifact not found")
     decision = brain.authz.resolve(
         organization_id=artifact["organization_id"],
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         purpose="artifact_query",
     )
     if artifact["scope_id"] not in set(decision.allowed_scope_ids):
         raise HTTPException(404, "artifact not found")
+    return artifact, decision
+
+
+@router.get("/v1/artifacts/{artifact_id}")
+def get_artifact(
+    artifact_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    artifact, decision = _authorized_artifact(artifact_id, request)
     return {
         "artifact": artifact,
         "permission_decision_id": decision.id,
@@ -2896,10 +3126,7 @@ _SVG_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbo
 
 @router.get("/v1/artifacts/{artifact_id}/download")
 def download_artifact(artifact_id: str, request: Request) -> Response:
-    brain = _app(request)
-    artifact = brain.artifacts.get(artifact_id)
-    if not artifact:
-        raise HTTPException(404, "artifact not found")
+    artifact, _decision = _authorized_artifact(artifact_id, request)
     # One implementation, shared with the Slack upload tool -- two copies is
     # how they diverged, and the tool's half-version shipped a base64
     # wrapper into a channel as a .json file.
@@ -2993,7 +3220,6 @@ def revoke_source(source_id: str, request: Request) -> dict[str, Any]:
 def get_source(
     source_id: str,
     request: Request,
-    acting_principal_id: str,
     organization_id: str | None = None,
     destination_type: str = "internal_agent_session",
     destination_id: str = "default",
@@ -3008,7 +3234,7 @@ def get_source(
     org = organization_id or src.get("organization_id")
     decision = brain.authz.resolve(
         organization_id=org,
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         destination={
             "type": destination_type,
             "id": destination_id,
@@ -3060,14 +3286,14 @@ def supersede_edge(edge_id: str, request: Request) -> dict[str, Any]:
 
 @router.get("/v1/graph/explorer")
 def graph_explorer_data(
-    request: Request, organization_id: str, acting_principal_id: str,
+    request: Request, organization_id: str,
     destination_type: str = "internal_agent_session", destination_id: str = "default",
     destination_is_private: bool = True, purpose: str | None = None,
     valid_at: str | None = None,
 ) -> dict[str, Any]:
     brain = _app(request)
     decision = brain.authz.resolve(
-        organization_id=organization_id, acting_principal_id=acting_principal_id,
+        organization_id=organization_id, acting_principal_id=_acting_principal(request),
         destination={"type": destination_type, "id": destination_id, "is_private": destination_is_private},
         purpose=purpose or "graph_explorer",
     )
@@ -3100,11 +3326,12 @@ def add_membership(body: MembershipRequest, request: Request) -> dict[str, str]:
 
 
 @router.post("/v1/search")
+@member_writable
 def search(body: SearchRequest, request: Request) -> dict[str, Any]:
     return _app(request).retrieval.search(
         organization_id=body.organization_id,
         query=body.query,
-        acting_principal_id=body.acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         destination=body.destination,
         purpose=body.purpose,
         entity_ids=body.entity_ids or None,
@@ -3115,11 +3342,12 @@ def search(body: SearchRequest, request: Request) -> dict[str, Any]:
 
 
 @router.post("/v1/context:prepare")
+@member_writable
 def prepare_context(body: ContextRequest, request: Request) -> dict[str, Any]:
     pkg = _app(request).context.prepare_context(
         organization_id=body.organization_id,
         task=body.task,
-        acting_principal_id=body.acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         destination=body.destination,
         purpose=body.purpose,
         entity_ids=body.entity_ids or None,
@@ -3131,23 +3359,25 @@ def prepare_context(body: ContextRequest, request: Request) -> dict[str, Any]:
 
 
 @router.post("/v1/relationships:query")
+@member_writable
 def relationship_query(body: RelationshipRequest, request: Request) -> dict[str, Any]:
     return _app(request).context.relationship_context(
         organization_id=body.organization_id,
         from_entity_id=body.from_entity_id,
         to_entity_id=body.to_entity_id,
-        acting_principal_id=body.acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         destination=body.destination,
         purpose=body.purpose,
     )
 
 
 @router.post("/v1/owners:resolve")
+@member_writable
 def resolve_owner(body: OwnerRequest, request: Request) -> dict[str, Any]:
     return _app(request).context.resolve_owner(
         organization_id=body.organization_id,
         issue_text=body.issue_text,
-        acting_principal_id=body.acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         entity_ids=body.entity_ids or None,
         include_on_call=body.include_on_call,
         destination=body.destination,
@@ -3156,11 +3386,12 @@ def resolve_owner(body: OwnerRequest, request: Request) -> dict[str, Any]:
 
 
 @router.post("/v1/projects:context")
+@member_writable
 def project_context(body: ProjectContextRequest, request: Request) -> dict[str, Any]:
     return _app(request).context.project_context(
         organization_id=body.organization_id,
         project_id=body.project_id,
-        acting_principal_id=body.acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         destination=body.destination,
         purpose=body.purpose,
     )
@@ -3170,13 +3401,13 @@ def project_context(body: ProjectContextRequest, request: Request) -> dict[str, 
 
 
 def _profile_response(
-    entity_id: str, request: Request, organization_id: str, acting_principal_id: str,
+    entity_id: str, request: Request, organization_id: str,
     destination_type: str, destination_id: str, destination_is_private: bool, purpose: str | None,
 ) -> dict[str, Any]:
     profile = _app(request).profiles.get(
         organization_id=organization_id,
         entity_id=entity_id,
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         destination={"type": destination_type, "id": destination_id, "is_private": destination_is_private},
         purpose=purpose,
     )
@@ -3186,13 +3417,14 @@ def _profile_response(
 
 
 @router.get("/v1/profiles/{entity_id}")
-def entity_profile(entity_id: str, request: Request, organization_id: str, acting_principal_id: str,
+def entity_profile(entity_id: str, request: Request, organization_id: str,
                    destination_type: str = "internal_agent_session", destination_id: str = "default",
                    destination_is_private: bool = True, purpose: str | None = None) -> dict[str, Any]:
-    return _profile_response(entity_id, request, organization_id, acting_principal_id, destination_type, destination_id, destination_is_private, purpose)
+    return _profile_response(entity_id, request, organization_id, destination_type, destination_id, destination_is_private, purpose)
 
 
 @router.post("/v1/profiles/{entity_id}:refresh")
+@member_writable
 def refresh_profile(entity_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
     organization_id = body.get("organization_id")
     if not organization_id:
@@ -3210,7 +3442,6 @@ def refresh_profile(entity_id: str, body: dict[str, Any], request: Request) -> d
 def get_memory(
     memory_id: str,
     request: Request,
-    acting_principal_id: str,
     organization_id: str | None = None,
     destination_type: str = "internal_agent_session",
     destination_id: str = "default",
@@ -3225,7 +3456,7 @@ def get_memory(
     org = organization_id or mem.get("organization_id")
     decision = brain.authz.resolve(
         organization_id=org,
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         destination={
             "type": destination_type,
             "id": destination_id,
@@ -3244,7 +3475,6 @@ def get_memory(
 def memory_lineage(
     memory_id: str,
     request: Request,
-    acting_principal_id: str,
     organization_id: str | None = None,
     destination_type: str = "internal_agent_session",
     destination_id: str = "default",
@@ -3259,7 +3489,7 @@ def memory_lineage(
     org = organization_id or mem.get("organization_id")
     decision = brain.authz.resolve(
         organization_id=org,
-        acting_principal_id=acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         destination={
             "type": destination_type,
             "id": destination_id,
@@ -3417,6 +3647,7 @@ def list_skills(
 
 
 @router.post("/v1/skills:search")
+@member_writable
 def search_skills(body: SkillSearchRequest, request: Request) -> dict[str, Any]:
     return {
         "results": _app(request).skills.search(body.organization_id, body.query, body.limit)
@@ -3424,6 +3655,7 @@ def search_skills(body: SkillSearchRequest, request: Request) -> dict[str, Any]:
 
 
 @router.post("/v1/skills:prepare")
+@member_writable
 def prepare_skill(body: dict[str, Any], request: Request) -> dict[str, Any]:
     skill_id = body.get("skill_id")
     if not skill_id:
@@ -3435,6 +3667,7 @@ def prepare_skill(body: dict[str, Any], request: Request) -> dict[str, Any]:
 
 
 @router.post("/v1/skills:validate")
+@member_writable
 def validate_skill(body: dict[str, Any], request: Request) -> dict[str, Any]:
     return _app(request).skills.validate_definition(body)
 
@@ -3510,7 +3743,7 @@ def proactive_evaluate(body: ProactiveRequest, request: Request) -> dict[str, An
     return _app(request).proactive.evaluate(
         organization_id=body.organization_id,
         trigger=body.trigger,
-        acting_principal_id=body.acting_principal_id,
+        acting_principal_id=_acting_principal(request),
         destination=body.destination,
         mode=body.mode,
         candidate=body.candidate,
@@ -3527,22 +3760,25 @@ def list_signals(request: Request, organization_id: str, state: str | None = Non
 
 
 @router.post("/v1/signals/{signal_id}:acknowledge")
+@member_writable
 def acknowledge_signal(signal_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
-    signal = _app(request).signals.acknowledge(signal_id, body.get("acting_principal_id"))
+    signal = _app(request).signals.acknowledge(signal_id, _acting_principal(request))
     if not signal:
         raise HTTPException(404, "signal not found")
     return signal
 
 
 @router.post("/v1/signals/{signal_id}:dismiss")
+@member_writable
 def dismiss_signal(signal_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
-    signal = _app(request).signals.dismiss(signal_id, body.get("acting_principal_id"))
+    signal = _app(request).signals.dismiss(signal_id, _acting_principal(request))
     if not signal:
         raise HTTPException(404, "signal not found")
     return signal
 
 
 @router.post("/v1/signals/{signal_id}:route")
+@member_writable
 def route_signal(signal_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
     signal = _app(request).signals.route(signal_id, body.get("recipient_id"))
     if not signal:

@@ -296,7 +296,7 @@ def test_network_runtime_rejects_disabled_auth(monkeypatch):
     monkeypatch.setattr(settings.server, "host", "0.0.0.0")
     monkeypatch.setattr(settings.dashboard, "auth_disabled", True)
     monkeypatch.setattr(settings.dashboard, "auto_approve_writes", False)
-    with pytest.raises(RuntimeError, match="DASHBOARD_AUTH_DISABLED"):
+    with pytest.raises(RuntimeError, match="dashboard.auth_disabled"):
         validate_runtime_exposure()
 
 
@@ -307,5 +307,5 @@ def test_network_runtime_rejects_auto_approved_writes(monkeypatch):
     monkeypatch.setattr(settings.server, "host", "0.0.0.0")
     monkeypatch.setattr(settings.dashboard, "auth_disabled", False)
     monkeypatch.setattr(settings.dashboard, "auto_approve_writes", True)
-    with pytest.raises(RuntimeError, match="AUTO_APPROVE_WRITES"):
+    with pytest.raises(RuntimeError, match="dashboard.auto_approve_writes"):
         validate_runtime_exposure()
