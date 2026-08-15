@@ -38,7 +38,12 @@ class ActionReviewer:
         }
 
     def review(
-        self, *, tool_name: str, description: str, arguments: dict[str, Any]
+        self,
+        *,
+        tool_name: str,
+        description: str,
+        arguments: dict[str, Any],
+        hazard: str | None = None,
     ) -> Verdict:
         """"escalate" is the safe fallback -- the existing human-approval
         path -- on any failure or when no live model is configured. Never
@@ -54,6 +59,12 @@ class ActionReviewer:
                         "role": "user",
                         "content": json.dumps(
                             {
+                                # A deterministic pre-scan finding, when
+                                # there is one. The reviewer still decides
+                                # -- this is signal it would otherwise have
+                                # to spot unaided in a wall of code, not a
+                                # verdict handed to it.
+                                **({"flagged_by_prescan": hazard} if hazard else {}),
                                 "action": tool_name,
                                 "description": description,
                                 "arguments": arguments,

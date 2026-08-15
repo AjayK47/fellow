@@ -37,6 +37,10 @@ _START_TASK = ToolDefinition(
         "- Research or synthesis: several searches or sources to read, "
         "compare, and write up\n"
         "- Anything needing delegation, approval, waiting, or a timer\n"
+        "- ANY work through a connected app (CRM, email, GitHub, calendar). "
+        "You can see what is connected with composio_list_integrations, but "
+        "finding the right action and running it belongs in a Task -- never "
+        "search the web to work out what a connected app can do.\n"
         "- A consequential external write, or a durable artifact "
         "(document, chart, report)\n"
         "- Work that would flood this turn with intermediate data\n\n"
@@ -64,9 +68,31 @@ _START_TASK = ToolDefinition(
     capability_id="task.start",
 )
 
-# These tools are safe and useful before a Task exists.  Mechanical writes,
-# planning, delegation, approvals and artifact creation require start_task.
+# What a conversation turn may reach for.
+#
+# The line is NOT read-vs-write -- it is *settles a question* vs *does the
+# work*. A conversation turn has no Task behind it: no durability across a
+# restart, no delegation, no progress in the channel, no plan. So it gets
+# the tools that answer something in a call or two, or that tell it whether
+# a Task is needed at all. Everything else is what `start_task` is for.
+#
+# This was briefly inverted into a denylist of Task-scoped tools, which
+# admitted 37 tools instead of 15. The safety argument for that was sound --
+# a read cannot damage anything -- but safety was the wrong axis. With
+# connector search, document readers and the rest in hand, the model could
+# run twelve iterations of genuine work in a lane with none of a Task's
+# machinery, and the promotion guard never fired because nothing it wanted
+# was outside the set. Observed directly: a request that should have been
+# two or three calls became a long inline grind with no Task ever created.
+#
+# The actual bug that inversion was fixing was one missing tool:
+# `composio_list_integrations`. Without it the model could not see that
+# HubSpot was connected and told a user there was no CRM. That one is back,
+# deliberately -- knowing *what exists* is discovery, and it is exactly what
+# decides whether to promote. Searching for a specific connector action and
+# reading its schema is the preamble to doing the work, so it is not.
 _CONVERSATION_READ_TOOLS = {
+    # Company memory: usually one lookup settles it.
     "brain_search",
     "brain_read_source",
     "brain_query_facts",
@@ -76,12 +102,28 @@ _CONVERSATION_READ_TOOLS = {
     "brain_find_skills",
     "brain_list_artifacts",
     "brain_read_artifact",
+    # What Toda can do, and what it has already done.
     "skills_list",
     "skill_view",
-    "web_search",
-    "web_fetch",
     "task_search",
     "task_get",
+    "session_search",
+    # Connector discovery. All of it, deliberately: withholding the search
+    # and schema tools did not make the model promote -- it made it search
+    # docs.composio.dev with Brave and scrape the results with Firecrawl to
+    # work out which HubSpot action to call. A model denied the right tool
+    # improvises with the wrong one. Executing is still Task-only
+    # (COMPOSIO_EXECUTE is a write), so the shape holds: it can find out
+    # what is possible here, and must start a Task to actually do it.
+    "composio_list_integrations",
+    "composio_search",
+    "composio_describe",
+    "automation_list",
+    # One external lookup that settles a question.
+    "web_search",
+    "web_fetch",
+    # Arithmetic, so a number in a reply is computed rather than guessed.
+    "calculate",
 }
 
 
@@ -95,7 +137,10 @@ class ConversationAgent:
         context_service: Any,
         task_agent_factory: Callable[[Any], Any],
         delivery_enqueue: Callable[..., dict[str, Any]],
-        max_iterations: int = 12,
+        # A conversation turn that cannot land in a few calls is a Task
+        # wearing the wrong clothes. Keeping this tight is what makes the
+        # model reach for start_task instead of grinding inline.
+        max_iterations: int = 5,
         max_tokens: int = 8_000,
     ) -> None:
         self.store = store
@@ -195,6 +240,10 @@ class ConversationAgent:
             and definition.risk == "read"
             and definition.runtime_ready
         ]
+        # The single source of truth for "what can be used without a Task".
+        # The promotion guard below reads the same set, so a tool can never
+        # be offered here yet treated as Task-only when the model calls it.
+        conversation_tools = {item.name for item in definitions}
         schemas = [_START_TASK.openai_schema(), *[item.openai_schema() for item in definitions]]
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": load("stable_system")},
@@ -284,7 +333,7 @@ class ConversationAgent:
                     )
                     self._acknowledge(root)
                     return task_agent.execute_task(root["id"])
-                if call.name not in _CONVERSATION_READ_TOOLS:
+                if call.name not in conversation_tools:
                     # The model selected a capability that requires durable
                     # state without explicitly calling start_task first. The
                     # runtime owns this boundary: promote the complete request
@@ -319,7 +368,33 @@ class ConversationAgent:
                         "content": json.dumps(output, sort_keys=True),
                     }
                 )
-        raise RuntimeError("conversation_iteration_limit")
+        # Out of budget without an answer. That is the definition of work
+        # that belongs in a Task, so promote instead of raising.
+        #
+        # Raising here failed the dispatch job, which retried, which re-ran
+        # the whole turn from scratch -- so a request the conversation lane
+        # could not finish became a loop rather than a Task. Observed live:
+        # the model wanted HubSpot's action list, could not reach
+        # composio_search from this lane, improvised with Brave and
+        # Firecrawl against Composio's own docs, exhausted its budget, and
+        # started over.
+        log.info(
+            "Conversation turn exhausted its budget; promoting to a Task: session=%s",
+            session["id"],
+        )
+        task_agent = self.task_agent_factory(runs)
+        root = runs.create_run(
+            session_id=session["id"],
+            envelope=envelope,
+            goal=user_text,
+            trigger_kind=trigger_kind,
+            trigger_event_id=trigger_event_id,
+            max_iterations=task_agent.max_iterations,
+            max_tool_calls=task_agent.max_tool_calls,
+            metadata={**task_metadata, "promoted_reason": "conversation_budget_exhausted"},
+        )
+        self._acknowledge(root)
+        return task_agent.execute_task(root["id"])
 
     def _organization_memory(self, organization_id: str) -> str:
         organization = self.store.get_organization(organization_id) or {}

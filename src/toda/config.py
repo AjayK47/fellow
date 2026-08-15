@@ -173,9 +173,13 @@ class ToolsConfig(_Section):
     web_extract_connection: str | None = None
     web_fetch_enabled: bool = True
     web_fetch_max_chars: int = 18_000
-    # Sandboxed run_code. Every invocation still requires human approval,
-    # and callbacks are restricted to a read-only allow-list re-verified on
-    # every call. Opt-in: approval is not a substitute for an OS sandbox.
+    # Sandboxed run_code. Callbacks are restricted to a read-only allow-list
+    # re-verified on every call, and every invocation goes through the
+    # action reviewer, which may approve it outright rather than escalating
+    # to a person -- only the `supervised` and `restricted` tool-policy
+    # modes guarantee a human sees it first. Opt-in, and defaults off,
+    # because neither review nor approval is a substitute for an OS sandbox:
+    # this runs a subprocess on the host.
     run_code_enabled: bool = False
     run_code_timeout_seconds: int = 900
     run_code_max_tool_calls: int = 100
@@ -235,7 +239,12 @@ class AgentConfig(_Section):
 
 
 class WorkerConfig(_Section):
-    enabled: bool = True
+    # There is deliberately no `enabled` flag. It existed for a documented
+    # split-process topology (`TODA_WORKER_ENABLED=false` plus a separate
+    # `toda-worker`) whose entry point and module no longer exist, so the
+    # only thing turning it off could still do was produce a gateway that
+    # accepted Slack events and processed no jobs at all, silently. The
+    # worker lanes are part of the gateway.
     poll_interval_seconds: float = 0.5
     lease_seconds: int = 60
     batch_size: int = 20

@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from toda.domain.models import new_id, utcnow
+from toda.config import settings
+from toda.harness.hazard import hazard_reason
 from toda.harness.models import AgentRunState
 from toda.harness.run_code import scrub_child_env
 from toda.services.scope_resolution import resolve_scope
@@ -85,6 +87,23 @@ def check_hardline_floor(prompt: str, command: list[str], workspace_root: Path) 
     if no_push and re.search(r"\bgit\s+push\b", command_text):
         return "Pi command blocked by Task hardline floor: pushing is forbidden"
     return None
+
+
+def prescan_pi_launch(prompt: str, command: list[str]) -> str | None:
+    """A deterministic observation about this launch, for the reviewer.
+
+    Not a block. Pi is a full-trust coding subprocess by design and the
+    whole point is that it gets on with the work; refusing outright on a
+    pattern match would make it useless for exactly the debugging tasks it
+    exists for. This only gives the reviewer something concrete to weigh.
+
+    Uses Toda's data dir, NOT the workspace: the workspace is precisely
+    where Pi is supposed to be writing, so scanning against it would flag
+    every legitimate run.
+    """
+    return hazard_reason(
+        f"{prompt}\n{' '.join(command)}", data_dir=settings.storage.data_dir
+    )
 
 
 def parse_terminal_event(output: str) -> dict[str, Any] | None:
@@ -180,6 +199,7 @@ class PiTaskExecutor:
         workspaces: Any,
         artifacts: Any,
         audit: Any,
+        action_reviewer: Any | None = None,
         provider: str,
         model: str,
         credential_env: str | None = None,
@@ -192,6 +212,12 @@ class PiTaskExecutor:
         lease_seconds: int = 1800,
     ) -> None:
         self.store = store
+        # Pi is the one execution path with no gate at all -- a full-trust
+        # subprocess with network access. Routing its launch through the
+        # same reviewer every other risky action already uses gives it a
+        # judgment step without putting a human in the loop for ordinary
+        # coding work.
+        self.action_reviewer = action_reviewer
         self.sessions = sessions
         self.workspaces = workspaces
         self.artifacts = artifacts
@@ -233,6 +259,27 @@ class PiTaskExecutor:
             self._record_blocked_attempt(task, command=command, workspace_root=workspace_root, violation=violation)
             self._fail(task, owner=owner, error=violation)
             return {"task_id": task_id, "started": False, "state": AgentRunState.FAILED.value, "reason": violation}
+
+        flagged = prescan_pi_launch(prompt, command)
+        if flagged and self.action_reviewer is not None:
+            verdict = self.action_reviewer.review(
+                tool_name="pi_coding_worker",
+                description=(
+                    "Launch a full-trust Pi coding subprocess with network "
+                    "access in this Task's workspace."
+                ),
+                arguments={"prompt": prompt, "command": command},
+                hazard=flagged,
+            )
+            if verdict == "deny":
+                denial = f"Pi launch denied by review: it {flagged}"
+                self._record_blocked_attempt(
+                    task, command=command, workspace_root=workspace_root,
+                    violation=denial,
+                )
+                self._fail(task, owner=owner, error=denial)
+                return {"task_id": task_id, "started": False,
+                        "state": AgentRunState.FAILED.value, "reason": denial}
 
         pi_dir = workspace_root / ".pi"
         pi_dir.mkdir(parents=True, exist_ok=True)

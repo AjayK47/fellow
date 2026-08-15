@@ -147,7 +147,32 @@ def generate_stub_module(allowed_tools: list[str]) -> str:
 
 class RunCodeSandbox:
     """Runs one script per call. Not a persistent computer — no state, no
-    container, no lifecycle beyond the single subprocess this spawns."""
+    container, no lifecycle beyond the single subprocess this spawns.
+
+    **The name is aspirational: this is not an isolation boundary.** The
+    script is launched with `subprocess.Popen([sys.executable, ...])` under
+    Toda's own operating-system account. What it actually constrains is:
+
+    * the working directory (a fresh temp dir),
+    * environment variables (`scrub_child_env` drops anything that looks
+      like a secret and keeps only a safe prefix list),
+    * which Toda tools it may call back into (read-risk only, re-verified
+      per call on the parent side),
+    * wall-clock time and output size.
+
+    What it does NOT constrain, and cannot: absolute filesystem paths, the
+    network, other processes, or resource usage. A script can read
+    `/etc/hosts`, list the operator's home directory, open a socket to any
+    host, and read the Toda database file directly. This was verified, not
+    assumed.
+
+    Consequently `tools.run_code_enabled` defaults to False, the tool
+    description tells the model plainly that it is running on the host, and
+    SECURITY.md documents the real blast radius. Approval is not
+    containment: an action reviewer deciding a script "looks fine" is a
+    judgment about intent, not a limit on capability. Enabling this is a
+    decision to trust the model with the host account.
+    """
 
     def __init__(
         self,

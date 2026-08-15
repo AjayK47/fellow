@@ -13,6 +13,7 @@ from toda.config import settings
 from toda.domain.models import new_id, utcnow
 from toda.harness.child_tasks import AwaitingChildren
 from toda.harness.composio import ComposioClient
+from toda.harness.hazard import hazard_reason
 from toda.harness.models import ModelToolCall, ToolDefinition, ToolResult
 from toda.harness.slack_markdown import to_slack_mrkdwn
 from toda.services.artifacts import artifact_payload
@@ -41,12 +42,19 @@ _CHILD_COORDINATOR_TOOLS = {
 }
 
 
-def _infer_capability_id(name: str) -> str:
+def _infer_capability_id(name: str, risk: str = "read") -> str:
     """Map legacy tool names to stable capability IDs.
 
     Explicit capability IDs can override this mapping, but registering legacy
     tools still produces a complete capability contract for readiness and run
     traces.
+
+    ``risk`` is taken into account because the ``brain_*`` fallback used to
+    return ``memory.read`` for every tool in the family, writes included --
+    so the console, the readiness API and skill capability-matching all
+    described a state-mutating tool as read-only memory access, and the
+    mislabel additionally fed ``runs_without_approval()``, waiving a write
+    on the strength of an ID that claimed it was a read.
     """
     if name == "web_search":
         return "web.search"
@@ -97,7 +105,7 @@ def _infer_capability_id(name: str) -> str:
     if name.startswith("skill_") or name == "skills_list":
         return "skill.manage"
     if name.startswith("brain_"):
-        return "memory.read"
+        return "memory.write" if risk != "read" else "memory.read"
     return f"tool.{name}"
 
 
@@ -116,7 +124,11 @@ class ToolRegistry:
             raise ValueError(f"duplicate tool: {definition.name}")
         if not definition.capability_id:
             definition = definition.model_copy(
-                update={"capability_id": _infer_capability_id(definition.name)}
+                update={
+                    "capability_id": _infer_capability_id(
+                        definition.name, definition.risk
+                    )
+                }
             )
         self._tools[definition.name] = RegisteredTool(definition, handler)
 
@@ -138,7 +150,11 @@ class ToolRegistry:
             raise KeyError(definition.name)
         if not definition.capability_id:
             definition = definition.model_copy(
-                update={"capability_id": _infer_capability_id(definition.name)}
+                update={
+                    "capability_id": _infer_capability_id(
+                        definition.name, definition.risk
+                    )
+                }
             )
         self._tools[definition.name] = RegisteredTool(
             definition=definition, handler=registered.handler
@@ -229,6 +245,26 @@ def _is_high_stakes_slug(slug: str, toolkit: str | None = None) -> bool:
         if any(keyword in upper for keyword in _EXTERNAL_COMMS_KEYWORDS):
             return True
     return False
+
+
+def hazard_prescan(call_name: str, arguments: dict[str, Any]) -> str | None:
+    """A deterministic observation about this call, for the reviewer to weigh.
+
+    Not a veto. The reviewer is the gate, and it can approve a flagged
+    script perfectly well -- reading a `.env` in a repo you are debugging is
+    ordinary work. What this buys is that the reviewer is *told*, rather
+    than having to notice one `open(".aws/credentials")` in two hundred
+    lines of plausible-looking code on its own.
+
+    Deliberately narrow. See harness/hazard.py for why this is a hint and
+    not a boundary.
+    """
+    if call_name != "run_code":
+        return None
+    reason = hazard_reason(
+        str(arguments.get("code") or ""), data_dir=settings.storage.data_dir
+    )
+    return f"This script {reason}." if reason else None
 
 
 def _requires_dynamic_high_stakes_approval(
@@ -969,7 +1005,7 @@ def build_tool_registry(
                 name="brain_update_case",
                 description=(
                     "Update the lifecycle state or summary of an existing "
-                    "company case. This is a governed write and requires approval."
+                    "company case."
                 ),
                 input_schema=_object_schema(
                     {
@@ -991,6 +1027,7 @@ def build_tool_registry(
                     ["case_id", "status"],
                 ),
                 risk="write",
+                capability_id="memory.write",
             ),
             lambda args, runtime: reality.update_case(
                 args["case_id"],
@@ -2015,14 +2052,7 @@ def build_tool_registry(
                 ),
             }
         else:
-            existing = composio.list_auth_configs(toolkit=toolkit)
-            items = existing.get("items") or []
-            auth_config_id = items[0].get("id") if items else None
-            if not auth_config_id:
-                created = composio.create_auth_config(toolkit=toolkit)
-                auth_config_id = created.get("id") or created.get("auth_config_id")
-            if not auth_config_id:
-                raise RuntimeError("Composio did not return an auth config id")
+            auth_config_id = composio.ensure_auth_config(toolkit=toolkit)
             link = composio.create_connect_link(
                 user_id=f"toda:{runtime['organization_id']}",
                 auth_config_id=str(auth_config_id),
@@ -2340,12 +2370,14 @@ def build_tool_registry(
                 "Execute an exact action slug previously found via "
                 "COMPOSIO_SEARCH_TOOLS/composio_search and inspected with "
                 "COMPOSIO_GET_TOOL_SCHEMAS/composio_describe. This is this "
-                "codebase's own approval-gated executor — the only path any "
-                "Composio action ever actually runs through. Most actions "
-                "execute immediately; an action whose slug is destructive "
-                "(delete/remove), financial (payment/invoice/charge/refund/"
-                "transfer/payout), or reaches an external/customer-facing "
-                "surface still pauses for human approval."
+                "codebase's own governed executor — the only path any "
+                "Composio action ever actually runs through. Every call is "
+                "assessed by an automated risk review that can approve, "
+                "deny, or escalate it to a person; an action whose slug is "
+                "destructive (delete/remove), financial (payment/invoice/"
+                "charge/refund/transfer/payout), or reaches an external/"
+                "customer-facing surface is the kind most likely to be "
+                "escalated, so state clearly what you are doing and why."
             ),
             input_schema=_object_schema(
                 {
@@ -2418,10 +2450,17 @@ def build_tool_registry(
                     "instead of doing it by hand across several tool calls. "
                     "The script can call back only into these read-only tools "
                     f"via the `toda_tools` module: {', '.join(allowed_read_tools) or 'none configured'}. "
-                    "It has no network access and no filesystem access beyond "
-                    "its own temporary directory. Only the script's printed "
-                    "output is returned to you — intermediate tool results "
-                    "never enter your context. Requires human approval."
+                    "Only the script's printed output is returned to you — "
+                    "intermediate tool results never enter your context. "
+                    "IMPORTANT: this is NOT a sandbox. The script runs as an "
+                    "ordinary process on the host, with that host's full "
+                    "filesystem and network access, under the same operating "
+                    "system account as Toda itself. Write only what the task "
+                    "actually requires: never read files outside your working "
+                    "directory, never make network requests, and never touch "
+                    "credentials or the database. Every call is assessed by an "
+                    "automated risk review before it runs, and may be "
+                    "escalated to a person."
                 ),
                 input_schema=_object_schema({"code": {"type": "string"}}, ["code"]),
                 risk="write",
@@ -2657,9 +2696,15 @@ class ToolExecutor:
         # Explicit conditional organization policy is a human gate. Dynamic
         # high-stakes classification promotes an otherwise-direct call into
         # AI review, where the reviewer can approve, deny, or escalate.
+        # A deterministic pre-scan of the arguments. It does NOT decide --
+        # it is handed to the reviewer as one more input. Forcing a human
+        # pause here was the wrong call: it re-litigated a settled decision
+        # (the reviewer is the gate) and put a person in the loop for
+        # scripts they would have approved anyway.
+        hazard = hazard_prescan(call.name, call.arguments)
         if conditional.get("approval_required", False):
             execution = "ask"
-        elif dynamic_review and execution == "direct":
+        elif (dynamic_review or hazard) and execution == "direct":
             execution = "ai_review"
         requires_approval = execution in {"ai_review", "ask"}
 
@@ -2693,6 +2738,7 @@ class ToolExecutor:
                     tool_name=definition.name,
                     description=definition.description,
                     arguments=call.arguments,
+                    hazard=hazard,
                 )
             if verdict == "deny":
                 record["status"] = "failed"
@@ -2713,6 +2759,10 @@ class ToolExecutor:
 
         if requires_approval and not approved:
             approval = self._create_approval(run, record, definition)
+            if hazard:
+                approval["preview"] = f"{hazard}\n\n{approval.get('preview') or ''}"
+                approval["hazard_reason"] = hazard
+                self.store.upsert_approval(approval)
             if self.policy_engine and conditional.get("preconditions"):
                 runtime = self._runtime(run, call.arguments)
                 captured = self.policy_engine.capture_preconditions(
