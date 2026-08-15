@@ -217,11 +217,13 @@ Pages are organized by what they let an operator do, not by data source:
   `GET /v1/sessions/{id}` back this view.
 - **Tasks / Task detail** — inspect a single Task's turns, tool calls, token
   usage, resolved skills, workspace, artifacts, attempts, and child Tasks.
-- **Approvals / Tools** — decide pending write approvals; set each tool's
-  organization policy to allow, always ask for approval, or forbid outright.
-  Write-risk tools always require approval regardless of this setting — the
-  policy only controls read-risk tools and whether the tool is offered to the
-  model at all.
+- **Approvals / Tools** — decide pending write approvals; set the
+  organization's tool-policy mode, and override any individual tool to run
+  directly, go through AI review, always ask a human, or be withheld from
+  the model entirely. What the mode governs is actions that *leave* Toda:
+  contained writes to its own memory, artifacts, plans, workspace, schedule
+  and Tasks run directly in every mode unless a per-tool override says
+  otherwise.
 - **Skills** — approve or deprecate versioned procedures, with agent-proposed
   drafts surfaced separately from the immutable platform catalog.
 - **Integrations / Channels** — review Slack and provider readiness, and
@@ -235,6 +237,18 @@ Pages are organized by what they let an operator do, not by data source:
   type, searchable, with a click-to-inspect panel over each entity's edges.
 - **Reality / Jobs / Audit** — bitemporal facts and conflicts, the durable
   job queue, and the append-only audit log.
+
+### What a console user can see and do
+
+The organization, the acting principal, and the identity deciding an approval
+all come from the signed-in session and are never read from the request.
+
+An ordinary member sees the Sessions and Tasks they took part in — including
+transcripts, prompts and tool arguments — plus the approvals they are named
+on. Owner and admin see everything, and a cross-participant read is written
+to the audit log. Mutations require an admin unless a route declares itself
+member-writable: asking Toda to do something, steering or cancelling that
+work, deciding an approval you were named on, and the search endpoints.
 
 ### How an event becomes action and memory
 
@@ -407,8 +421,10 @@ finds public sources; Firecrawl converts public pages and URL-addressable PDFs
 to clean markdown. Without Firecrawl, `web_fetch` uses a safe, read-only direct
 fetch fallback; without Brave, the agent does not get web search. Browser
 automation, model-generated code execution, and Pi coding workers are optional
-high-risk capabilities. `run_code` is bounded and approval-gated, but approval
-is not an OS-level sandbox. Review `SECURITY.md` before enabling these surfaces;
+high-risk capabilities. `run_code` is bounded and every call is assessed by
+the action reviewer, which may approve it without escalating to a person —
+only the `supervised` and `restricted` policy modes guarantee a human sees
+it first, and neither review nor approval is an OS-level sandbox. Review `SECURITY.md` before enabling these surfaces;
 workspace tools remain confined to the configured organizational workspace.
 
 The gateway creates the SQLite database when needed but does not seed demo data.
@@ -436,13 +452,9 @@ Open:
 - OpenAPI documentation: <http://127.0.0.1:8080/docs>
 - Runtime readiness: <http://127.0.0.1:8080/v1/harness/status>
 
-The API starts an in-process durable worker by default. To run API and worker
-separately:
-
-```bash
-TODA_WORKER_ENABLED=false uv run toda
-uv run toda-worker
-```
+Toda is one process: the three worker lanes (agent, knowledge,
+infrastructure) run inside the gateway and cannot be split out or turned
+off. Only one host may write the SQLite file.
 
 ## Configuration
 
@@ -453,12 +465,12 @@ complete template. Unknown keys are rejected rather than silently ignored.
 
 No external key is required:
 
-```dotenv
-TODA_DATA_DIR=data
-TODA_DB_NAME=brain.db
-TODA_PROVIDER_CONNECTIONS={}
-TODA_MODEL_ASSIGNMENTS={}
-TODA_WORKER_ENABLED=true
+```json
+{
+  "organization": {"id": "org_acme", "name": "Acme", "owner_email": "you@acme.com"},
+  "storage": {"data_dir": "data", "db_name": "brain.db"},
+  "models": {"providers": {}, "assignments": {}}
+}
 ```
 
 This mode exercises the complete ingestion, permission, memory, graph, policy,
@@ -467,9 +479,20 @@ are deterministic test behavior, not production reasoning.
 
 ### Live provider configuration
 
-```dotenv
-TODA_PROVIDER_CONNECTIONS={"openrouter-company":{"provider":"openrouter","api_key":"sk-or-..."}}
-TODA_MODEL_ASSIGNMENTS={"main":{"connection":"openrouter-company","model":"openai/gpt-5.4"},"attention":{"connection":"openrouter-company","model":"openai/gpt-5-mini"},"extraction":{"connection":"openrouter-company","model":"openai/gpt-5-mini"},"embedding":{"connection":"openrouter-company","model":"qwen/qwen3-embedding-8b"}}
+```json
+{
+  "models": {
+    "providers": {
+      "openrouter-company": {"provider": "openrouter", "api_key": "sk-or-..."}
+    },
+    "assignments": {
+      "main":       {"connection": "openrouter-company", "model": "openai/gpt-5.4"},
+      "attention":  {"connection": "openrouter-company", "model": "openai/gpt-5-mini"},
+      "extraction": {"connection": "openrouter-company", "model": "openai/gpt-5-mini"},
+      "embedding":  {"connection": "openrouter-company", "model": "qwen/qwen3-embedding-8b"}
+    }
+  }
+}
 ```
 
 Omitted auxiliary roles fall back to `main`. Credentials belong to the named
@@ -487,7 +510,7 @@ sees stable vendor-neutral tools (`vision_analyze`, `image_generate`,
 `media_transcribe`, and `text_to_speech`), while deployment configuration owns
 the provider and model selection.
 
-Set `TODA_MAIN_MODEL_SUPPORTS_VISION=true` to pass pixels to the main
+Set `models.main_supports_vision` to `true` to pass pixels to the main
 multimodal model, or add a `vision` model assignment for a separate model.
 Image, transcription, and TTS use `image`, `transcription`, and `tts` model
 assignments. Omitting a role disables that capability. Slack
@@ -495,13 +518,14 @@ voice files are downloaded and transcribed in the background routing job,
 stored in the Slack room's permission scope, and added to the message context.
 Distributed Slack installations need the `files:read` OAuth scope.
 
-The browser is enabled with `TODA_BROWSER_ENABLED=true` and a comma-separated
-`TODA_BROWSER_ALLOWED_DOMAINS` allowlist. Its snapshot output assigns refs
+The browser is enabled with `tools.browser_enabled` and a
+`tools.browser_allowed_domains` allowlist. Its snapshot output assigns refs
 such as `@e1` for later click/type actions, and it exposes image discovery,
 screenshots, console/network logs, dialogs, and vision-assisted inspection.
 An optional `browser_cdp` surface is separately gated by
-`TODA_BROWSER_CDP_ENABLED=true` and permits only a small read-only CDP method
-allowlist.
+`tools.browser_cdp_enabled` and permits only a small read-only CDP method
+allowlist. It drives a real browser against live sites carrying whatever
+credentials that browser holds — read `SECURITY.md` first.
 
 Every new source chunk and extracted atomic memory is embedded once. Retrieval
 first filters by permission, then combines lexical matching, FTS5, graph
@@ -511,30 +535,37 @@ service boundaries.
 
 ### Runtime and proactivity controls
 
-```dotenv
-TODA_AGENT_MAX_ITERATIONS=12
-TODA_AGENT_MAX_TOOL_CALLS=24
-TODA_AGENT_CONTEXT_TOKEN_BUDGET=12000
-TODA_AGENT_MAX_TOTAL_TOKENS=100000
-
-TODA_CHILD_TASK_MAX_PARALLEL=3
-TODA_CHILD_TASK_MAX_DEPTH=1
-
-TODA_WORKER_ENABLED=true
-TODA_WORKER_POLL_INTERVAL_SECONDS=0.5
-TODA_WORKER_CONCURRENCY=4
-
-TODA_ATTENTION_MINIMUM_CONFIDENCE=0.72
-TODA_PROACTIVE_COOLDOWN_SECONDS=900
-TODA_EPISODE_QUIET_SECONDS=300
+```json
+{
+  "agent": {
+    "max_iterations": 50,
+    "max_tool_calls": 100,
+    "context_token_budget": 200000,
+    "max_total_tokens": 2000000,
+    "child_max_parallel": 3,
+    "child_max_depth": 1
+  },
+  "worker": {
+    "poll_interval_seconds": 0.5,
+    "concurrency": 30,
+    "knowledge_concurrency": 8,
+    "attention_minimum_confidence": 0.72,
+    "proactive_cooldown_seconds": 900,
+    "episode_quiet_seconds": 300
+  }
+}
 ```
+
+`worker.concurrency` is the combined budget for the agent and infrastructure
+lanes; the agent lane takes two thirds of it. `worker.knowledge_concurrency`
+is a separate pool, so an ingest burst cannot starve a Slack reply.
 
 Child Tasks are additionally capped per Task by iterations, tool calls, token
 budget, and deadline, and can never delegate further regardless of what a
 direct or malformed model call requests — delegation depth is capped at one
 independently of tool access. A worker can be granted a write tool by the
-delegating task, but that write still requires the same human approval any
-main-agent write would need.
+delegating task, and that write passes through exactly the same policy,
+review and approval path a main-agent write would — no more, and no less.
 
 Approving a write wakes the waiting Task, revalidates its external preconditions,
 and executes it once. If a precondition is stale, the Task remains parked with
@@ -546,10 +577,14 @@ an explicit failure rather than silently applying an outdated write.
 
 Configure:
 
-```dotenv
-TODA_SLACK_SIGNING_SECRET=...
-TODA_SLACK_BOT_TOKEN=xoxb-...
-TODA_SLACK_BOT_USER_ID=U...
+```json
+{
+  "slack": {
+    "signing_secret": "...",
+    "bot_token": "xoxb-...",
+    "bot_user_id": "U..."
+  }
+}
 ```
 
 Expose the API over HTTPS and configure the Slack app:
@@ -563,8 +598,8 @@ POST https://your-host/v1/slack/interactions
 
 Add an app-level token:
 
-```dotenv
-TODA_SLACK_APP_TOKEN=xapp-...
+```json
+{"slack": {"app_token": "xapp-..."}}
 ```
 
 Run the unified gateway:
@@ -574,9 +609,9 @@ uv run toda gateway
 ```
 
 The setup UI creates the installation, identity mapping, and optional first
-channel policy. `uv run toda-slack` remains available when you
-intentionally want the Slack listener as a separate process. The lower-level
-API equivalents are:
+channel policy. `toda gateway` runs the Slack Socket Mode listener in the
+same process as the API; use `toda serve` for the API without it. The
+lower-level API equivalents are:
 
 1. The Slack installation with `POST /v1/slack/installations`.
 2. Slack-user-to-principal mappings with `POST /v1/identity-mappings`.
@@ -623,10 +658,14 @@ and a PNG preview suitable for Slack delivery.
 
 Configure:
 
-```dotenv
-TODA_COMPOSIO_API_KEY=...
-TODA_COMPOSIO_WEBHOOK_SECRET=...
-TODA_COMPOSIO_TOOLKIT_VERSIONS=latest
+```json
+{
+  "composio": {
+    "api_key": "...",
+    "webhook_secret": "...",
+    "toolkit_versions": "latest"
+  }
+}
 ```
 
 The typical onboarding flow is:

@@ -45,14 +45,20 @@ type ToolsResponse = {
   composio_configured: boolean;
 };
 
+// Every mode below describes what happens to actions that LEAVE Toda.
+// Contained actions -- writing to Toda's own memory, artifacts, plans,
+// workspace, schedule or Tasks -- run directly in all four, because the
+// mode default does not override that waiver (harness/tools.py,
+// runs_without_approval). Saying otherwise here told an operator picking
+// the most conservative setting something the runtime does not do.
 const MODE_COPY: Record<PolicyMode, { label: string; description: string }> = {
   supervised: {
     label: "Supervised",
-    description: "Reads run directly. Every write asks a human.",
+    description: "Reads run directly. Every outbound write asks a human.",
   },
   autonomous: {
     label: "Autonomous",
-    description: "Reads run directly. Writes go through AI review.",
+    description: "Reads run directly. Outbound writes go through AI review.",
   },
   full_access: {
     label: "Full access",
@@ -60,7 +66,8 @@ const MODE_COPY: Record<PolicyMode, { label: string; description: string }> = {
   },
   restricted: {
     label: "Restricted",
-    description: "Every read and write asks a human.",
+    description:
+      "Every read and outbound write asks a human. Toda's own memory, artifacts and schedule still update directly.",
   },
 };
 

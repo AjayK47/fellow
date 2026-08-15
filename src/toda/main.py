@@ -60,19 +60,27 @@ def init_cli(args: argparse.Namespace) -> None:
     print(f"Then sign in at http://127.0.0.1:{settings.server.port}")
 
 
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
 def validate_runtime_exposure() -> None:
     """Refuse explicitly unsafe combinations on a network-bound server."""
     host = settings.server.host.strip().lower()
     local_only = host in {"127.0.0.1", "::1", "localhost"}
+    # Names the config.json paths, not the environment variables these used
+    # to be -- Toda reads exactly one file and no environment layer, so an
+    # operator who searched for the old TODA_* names found nothing at all.
     if not local_only and settings.dashboard.auth_disabled:
         raise RuntimeError(
-            "TODA_DASHBOARD_AUTH_DISABLED cannot be used when TODA_HOST is "
-            "network-accessible"
+            f'dashboard.auth_disabled cannot be true when server.host is '
+            f'network-accessible (currently "{settings.server.host}"). '
+            f"Set it to false in {config_path()}, or bind to 127.0.0.1."
         )
     if not local_only and settings.dashboard.auto_approve_writes:
         raise RuntimeError(
-            "TODA_AUTO_APPROVE_WRITES cannot be used when TODA_HOST is "
-            "network-accessible"
+            f'dashboard.auto_approve_writes cannot be true when server.host '
+            f'is network-accessible (currently "{settings.server.host}"). '
+            f"Set it to false in {config_path()}, or bind to 127.0.0.1."
         )
 
 
@@ -110,63 +118,62 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             brain = reset_app(Path(db) if db else settings.storage.db_path)
         app.state.brain = brain
         brain.indexing.backfill()
-        if settings.worker.enabled:
-            # Independent lanes keep long agent work and ingestion from
-            # delaying infrastructure jobs, while all lanes remain inside
-            # the single database-owning process.
-            async def _lane(kinds: list[str], *, tick_automations: bool) -> None:
-                last_dispatcher_tick = 0.0
-                last_recovery_tick = 0.0
-                while True:
-                    if tick_automations and (
-                        time.monotonic() - last_dispatcher_tick
-                        >= settings.worker.dispatcher_tick_interval_seconds
-                    ):
-                        await asyncio.to_thread(brain.automations.tick)
-                        last_dispatcher_tick = time.monotonic()
-                    if (
-                        tick_automations
-                        and time.monotonic() - last_recovery_tick >= 30
-                    ):
-                        for organization in brain.store.list_organizations():
-                            await asyncio.to_thread(
-                                brain.recovery_heartbeat.tick, organization["id"]
-                            )
-                            await asyncio.to_thread(
-                                brain.proactive.heartbeat, organization["id"]
-                            )
-                        last_recovery_tick = time.monotonic()
-                    # pump() starts work without waiting for it, so a long
-                    # agent run never stalls this loop's next lease.
-                    result = await asyncio.to_thread(
-                        brain.harness_worker.pump, kinds=kinds
-                    )
-                    if result["leased"] == 0:
-                        await asyncio.sleep(settings.worker.poll_interval_seconds)
-                    else:
-                        await asyncio.sleep(0)
+        # Independent lanes keep long agent work and ingestion from
+        # delaying infrastructure jobs, while all lanes remain inside
+        # the single database-owning process.
+        async def _lane(kinds: list[str], *, tick_automations: bool) -> None:
+            last_dispatcher_tick = 0.0
+            last_recovery_tick = 0.0
+            while True:
+                if tick_automations and (
+                    time.monotonic() - last_dispatcher_tick
+                    >= settings.worker.dispatcher_tick_interval_seconds
+                ):
+                    await asyncio.to_thread(brain.automations.tick)
+                    last_dispatcher_tick = time.monotonic()
+                if (
+                    tick_automations
+                    and time.monotonic() - last_recovery_tick >= 30
+                ):
+                    for organization in brain.store.list_organizations():
+                        await asyncio.to_thread(
+                            brain.recovery_heartbeat.tick, organization["id"]
+                        )
+                        await asyncio.to_thread(
+                            brain.proactive.heartbeat, organization["id"]
+                        )
+                    last_recovery_tick = time.monotonic()
+                # pump() starts work without waiting for it, so a long
+                # agent run never stalls this loop's next lease.
+                result = await asyncio.to_thread(
+                    brain.harness_worker.pump, kinds=kinds
+                )
+                if result["leased"] == 0:
+                    await asyncio.sleep(settings.worker.poll_interval_seconds)
+                else:
+                    await asyncio.sleep(0)
 
-            worker_tasks = [
-                asyncio.create_task(
-                    _lane(
-                        brain.harness_worker.infrastructure_job_kinds(),
-                        tick_automations=True,
-                    ),
-                    name="toda-harness-worker-infra",
+        worker_tasks = [
+            asyncio.create_task(
+                _lane(
+                    brain.harness_worker.infrastructure_job_kinds(),
+                    tick_automations=True,
                 ),
-                asyncio.create_task(
-                    _lane(
-                        brain.harness_worker.agent_job_kinds(), tick_automations=False
-                    ),
-                    name="toda-harness-worker-agent",
+                name="toda-harness-worker-infra",
+            ),
+            asyncio.create_task(
+                _lane(
+                    brain.harness_worker.agent_job_kinds(), tick_automations=False
                 ),
-                asyncio.create_task(
-                    _lane(
-                        brain.harness_worker.knowledge_job_kinds(), tick_automations=False
-                    ),
-                    name="toda-harness-worker-knowledge",
+                name="toda-harness-worker-agent",
+            ),
+            asyncio.create_task(
+                _lane(
+                    brain.harness_worker.knowledge_job_kinds(), tick_automations=False
                 ),
-            ]
+                name="toda-harness-worker-knowledge",
+            ),
+        ]
         yield
     finally:
         # Coordinated shutdown: stop accepting new Slack events first, then let
@@ -228,7 +235,16 @@ def create_app(
             raise
         response.headers["X-Request-ID"] = request_id
         brain = getattr(request.app.state, "brain", None)
-        if brain and not suppress_audit:
+        # A successful read is not an auditable act. Recording every one of
+        # them put the console's own 8-second polling into the audit trail
+        # -- roughly 900 rows an hour from a single idle browser tab, in the
+        # same SQLite file as memory, embeddings and the job queue -- which
+        # diluted the record that actually matters: who changed what, and
+        # anything that failed. Mutations and non-2xx responses are still
+        # recorded in full, including the 401/403 an intrusion attempt
+        # produces.
+        auditable = request.method not in _READ_METHODS or response.status_code >= 400
+        if brain and not suppress_audit and auditable:
             brain.audit.record(settings.organization.id, "http.request", {"request_id": request_id, "path": request.url.path, "method": request.method, "status_code": response.status_code, "duration_ms": round((time.perf_counter() - started) * 1000, 2)})
         return response
     return app

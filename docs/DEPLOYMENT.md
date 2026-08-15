@@ -27,9 +27,15 @@ Do not change the port mapping to `0.0.0.0` without an authenticated TLS
 reverse proxy. Keep dashboard authentication enabled, use a secret manager,
 set remote ingestion keys, and follow `SECURITY.md`.
 
-For larger deployments, run `toda serve` and `toda-worker` as separate
-processes against the same protected database volume. SQLite remains the
-supported community backend; only one host should write the database file.
+Toda runs as a single process. The agent, knowledge and infrastructure
+worker lanes live inside the gateway, each with its own thread pool and
+capacity budget, so a burst in one cannot starve another. They cannot be
+split into a separate service, and there is no setting that disables them.
+Scale by giving that process more lane concurrency: `worker.concurrency` is
+the combined agent + infrastructure budget (the agent lane takes two thirds
+by default) and `worker.knowledge_concurrency` is separate. Not more
+processes -- SQLite is the supported community backend and exactly one host
+may write the database file.
 
 ## Upgrades
 

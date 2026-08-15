@@ -169,13 +169,27 @@ From there:
 Per iteration: assemble context → call the model → execute tool calls →
 record everything → decide whether to continue.
 
-**Prompt assembly** is layered for cache friendliness: a stable system
-prompt, then a trusted invocation block (who asked, where, when, budgets),
+**Prompt assembly** is layered for cache friendliness, and the ordering is
+load-bearing: prefix caching matches an exact token prefix, so a single
+mutating value early in the request invalidates everything after it. Stable
+first — system prompt, then a trusted invocation block (who asked, where,
+what limits) —
 then conversation context, skills, and company evidence — each in an
-explicitly labelled block. Untrusted material (web pages, fetched documents)
-is wrapped in a framing that marks it as data, never instructions.
+explicitly labelled block, with the three genuinely volatile values (the
+iteration counter, the tool-call counter and the clock) isolated in a
+`<runtime_state>` block at the very end. They previously sat at message #2,
+which left the system prompt as the only cacheable thing — about 12% of a
+typical 43k-token request; now it is over 99%.
 
-**Skills** are approved procedures — 52 ship built in (research, PDF/report
+Any tool result Toda did not author itself —
+connector actions, browser text, MCP servers, fetched pages, extracted
+documents — is wrapped in a framing that marks it as data, never
+instructions. The *trusted* half is the named one
+(`prompts._TRUSTED_TOOL_NAMES`), so a newly registered tool is framed by
+default rather than waived: over-framing costs a few tokens, under-framing
+costs an injected instruction run with the company's credentials.
+
+**Skills** are approved procedures — 51 ship built in (research, PDF/report
 production, GitHub workflows, meetings, debugging, visual design…). The
 model sees the *entire* compatible catalog as name + description and loads
 full bodies on demand, rather than a server-side relevance guess deciding
@@ -193,9 +207,20 @@ whole workflows.
 ## 6. Acting on the world
 
 Tools are typed and carry a risk tier. Reads run freely and in parallel.
-Writes execute immediately for ordinary work. A narrow set is gated: code
-execution, automation lifecycle changes, and connected-app actions that are
-destructive, financial, or reach an external/customer surface.
+
+The line that decides governance is **whether an action leaves Toda**, not
+its risk tier. Writing a PDF into Toda's artifact store, editing its
+workspace, updating its memory, scheduling its own automation, cancelling
+its own Task — all contained, all reversible, and none of them something a
+person can meaningfully consent to without reading the whole task anyway.
+Those run directly. Sending an action to a customer's CRM is a different
+kind of act, and so is executing code on the host.
+
+The rule is named positively (`_CONTAINED_CAPABILITY_PREFIXES` in
+`harness/tools.py`), so a tool carrying an unrecognised capability is gated
+rather than waived: wrongly pausing a contained action costs a moment of
+friction, wrongly waiving an uncontained one costs an action nobody agreed
+to. `connector.*`, `browser.*` and `code.*` are deliberately excluded.
 
 Every gated action passes one front door:
 
@@ -207,16 +232,23 @@ gated action
          └─ ESCALATE → Slack approval card (Approve / Deny)
 ```
 
+The organization's tool-policy mode sets what "gated" resolves to.
+`autonomous` (the default) sends uncontained writes to the reviewer above;
+`supervised` and `restricted` send them straight to a person; `full_access`
+runs ordinary writes directly. A per-tool override in `tool_policies` beats
+the mode. Note that under the default mode an automated reviewer, not a
+human, is the last thing between the model and a connector write — including
+a destructive one.
+
 `request_batch_approval` lets a Task declare its whole plan up front and get
 one human decision instead of a pause per action.
 
-Some actions are hardcoded safe and skip the reviewer entirely — for example
-a recurring reminder scoped to the requester's own DM, which affects nobody
-else and is as easy to stop as to start.
-
 **Connected apps** go through Composio: search for the right action in plain
-English, fetch its schema, execute it. Curated shortcuts exist for GitHub and
-Linear; any toolkit the org connects is reachable generically.
+English, fetch its schema, execute it. There are no per-vendor tools —
+`COMPOSIO_EXECUTE` is the single path every connector action runs through,
+so any toolkit the org connects is reachable the moment it is connected.
+GitHub, Linear and the rest are covered by *skills* (how to use them well),
+not by bespoke tools.
 
 ---
 
@@ -226,11 +258,14 @@ A SQLite-backed job queue with leases, exponential retry, dead-lettering and
 idempotency keys drives everything. Two properties are worth calling out
 because both came from real production failures:
 
-**Two lanes.** Long agent runs and fast infrastructure jobs are leased and
-run separately. Sharing one lane meant a 57-second agent run could hold
-inbound Slack routing behind it for over a minute. Jobs are also *started*
-without waiting for the batch to finish, so one slow job never stalls the
-lane it's in. Leasing is capped at free capacity, so a job's lease clock
+**Three lanes, three pools.** Long agent runs, knowledge work, and fast
+infrastructure jobs are leased *and* executed separately, each with its own
+thread pool and capacity budget. Sharing one lane meant a 57-second agent
+run could hold inbound Slack routing behind it for over a minute; splitting
+only the leases fixed head-of-line blocking within a batch but still let a
+burst of agent runs occupy every thread, which is the same starvation one
+level down. Jobs are also *started* without waiting for the batch to finish,
+and leasing is capped at each lane's free capacity, so a job's lease clock
 never starts while it waits for a thread.
 
 **Contention is not failure.** A dispatch that finds the Session Manager busy
@@ -242,6 +277,14 @@ after Toda was already idle.
 **Delivery** reserves its idempotency key *before* the send, atomically, and
 hands the reservation back if the send fails. Slack does not deduplicate bot
 messages, so without this a retry after a partial failure posts twice.
+
+This makes delivery **at-least-once, not exactly-once**, and the distinction
+is worth stating plainly: a crash in the window after Slack accepts a message
+but before the delivery row is recorded leaves the reservation in `sending`,
+and once it goes stale (300s, `_STALE_RESERVATION_SECONDS`) a retry may post
+the same message a second time. Closing that window entirely would need a
+two-phase commit with Slack, which Slack does not offer. The reservation
+bounds duplicates to that one narrow window instead of every retry.
 
 ---
 
@@ -310,30 +353,85 @@ memories a day and steadily degraded retrieval for real questions.
 
 - **Slack** — the primary interface. Block Kit for approvals, structured
   replies, and file/artifact links.
-- **HTTP API** — ~163 routes: sessions, tasks, approvals, memory, graph,
+- **HTTP API** — 157 routes: sessions, tasks, approvals, memory, graph,
   skills, tools, automations, connections, audit, artifact download.
 - **Console** — a React dashboard (Overview, Sessions, Tasks, Approvals,
   Skills, Tools, Graph, Reality, Automations, Connections, Jobs, Policies,
-  Audit, Channels, Setup), with Sign in with Slack.
+  Audit, Channels, Setup), behind a dashboard account.
 
-## 10. Processes
+### Who sees what in the console
 
-| Command | Role |
-|---|---|
-| `toda gateway` | API + Slack gateway + in-process worker (single-process default) |
-| `toda serve` | API only |
-| `toda-worker` | Standalone worker, for splitting execution out |
-| `toda-slack` | Socket Mode connector |
-| `toda reset --yes` | Delete **all** local state: database *and* task workspaces |
+Three things are derived from the signed-in session and never accepted from
+the request: the **organization**, the **acting principal** (which decides
+what retrieval may touch), and **who decided an approval**. Each was once a
+plain parameter, and each was therefore self-asserted.
 
-`toda reset --yes` clears every local table — memory, graph, embeddings,
-sessions, tasks, artifacts, conversation log — and the on-disk workspace
-tree. It does **not** clear `.env`, nor remote state (Composio connections
-and webhooks, Slack OAuth installs), which live outside this machine.
+On top of that, a member sees the Sessions and Tasks they took part in —
+transcripts, prompts, tool arguments and results included. Retrieval is
+permission-filtered at query time, so without this the Task that *consumed*
+that retrieval became a second way to read it. Owner and admin may read any
+conversation, and that read is written to the audit log. Mutations require
+an admin unless the route explicitly declares itself member-writable, so a
+route added without thinking about permissions fails closed.
+
+**Participation is a grant, so only trustworthy sources write it.** Waking a
+conversation records you as a participant, and participation is what decides
+who may read it back — which makes the write path a grant of the read
+permission. `SessionService.wake()` therefore takes `may_join`, defaulting to
+False. The platform gateways pass True, because Slack already enforced that
+the actor can post in that channel before the event arrived. Nothing else
+may: the API and automations can start a new conversation or wake one the
+acting principal is already in, and are refused otherwise. API conversation
+keys are additionally namespaced `api:{principal_id}:{id}`, so a caller
+cannot address a platform conversation's key at all — Slack's is
+`slack:{workspace_id}:{channel_id}`, constructible by anyone who knows a
+channel id.
+
+## 10. Measuring it
+
+The test suite proves the machinery: leases, idempotency, authorization,
+state transitions. It says nothing about whether Toda is *good* — whether
+retrieval surfaces the right memory, whether attention stays quiet, whether
+an answer is current and safe to send.
+
+`toda-eval` covers those four, against a generated fictional organization
+whose facts are pinned in `evals/spec.py` while a model writes the prose.
+Corpora and results are not committed; the generator, the labeled cases and
+the scorers are. Model-dependent suites run N samples and report spread, so a
+change smaller than the sampling noise is reported as noise rather than as a
+result. See `docs/EVALS.md`.
 
 ---
 
-## 11. Trust boundaries
+## 11. Processes
+
+| Command | Role |
+|---|---|
+| `toda gateway` | API + Slack Socket Mode + the three worker lanes |
+| `toda serve` | API and worker lanes, without the Slack connector |
+| `toda init` | Create the organization and owner account from `config.json` |
+| `toda reindex` | Rebuild the vec0 ANN indexes from stored embeddings |
+| `toda retention` | Preview or apply retention cleanup, or delete an organization |
+| `toda reset --yes` | Delete **all** local state: database *and* task workspaces |
+
+Toda is one process. The worker lanes are part of the gateway, not a
+separately runnable service — there is no way to turn them off and nothing
+to run in their place. (An earlier `toda-worker` / `toda-slack` split was
+documented here and in the deployment guide long after its entry points and
+module were removed; following it produced a gateway that accepted Slack
+events and processed no jobs at all.) Only one host may write the SQLite
+file, which is what made the split a design question rather than a missing
+script.
+
+`toda reset --yes` clears every local table — memory, graph, embeddings,
+sessions, tasks, artifacts, conversation log — and the on-disk workspace
+tree. It does **not** clear `config.json`, nor remote state (Composio
+connections and webhooks, Slack OAuth installs), which live outside this
+machine.
+
+---
+
+## 12. Trust boundaries
 
 1. Instructions come only from the user in Slack. Everything reached through
    a tool — web pages, documents, tool output — is data, and is framed as
