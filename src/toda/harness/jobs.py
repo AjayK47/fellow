@@ -11,11 +11,11 @@ from toda.storage.db import BrainStore
 # Session and child Task execution can drive CompanyAgent._loop() to completion -- potentially
 # several iterations, each with a model round-trip plus tool calls -- and can
 # legitimately run past the default 60s lease. Without a longer lease, a
-# second worker process (the documented TODA_WORKER_ENABLED=false +
-# separate toda-worker topology) could see the lease as expired mid-run and
-# re-lease + re-execute the same run concurrently. A stale lease only matters
-# for actual crash recovery, so a generous static override is enough here --
-# true lease renewal isn't needed for jobs this infrequent.
+# concurrent lane (or a process restarted while a run was in flight) could
+# see the lease as expired mid-run and re-lease + re-execute the same run.
+# A stale lease only matters for actual crash recovery, so a generous static
+# override is enough here -- true lease renewal isn't needed for jobs this
+# infrequent.
 _LONG_RUNNING_LEASE_OVERRIDES = {
     "session.dispatch": 3600,
     "task.run_child": 3600,
@@ -40,6 +40,34 @@ _MAX_ATTEMPT_OVERRIDES = {
 # unanswered for minutes AFTER the Manager was free -- a user-visible
 # "Toda ignored me" stall with nothing wrong in any log.
 _CONTENTION_RETRY_SECONDS = 1.0
+
+# Ceiling on how many jobs of one kind may be waiting at once.
+#
+# Nothing bounded this, so a single connector trigger's first poll enqueued
+# 6,200 jobs -- ~5,300 `event.route` and ~900 `attention.evaluate`, the
+# latter a model call each -- and the only signal was the bill. Evidence is
+# still persisted when the ceiling is hit; what gets shed is the queued
+# *model* work, which is the expensive part and the part that was producing
+# nothing.
+#
+# Deliberately per-kind rather than global: a burst of one kind must not be
+# able to starve dispatch or delivery, and shedding the right one requires
+# knowing which is flooding.
+_MAX_PENDING_PER_KIND = {
+    "attention.evaluate": 500,
+    "event.route": 2_000,
+    "knowledge.index_evidence": 5_000,
+    "knowledge.consolidate_episode": 2_000,
+}
+
+
+class QueueSaturated(RuntimeError):
+    """Raised when a job kind already has more work queued than its ceiling.
+
+    Not an error in the caller -- it means something upstream is producing
+    faster than the lane can consume, and continuing to enqueue would only
+    deepen a backlog nobody asked for.
+    """
 
 
 class JobContention(RuntimeError):
@@ -70,6 +98,14 @@ class JobQueue:
         available_at: str | None = None,
         max_attempts: int | None = None,
     ) -> dict[str, Any]:
+        ceiling = _MAX_PENDING_PER_KIND.get(kind)
+        if ceiling is not None:
+            pending = self.store.count_pending_jobs(organization_id, kind)
+            if pending >= ceiling:
+                raise QueueSaturated(
+                    f"{kind} already has {pending} jobs pending (ceiling {ceiling}); "
+                    "shedding rather than deepening the backlog"
+                )
         now = utcnow().isoformat()
         job = {
             "id": new_id("hjob"),
@@ -127,10 +163,15 @@ class JobQueue:
         error: str,
         *,
         retry_in_seconds: float | None = None,
+        permanent: bool = False,
     ) -> dict[str, Any] | None:
+        """`permanent=True` dead-letters immediately, whatever the attempt
+        ceiling says. An invalid prompt, a rejected schema or a malformed
+        request does not become valid by being sent again, and retrying it
+        costs a full model round trip per lap."""
         attempts = int(job.get("attempts", 0))
         max_attempts = int(job.get("max_attempts", self.max_attempts))
-        if attempts >= max_attempts:
+        if permanent or attempts >= max_attempts:
             return self.store.finish_harness_job(
                 job["id"],
                 status="dead_letter",

@@ -132,3 +132,99 @@ def test_explicit_policy_on_event_is_respected_as_is() -> None:
     assert policy.memory_policy == "immediate"
     assert policy.group_key == "custom:1"
     assert policy.group_kind == "custom"
+
+
+def _connector_event(*, occurred_at, raw=None, slug="GITHUB_PULL_REQUEST_CREATED"):
+    from toda.harness.models import EventActor, EventScope, NormalizedEvent
+
+    return NormalizedEvent(
+        id="ev_test",
+        organization_id="org_acme",
+        source="composio:github",
+        type="composio.github_pull_request_created",
+        occurred_at=occurred_at,
+        actor=EventActor(id="connector:x", source_id="x", type="service"),
+        scope=EventScope(workspace_id="", channel_id="", visibility="organization_public",
+                         scope_id="scope_org_public"),
+        payload={"toolkit": "github", "trigger_slug": slug, "raw_data": raw or {}},
+        dedupe_key="ev_test",
+    )
+
+
+_COMPOSIO_PR = {
+    # The shape Composio actually sends: flat, repository_url not repository.
+    "number": 681,
+    "pr_id": 2938471,
+    "repository_url": "https://api.github.com/repos/acme/export-worker",
+    "html_url": "https://github.com/acme/export-worker/pull/681",
+    "title": "Fix retry storm",
+    "author_login": "ajay",
+}
+
+
+def test_composio_github_payloads_produce_a_group_key():
+    """`_github_object` looked for `repository`; Composio sends
+    `repository_url`. Every real GitHub event therefore returned None, fell
+    through to evidence_only, and was never extracted into a memory --
+    measured live as 1,229 events producing 4,421 chunks and zero facts."""
+    from toda.harness.event_policy import _github_object
+
+    assert _github_object(_COMPOSIO_PR) == (
+        "github_pr:acme/export-worker#681",
+        "github_pr",
+    )
+    # The older nested webhook shape still works.
+    assert _github_object(
+        {"repository": {"full_name": "acme/x"}, "number": 4, "pull_request": {"number": 4}}
+    ) == ("github_pr:acme/x#4", "github_pr")
+    # An issue is distinguished by the absence of PR markers.
+    assert _github_object(
+        {"repository_url": "https://api.github.com/repos/acme/x", "number": 9,
+         "html_url": "https://github.com/acme/x/issues/9"}
+    ) == ("github_issue:acme/x#9", "github_issue")
+
+
+def test_historical_connector_events_never_reach_the_classifier():
+    """A poll trigger's first run emits the account's whole history as
+    "new". One GitHub trigger produced 6,525 events in under an hour, each
+    routed to a ~5.8s model call to decide not to interrupt anyone."""
+    from datetime import datetime, timedelta, timezone
+
+    from toda.harness.event_policy import resolve_event_policy
+
+    now = datetime.now(timezone.utc)
+    old = resolve_event_policy(
+        _connector_event(occurred_at=now - timedelta(days=400), raw=_COMPOSIO_PR)
+    )
+    assert old.wake_policy == "never"
+    # Still remembered and searchable -- only the model call is skipped.
+    assert old.memory_policy == "episode"
+    assert old.group_key == "github_pr:acme/export-worker#681"
+
+    fresh = resolve_event_policy(
+        _connector_event(occurred_at=now - timedelta(minutes=5), raw=_COMPOSIO_PR)
+    )
+    assert fresh.wake_policy == "attention"
+
+
+def test_slack_is_unaffected_by_the_connector_age_cutoff():
+    """The cutoff is about connector backfills. Slack has no equivalent
+    flood and must keep its ambient attention behaviour."""
+    from datetime import datetime, timedelta, timezone
+
+    from toda.harness.event_policy import resolve_event_policy
+    from toda.harness.models import EventActor, EventScope, NormalizedEvent
+
+    event = NormalizedEvent(
+        id="ev_slack_old",
+        organization_id="org_acme",
+        source="slack",
+        type="slack.channel_message",
+        occurred_at=datetime.now(timezone.utc) - timedelta(days=30),
+        actor=EventActor(id="person_ajay", source_id="U1", type="person"),
+        scope=EventScope(workspace_id="T1", channel_id="C1",
+                         visibility="organization_public", scope_id="scope_org_public"),
+        payload={"text": "hi", "conversation_key": "slack:T1:C1"},
+        dedupe_key="ev_slack_old",
+    )
+    assert resolve_event_policy(event).wake_policy == "attention"

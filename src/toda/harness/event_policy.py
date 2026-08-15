@@ -16,6 +16,7 @@ with real per-object semantics) can set these fields directly on the
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from toda.harness.models import NormalizedEvent
@@ -26,12 +27,35 @@ from toda.harness.models import NormalizedEvent
 # not listed (or that doesn't match) falls back to evidence_only rather
 # than guessing at a group (plan §5 Phase C: "a missing or ambiguous group
 # key should fall back to evidence-only processing").
+def _repo_from_url(value: Any) -> str | None:
+    """"https://api.github.com/repos/acme/export-worker" -> "acme/export-worker"."""
+    text = str(value or "")
+    marker = "/repos/"
+    if marker not in text:
+        return None
+    slug = text.split(marker, 1)[1].strip("/")
+    parts = slug.split("/")
+    return "/".join(parts[:2]) if len(parts) >= 2 else None
+
+
 def _github_object(data: dict[str, Any]) -> tuple[str, str] | None:
     # Composio/toolkit payload shapes are inconsistent about whether
-    # `repository` is a nested object or already a "owner/repo" string —
-    # tolerate both rather than assuming the richer GitHub webhook shape.
+    # `repository` is a nested object, already an "owner/repo" string, or --
+    # as Composio's own GitHub triggers actually send -- absent entirely in
+    # favour of `repository_url`. Only the first two were handled, so every
+    # real Composio GitHub event returned None here, fell through to
+    # `evidence_only`, and was never extracted into a memory. Measured
+    # live: 1,229 pull-request events produced 4,421 searchable chunks and
+    # zero facts, because this function could not name the object they all
+    # belonged to.
     repository = data.get("repository")
-    repo = repository.get("full_name") if isinstance(repository, dict) else repository
+    repo = (
+        repository.get("full_name")
+        if isinstance(repository, dict)
+        else repository
+        or _repo_from_url(data.get("repository_url"))
+        or _repo_from_url(data.get("html_url"))
+    )
     pr = data.get("pull_request")
     pr = pr if isinstance(pr, dict) else {}
     issue = data.get("issue")
@@ -39,7 +63,15 @@ def _github_object(data: dict[str, Any]) -> tuple[str, str] | None:
     number = data.get("number") or pr.get("number") or issue.get("number")
     if not repo or not number:
         return None
-    kind = "github_pr" if pr else "github_issue"
+    # Composio flattens the object rather than nesting it, so `pull_request`
+    # is absent even for a PR event -- `pr_id` and the /pull/ URL are what
+    # actually distinguish one from an issue.
+    is_pr = bool(
+        pr
+        or data.get("pr_id")
+        or "/pull/" in str(data.get("html_url") or "")
+    )
+    kind = "github_pr" if is_pr else "github_issue"
     return f"{kind}:{repo}#{number}", kind
 
 
@@ -62,6 +94,20 @@ _CONNECTOR_OBJECT_KEYS = {
 # wake, matching the plan's "security, billing or failure alert" row.
 _ALERT_TRIGGER_HINTS = ("alert", "failure", "failed", "incident", "security", "billing", "payment")
 
+# How recent a connector event must be to be worth a model call.
+#
+# A poll trigger's first run has seen nothing, so every object in the
+# account's history arrives at once as "new". Measured live: enabling one
+# GitHub PR trigger produced 6,525 events in under an hour, each one routed
+# to the attention classifier at ~5.8s a call, to decide 6,000 times not to
+# interrupt anyone. Nothing about a pull request from 2023 is news.
+#
+# Older events are still persisted, chunked, embedded and searchable -- only
+# the model call is skipped. Deliberately age-based rather than
+# connector-based: it bounds every backfill, including ones from connectors
+# that do not exist yet, while a genuinely live event still gets attention.
+_CONNECTOR_ATTENTION_MAX_AGE_SECONDS = 6 * 60 * 60
+
 
 class EventPolicy:
     __slots__ = ("wake_policy", "memory_policy", "group_key", "group_kind")
@@ -78,6 +124,17 @@ class EventPolicy:
         self.memory_policy = memory_policy
         self.group_key = group_key
         self.group_kind = group_kind
+
+
+def _is_historical(event: NormalizedEvent) -> bool:
+    """True when this event is old enough to be history rather than news."""
+    occurred = event.occurred_at
+    if occurred is None:
+        return False
+    if occurred.tzinfo is None:
+        occurred = occurred.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - occurred).total_seconds()
+    return age > _CONNECTOR_ATTENTION_MAX_AGE_SECONDS
 
 
 def resolve_event_policy(event: NormalizedEvent) -> EventPolicy:
@@ -126,10 +183,20 @@ def resolve_event_policy(event: NormalizedEvent) -> EventPolicy:
             )
         if object_key:
             group_key, group_kind = object_key
-            return EventPolicy(wake_policy="attention", memory_policy="episode", group_key=group_key, group_kind=group_kind)
+            return EventPolicy(
+                wake_policy="never" if _is_historical(event) else "attention",
+                memory_policy="episode",
+                group_key=group_key,
+                group_kind=group_kind,
+            )
         # No stable per-object identifier for this toolkit/payload shape —
         # stay evidence-only rather than batching unrelated events together.
-        return EventPolicy(wake_policy="attention", memory_policy="evidence_only", group_key=None, group_kind=None)
+        return EventPolicy(
+            wake_policy="never" if _is_historical(event) else "attention",
+            memory_policy="evidence_only",
+            group_key=None,
+            group_kind=None,
+        )
 
     # Unknown/background connector noise: don't wake, don't extract, but the
     # canonical evidence row is still written and searchable.

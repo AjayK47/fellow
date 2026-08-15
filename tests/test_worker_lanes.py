@@ -152,11 +152,17 @@ def test_pump_never_leases_more_than_it_can_start(brain):
     starts while it waits for a thread -- otherwise a lease could expire
     before the job ever ran and a second worker would double-execute it."""
     worker = brain.harness_worker
-    worker.concurrency = 2
     release = threading.Event()
+    # The lane's own budget, not `concurrency` -- that is now the total
+    # split across the agent and infrastructure pools, and a pool's
+    # max_workers is fixed when it is built, so reassigning the total after
+    # construction would change what is leased without changing what can
+    # actually run.
+    capacity = worker.available_capacity(kinds=["test.block"])
+    assert capacity >= 1
 
     worker.register("test.block", lambda _payload: release.wait(timeout=10) or {})
-    for index in range(5):
+    for index in range(capacity + 3):
         brain.harness_jobs.enqueue(
             organization_id="org_acme",
             kind="test.block",
@@ -164,7 +170,7 @@ def test_pump_never_leases_more_than_it_can_start(brain):
             idempotency_key=f"pump:capacity:{index}",
         )
 
-    assert worker.pump(kinds=["test.block"])["leased"] == 2
+    assert worker.pump(kinds=["test.block"])["leased"] == capacity
     assert worker.pump(kinds=["test.block"]) == {"leased": 0, "saturated": True}
 
     release.set()
@@ -185,3 +191,42 @@ def test_draining_one_lane_never_leases_the_other_lanes_jobs(brain):
     result = worker.drain_once(kinds=worker.infrastructure_job_kinds())
 
     assert result["leased"] == 0
+
+
+def test_each_lane_has_its_own_capacity(brain):
+    """Splitting the leases bounded head-of-line blocking inside a batch, but
+    agent and infrastructure jobs still shared one pool -- so a burst of long
+    agent runs could occupy every slot and leave routing and delivery with
+    nowhere to run. Capacity has to be partitioned, not just leases."""
+    worker = brain.harness_worker
+    agent = worker.agent_job_kinds()
+    infra = worker.infrastructure_job_kinds()
+    knowledge = worker.knowledge_job_kinds()
+
+    assert worker._pool_for(agent) is not worker._pool_for(infra)
+    assert worker._pool_for(knowledge) is not worker._pool_for(infra)
+    assert worker._pool_for(knowledge) is not worker._pool_for(agent)
+
+    # Saturating one lane must not reduce another's free capacity.
+    infra_before = worker.available_capacity(kinds=infra)
+    knowledge_before = worker.available_capacity(kinds=knowledge)
+    released = threading.Event()
+    try:
+        for _ in range(worker.available_capacity(kinds=agent)):
+            worker._agent_inflight.add(
+                worker._agent_pool.submit(released.wait)
+            )
+        assert worker.available_capacity(kinds=agent) == 0
+        assert worker.available_capacity(kinds=infra) == infra_before
+        assert worker.available_capacity(kinds=knowledge) == knowledge_before
+    finally:
+        released.set()
+
+
+def test_lane_capacity_splits_the_configured_budget():
+    from toda.harness.worker import _agent_share
+
+    for concurrency in (4, 8, 30):
+        agent = _agent_share(concurrency)
+        assert 1 <= agent < concurrency
+        assert concurrency - agent >= 1

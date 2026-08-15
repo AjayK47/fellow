@@ -87,3 +87,110 @@ def test_worker_routes_a_contention_exception_to_the_fast_retry(brain):
     by_kind = {job["kind"]: job["id"] for job in leased}
     assert _retry_delay_seconds(brain, by_kind["test.contended"], failed_at=now) <= 2.0
     assert _retry_delay_seconds(brain, by_kind["test.broken"], failed_at=now) > 200.0
+
+
+def test_a_flooding_job_kind_is_shed_rather_than_queued_without_limit(brain):
+    """Nothing bounded the queue, so one connector trigger's first poll
+    enqueued 6,200 jobs -- ~900 of them a model call each -- and the only
+    signal was the bill."""
+    import pytest
+
+    from toda.harness.jobs import QueueSaturated, _MAX_PENDING_PER_KIND
+
+    ceiling = _MAX_PENDING_PER_KIND["attention.evaluate"]
+    for index in range(ceiling):
+        brain.harness_jobs.enqueue(
+            organization_id="org_acme",
+            kind="attention.evaluate",
+            payload={"event": {"id": f"e{index}"}},
+            idempotency_key=f"attention:flood:{index}",
+        )
+    with pytest.raises(QueueSaturated) as excinfo:
+        brain.harness_jobs.enqueue(
+            organization_id="org_acme",
+            kind="attention.evaluate",
+            payload={"event": {"id": "one_too_many"}},
+            idempotency_key="attention:flood:overflow",
+        )
+    assert "attention.evaluate" in str(excinfo.value)
+
+    # A different kind is unaffected: the ceiling is per-kind precisely so a
+    # burst of one cannot starve dispatch or delivery.
+    assert brain.harness_jobs.enqueue(
+        organization_id="org_acme",
+        kind="delivery.send",
+        payload={"task_id": "t1"},
+        idempotency_key="delivery.send:t1",
+    )
+
+
+def test_routing_sheds_a_saturated_lane_instead_of_failing_the_event(brain):
+    """Evidence is persisted before the enqueue, so shedding loses only the
+    queued model work -- the event stays searchable either way."""
+    from toda.harness.jobs import QueueSaturated
+
+    def _saturated(**_kwargs):
+        raise QueueSaturated("attention.evaluate already has 500 jobs pending")
+
+    brain.event_router.queue = type(
+        "Q", (), {"enqueue": staticmethod(_saturated)}
+    )()
+    routed = brain.event_router.route(
+        {
+            "id": "ev_shed", "organization_id": "org_acme", "source": "slack",
+            "type": "slack.channel_message",
+            "actor": {"id": "person_ajay", "type": "person"},
+            "scope": {"workspace_id": "T1", "channel_id": "C1",
+                      "visibility": "organization_public", "scope_id": "scope_org_public"},
+            "payload": {"text": "ambient chatter", "conversation_key": "slack:T1:C1"},
+            "dedupe_key": "ev_shed",
+        }
+    )
+    assert routed["shed"] is True
+    assert routed["source_id"], "the evidence row must still exist"
+    assert any(
+        e["event_type"] == "queue.saturated"
+        for e in brain.store.list_audit("org_acme", "queue.saturated")
+    )
+
+
+def test_a_permanent_provider_rejection_is_not_retried(brain):
+    """`session.dispatch` allows 100 attempts because contention is normal.
+    Applied to a request the provider rejects outright, that meant one
+    poisoned transcript re-ran the whole discovery sequence a hundred times
+    -- observed live as a Task that kept searching HubSpot, describing the
+    same action and 400ing, for minutes, at full model cost per lap."""
+    worker = brain.harness_worker
+
+    def _invalid_prompt(_payload):
+        raise RuntimeError(
+            "concentrate 400 for model gemini-3.7-flash: "
+            '{"error":{"code":"invalid_prompt","message":"rejected the request"}}'
+        )
+
+    worker.register("test.permanent", _invalid_prompt)
+    job = brain.harness_jobs.enqueue(
+        organization_id="org_acme", kind="test.permanent",
+        payload={}, idempotency_key="permanent:1",
+    )
+    result = worker._process_job({**job, "attempts": 0})
+    assert result.get("permanent") is True
+    assert brain.store.get_harness_job(job["id"])["status"] == "dead_letter"
+
+
+def test_a_transient_failure_still_retries(brain):
+    """The distinction has to hold in both directions -- dead-lettering a
+    rate limit would lose real work."""
+    worker = brain.harness_worker
+
+    def _rate_limited(_payload):
+        raise RuntimeError("429 rate limit exceeded, retry shortly")
+
+    worker.register("test.transient", _rate_limited)
+    job = brain.harness_jobs.enqueue(
+        organization_id="org_acme", kind="test.transient",
+        payload={}, idempotency_key="transient:1",
+    )
+    result = worker._process_job({**job, "attempts": 0})
+    assert not result.get("permanent")
+    assert brain.store.get_harness_job(job["id"])["status"] == "queued"

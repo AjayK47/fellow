@@ -7,6 +7,8 @@ agent/message_sanitization.py and repair_empty_non_final_messages.
 
 from __future__ import annotations
 
+import json
+
 from toda.harness.message_sanitization import (
     INTERRUPTED_PLACEHOLDER,
     needs_reasoning_echo,
@@ -126,3 +128,39 @@ def test_a_tool_call_message_counts_as_non_empty():
     ])
     assert out[0]["content"] == ""
     assert out[1]["content"] == ""
+
+
+def test_schema_references_in_tool_output_are_neutralized():
+    """A tool that returns a JSON Schema puts `$defs`/`$ref` into the
+    transcript, and Gemini tries to *resolve* them instead of reading them
+    as data:
+
+        The referenced name `#/$defs/SearchContactsByCriteriaResponse` in
+        function_response.response does not match to a display_name
+
+    One `composio_describe` of a HubSpot action poisoned every later request
+    in that Task with a permanent 400."""
+    from toda.harness.message_sanitization import neutralize_schema_refs
+
+    described = {
+        "slug": "HUBSPOT_SEARCH_CONTACTS_BY_CRITERIA",
+        "output_parameters": {
+            "$defs": {"SearchContactsByCriteriaResponse": {"type": "object"}},
+            "properties": {"data": {"$ref": "#/$defs/SearchContactsByCriteriaResponse"}},
+        },
+    }
+    clean = neutralize_schema_refs(described)
+    flat = json.dumps(clean)
+    assert "$defs" not in flat and "$ref" not in flat
+    # The information survives -- a schema stripped of its definitions would
+    # actively mislead a model about to call the tool.
+    assert "defs_" in flat and "ref_" in flat
+    assert "SearchContactsByCriteriaResponse" in flat
+    assert clean["slug"] == "HUBSPOT_SEARCH_CONTACTS_BY_CRITERIA"
+
+
+def test_ordinary_tool_output_is_untouched():
+    from toda.harness.message_sanitization import neutralize_schema_refs
+
+    payload = {"contacts": [{"id": 1, "email": "a@b.com"}], "count": 1}
+    assert neutralize_schema_refs(payload) == payload

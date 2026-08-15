@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from toda.domain.models import new_id
 from toda.harness.jobs import _CONTENTION_RETRY_SECONDS, JobContention
-from toda.harness.retry import is_retryable_task_error
+from toda.harness.retry import is_permanent_task_error, is_retryable_task_error
 from toda.harness.task_run_store import TaskRunStore
 
 # Job kinds that drive a full agent reasoning loop and can legitimately run
@@ -47,6 +47,17 @@ KNOWLEDGE_JOB_KINDS = (
 )
 
 
+def _agent_share(concurrency: int) -> int:
+    """How much of the main budget the agent lane gets by default.
+
+    Two thirds. Agent jobs are the slow ones and there are usually more of
+    them wanting to run at once, while the infrastructure lane only needs
+    enough headroom to stay responsive -- its jobs finish in well under a
+    second, so a handful of slots absorbs a large arrival rate.
+    """
+    return max(1, (concurrency * 2) // 3)
+
+
 class HarnessWorker:
     """Process only infrastructure jobs and Task-native execution jobs.
 
@@ -69,6 +80,7 @@ class HarnessWorker:
         profiles: Any | None = None,
         batch_size: int = 20,
         concurrency: int = 4,
+        agent_concurrency: int | None = None,
         knowledge_concurrency: int = 4,
         worker_id: str | None = None,
         store: Any,
@@ -89,20 +101,30 @@ class HarnessWorker:
         self.knowledge_concurrency = max(1, knowledge_concurrency)
         self.worker_id = worker_id or new_id("worker")
         self.store = store
-        # One long-lived pool shared by the agent and infra lanes, instead
-        # of building and tearing one down per batch. `pump()` (below) is
-        # what the live loops use: it keeps the pool topped up without ever
-        # waiting on the slowest job in a batch. Knowledge jobs get their
-        # own, smaller pool (see KNOWLEDGE_JOB_KINDS above) so they can
-        # never crowd out event routing / dispatch / delivery.
+        # Three lanes, three pools. `pump()` (below) keeps each topped up
+        # without ever waiting on the slowest job in a batch.
+        #
+        # The agent lane used to share the infrastructure pool: separating
+        # the *leases* bounded head-of-line blocking within a batch, but a
+        # burst of long agent runs could still occupy every slot in the
+        # shared pool and leave event routing and delivery with nowhere to
+        # run -- the same starvation the split was introduced to prevent,
+        # one level down. Capacity has to be partitioned, not just leases.
+        self._agent_concurrency = max(1, agent_concurrency or _agent_share(self.concurrency))
+        self._infra_concurrency = max(1, self.concurrency - self._agent_concurrency)
         self._pool = ThreadPoolExecutor(
-            max_workers=self.concurrency, thread_name_prefix="toda-job"
+            max_workers=self._infra_concurrency, thread_name_prefix="toda-job"
+        )
+        self._agent_pool = ThreadPoolExecutor(
+            max_workers=self._agent_concurrency, thread_name_prefix="toda-agent"
         )
         self._knowledge_pool = ThreadPoolExecutor(
             max_workers=self.knowledge_concurrency, thread_name_prefix="toda-knowledge"
         )
         self._inflight: set[Future[dict[str, Any]]] = set()
         self._inflight_lock = threading.Lock()
+        self._agent_inflight: set[Future[dict[str, Any]]] = set()
+        self._agent_inflight_lock = threading.Lock()
         self._knowledge_inflight: set[Future[dict[str, Any]]] = set()
         self._knowledge_inflight_lock = threading.Lock()
         self.task_agent_factory = task_agent_factory
@@ -178,18 +200,40 @@ class HarnessWorker:
     def _is_knowledge_lane(self, kinds: list[str] | None) -> bool:
         return bool(kinds) and all(kind in KNOWLEDGE_JOB_KINDS for kind in kinds)
 
+    def _is_agent_lane(self, kinds: list[str] | None) -> bool:
+        return bool(kinds) and all(kind in AGENT_JOB_KINDS for kind in kinds)
+
+    def _lane(
+        self, kinds: list[str] | None
+    ) -> tuple[ThreadPoolExecutor, set[Future[dict[str, Any]]], threading.Lock, int]:
+        """The pool, inflight set, lock and capacity serving `kinds`."""
+        if self._is_knowledge_lane(kinds):
+            return (
+                self._knowledge_pool,
+                self._knowledge_inflight,
+                self._knowledge_inflight_lock,
+                self.knowledge_concurrency,
+            )
+        if self._is_agent_lane(kinds):
+            return (
+                self._agent_pool,
+                self._agent_inflight,
+                self._agent_inflight_lock,
+                self._agent_concurrency,
+            )
+        return self._pool, self._inflight, self._inflight_lock, self._infra_concurrency
+
     def _pool_for(self, kinds: list[str] | None) -> ThreadPoolExecutor:
-        return self._knowledge_pool if self._is_knowledge_lane(kinds) else self._pool
+        return self._lane(kinds)[0]
 
     def available_capacity(self, *, kinds: list[str] | None = None) -> int:
         """Free slots in the pool that would serve `kinds` right now."""
-        if self._is_knowledge_lane(kinds):
-            with self._knowledge_inflight_lock:
-                self._knowledge_inflight = {f for f in self._knowledge_inflight if not f.done()}
-                return max(0, self.knowledge_concurrency - len(self._knowledge_inflight))
-        with self._inflight_lock:
-            self._inflight = {f for f in self._inflight if not f.done()}
-            return max(0, self.concurrency - len(self._inflight))
+        _pool, inflight, lock, capacity = self._lane(kinds)
+        with lock:
+            live = {future for future in inflight if not future.done()}
+            inflight.clear()
+            inflight.update(live)
+            return max(0, capacity - len(live))
 
     def pump(self, *, kinds: list[str] | None = None) -> dict[str, Any]:
         """Lease up to the currently free capacity and start those jobs
@@ -216,12 +260,7 @@ class HarnessWorker:
             worker_id=self.worker_id, limit=capacity, kinds=kinds
         )
         if jobs:
-            pool = self._pool_for(kinds)
-            inflight, lock = (
-                (self._knowledge_inflight, self._knowledge_inflight_lock)
-                if self._is_knowledge_lane(kinds)
-                else (self._inflight, self._inflight_lock)
-            )
+            pool, inflight, lock, _capacity = self._lane(kinds)
             with lock:
                 for job in jobs:
                     inflight.add(pool.submit(self._process_job, job))
@@ -247,9 +286,10 @@ class HarnessWorker:
         }
 
     def close(self) -> None:
-        """Stop both pools. In-flight jobs are allowed to finish so a
+        """Stop all three pools. In-flight jobs are allowed to finish so a
         shutdown never abandons a leased job mid-execution."""
         self._pool.shutdown(wait=True)
+        self._agent_pool.shutdown(wait=True)
         self._knowledge_pool.shutdown(wait=True)
 
     def _process_job(self, job: dict[str, Any]) -> dict[str, Any]:
@@ -270,6 +310,21 @@ class HarnessWorker:
             self.queue.fail(job, str(exc), retry_in_seconds=_CONTENTION_RETRY_SECONDS)
             return {"job_id": job["id"], "kind": job["kind"], "error": str(exc)}
         except Exception as exc:
+            # A permanent failure must not be retried. `session.dispatch`
+            # allows 100 attempts because contention is normal, but that
+            # ceiling applied to a provider rejecting the request outright
+            # meant one poisoned transcript re-ran the whole discovery
+            # sequence a hundred times -- observed live as a Task that kept
+            # searching HubSpot, describing the same action and 400ing, for
+            # minutes, at full model cost per lap.
+            #
+            # Nothing about an invalid prompt resolves by sending it again.
+            if is_permanent_task_error(str(exc)):
+                self.queue.fail(job, str(exc), permanent=True)
+                return {
+                    "job_id": job["id"], "kind": job["kind"],
+                    "error": str(exc), "permanent": True,
+                }
             self.queue.fail(job, str(exc))
             return {"job_id": job["id"], "kind": job["kind"], "error": str(exc)}
 

@@ -453,6 +453,9 @@ class AttentionPipeline:
             },
             trigger_kind="proactive",
             purpose="proactive_attention",
+            # An ambient platform event: the actor spoke in the room, which
+            # the platform authorized before we saw it.
+            may_join=True,
         )
 
     def _update_conversation_state(self, event: NormalizedEvent) -> dict[str, Any]:

@@ -257,6 +257,66 @@ class ComposioClient:
             body={"toolkit": {"slug": toolkit}, "auth_config": auth_config},
         )
 
+    @staticmethod
+    def _auth_config_id(payload: dict[str, Any]) -> str | None:
+        """Pull the id out of a create-auth-config response.
+
+        Composio has returned this at several nestings, and reading only the
+        top-level `id`/`auth_config_id` meant a successful creation looked
+        like a failure: the config was created on their side, we raised
+        "Composio did not return an auth config id", and the user saw a
+        broken connect dialog for an app that was now half set up. Confirmed
+        against a real HubSpot attempt, which left an ENABLED config with
+        zero connections behind.
+        """
+        for candidate in (
+            payload.get("id"),
+            payload.get("auth_config_id"),
+            (payload.get("auth_config") or {}).get("id"),
+            (payload.get("data") or {}).get("id"),
+            ((payload.get("data") or {}).get("auth_config") or {}).get("id"),
+        ):
+            if candidate:
+                return str(candidate)
+        return None
+
+    def ensure_auth_config(self, *, toolkit: str) -> str:
+        """Find or create this toolkit's auth config and return its id.
+
+        One implementation, because there were two -- the console's connect
+        route and the agent's `request_app_connection` tool each had their
+        own copy of find-then-create-then-read, which is how they were both
+        wrong in the same way at once.
+        """
+        existing = self.list_auth_configs(toolkit=toolkit)
+        for item in existing.get("items") or []:
+            item_toolkit = item.get("toolkit")
+            slug = (
+                item_toolkit.get("slug")
+                if isinstance(item_toolkit, dict)
+                else item_toolkit
+            )
+            # Never accept another toolkit's config just because it came
+            # back first -- that would hand the user an OAuth link for the
+            # wrong application.
+            if not slug or str(slug).lower() == toolkit.lower():
+                if item.get("id"):
+                    return str(item["id"])
+        created = self.create_auth_config(toolkit=toolkit)
+        auth_config_id = self._auth_config_id(created)
+        if auth_config_id:
+            return auth_config_id
+        # Creation may have succeeded server-side even when the response is
+        # unreadable, so look again before giving up -- and if it really did
+        # fail, say what came back instead of only that something was absent.
+        for item in (self.list_auth_configs(toolkit=toolkit).get("items") or []):
+            if item.get("id"):
+                return str(item["id"])
+        raise RuntimeError(
+            "Composio did not return an auth config id for "
+            f"{toolkit!r}; response keys were {sorted(created)!r}"
+        )
+
     def list_toolkits(
         self,
         *,
@@ -400,6 +460,112 @@ class ComposioClient:
         return self._request(
             "DELETE", f"trigger_instances/manage/{trigger_id}"
         )
+
+    def subscribe_all_triggers(
+        self,
+        *,
+        toolkit: str,
+        connected_account_id: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Subscribe a freshly connected account to every trigger its
+        toolkit offers.
+
+        Connecting an app and receiving events from it are separate objects
+        in Composio, and nothing linked them: an organization could connect
+        HubSpot, watch Toda answer questions about it, and never learn that
+        it would not hear about a new contact unless someone POSTed to an
+        undocumented route. Trigger lifecycle now follows connection
+        lifecycle.
+
+        Only *webhook* triggers, and only those needing no configuration.
+        Both exclusions are deliberate and both are reported rather than
+        silently dropped. Note that today this subscribes to nothing on
+        GitHub, Gmail or HubSpot -- every no-config trigger they offer is a
+        poll, and every webhook they offer needs configuration. That is a
+        correct fail-closed outcome, not a bug: automatic subscription
+        should never be able to start a firehose.
+        """
+        subscribed: list[str] = []
+        needs_config: list[dict[str, str]] = []
+        skipped_poll: list[str] = []
+        for item in (self.list_trigger_types(toolkit=toolkit).get("items") or []):
+            slug = item.get("slug")
+            if not slug:
+                continue
+            # `type` and `config` are already on the list item, so asking
+            # again per slug was 46 pointless HTTP round trips per GitHub
+            # connect -- visible in the gateway log as a wall of
+            # triggers_types/... GETs before a single subscription happened.
+            detail = item
+            # Webhook triggers only. A poll trigger's first run has seen
+            # nothing, so it emits the account's entire history as "new" --
+            # enabling one GitHub PR poll produced 6,525 events in under an
+            # hour, every one of them billed. Webhooks only fire on things
+            # that genuinely happen after subscription, which is the whole
+            # point of subscribing automatically.
+            if str(detail.get("type") or "").lower() != "webhook":
+                skipped_poll.append(str(slug))
+                continue
+            # Anything needing configuration Toda cannot invent (a repo to
+            # watch, a HubSpot developer app) is a human decision, not an
+            # automatic one.
+            if (detail.get("config") or {}).get("required"):
+                needs_config.append({"slug": str(slug), "error": "requires configuration"})
+                continue
+            try:
+                # `trigger_instances/{slug}/upsert` is idempotent, so a
+                # re-sync of an already-connected account is a no-op rather
+                # than a duplicate subscription.
+                self.create_trigger(
+                    slug=str(slug),
+                    connected_account_id=connected_account_id,
+                    user_id=user_id,
+                )
+                subscribed.append(str(slug))
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                needs_config.append({"slug": str(slug), "error": str(exc)[:200]})
+        return {
+            "toolkit": toolkit,
+            "connected_account_id": connected_account_id,
+            "subscribed": subscribed,
+            "needs_config": needs_config,
+            "skipped_poll": skipped_poll,
+        }
+
+    def unsubscribe_all_triggers(
+        self, *, connected_account_id: str
+    ) -> dict[str, Any]:
+        """Remove every trigger instance belonging to one connected account.
+
+        The counterpart to subscribe_all_triggers. Without it, disconnecting
+        an app leaves its triggers live on Composio's side, still delivering
+        events for a connection the organization believes it has removed --
+        the same add-only shape that made Slack channel membership
+        irrevocable.
+        """
+        removed: list[str] = []
+        failed: list[dict[str, str]] = []
+        try:
+            active = self.list_active_triggers(
+                connected_account_ids=[connected_account_id]
+            ).get("items") or []
+        except Exception as exc:  # noqa: BLE001
+            return {"removed": [], "failed": [{"slug": "*", "error": str(exc)[:200]}]}
+        for instance in active:
+            trigger_id = instance.get("id")
+            if not trigger_id:
+                continue
+            try:
+                self.delete_trigger(str(trigger_id))
+                removed.append(str(trigger_id))
+            except Exception as exc:  # noqa: BLE001
+                failed.append({"slug": str(trigger_id), "error": str(exc)[:200]})
+        return {
+            "connected_account_id": connected_account_id,
+            "removed": removed,
+            "failed": failed,
+        }
 
     def verify_webhook(
         self,

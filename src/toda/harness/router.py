@@ -119,12 +119,26 @@ class EventRouter:
             return result
         if policy.wake_policy == "never":
             return {"route": "observed", "source_id": source["id"]}
-        job = self.queue.enqueue(
-            organization_id=event.organization_id,
-            kind="attention.evaluate",
-            payload={"event": event.model_dump(mode="json")},
-            idempotency_key=f"attention:{event.id}",
-        )
+        # The single most expensive queue in the system -- one model call
+        # per job -- so it is the one that most needs a ceiling.
+        from toda.harness.jobs import QueueSaturated
+
+        try:
+            job = self.queue.enqueue(
+                organization_id=event.organization_id,
+                kind="attention.evaluate",
+                payload={"event": event.model_dump(mode="json")},
+                idempotency_key=f"attention:{event.id}",
+            )
+        except QueueSaturated as exc:
+            log.warning("Shedding attention.evaluate: %s", exc)
+            self.audit.record(
+                event.organization_id,
+                "queue.saturated",
+                {"kind": "attention.evaluate", "event_id": event.id,
+                 "source": event.source, "detail": str(exc)},
+            )
+            return {"route": "observed", "source_id": source["id"], "shed": True}
         return {
             "route": "ambient_attention",
             "source_id": source["id"],
@@ -137,15 +151,15 @@ class EventRouter:
         """Background knowledge processing (plan §2 Phase B) — chunking,
         embedding, extraction, episode membership. Always enqueued so
         evidence stays searchable; never awaited by the caller."""
-        self.queue.enqueue(
-            organization_id=event.organization_id,
+        self._enqueue_or_shed(
+            event,
             kind="knowledge.index_evidence",
             payload={"source_id": source["id"], "memory_policy": policy.memory_policy},
             idempotency_key=f"knowledge.index_evidence:{source['id']}",
         )
         if policy.memory_policy == "episode" and policy.group_key:
-            self.queue.enqueue(
-                organization_id=event.organization_id,
+            self._enqueue_or_shed(
+                event,
                 kind="knowledge.consolidate_episode",
                 payload={
                     "organization_id": event.organization_id,
@@ -159,6 +173,32 @@ class EventRouter:
                 available_at=(
                     event.occurred_at + timedelta(seconds=self.config.worker.episode_quiet_seconds)
                 ).isoformat(),
+            )
+
+    def _enqueue_or_shed(self, event: NormalizedEvent, **kwargs: Any) -> None:
+        """Enqueue, or drop the job and say so loudly if the lane is full.
+
+        The canonical evidence row is already persisted by the time this
+        runs, so shedding costs searchability of nothing -- only the queued
+        model work is lost. That is the correct thing to lose: an unbounded
+        backlog of model calls is how one connector trigger's first poll
+        turned into 6,200 queued jobs and a bill nobody saw coming.
+        """
+        from toda.harness.jobs import QueueSaturated
+
+        try:
+            self.queue.enqueue(organization_id=event.organization_id, **kwargs)
+        except QueueSaturated as exc:
+            log.warning("Shedding %s: %s", kwargs.get("kind"), exc)
+            self.audit.record(
+                event.organization_id,
+                "queue.saturated",
+                {
+                    "kind": kwargs.get("kind"),
+                    "event_id": event.id,
+                    "source": event.source,
+                    "detail": str(exc),
+                },
             )
 
 
@@ -235,6 +275,11 @@ class EventRouter:
                 or event.actor.id,
                 "thread_ts": event.payload.get("thread_ts"),
             },
+            # Slack already enforced that this actor can post in this
+            # channel before the event reached us, so speaking here is a
+            # trustworthy claim to the conversation. No other wake path can
+            # say that -- see SessionJoinDenied.
+            may_join=True,
         )
         job = self.queue.enqueue(
             organization_id=event.organization_id,

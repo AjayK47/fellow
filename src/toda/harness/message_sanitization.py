@@ -81,6 +81,46 @@ def needs_reasoning_echo(provider: Any, model: Any, base_url: Any) -> bool:
     return reasoning_echo_family(provider, model, base_url) is not None
 
 
+# JSON-Schema keywords that a provider will try to *resolve* when they
+# appear inside a tool result, rather than treating them as the data they
+# are. Gemini via ai-studio rejects the whole request:
+#
+#   The referenced name `#/$defs/SearchContactsByCriteriaResponse` in
+#   function_response.response does not match to a display_name in the
+#   function_response.parts.
+#
+# Any tool that returns a schema hits this -- `composio_describe`,
+# COMPOSIO_GET_TOOL_SCHEMAS, MCP tool listings. Observed live: one
+# `composio_describe` of a HubSpot action poisoned every subsequent request
+# in the Task with a permanent 400, and because the retry re-ran discovery
+# from the top it reproduced the same 400 on every attempt.
+_SCHEMA_REF_KEYS = ("$defs", "$ref", "$schema", "$id")
+
+
+def neutralize_schema_refs(value: Any) -> Any:
+    """Rename JSON-Schema reference keys inside tool output so a provider
+    reads them as data instead of trying to resolve them.
+
+    The model still sees the full structure and the same information -- only
+    the sigil changes, so `$ref` becomes `ref_`. Deliberately done to the
+    *content* rather than by dropping the keys: a tool schema without its
+    definitions is actively misleading to a model about to call it.
+    """
+    if isinstance(value, dict):
+        return {
+            (f"{key[1:]}_" if key in _SCHEMA_REF_KEYS else key): neutralize_schema_refs(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [neutralize_schema_refs(item) for item in value]
+    if isinstance(value, str) and "#/$" in value:
+        # The pointer STRING is what the provider actually quotes back:
+        #   The referenced name `#/$defs/SearchContactsByCriteriaResponse` ...
+        # so renaming only the key left the payload just as poisonous.
+        return value.replace("#/$", "#/")
+    return value
+
+
 def repair_empty_non_final_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Heal empty-content messages that are not the final turn.
 
