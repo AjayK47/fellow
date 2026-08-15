@@ -58,3 +58,9 @@ IMPLEMENTATION_STATUS.md
 CLAUDE.md
 .claude/
 .commandcode/
+
+# Eval corpora and results. The generator, cases and scorers are tracked;
+# the generated organization and every run's scores are not -- corpora are
+# model-written and large, and results are per-machine.
+evals/data/
+evals/results/

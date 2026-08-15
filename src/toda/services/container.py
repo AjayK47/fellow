@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 import json
 
-from toda.config import settings
+from toda.config import Settings, settings as _module_settings
 from toda.domain.models import new_id
 from toda.services.audit import AuditService
 from toda.services.authorization import AuthorizationService
@@ -68,14 +69,30 @@ from toda.harness.task_run_store import TaskRunStore
 
 
 class TodaApp:
-    def __init__(self, db_path: Path | str | None = None) -> None:
-        path = Path(db_path) if db_path else settings.storage.db_path
+    def __init__(
+        self,
+        db_path: Path | str | None = None,
+        *,
+        settings: Settings | None = None,
+    ) -> None:
+        """`settings` overrides the loaded config.json for this container.
+
+        Added so a caller can pin which providers are in play without
+        touching the environment or monkeypatching the module. Determinism
+        here is decided by whether ``models.assignments`` resolves, so
+        "run this offline" previously had no expressible form: the eval
+        harness and the 1,000-member benchmark both set TODA_* variables
+        that nothing reads, and made real billable embedding calls while
+        claiming not to.
+        """
+        runtime_settings = settings or _module_settings
+        path = Path(db_path) if db_path else runtime_settings.storage.db_path
         path.parent.mkdir(parents=True, exist_ok=True)
         self.store = BrainStore(path)
         self.audit = AuditService(self.store)
         self.graph = GraphService(self.store)
         self.authz = AuthorizationService(self.store, self.audit)
-        self.embeddings = build_embedding_provider()
+        self.embeddings = build_embedding_provider(runtime_settings)
         self.indexing = IndexingService(self.store, self.embeddings)
         self.memory = MemoryService(self.store, self.graph, self.audit, indexing=self.indexing)
         self.reality = RealityEngine(
@@ -99,12 +116,12 @@ class TodaApp:
         )
         self.context = ContextService(self.store, self.retrieval, self.graph, self.audit)
         self.profiles = ProfilesService(self.store, self.retrieval, self.graph, self.audit)
-        # The one loaded configuration, not a fresh instance. This used to
-        # construct a second Settings so it would re-read the environment
-        # after the setup wizard rewrote .env mid-process; config.json is
-        # read once at import and never written at runtime, and rebuilding
-        # here would silently discard every configured value.
-        runtime_settings = settings
+        # `runtime_settings` is bound once at the top of __init__ -- either
+        # the loaded config.json or an explicit override. It used to
+        # construct a second Settings here so it would re-read the
+        # environment after the setup wizard rewrote .env mid-process;
+        # config.json is read once at import and never written at runtime,
+        # and rebuilding would silently discard every configured value.
         self.skill_packages = SkillPackageCatalog()
         self.workspaces = WorkspaceService(
             self.store, self.audit, runtime_settings.storage.workspaces
@@ -318,6 +335,7 @@ class TodaApp:
             stale_heartbeat_seconds=runtime_settings.agent.pi_stale_heartbeat_seconds,
             poll_interval_seconds=runtime_settings.agent.pi_poll_interval_seconds,
             cancel_grace_seconds=runtime_settings.agent.pi_cancel_grace_seconds,
+            action_reviewer=self.action_reviewer,
         )
         self.child_task_executor = ChildTaskExecutor(
             store=self.store,
@@ -522,6 +540,12 @@ class TodaApp:
         self.harness_worker.register(
             "connector.backfill", self._process_connector_backfill
         )
+        self.harness_worker.register(
+            "connector.subscribe_triggers", self._subscribe_connector_triggers
+        )
+        self.harness_worker.register(
+            "connector.unsubscribe_triggers", self._unsubscribe_connector_triggers
+        )
         self.harness_evaluation = HarnessEvaluationService(
             store=self.store, audit=self.audit, reality=self.reality
         )
@@ -588,6 +612,70 @@ class TodaApp:
         return self.automations.run_now(
             str(automation["id"]), str(automation["organization_id"])
         )
+
+    def _subscribe_connector_triggers(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Subscribe a newly connected account to its toolkit's triggers.
+
+        Runs as a job rather than inline in the connect request: GitHub
+        alone offers 46 trigger types, so doing this synchronously would
+        hold the HTTP response open for the whole round trip and fail the
+        connection if any one of them errored.
+        """
+        # Registering a connector account must not acquire a network
+        # dependency: an installation without Composio configured (a fresh
+        # checkout, the test suite) would otherwise enqueue a job that fails,
+        # retries and dead-letters on every connection.
+        if not self.composio.configured:
+            return {"skipped": "composio_not_configured"}
+        account = self.store.connector_account_by_external_id(
+            str(payload["connected_account_id"])
+        )
+        if not account:
+            return {"skipped": "account_not_active"}
+        result = self.composio.subscribe_all_triggers(
+            toolkit=str(account["toolkit"]),
+            connected_account_id=str(account["connected_account_id"]),
+            user_id=account.get("composio_user_id"),
+        )
+        self.audit.record(
+            account["organization_id"],
+            "connector.triggers_subscribed",
+            {
+                "toolkit": result["toolkit"],
+                "subscribed": result["subscribed"],
+                "needs_config": [item["slug"] for item in result["needs_config"]],
+            },
+            principal_id=account.get("principal_id"),
+        )
+        return result
+
+    def _unsubscribe_connector_triggers(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Tear down a disconnected account's triggers.
+
+        Without this, disconnecting leaves the triggers live on Composio's
+        side, still firing for a connection the organization believes it
+        removed.
+        """
+        if not self.composio.configured:
+            return {"skipped": "composio_not_configured"}
+        connected_account_id = str(payload["connected_account_id"])
+        result = self.composio.unsubscribe_all_triggers(
+            connected_account_id=connected_account_id
+        )
+        self.audit.record(
+            str(payload["organization_id"]),
+            "connector.triggers_unsubscribed",
+            {
+                "connected_account_id": connected_account_id,
+                "removed": len(result["removed"]),
+                "failed": [item["slug"] for item in result["failed"]],
+            },
+        )
+        return result
 
     def _process_connector_backfill(
         self, payload: dict[str, object]

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
 import statistics
 import sys
@@ -24,8 +23,12 @@ from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-os.environ["TODA_MODEL_PROVIDER"] = "deterministic"
-os.environ["TODA_EMBEDDING_PROVIDER"] = "deterministic"
+# Providers are pinned by passing Settings into TodaApp below, not by the
+# environment. These used to be TODA_MODEL_PROVIDER / TODA_EMBEDDING_PROVIDER
+# environment variables, which nothing has read since config.json became the
+# single source of configuration -- so this benchmark's "no model or network
+# calls" promise was false, and a developer with a configured embedding model
+# made 1,000 real billable calls by running it.
 
 ORG = "org_benchmark"
 
@@ -141,7 +144,12 @@ def run(*, people: int = 1_000, tasks: int = 2_000) -> dict[str, Any]:
     from toda.services.container import TodaApp
 
     with tempfile.TemporaryDirectory(prefix="toda-benchmark-") as directory:
-        app = TodaApp(db_path=Path(directory) / "organization.db")
+        from toda.config import ModelsConfig, settings as loaded
+
+        app = TodaApp(
+            db_path=Path(directory) / "organization.db",
+            settings=loaded.model_copy(update={"models": ModelsConfig()}),
+        )
         metrics: dict[str, Any] = seed(app, people=people, tasks=tasks)
 
         candidates, metrics["entity_alias_lookup"] = measure(
