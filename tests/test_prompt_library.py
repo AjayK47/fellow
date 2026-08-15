@@ -93,4 +93,10 @@ def test_untrusted_web_framing_still_wraps_content():
     assert framed.startswith('<untrusted_tool_result source="web_fetch">')
     assert prompt_library.load("untrusted_tool_result_header") in framed
     assert framed.endswith("</untrusted_tool_result>")
+    # An outbound Slack tool returns an acknowledgement of what Toda itself
+    # just sent, so there is nothing untrusted in it to frame.
     assert frame_untrusted_tool_result("slack_send_message", "hi") == "hi"
+    # A connector action is not Toda's own output, and is framed now --
+    # this used to pass through unframed because the boundary named the
+    # untrusted half rather than the trusted one.
+    assert frame_untrusted_tool_result("COMPOSIO_EXECUTE", "hi") != "hi"

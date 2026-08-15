@@ -43,3 +43,40 @@ def test_native_fts_is_limited_to_authorized_memories(brain):
         if memory.get("scope_id") == "scope_channel_leadership_private"
     ]
     assert not set(ranks).intersection(private)
+
+
+def test_display_name_lookup_never_memoizes_a_miss(brain):
+    """`_entity_name` is documented as lazy precisely so a source written
+    before a display name was known does not render as a raw `U08ABC123`
+    forever. Memoizing the miss on a service that lives for the whole
+    process reintroduced exactly that."""
+    retrieval = brain.retrieval
+    assert retrieval._entity_name("person_not_yet_known") is None
+
+    brain.graph.upsert_entity(
+        {
+            "id": "person_not_yet_known",
+            "organization_id": "org_acme",
+            "entity_type": "person",
+            "name": "Newly Resolved",
+            "aliases": [],
+            "attributes": {},
+        }
+    )
+    assert retrieval._entity_name("person_not_yet_known") == "Newly Resolved"
+
+
+def test_display_name_cache_is_bounded_and_expires():
+    from toda.services.retrieval import _LookupCache
+
+    cache = _LookupCache(ttl_seconds=0.0, max_entries=2)
+    cache.put("a", "Alpha")
+    # A zero TTL means every read is a miss, so a rename always propagates.
+    assert cache.get("a") is None
+
+    bounded = _LookupCache(ttl_seconds=300.0, max_entries=2)
+    for key in ("a", "b", "c"):
+        bounded.put(key, key.upper())
+    assert len(bounded._entries) == 2
+    assert bounded.get("a") is None
+    assert bounded.get("c") == "C"

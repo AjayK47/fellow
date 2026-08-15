@@ -134,7 +134,15 @@ def test_delivering_the_final_answer_clears_the_ack_reaction(brain, monkeypatch)
 
     brain.delivery.deliver_task(task_id)
 
-    unreact.assert_called_once_with(
+    # Both the acknowledgement and the final delivery clear the reaction:
+    # the acknowledgement normally gets there first, and the delivery keeps
+    # a safety net for a run whose acknowledgement never posted. This
+    # asserted exactly one call, which only held while
+    # deliver_acknowledgement was silently raising TypeError against the
+    # deterministic model (it passes reasoning=False, which that model did
+    # not accept). Unreacting an absent reaction is a no-op, so the second
+    # call is harmless -- the alternative is losing the safety net.
+    unreact.assert_any_call(
         channel_id="Ddeliver",
         timestamp="1700000004.000100",
         name=_ACK_REACTION,
@@ -173,7 +181,7 @@ def test_delivering_a_task_failure_also_clears_the_ack_reaction(brain, monkeypat
 
     brain.delivery.deliver_task_failure(task_id)
 
-    unreact.assert_called_once_with(
+    unreact.assert_any_call(
         channel_id="Dfailure",
         timestamp="1700000005.000100",
         name=_ACK_REACTION,

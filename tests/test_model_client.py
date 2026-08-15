@@ -367,3 +367,51 @@ def test_every_request_passes_through_the_sanitizer(monkeypatch):
         {"role": "user", "content": "still there?"},
     ])
     assert bodies[0]["messages"][1]["content"] == "[response interrupted]"
+
+
+def test_concentrate_reports_prompt_cache_hits():
+    """`input_tokens_details.cached_tokens` is how the Responses API reports
+    a prompt-cache hit. It was dropped, so there was no way to tell whether
+    the cache-friendly prompt ordering bought anything."""
+    from toda.harness.model_client import ConcentrateResponsesModelClient
+
+    client = ConcentrateResponsesModelClient.__new__(ConcentrateResponsesModelClient)
+    client.model = "gemini-3.7-flash"
+    parsed = client._parse(  # type: ignore[attr-defined]
+        {
+            "model": "gemini-3.7-flash",
+            "output": [],
+            "usage": {
+                "input_tokens": 43000,
+                "output_tokens": 120,
+                "total_tokens": 43120,
+                "input_tokens_details": {"cached_tokens": 41000},
+            },
+        }
+    )
+    assert parsed.usage["prompt_tokens"] == 43000
+    assert parsed.usage["prompt_tokens_details"]["cached_tokens"] == 41000
+
+
+def test_the_deterministic_model_implements_the_whole_protocol():
+    """A fresh checkout with no API key runs on this model, and both the
+    Task acknowledgement and the approval card suppress deliberation with
+    `reasoning=False`. Missing that keyword meant the no-API-key path raised
+    TypeError on exactly the two messages meant to reach a human first."""
+    import inspect
+
+    from toda.harness.model_client import DeterministicHarnessModel, ModelClient
+
+    protocol = inspect.signature(ModelClient.generate).parameters
+    concrete = inspect.signature(DeterministicHarnessModel.generate).parameters
+    missing = set(protocol) - set(concrete)
+    assert not missing, f"deterministic model is missing protocol kwargs: {missing}"
+
+    # And it actually accepts the call the delivery path makes.
+    response = DeterministicHarnessModel().generate(
+        messages=[{"role": "user", "content": "acknowledge this"}],
+        temperature=0.4,
+        max_tokens=1500,
+        reasoning=False,
+    )
+    assert response.content

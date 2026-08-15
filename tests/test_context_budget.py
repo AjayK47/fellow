@@ -91,3 +91,110 @@ def test_oversized_fixed_request_leaves_no_retrieval_budget():
         configured_context_budget=200_000,
     )
     assert budget == 0
+
+
+def test_root_tasks_are_not_treated_as_child_workers():
+    """The context-shrink retry, the child-context skip and the Slack
+    history load all branch on "is this a delegated specialist".
+
+    That predicate was written out inline three times, and one copy drifted
+    into `not metadata.get("worker_type")` -- "no worker type at all" rather
+    than "not a child". Every root Task carries one
+    (SessionManagerScheduler sets "session_manager", ConversationAgent sets
+    "conversation"), so the retry silently never ran for a single Slack
+    conversation and an over-budget request skipped straight to truncating
+    history. Pin the predicate itself.
+    """
+    from toda.harness.runtime import _is_child_worker
+
+    assert _is_child_worker({"worker_type": "general"})
+    assert _is_child_worker({"worker_type": "pi"})
+    assert _is_child_worker({"metadata": {"worker_type": "general"}})
+
+    assert not _is_child_worker({"worker_type": "session_manager"})
+    assert not _is_child_worker({"metadata": {"worker_type": "session_manager"}})
+    assert not _is_child_worker({"metadata": {"worker_type": "conversation"}})
+    assert not _is_child_worker({})
+
+
+def test_volatile_state_sits_after_every_cacheable_block():
+    """Prefix caching matches an exact token prefix, so one mutating value
+    early in the request invalidates everything after it.
+
+    The iteration counter, tool-call counter and clock used to live in
+    `<trusted_invocation>` at message #2 -- immediately after the system
+    prompt. That made the cacheable prefix the system prompt and nothing
+    else: measured at ~5k of a ~43k-token request. Skills, organization
+    memory and the entire company_context block were re-billed uncached on
+    every iteration of every Task.
+    """
+    import json
+
+    from toda.harness.context_budget import estimate_tokens
+    from toda.harness.prompts import build_agent_messages
+
+    def run_at(iteration: int, calls: int) -> dict:
+        return {
+            "id": "task_x", "goal": "g", "trigger_kind": "reactive",
+            "max_iterations": 50, "max_tool_calls": 100,
+            "iteration_count": iteration, "tool_call_count": calls,
+            "organization_id": "org", "session_id": "s", "metadata": {},
+            "envelope": {
+                "principal_id": "p1",
+                "destination": {"type": "dm", "id": "d"},
+                "purpose": "reactive_agent",
+                "allowed_scope_ids": ["scope_org_public"],
+            },
+        }
+
+    context = {"request_id": "r", "permission_decision_id": "d", "summary": "x" * 20_000}
+    first = build_agent_messages(run=run_at(1, 0), context=context, history=[])
+    second = build_agent_messages(run=run_at(2, 3), context=context, history=[])
+
+    shared = 0
+    for a, b in zip(first, second):
+        if json.dumps(a, sort_keys=True) != json.dumps(b, sort_keys=True):
+            break
+        shared += estimate_tokens([a])
+
+    total = estimate_tokens(first)
+    assert shared / total > 0.9, (
+        f"only {shared / total:.1%} of the request is a stable prefix; "
+        "something volatile moved ahead of a cacheable block"
+    )
+    # The one block that legitimately differs must be the last.
+    assert "<runtime_state>" in first[-1]["content"]
+    assert first[-1] != second[-1]
+
+
+def test_runtime_state_still_carries_the_clock_and_counters():
+    """Moving them must not drop them -- the model still needs to know what
+    time it is and how much budget it has spent."""
+    import json
+
+    from toda.harness.prompts import build_agent_messages
+
+    messages = build_agent_messages(
+        run={
+            "id": "t", "goal": "g", "trigger_kind": "reactive",
+            "max_iterations": 50, "max_tool_calls": 100,
+            "iteration_count": 7, "tool_call_count": 11,
+            "organization_id": "org", "session_id": "s", "metadata": {},
+            "envelope": {
+                "principal_id": "p1",
+                "destination": {"type": "dm", "id": "d"},
+                "purpose": "reactive_agent",
+                "allowed_scope_ids": [],
+            },
+        },
+        context={},
+        history=[],
+    )
+    state = json.loads(
+        messages[-1]["content"].split("<runtime_state>\n")[1].split("\n</runtime_state>")[0]
+    )
+    assert state["used_iterations"] == 7
+    assert state["used_tool_calls"] == 11
+    assert state["current_time"]["utc"]
+    # The limits stay in the stable block, since they never change.
+    assert '"max_iterations": 50' in messages[1]["content"]

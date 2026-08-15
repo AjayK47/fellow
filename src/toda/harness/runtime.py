@@ -20,6 +20,7 @@ from toda.harness.models import (
     ToolResult,
     TriggerKind,
 )
+from toda.harness.message_sanitization import neutralize_schema_refs
 from toda.harness.prompts import build_agent_messages, frame_untrusted_tool_result
 from toda.harness.task_run_store import TaskRunStore
 from toda.harness.tools import ToolExecutor
@@ -59,6 +60,31 @@ def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
     from toda.harness.context_budget import estimate_tokens
 
     return estimate_tokens(messages)
+
+
+_CHILD_WORKER_TYPES = {"general", "pi"}
+
+
+def _is_child_worker(run: dict[str, Any]) -> bool:
+    """True for a delegated specialist (general/pi), false for a root Task.
+
+    The same test was spelled out inline at three points in this file, and
+    one of them drifted: the context-shrink retry below guarded on
+    ``not metadata.get("worker_type")`` -- "no worker type at all" rather
+    than "not a child". Every root Task has one
+    (SessionManagerScheduler._root_task_metadata sets "session_manager",
+    ConversationAgent sets "conversation"), so the retry silently never ran
+    for a single Slack conversation, and an over-budget request skipped
+    straight to truncating history. One predicate, used everywhere, is what
+    stops that happening again.
+
+    Checks both the denormalized column and the metadata copy because
+    child Tasks created before the column existed only carry the latter.
+    """
+    return (
+        run.get("worker_type") in _CHILD_WORKER_TYPES
+        or (run.get("metadata") or {}).get("worker_type") in _CHILD_WORKER_TYPES
+    )
 
 
 class CompanyAgent:
@@ -447,7 +473,7 @@ class CompanyAgent:
                 preliminary_budget.remaining_for_context,
             )
 
-            if run.get("worker_type") in {"general", "pi"} or (run.get("metadata") or {}).get("worker_type") in {"general", "pi"}:
+            if _is_child_worker(run):
                 # Child Tasks already get an explicit prompt from the
                 # delegating call and do not inherit broad Session retrieval.
                 if cached_context is None:
@@ -494,9 +520,7 @@ class CompanyAgent:
                 model=model_name,
                 calibration_factor=calibration_factor,
             )
-            if not final_budget.fits and not (run.get("metadata") or {}).get(
-                "worker_type"
-            ):
+            if not final_budget.fits and not _is_child_worker(run):
                 # Retrieval is the lowest-priority input. Rebuild it using the
                 # exact remaining space before throwing away conversation
                 # history, which keeps the active Task and latest user turn
@@ -649,6 +673,24 @@ class CompanyAgent:
             # cumulative usage. This is the calibration signal for later
             # preflight estimates and remains inspectable in Task detail.
             run_metadata = dict(run.get("metadata") or {})
+            # Prompt-cache accounting. The prompt is ordered so that
+            # everything except <runtime_state> is a stable prefix across
+            # iterations (see prompts.build_agent_messages), but whether the
+            # provider actually serves that from cache is a separate
+            # question -- and one nobody could answer, because the field was
+            # parsed away. Accumulated here so a Task's own usage shows the
+            # hit rate instead of an assumption.
+            cached = int(
+                (response_usage.get("prompt_tokens_details") or {}).get(
+                    "cached_tokens"
+                )
+                or 0
+            )
+            usage["cached_prompt_tokens"] = int(
+                usage.get("cached_prompt_tokens", 0)
+            ) + cached
+            run["usage"] = usage
+            run_metadata["last_cached_prompt_tokens"] = cached
             run_metadata["last_prompt_tokens"] = response_usage.get("prompt_tokens")
             run_metadata["last_completion_tokens"] = response_usage.get(
                 "completion_tokens"
@@ -1272,10 +1314,13 @@ class CompanyAgent:
         return run
 
     def _append_tool_result(self, run: dict[str, Any], result: Any) -> None:
-        content = json.dumps(
-            result.output if result.status == "completed" else {"error": result.error},
-            default=str,
-        )
+        payload = result.output if result.status == "completed" else {"error": result.error}
+        # A tool that returns a JSON Schema puts `$defs`/`$ref` into the
+        # transcript, and some providers try to *resolve* those instead of
+        # reading them as data -- Gemini rejects the entire request. Once
+        # one such result is in the transcript every later turn fails
+        # identically, so the Task can never recover by retrying.
+        content = json.dumps(neutralize_schema_refs(payload), default=str)
         content = frame_untrusted_tool_result(result.tool_name, content)
         self.runs.add_message(
             organization_id=run["organization_id"],
@@ -1363,7 +1408,7 @@ class CompanyAgent:
 
     def _slack_conversation(self, run: dict[str, Any]) -> list[dict[str, Any]]:
         """Load previous messages from the exact Slack channel or DM."""
-        if run.get("worker_type") in {"general", "pi"} or (run.get("metadata") or {}).get("worker_type") in {"general", "pi"}:
+        if _is_child_worker(run):
             return []
         slack = (run.get("metadata") or {}).get("slack") or {}
         workspace_id = str(slack.get("workspace_id") or "")
@@ -1412,7 +1457,7 @@ class CompanyAgent:
         if metadata.get("skills_resolved"):
             return list(metadata.get("active_skills") or [])
         destination = dict(run["envelope"]["destination"])
-        if metadata.get("worker_type") in {"general", "pi"}:
+        if _is_child_worker(run):
             destination = {
                 "type": "internal_agent_session",
                 "id": run["id"],

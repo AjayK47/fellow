@@ -74,3 +74,31 @@ def test_external_apps_share_one_dynamic_composio_surface(brain):
         assert "COMPOSIO_EXECUTE" in package.body
         assert "github_get_pull_request" not in package.body
         assert "github_list_commits" not in package.body
+
+
+def test_brain_write_tools_are_not_labelled_read_capabilities():
+    """The `brain_*` fallback returned `memory.read` for the whole family,
+    writes included -- so the console, the readiness API and skill
+    capability-matching all described a state-mutating tool as read-only
+    memory access, and the mislabel additionally fed
+    `runs_without_approval()`, waiving a write on the strength of an ID
+    claiming it was a read."""
+    from toda.harness.tools import _infer_capability_id
+
+    assert _infer_capability_id("brain_search", "read") == "memory.read"
+    assert _infer_capability_id("brain_update_case", "write") == "memory.write"
+    assert _infer_capability_id("brain_anything_new", "destructive") == "memory.write"
+
+
+def test_registered_brain_tools_declare_a_capability_matching_their_risk(brain):
+    for definition in brain.tool_registry.definitions():
+        if not definition.name.startswith("brain_"):
+            continue
+        capability = definition.capability_id or ""
+        if not capability.startswith("memory."):
+            continue  # artifact.* tools declare their own, deliberately
+        expected = "memory.read" if definition.risk == "read" else "memory.write"
+        assert capability == expected, (
+            f"{definition.name} is risk={definition.risk} "
+            f"but declares capability {capability}"
+        )

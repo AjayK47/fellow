@@ -259,3 +259,143 @@ def test_blocked_emoji_are_scrubbed_before_the_real_slack_call(monkeypatch):
     # The rest of the message survives untouched, just the emoji is gone.
     assert "Time for a water break, ajay" in posted[0]["text"]
     assert "grab a glass and take a sip." in posted[0]["text"]
+
+
+def test_conversation_reply_reserves_before_sending(brain):
+    """`deliver_conversation` used to look up an existing delivery and then
+    send -- exactly the read-then-send gap `reserve_delivery` exists to
+    close, on the most frequent send in the system. Two concurrent
+    deliveries of one reply must produce one Slack message."""
+    session = brain.sessions.resolve(
+        organization_id="org_acme",
+        conversation_key="slack:C_TEST:conversation-idempotency",
+        destination={"type": "slack_channel", "id": "C_TEST", "is_private": False},
+        metadata={"slack": {"workspace_id": "T_TEST", "channel_id": "C_TEST"}},
+    )
+    message = brain.sessions.append_message(
+        organization_id="org_acme",
+        session_id=session["id"],
+        role="assistant",
+        content="A quick reply.",
+    )
+
+    sent: list[dict[str, Any]] = []
+    brain.delivery.slack.send = lambda **kwargs: (
+        sent.append(kwargs) or {"ok": True, "ts": "1.0"}
+    )
+
+    first = brain.delivery.deliver_conversation(session["id"], message["id"])
+    second = brain.delivery.deliver_conversation(session["id"], message["id"])
+
+    assert first["delivered"] is True
+    assert second["delivered"] is False
+    assert second["reason"] == "already_delivered"
+    assert len(sent) == 1
+
+
+def test_a_failed_conversation_send_releases_its_claim(brain):
+    """A transient Slack error must not lock the reply out forever."""
+    session = brain.sessions.resolve(
+        organization_id="org_acme",
+        conversation_key="slack:C_TEST:conversation-release",
+        destination={"type": "slack_channel", "id": "C_TEST", "is_private": False},
+        metadata={"slack": {"workspace_id": "T_TEST", "channel_id": "C_TEST"}},
+    )
+    message = brain.sessions.append_message(
+        organization_id="org_acme",
+        session_id=session["id"],
+        role="assistant",
+        content="A reply that fails once.",
+    )
+
+    attempts: list[dict[str, Any]] = []
+
+    def _flaky(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise RuntimeError("slack 503")
+        return {"ok": True, "ts": "1.0"}
+
+    brain.delivery.slack.send = _flaky
+    with pytest.raises(RuntimeError):
+        brain.delivery.deliver_conversation(session["id"], message["id"])
+
+    retried = brain.delivery.deliver_conversation(session["id"], message["id"])
+    assert retried["delivered"] is True
+    assert len(attempts) == 2
+
+
+def test_a_suppressed_task_records_the_skip(brain):
+    """The model posting its own message wrote no delivery row at all, so
+    the Task matched list_completed_tasks_missing_delivery() forever -- and
+    that sweep is ORDER BY completed_at LIMIT 100, so accumulated
+    suppressed Tasks permanently filled its window."""
+    brain.company_agent.model = ScriptedModelClient(
+        [ModelResponse(content="The model already said this itself.")]
+    )
+    task = brain.company_agent.create_invocation(
+        envelope=_slack_envelope(brain),
+        goal="Say it directly",
+        trigger_kind="reactive",
+        initial_message="Say it directly",
+    )
+    brain.company_agent.execute_task(task["id"])
+    record = brain.store.get_task(task["id"])
+    record["metadata"] = {**(record.get("metadata") or {}), "suppress_delivery": True}
+    brain.store.update_task(record)
+
+    sent: list[dict[str, Any]] = []
+    brain.delivery.slack.send = lambda **kwargs: (
+        sent.append(kwargs) or {"ok": True, "ts": "1.0"}
+    )
+    result = brain.delivery.deliver_task(task["id"])
+
+    assert result["delivered"] is False
+    assert result["reason"] == "suppressed"
+    assert sent == []
+    delivery = brain.store.delivery_by_idempotency_key(
+        "org_acme", f"slack.final:{task['id']}"
+    )
+    assert delivery is not None
+    assert delivery["status"] == "suppressed"
+    assert task["id"] not in {
+        item["id"]
+        for item in brain.store.list_completed_tasks_missing_delivery("org_acme")
+    }
+
+
+def test_recovery_sweep_can_actually_requeue_a_lost_delivery(brain):
+    """The sweep re-enqueued under `delivery.send:{task_id}` -- the key the
+    Task's own completion already used -- and enqueue_harness_job() dedupes
+    by returning the EXISTING terminal row, so this entire safety net
+    queued nothing and could never re-deliver anything."""
+    brain.company_agent.model = ScriptedModelClient(
+        [ModelResponse(content="An answer that never reached Slack.")]
+    )
+    task = brain.company_agent.create_invocation(
+        envelope=_slack_envelope(brain),
+        goal="Answer once",
+        trigger_kind="reactive",
+        initial_message="Answer once",
+    )
+    brain.company_agent.execute_task(task["id"])
+
+    # The Task's own completion already enqueued and finished delivery.send.
+    original = brain.harness_jobs.enqueue(
+        organization_id="org_acme",
+        kind="delivery.send",
+        payload={"task_id": task["id"]},
+        idempotency_key=f"delivery.send:{task['id']}",
+    )
+    brain.harness_jobs.complete(original["id"], {})
+
+    swept = brain.recovery_heartbeat.tick("org_acme")
+    assert task["id"] in swept["queued_delivery_task_ids"]
+    leasable = brain.harness_jobs.lease(
+        worker_id="recovery-test", kinds=["delivery.send"]
+    )
+    assert [
+        job
+        for job in leasable
+        if (job.get("payload") or {}).get("task_id") == task["id"]
+    ], "recovery must produce a job that will actually run"

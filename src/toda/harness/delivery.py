@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
@@ -98,6 +99,46 @@ what, so they can decide without knowing anything about how you work.
 """
 
 
+@dataclass(frozen=True)
+class DeliveryOwner:
+    """What a delivery belongs to.
+
+    A Task for the five task-driven sends, a Session for a conversation
+    reply. Both need the identical atomic reservation, so the reservation
+    helpers take this instead of a Task -- previously they took a Task
+    outright, which is why conversation delivery could not use them and
+    quietly kept the double-post race everywhere else had closed.
+    """
+
+    organization_id: str
+    task_id: str | None = None
+    session_id: str | None = None
+    message_id: str | None = None
+    principal_id: str | None = None
+    trace_id: str | None = None
+
+    @classmethod
+    def for_task(cls, task: dict[str, Any]) -> "DeliveryOwner":
+        return cls(
+            organization_id=task["organization_id"],
+            task_id=task["id"],
+            session_id=task.get("session_id"),
+            principal_id=(task.get("envelope") or {}).get("principal_id"),
+            trace_id=task.get("trace_id"),
+        )
+
+    @classmethod
+    def for_session_message(
+        cls, session: dict[str, Any], message_id: str
+    ) -> "DeliveryOwner":
+        return cls(
+            organization_id=session["organization_id"],
+            session_id=session["id"],
+            message_id=message_id,
+            principal_id=session.get("last_actor_principal_id"),
+        )
+
+
 class DeliveryService:
     def __init__(
         self,
@@ -143,33 +184,47 @@ class DeliveryService:
         metadata = session.get("metadata") or {}
         slack = metadata.get("slack") or {}
         idempotency_key = f"slack.conversation:{message_id}"
-        existing = self.store.delivery_by_idempotency_key(
-            session["organization_id"], idempotency_key
+        owner = DeliveryOwner.for_session_message(session, message_id)
+        # The same atomic claim every task-driven send uses. This path used
+        # to look up an existing delivery and then send, which is precisely
+        # the gap reserve_delivery() exists to close -- and it is the most
+        # frequent send in the system, so it was the likeliest place for the
+        # confirmed double-post to recur.
+        reservation = self._reserve(
+            owner=owner, kind="conversation", idempotency_key=idempotency_key
         )
-        if existing and existing.get("status") in {"completed", "dry_run"}:
-            return {"session_id": session_id, "delivered": False, "reason": "already_delivered"}
-        result = self.slack.send(
-            channel_id=slack.get("channel_id") or destination.get("id") or "",
-            text=to_slack_mrkdwn(str(message.get("content") or "")),
-            workspace_id=slack.get("workspace_id"),
-            organization_id=session["organization_id"],
+        if reservation is not None:
+            already_sent = reservation.get("status") in {"completed", "dry_run"}
+            return {
+                "session_id": session_id,
+                "delivered": False,
+                "reason": "already_delivered"
+                if already_sent
+                else "send_in_progress_elsewhere",
+                "delivery": reservation,
+            }
+        try:
+            result = self.slack.send(
+                channel_id=slack.get("channel_id") or destination.get("id") or "",
+                text=to_slack_mrkdwn(str(message.get("content") or "")),
+                workspace_id=slack.get("workspace_id"),
+                organization_id=session["organization_id"],
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            # Hand the claim back so the job's own retry can re-send rather
+            # than being locked out by this attempt's abandoned reservation.
+            self._release_reservation(
+                owner=owner, kind="conversation", idempotency_key=idempotency_key
+            )
+            raise
+        delivery = self._record(
+            owner=owner,
+            kind="conversation",
+            status="completed" if result.get("ok") else "dry_run",
+            payload={"provider_result": result},
             idempotency_key=idempotency_key,
         )
-        now = utcnow().isoformat()
-        delivery = {
-            "id": new_id("delivery"),
-            "organization_id": session["organization_id"],
-            "task_id": None,
-            "session_id": session_id,
-            "message_id": message_id,
-            "kind": "conversation",
-            "status": "completed" if result.get("ok") else "dry_run",
-            "idempotency_key": idempotency_key,
-            "provider_result": result,
-            "created_at": now,
-            "updated_at": now,
-        }
-        self.store.upsert_delivery(delivery)
         # A quick reply is Toda speaking too. This path never cleared the
         # reaction, so every greeting left an hourglass sitting on the
         # user's message forever.
@@ -235,6 +290,21 @@ class DeliveryService:
             # model's direct send AND a redundant auto-delivered final
             # answer as two separate Slack messages for one automation
             # firing.
+            #
+            # Record the skip rather than writing nothing. An absent
+            # delivery row is indistinguishable from "we never got round to
+            # it", which is exactly how these Tasks came to match
+            # list_completed_tasks_missing_delivery() forever -- and since
+            # that sweep is ORDER BY completed_at LIMIT 100, a hundred
+            # accumulated suppressed Tasks permanently filled its window and
+            # a genuinely undelivered newer answer was never even examined.
+            self._record(
+                owner=DeliveryOwner.for_task(task),
+                kind="final_answer",
+                status="suppressed",
+                payload={"reason": "model_sent_its_own_message"},
+                idempotency_key=f"slack.final:{task_id}",
+            )
             return {
                 "task_id": task_id,
                 "delivered": False,
@@ -244,7 +314,7 @@ class DeliveryService:
         self._recheck(task)
         idempotency_key = f"slack.final:{task_id}"
         reservation = self._reserve(
-            task=task, kind="final_answer", idempotency_key=idempotency_key
+            owner=DeliveryOwner.for_task(task), kind="final_answer", idempotency_key=idempotency_key
         )
         if reservation is not None:
             already_sent = reservation.get("status") in {"completed", "dry_run"}
@@ -278,11 +348,11 @@ class DeliveryService:
             # own retry can actually re-send instead of being locked out by
             # this attempt's abandoned claim.
             self._release_reservation(
-                task=task, kind="final_answer", idempotency_key=idempotency_key
+                owner=DeliveryOwner.for_task(task), kind="final_answer", idempotency_key=idempotency_key
             )
             raise
         delivery = self._record(
-            task=task,
+            owner=DeliveryOwner.for_task(task),
             kind="final_answer",
             status="completed" if result.get("ok") else "dry_run",
             payload={"provider_result": result, "text": task["final_answer"]},
@@ -331,7 +401,7 @@ class DeliveryService:
         self._recheck(task)
         idempotency_key = f"slack.failure:{task_id}"
         reservation = self._reserve(
-            task=task, kind="task_failure", idempotency_key=idempotency_key
+            owner=DeliveryOwner.for_task(task), kind="task_failure", idempotency_key=idempotency_key
         )
         if reservation is not None:
             already_sent = reservation.get("status") in {"completed", "dry_run"}
@@ -366,11 +436,11 @@ class DeliveryService:
             )
         except Exception:
             self._release_reservation(
-                task=task, kind="task_failure", idempotency_key=idempotency_key
+                owner=DeliveryOwner.for_task(task), kind="task_failure", idempotency_key=idempotency_key
             )
             raise
         delivery = self._record(
-            task=task,
+            owner=DeliveryOwner.for_task(task),
             kind="task_failure",
             status="completed" if result.get("ok") else "dry_run",
             payload={"provider_result": result, "text": text},
@@ -432,7 +502,7 @@ class DeliveryService:
         # has done its job.
         self._clear_ack(task, slack)
         delivery = self._record(
-            task=task,
+            owner=DeliveryOwner.for_task(task),
             kind="acknowledgement",
             status="completed" if result.get("ok") else "dry_run",
             payload={"provider_result": result, "text": text},
@@ -536,7 +606,7 @@ class DeliveryService:
                 organization_id=task["organization_id"],
             )
             delivery = self._record(
-                task=task,
+                owner=DeliveryOwner.for_task(task),
                 kind="status_update",
                 status="completed" if result.get("ok") else "dry_run",
                 payload={"provider_result": result, "text": text},
@@ -637,7 +707,7 @@ class DeliveryService:
             organization_id=task["organization_id"],
         )
         delivery = self._record(
-            task=task,
+            owner=DeliveryOwner.for_task(task),
             kind="approval_request",
             status="completed" if result.get("ok") else "dry_run",
             payload={
@@ -730,7 +800,7 @@ class DeliveryService:
             organization_id=task["organization_id"],
         )
         delivery = self._record(
-            task=task,
+            owner=DeliveryOwner.for_task(task),
             kind="human_question",
             status="completed" if result.get("ok") else "dry_run",
             payload={
@@ -827,8 +897,24 @@ class DeliveryService:
                     "the current destination's allowed scopes"
                 )
 
+    def _base_delivery(
+        self, owner: DeliveryOwner, *, kind: str, status: str
+    ) -> dict[str, Any]:
+        now = utcnow().isoformat()
+        return {
+            "id": new_id("delivery"),
+            "organization_id": owner.organization_id,
+            "task_id": owner.task_id,
+            "session_id": owner.session_id,
+            "message_id": owner.message_id,
+            "kind": kind,
+            "status": status,
+            "created_at": now,
+            "updated_at": now,
+        }
+
     def _reserve(
-        self, *, task: dict[str, Any], kind: str, idempotency_key: str
+        self, *, owner: DeliveryOwner, kind: str, idempotency_key: str
     ) -> dict[str, Any] | None:
         """Atomically claim this idempotency key BEFORE the real Slack
         send -- a read-then-send check (look up an existing delivery,
@@ -841,17 +927,17 @@ class DeliveryService:
         Returns None when this call won the reservation (safe to send);
         returns the existing record otherwise (already completed, or a
         concurrent/crashed attempt owns it -- either way this call must
-        not send)."""
+        not send).
+
+        Takes a DeliveryOwner rather than a Task because conversation
+        replies -- the most frequent send in the system -- have no Task to
+        key off, and that is exactly why deliver_conversation was still on
+        the unsafe read-then-send path this method exists to replace.
+        """
         now = utcnow()
         placeholder = {
-            "id": new_id("delivery"),
-            "organization_id": task["organization_id"],
-            "task_id": task["id"],
-            "kind": kind,
-            "status": "sending",
+            **self._base_delivery(owner, kind=kind, status="sending"),
             "idempotency_key": idempotency_key,
-            "created_at": now.isoformat(),
-            "updated_at": now.isoformat(),
         }
         return self.store.reserve_delivery(
             placeholder,
@@ -861,56 +947,43 @@ class DeliveryService:
         )
 
     def _release_reservation(
-        self, *, task: dict[str, Any], kind: str, idempotency_key: str
+        self, *, owner: DeliveryOwner, kind: str, idempotency_key: str
     ) -> None:
         """Mark a reservation failed so a retry can claim it. Without this,
         one transient Slack error would block that message forever."""
-        now = utcnow().isoformat()
         self.store.upsert_delivery(
             {
-                "id": new_id("delivery"),
-                "organization_id": task["organization_id"],
-                "task_id": task["id"],
-                "kind": kind,
-                "status": "failed",
+                **self._base_delivery(owner, kind=kind, status="failed"),
                 "idempotency_key": idempotency_key,
-                "created_at": now,
-                "updated_at": now,
             }
         )
 
     def _record(
         self,
         *,
-        task: dict[str, Any],
+        owner: DeliveryOwner,
         kind: str,
         status: str,
         payload: dict[str, Any],
         idempotency_key: str,
     ) -> dict[str, Any]:
-        now = utcnow().isoformat()
         delivery = {
-            "id": new_id("delivery"),
-            "organization_id": task["organization_id"],
-            "task_id": task["id"],
-            "kind": kind,
-            "status": status,
+            **self._base_delivery(owner, kind=kind, status=status),
             "idempotency_key": idempotency_key,
             **payload,
-            "created_at": now,
-            "updated_at": now,
         }
         self.store.upsert_delivery(delivery)
         self.audit.record(
-            task["organization_id"],
+            owner.organization_id,
             "task.delivery",
             {
-                "task_id": task["id"],
+                "task_id": owner.task_id,
+                "session_id": owner.session_id,
                 "delivery_id": delivery["id"],
                 "kind": kind,
                 "status": status,
             },
-            principal_id=task["envelope"]["principal_id"],
-            trace_id=task["trace_id"],
+            principal_id=owner.principal_id,
+            trace_id=owner.trace_id,
         )
         return delivery

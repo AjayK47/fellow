@@ -52,11 +52,11 @@ def build_agent_messages(
         "destination": envelope["destination"],
         "purpose": envelope["purpose"],
         "allowed_scope_ids": envelope["allowed_scope_ids"],
+        # Only the *limits* live here. The counters and the clock moved to a
+        # trailing block -- see _runtime_state_block below for why.
         "budgets": {
             "max_iterations": run["max_iterations"],
             "max_tool_calls": run["max_tool_calls"],
-            "used_iterations": run.get("iteration_count", 0),
-            "used_tool_calls": run.get("tool_call_count", 0),
         },
     }
     # "session_manager" is the root Task's OWN worker_type (set by
@@ -92,7 +92,11 @@ def build_agent_messages(
         or envelope["principal_id"],
         "real_name": actor_profile.get("real_name"),
     }
-    invocation["current_time"] = {
+    runtime_state: dict[str, Any] = {
+        "used_iterations": run.get("iteration_count", 0),
+        "used_tool_calls": run.get("tool_call_count", 0),
+    }
+    runtime_state["current_time"] = {
         "utc": now_utc.isoformat(),
         "local": now_local.isoformat(),
         "timezone": timezone_name,
@@ -219,6 +223,28 @@ def build_agent_messages(
         messages.append({"role": "system", "content": AUTOMATION_TRIGGER_GUIDANCE})
     if any((item.get("metadata") or {}).get("steered") for item in history):
         messages.append({"role": "system", "content": STEER_GUIDANCE})
+    # LAST system block, deliberately. Prefix caching matches an exact token
+    # prefix, so anything that changes between iterations invalidates
+    # everything after it. These three fields -- the iteration counter, the
+    # tool-call counter and the clock -- change on literally every call, and
+    # they used to sit in <trusted_invocation> at message #2. That put a
+    # mutating value immediately after the system prompt, so the cacheable
+    # prefix was the system prompt and nothing else: measured at ~5k of a
+    # ~43k-token request, or 11.6%. Every skill body, the organization
+    # memory and the whole company_context block were re-billed uncached on
+    # every iteration of every Task.
+    #
+    # Kept as a separate labelled block rather than merged into the
+    # invocation so it is obvious to the next person that its position is
+    # load-bearing.
+    messages.append(
+        {
+            "role": "system",
+            "content": "<runtime_state>\n"
+            + json.dumps(runtime_state, sort_keys=True)
+            + "\n</runtime_state>",
+        }
+    )
     if conversation_summary:
         from toda.harness.history_compaction import SUMMARY_PREFIX
 
@@ -321,14 +347,90 @@ ATTENTION_SCHEMA: dict[str, Any] = {
 }
 
 
+# Tools whose output Toda itself produced, and which therefore need no
+# untrusted framing. Everything else is framed.
+#
+# This list is deliberately the TRUSTED half. It began as the untrusted
+# half -- {"web_search", "web_fetch"} -- which meant a connector action
+# returning a CRM note, a browser tool returning page text, an MCP server's
+# response, and extracted document bodies all reached the model as ordinary
+# trusted output. Those carry text written by people outside the company
+# just as surely as a web page does, and prompt injection does not care
+# which tool fetched it.
+#
+# Naming the trusted half instead makes a newly registered tool untrusted
+# until someone decides otherwise: over-framing costs a few tokens and a
+# slightly more cautious model, under-framing costs an injected instruction
+# executed with the company's credentials.
+_TRUSTED_TOOL_NAMES = frozenset(
+    {
+        # Toda's own memory and evidence, already permission-filtered. The
+        # content originally came from company sources, but it has been
+        # through ingestion, redaction and scope authorization to get here.
+        "brain_search",
+        "brain_read_source",
+        "brain_query_facts",
+        "brain_list_cases",
+        "brain_update_case",
+        "brain_judgment_guidance",
+        "brain_resolve_owner",
+        "brain_find_skills",
+        "brain_list_artifacts",
+        "brain_read_artifact",
+        "brain_create_artifact",
+        # Toda's own control surfaces: plans, scratchpads, Tasks, skills,
+        # workspace, schedule, arithmetic. Output here is Toda's own state.
+        "calculate",
+        "delegate_tasks",
+        "manage_child_task",
+        "plan_create",
+        "plan_get",
+        "plan_update",
+        "request_batch_approval",
+        "request_human_input",
+        "scratchpad_read",
+        "scratchpad_update",
+        "session_search",
+        "skill_validate",
+        "skill_view",
+        "skills_list",
+        "skill_propose_create",
+        "skill_propose_update",
+        "start_parallel_task",
+        # Outbound Slack tools return an acknowledgement of what Toda itself
+        # just sent (ok / ts / channel), never anyone else's content.
+        "slack_react",
+        "slack_send_artifact",
+        "slack_send_message",
+        "slack_set_channel_proactivity",
+        "task_cancel",
+        "task_continue",
+        "task_get",
+        "task_search",
+        "wait_for_children",
+        "workspace_diff",
+        "workspace_list",
+        "workspace_patch",
+        "workspace_read",
+        "workspace_search",
+        "workspace_write",
+    }
+)
+
+
+def is_trusted_tool(tool_name: str) -> bool:
+    """True when a tool's output originates inside Toda."""
+    return tool_name in _TRUSTED_TOOL_NAMES or tool_name.startswith("automation_")
+
+
 def frame_untrusted_tool_result(tool_name: str, content: str) -> str:
-    """Preserve a trust boundary around attacker-controlled web material.
+    """Preserve a trust boundary around material Toda did not author.
 
     This adopts the important Hermes pattern (semantic framing of untrusted tool
     output) without importing the personal-agent prompt wholesale into a
     multi-tenant company product.
     """
-    if tool_name not in {"web_search", "web_fetch"}:
+    if is_trusted_tool(tool_name):
         return content
     safe = re.sub(r"untrusted_tool_result", "untrusted-tool-result", content, flags=re.I)
     return (

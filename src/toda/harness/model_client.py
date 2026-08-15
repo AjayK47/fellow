@@ -692,6 +692,13 @@ class ConcentrateResponsesModelClient:
                 "completion_tokens": usage.get("output_tokens"),
                 "total_tokens": usage.get("total_tokens"),
                 "completion_tokens_details": usage.get("output_tokens_details") or {},
+                # `input_tokens_details.cached_tokens` is how the Responses
+                # API reports a prompt-cache hit, and it was being dropped --
+                # so there was no way to tell whether the cache-friendly
+                # prompt ordering was actually buying anything, only that it
+                # ought to. Normalized to the chat-completions spelling so
+                # both transports report cache hits the same way.
+                "prompt_tokens_details": usage.get("input_tokens_details") or {},
             },
             raw=payload,
             reasoning="\n".join(part for part in reasoning_parts if part).strip(),
@@ -899,8 +906,15 @@ class DeterministicHarnessModel:
         response_schema: dict[str, Any] | None = None,
         temperature: float = 0.1,
         max_tokens: int = 1500,
+        # Part of the ModelClient protocol and previously missing here, so
+        # any caller that suppressed deliberation -- the Task
+        # acknowledgement and the approval card both do -- raised TypeError
+        # against the deterministic model instead of running. That is the
+        # configuration a fresh checkout runs in, so the no-API-key path
+        # crashed on exactly the two messages meant to reach a human first.
+        reasoning: bool | None = None,
     ) -> ModelResponse:
-        del temperature, max_tokens
+        del temperature, max_tokens, reasoning
         joined = "\n".join(str(m.get("content") or "") for m in messages)
         if response_schema:
             if "corrected_response" in (response_schema.get("properties") or {}):

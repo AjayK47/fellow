@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 
 from toda.domain.models import AuthorizationDecision, Destination, SearchResult, utcnow
@@ -57,6 +59,55 @@ def _as_datetime(value: Any) -> "datetime | None":
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+class _LookupCache:
+    """Bounded, expiring memo for display-name lookups.
+
+    Three properties, each fixing a way the plain dict this replaces was
+    wrong on a service that lives for the whole process:
+
+    * a MISS is never stored. An entity looked up before its Slack profile
+      resolved was memoized as nameless and stayed that way for the life of
+      the gateway -- reintroducing precisely the "renders as a raw
+      U08ABC123 forever" failure `_entity_name`'s docstring says it exists
+      to avoid.
+    * entries EXPIRE, so a rename propagates within a few minutes instead
+      of never.
+    * entries are BOUNDED, so a long-running gateway that has seen a lot of
+      entities cannot grow this without limit.
+
+    Within one retrieval -- the case the memo actually exists for, where
+    the same author is resolved for result after result -- all three are
+    invisible.
+    """
+
+    __slots__ = ("_entries", "_ttl", "_max_entries")
+
+    def __init__(self, *, ttl_seconds: float = 300.0, max_entries: int = 2_048) -> None:
+        self._entries: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self._ttl = ttl_seconds
+        self._max_entries = max_entries
+
+    def get(self, key: str) -> str | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        stored_at, value = entry
+        if monotonic() - stored_at > self._ttl:
+            del self._entries[key]
+            return None
+        self._entries.move_to_end(key)
+        return value
+
+    def put(self, key: str, value: str) -> None:
+        if not value:
+            # Never memoize "we don't know yet" -- see the class docstring.
+            return
+        self._entries[key] = (monotonic(), value)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+
 class RetrievalService:
     def __init__(
         self,
@@ -71,8 +122,8 @@ class RetrievalService:
         self.graph = graph
         self.embeddings = embeddings
         self.reality = reality
-        self._entity_name_cache: dict[str, str] = {}
-        self._scope_label_cache: dict[str, str] = {}
+        self._entity_name_cache: _LookupCache = _LookupCache()
+        self._scope_label_cache: _LookupCache = _LookupCache()
 
     def _scope_label(self, scope_id: str | None) -> str | None:
         """Human-readable name for the room a claim came from.
@@ -84,11 +135,11 @@ class RetrievalService:
         """
         if not scope_id:
             return None
-        if scope_id in self._scope_label_cache:
-            return self._scope_label_cache[scope_id] or None
-        scope = self.store.get_scope(scope_id)
-        label = (scope or {}).get("label") or ""
-        self._scope_label_cache[scope_id] = label
+        cached = self._scope_label_cache.get(scope_id)
+        if cached is not None:
+            return cached
+        label = (self.store.get_scope(scope_id) or {}).get("label") or ""
+        self._scope_label_cache.put(scope_id, label)
         return label or None
 
     def _entity_name(self, entity_id: str | None) -> str | None:
@@ -99,14 +150,18 @@ class RetrievalService:
         otherwise keep rendering as a raw `U08ABC123` forever. Falls back to
         None (not the id) so a caller can tell "no name known" apart from a
         name that happens to look like an id.
+
+        The memo is deliberately miss-free and expiring (see _LookupCache):
+        caching a miss on this service, which lives as long as the process,
+        is what reintroduced the exact staleness described above.
         """
         if not entity_id:
             return None
-        if entity_id in self._entity_name_cache:
-            return self._entity_name_cache[entity_id] or None
-        entity = self.store.get_entity(entity_id)
-        name = (entity or {}).get("name") or ""
-        self._entity_name_cache[entity_id] = name
+        cached = self._entity_name_cache.get(entity_id)
+        if cached is not None:
+            return cached
+        name = (self.store.get_entity(entity_id) or {}).get("name") or ""
+        self._entity_name_cache.put(entity_id, name)
         return name or None
 
     def authorize(
