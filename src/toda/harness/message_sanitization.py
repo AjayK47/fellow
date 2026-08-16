@@ -198,11 +198,103 @@ def apply_reasoning_policy(
     return out
 
 
+MISSING_TOOL_RESULT = "[no result recorded]"
+
+
+def repair_tool_call_pairing(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Make every tool call and its result travel together.
+
+    Providers agree on this shape: an assistant turn carrying ``tool_calls``
+    must be followed by the ``tool`` messages answering each of its ids, and
+    a ``tool`` message must answer a call that was actually made. Break
+    either half and the request is rejected whole -- as ``invalid_request``,
+    which is_permanent_task_error treats as final, so the job dead-letters
+    and the conversation stops with nothing obviously wrong in any log.
+
+    Three ways a transcript reaches here broken, which is why the rule is
+    enforced at the chokepoint rather than at each of them:
+
+    - **Trimming.** History is cut by message count, so the cut can land
+      between a call and its result. ``runtime._tool_safe_head`` now avoids
+      this, but it only guards the two sites that exist today.
+    - **Delegation.** Children share their parent's Session, so their turns
+      interleave with each other by timestamp.
+      ``list_session_messages(exclude_delegated=True)`` now keeps them out of
+      a root's prompt.
+    - **A message arriving mid-run.** Nothing prevents this one: a person
+      typing while the agent works appends a session-level user turn, which
+      is timestamped between an assistant's tool call and its result and
+      lands in the middle of the group on the next rebuild.
+
+    So: results are pulled up to sit immediately after the call that asked
+    for them, a declared call with no result anywhere gets a placeholder,
+    and a result answering nothing is dropped. Nothing a person said is ever
+    discarded -- an interloper turn is ordered after the group, not removed.
+    """
+    remaining = list(messages)
+    out: list[dict[str, Any]] = []
+    consumed: set[int] = set()
+    answered: set[str] = set()
+
+    for index, message in enumerate(remaining):
+        if index in consumed:
+            continue
+        role = message.get("role")
+        if role == "tool":
+            call_id = message.get("tool_call_id")
+            # Reached without having been pulled up by its call, so no
+            # preceding assistant turn declared it.
+            if call_id not in answered:
+                continue
+            out.append(message)
+            continue
+        out.append(message)
+        tool_calls = message.get("tool_calls") if role == "assistant" else None
+        if not tool_calls:
+            continue
+        for call in tool_calls:
+            call_id = call.get("id")
+            answered.add(call_id)
+            match = next(
+                (
+                    later
+                    for later, candidate in enumerate(remaining)
+                    if later > index
+                    and later not in consumed
+                    and candidate.get("role") == "tool"
+                    and candidate.get("tool_call_id") == call_id
+                ),
+                None,
+            )
+            if match is None:
+                out.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": (call.get("function") or {}).get("name") or "",
+                        "content": MISSING_TOOL_RESULT,
+                    }
+                )
+                continue
+            consumed.add(match)
+            out.append(remaining[match])
+    return out
+
+
 def sanitize_api_messages(
     messages: list[dict[str, Any]], *, provider: Any, model: Any, base_url: Any
 ) -> list[dict[str, Any]]:
-    """The one call every request goes through before the wire."""
-    repaired = repair_empty_non_final_messages(list(messages))
+    """Every OpenAI-compatible request, before the wire.
+
+    The other two transports build their own request shape and so call
+    ``repair_tool_call_pairing`` directly -- that rule is universal, while
+    the reasoning-echo and empty-message rules below are specific to this
+    protocol.
+    """
+    paired = repair_tool_call_pairing(list(messages))
+    repaired = repair_empty_non_final_messages(paired)
     return apply_reasoning_policy(
         repaired, echo_required=needs_reasoning_echo(provider, model, base_url)
     )

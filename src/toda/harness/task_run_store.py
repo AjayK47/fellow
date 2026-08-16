@@ -433,9 +433,13 @@ class TaskRunStore:
         *,
         limit: int = 100,
         task_id: str | None = None,
+        exclude_delegated: bool = False,
     ) -> list[dict[str, Any]]:
         return self._raw_store.list_session_messages(
-            session_id, limit=limit, task_id=task_id
+            session_id,
+            limit=limit,
+            task_id=task_id,
+            exclude_delegated=exclude_delegated,
         )
 
     def append_turn(

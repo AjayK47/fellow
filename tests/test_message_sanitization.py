@@ -11,11 +11,33 @@ import json
 
 from toda.harness.message_sanitization import (
     INTERRUPTED_PLACEHOLDER,
+    MISSING_TOOL_RESULT,
     needs_reasoning_echo,
     reasoning_echo_family,
     repair_empty_non_final_messages,
+    repair_tool_call_pairing,
     sanitize_api_messages,
 )
+
+
+def _call(call_id: str, name: str = "brain_search") -> dict:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": "{}"},
+    }
+
+
+def _pairs(messages: list[dict]) -> list[tuple]:
+    """The only thing providers actually check: role, ids asked, id answered."""
+    return [
+        (
+            m["role"],
+            tuple(c["id"] for c in m.get("tool_calls") or ()),
+            m.get("tool_call_id"),
+        )
+        for m in messages
+    ]
 
 
 def test_deepseek_requires_echo_back_wherever_it_is_served():
@@ -80,7 +102,10 @@ def test_only_tool_call_messages_are_padded():
          {"role": "assistant", "content": "", "tool_calls": [{"id": "c"}]}],
         provider="deepseek", model="deepseek-chat", base_url="https://api.deepseek.com",
     )
-    assert out[-1]["reasoning_content"] == " "
+    # Selected by role rather than position: pairing repair runs first in the
+    # chokepoint, so an unanswered call is followed by a placeholder result.
+    assistant = next(m for m in out if m["role"] == "assistant")
+    assert assistant["reasoning_content"] == " "
 
 
 def test_a_plain_assistant_turn_is_never_padded():
@@ -164,3 +189,107 @@ def test_ordinary_tool_output_is_untouched():
 
     payload = {"contacts": [{"id": 1, "email": "a@b.com"}], "count": 1}
     assert neutralize_schema_refs(payload) == payload
+
+
+def test_a_result_whose_call_was_trimmed_away_is_dropped():
+    """History is cut by message count, so the cut lands between a call and
+    its result about as often as not. Every provider rejects the leftover
+    result, and the rejection reads as `invalid_request` -- which
+    is_permanent_task_error treats as final, so the job dead-letters and the
+    conversation stops."""
+    out = repair_tool_call_pairing([
+        {"role": "tool", "tool_call_id": "gone", "content": "{}"},
+        {"role": "user", "content": "so what did you find?"},
+    ])
+    assert _pairs(out) == [("user", (), None)]
+
+
+def test_a_call_with_no_result_anywhere_gets_a_placeholder():
+    """The mirror case: an assistant turn whose results were trimmed off the
+    other end. Dropping the assistant turn would lose what it said, so the
+    gap is filled instead."""
+    out = repair_tool_call_pairing([
+        {"role": "assistant", "content": "looking", "tool_calls": [_call("c1")]},
+    ])
+    assert _pairs(out) == [("assistant", ("c1",), None), ("tool", (), "c1")]
+    assert out[1]["content"] == MISSING_TOOL_RESULT
+    assert out[1]["name"] == "brain_search"
+
+
+def test_interleaved_children_are_regrouped_with_their_own_results():
+    """Children share their parent's Session, so their turns interleave by
+    timestamp: A asks, B asks, A answers, B answers. Each call must be
+    followed by its own result."""
+    out = repair_tool_call_pairing([
+        {"role": "assistant", "content": "", "tool_calls": [_call("a1")]},
+        {"role": "assistant", "content": "", "tool_calls": [_call("b1", "web_search")]},
+        {"role": "tool", "tool_call_id": "a1", "content": "A"},
+        {"role": "tool", "tool_call_id": "b1", "content": "B"},
+    ])
+    assert _pairs(out) == [
+        ("assistant", ("a1",), None),
+        ("tool", (), "a1"),
+        ("assistant", ("b1",), None),
+        ("tool", (), "b1"),
+    ]
+
+
+def test_a_message_arriving_mid_run_is_kept_but_moved_out_of_the_group():
+    """Nothing stops a person typing while the agent works: the wake appends
+    a session-level user turn timestamped between a call and its result. It
+    must not split the group -- and must not be discarded either."""
+    out = repair_tool_call_pairing([
+        {"role": "assistant", "content": "", "tool_calls": [_call("c1")]},
+        {"role": "user", "content": "actually, make it top 5"},
+        {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+    ])
+    assert _pairs(out) == [
+        ("assistant", ("c1",), None),
+        ("tool", (), "c1"),
+        ("user", (), None),
+    ]
+    assert any(m.get("content") == "actually, make it top 5" for m in out)
+
+
+def test_parallel_calls_are_answered_in_the_order_they_were_declared():
+    out = repair_tool_call_pairing([
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_call("c1"), _call("c2"), _call("c3")],
+        },
+        {"role": "tool", "tool_call_id": "c3", "content": "3"},
+        {"role": "tool", "tool_call_id": "c1", "content": "1"},
+    ])
+    assert _pairs(out) == [
+        ("assistant", ("c1", "c2", "c3"), None),
+        ("tool", (), "c1"),
+        ("tool", (), "c2"),
+        ("tool", (), "c3"),
+    ]
+    assert out[2]["content"] == MISSING_TOOL_RESULT
+
+
+def test_a_well_formed_transcript_is_left_exactly_as_it_was():
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "tool_calls": [_call("c1")]},
+        {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        {"role": "assistant", "content": "done"},
+    ]
+    assert repair_tool_call_pairing(messages) == messages
+
+
+def test_pairing_runs_on_the_openai_path_too():
+    """The repair has to be part of the pre-send chokepoint, not something a
+    caller remembers to do."""
+    out = sanitize_api_messages(
+        [
+            {"role": "tool", "tool_call_id": "gone", "content": "{}"},
+            {"role": "user", "content": "hello"},
+        ],
+        provider="openai",
+        model="gpt-4o",
+        base_url="https://api.openai.com/v1",
+    )
+    assert [m["role"] for m in out] == ["user"]

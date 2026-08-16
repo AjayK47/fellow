@@ -62,6 +62,29 @@ def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
     return estimate_tokens(messages)
 
 
+def _tool_safe_head(messages: list[dict[str, Any]], keep: int) -> int:
+    """Where a transcript may start without orphaning a tool result.
+
+    Both trim sites below cut by raw message count, and a `tool` message is
+    only meaningful immediately after the assistant turn that requested it.
+    Landing the cut on one leaves a result whose request is no longer in the
+    transcript, which every provider rejects outright -- and the rejection
+    reads as `invalid_request`, which is_permanent_task_error treats as
+    final, so the job dead-letters and the conversation simply stops. In a
+    tool-heavy transcript the boundary lands badly about as often as not.
+
+    Resolved *backwards*, to the assistant turn that opened the group,
+    rather than forwards past the orphans: backwards can never empty a
+    history that had messages in it, and it costs at most one group.
+    """
+    if keep >= len(messages):
+        return 0
+    index = len(messages) - keep
+    while index > 0 and messages[index].get("role") == "tool":
+        index -= 1
+    return index
+
+
 _CHILD_WORKER_TYPES = {"general", "pi"}
 
 
@@ -373,10 +396,16 @@ class CompanyAgent:
                 raise RuntimeError("worker_deadline_exceeded")
             active_skills = self._active_skills(run)
             is_child = bool(run.get("parent_task_id"))
+            # A child loads only its own turns. A root loads the
+            # conversation *minus* whatever its specialists did internally --
+            # not the whole Session, which is the same thing plus every
+            # child's tool transcript, because children share their parent's
+            # session_id. See BrainStore.list_session_messages.
             full_history = self.runs.messages(
                 run["session_id"],
                 limit=200,
                 task_id=run["id"] if is_child else None,
+                exclude_delegated=not is_child,
             )
             summary = ""
             history = full_history
@@ -415,8 +444,9 @@ class CompanyAgent:
             )
             if len(full_history) > 30 and _estimate_tokens(full_history) > threshold_tokens:
                 session = self.runs.store.get_session(run["session_id"])
-                older = full_history[:-30]
-                history = full_history[-30:]
+                split = _tool_safe_head(full_history, 30)
+                older = full_history[:split]
+                history = full_history[split:]
                 previous_summary = (session or {}).get("summary") or ""
                 already_through = (session or {}).get("summary_through_message_id")
                 # H-05: only fold in messages that haven't already been
@@ -438,7 +468,10 @@ class CompanyAgent:
                         summary = self._compact_history(older)
                 else:
                     summary = previous_summary
-                if session:
+                # `older` can be empty when the trim boundary backed all the
+                # way to the start to keep a tool group intact; there is then
+                # nothing aged out to summarize or watermark.
+                if session and older:
                     session["summary"] = summary
                     session["summary_through_message_id"] = older[-1]["id"]
                     session["updated_at"] = utcnow().isoformat()
@@ -557,7 +590,7 @@ class CompanyAgent:
             if not final_budget.fits:
                 # Keep the newest conversation evidence and the active prompt;
                 # the incremental summary carries the aged-out middle.
-                history = history[-8:]
+                history = history[_tool_safe_head(history, 8):]
                 messages = build_agent_messages(
                     run=run,
                     context=context,

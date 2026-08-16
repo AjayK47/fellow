@@ -190,6 +190,23 @@ model sees the *entire* compatible catalog as name + description and loads
 full bodies on demand, rather than a server-side relevance guess deciding
 what it's allowed to know about.
 
+**History is scoped, and a tool call never travels without its result.** A
+child Task shares its parent's Session, so the unfiltered transcript handed a
+root Task every search its specialists ran — the opposite of what delegating
+is for, and, because children run concurrently, in an order that interleaved
+one child's call with another's. A root now loads the conversation minus
+delegated work (`list_session_messages(exclude_delegated=True)`), a child
+loads only its own turns, and both trim sites resolve backwards to the
+assistant turn that opened a tool group rather than cutting mid-group
+(`runtime._tool_safe_head`). A person typing mid-run can still interleave a
+turn into a group, so `message_sanitization.repair_tool_call_pairing` is the
+backstop on all three transports: results are pulled up to their call, an
+unanswered call gets a placeholder, a result answering nothing is dropped.
+Getting this wrong is not a degraded prompt — providers reject the request as
+`invalid_request`, which `is_permanent_task_error` treats as final, so the
+job dead-letters and the conversation goes silent with nothing obviously
+wrong in any log.
+
 **Reasoning** uses the provider's native extended-thinking budget on the main
 model only; the small auxiliary classifiers don't get it.
 

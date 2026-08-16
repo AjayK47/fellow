@@ -2850,9 +2850,47 @@ class BrainStore:
         *,
         limit: int = 200,
         task_id: str | None = None,
+        exclude_delegated: bool = False,
     ) -> list[dict[str, Any]]:
+        """Messages for a Session.
+
+        Three scopes, because three callers want genuinely different things:
+
+        - default: every message, for the console, memory capture and
+          ``session_search`` -- they are reading the record, not building a
+          prompt.
+        - ``task_id``: only that Task's own turns, which is what a delegated
+          child worker loads.
+        - ``exclude_delegated``: the conversation without the internals of
+          delegated work, which is what a root Task loads.
+
+        That last scope exists because a child Task shares its parent's
+        ``session_id`` (child_tasks.py) while carrying its own ``task_id``,
+        so the unfiltered query handed a root Task every search its
+        specialists ran and every result they got back. Delegation is
+        supposed to keep exactly that out of the parent's context, and the
+        cost was not only tokens: children run concurrently, so their turns
+        interleave by timestamp, and an assistant turn requesting a tool
+        would be followed by a *different* child's assistant turn rather
+        than by its own result -- a message sequence every provider
+        rejects outright.
+        """
         with self.cursor() as cur:
-            if task_id is None:
+            if exclude_delegated:
+                # A message belongs to delegated work when its Task has a
+                # parent. Session-level messages (task_id IS NULL -- inbound
+                # user turns and conversation-lane answers) always belong to
+                # the conversation itself.
+                cur.execute(
+                    """SELECT payload FROM session_messages
+                    WHERE session_id = ?
+                      AND (task_id IS NULL OR task_id NOT IN (
+                            SELECT id FROM tasks
+                            WHERE session_id = ? AND parent_task_id IS NOT NULL))
+                    ORDER BY created_at DESC LIMIT ?""",
+                    (session_id, session_id, limit),
+                )
+            elif task_id is None:
                 cur.execute(
                     """SELECT payload FROM session_messages WHERE session_id = ?
                     ORDER BY created_at DESC LIMIT ?""",

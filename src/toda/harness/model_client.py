@@ -14,6 +14,7 @@ from toda.config import Settings, settings as _loaded_settings
 from toda.domain.models import new_id
 from toda.harness.message_sanitization import (
     needs_reasoning_echo,
+    repair_tool_call_pairing,
     sanitize_api_messages,
 )
 from toda.harness.models import ModelResponse, ModelToolCall
@@ -588,7 +589,9 @@ class ConcentrateResponsesModelClient:
         max_tokens: int = 1500,
         reasoning: bool | None = None,
     ) -> ModelResponse:
-        items, instructions = self._to_input_items(messages)
+        items, instructions = self._to_input_items(
+            repair_tool_call_pairing(messages)
+        )
         body: dict[str, Any] = {
             "model": self.model,
             "input": items,
@@ -760,7 +763,7 @@ class AnthropicModelClient:
     ) -> ModelResponse:
         system_parts: list[str] = []
         anthropic_messages: list[dict[str, Any]] = []
-        for message in messages:
+        for message in repair_tool_call_pairing(messages):
             role = message.get("role")
             if role == "system":
                 system_parts.append(str(message.get("content") or ""))

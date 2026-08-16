@@ -214,7 +214,15 @@ def test_a_trailing_model_turn_gets_a_synthetic_user_turn(monkeypatch):
     assert items[-2] == {"role": "assistant", "content": "Hey! How can I help?"}
 
 
-def test_a_trailing_function_call_also_counts_as_a_model_turn(monkeypatch):
+def test_a_trailing_call_is_completed_rather_than_left_dangling(monkeypatch):
+    """A transcript can genuinely end on an unanswered call -- the loop
+    persists the assistant turn before executing it, so a crash in that
+    window leaves exactly this shape on disk.
+
+    Pairing repair closes the call with a placeholder result first, which is
+    what the Anthropic path requires outright and what lets the model retry
+    here. The tail is then a tool result, so the trailing-model-turn rule
+    correctly does not fire (see the test below)."""
     sent = _capture(monkeypatch, _OK)
     _client().generate(messages=[
         {"role": "user", "content": "go"},
@@ -222,8 +230,9 @@ def test_a_trailing_function_call_also_counts_as_a_model_turn(monkeypatch):
             {"id": "c1", "function": {"name": "f", "arguments": "{}"}}]},
     ])
     items = sent[0]["json"]["input"]
-    assert items[-1]["role"] == "user"
     assert items[-2]["type"] == "function_call"
+    assert items[-1]["type"] == "function_call_output"
+    assert items[-1]["call_id"] == "c1"
 
 
 def test_a_tool_result_tail_is_left_alone(monkeypatch):
