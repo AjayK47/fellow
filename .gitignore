@@ -39,13 +39,15 @@ data/
 
 # Private research/reference worktrees and generated product experiments
 harnesses/
-old/
 build/
 dist/
 imgs/
 landing/
 site/
---help
+
+# Superseded planning docs and research notes. Never tracked; kept on disk
+# only as a record of how the thinking went. See archive/README.md.
+archive/
 
 # Working notes are not part of the community distribution. These are the
 # documents written while building a change -- plans, handoffs, audits, the
