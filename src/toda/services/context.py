@@ -49,6 +49,11 @@ class ContextService:
         agent_id: str | None = None,
         conversation: dict[str, Any] | None = None,
     ) -> ContextPackage:
+        self.store.trace.record(
+            "context.prepare", component="context", phase="started",
+            input={"task": task, "token_budget": token_budget, "agent_id": agent_id},
+            organization_id=organization_id,
+        )
         search = self.retrieval.search(
             organization_id=organization_id,
             query=task,
@@ -359,6 +364,12 @@ class ContextService:
                 "issue_count": len(package.issues),
                 "summary": package.summary,
             },
+        )
+        self.store.trace.record(
+            "context.prepare", component="context", phase="completed",
+            output={"request_id": package.request_id, "permission_decision_id": decision_id,
+                    "token_estimate": used, "source_count": len(package.sources)},
+            organization_id=organization_id,
         )
         return package
 

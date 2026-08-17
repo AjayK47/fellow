@@ -274,6 +274,11 @@ class DeliveryService:
         task = self.store.get_task(task_id)
         if not task:
             raise KeyError(task_id)
+        self.store.trace.record(
+            "delivery.task", component="delivery", phase="started",
+            input={"task_id": task_id, "state": task.get("state")},
+            trace_id=task.get("trace_id"), task_id=task_id,
+        )
         if task["state"] != "completed" or not task.get("final_answer"):
             return {
                 "task_id": task_id,
@@ -382,7 +387,12 @@ class DeliveryService:
                 conversation["last_agent_intervention_at"] = intervention["created_at"]
                 conversation["updated_at"] = intervention["created_at"]
                 self.store.upsert_conversation_state(conversation)
-        return {"task_id": task_id, "delivered": True, "delivery": delivery}
+        result = {"task_id": task_id, "delivered": True, "delivery": delivery}
+        self.store.trace.record(
+            "delivery.task", component="delivery", phase="completed", output=result,
+            trace_id=task.get("trace_id"), task_id=task_id,
+        )
+        return result
 
     def deliver_task_failure(self, task_id: str) -> dict[str, Any]:
         """The failed-task counterpart to final delivery.

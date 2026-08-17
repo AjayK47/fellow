@@ -18,6 +18,7 @@ import {
   Search,
   Server,
   Settings2,
+  Route as RouteIcon,
   Share2,
   ShieldCheck,
   Sparkles,
@@ -46,6 +47,7 @@ const Graph = lazy(() => import("./pages/Graph"));
 const Reality = lazy(() => import("./pages/Reality"));
 const Jobs = lazy(() => import("./pages/Jobs"));
 const Audit = lazy(() => import("./pages/Audit"));
+const Traces = lazy(() => import("./pages/Traces"));
 
 type NavItem = { to: string; label: string; end?: boolean; icon: typeof Activity };
 type NavGroup = { title: string; items: NavItem[] };
@@ -88,6 +90,7 @@ const GROUPS: NavGroup[] = [
       { to: "/channels", label: "Slack", icon: MessageSquare },
       { to: "/mcp", label: "MCP servers", icon: Server },
       { to: "/jobs", label: "System", icon: ListChecks },
+      { to: "/traces", label: "Traces", icon: RouteIcon },
     ],
   },
 ];
@@ -419,6 +422,7 @@ export default function App() {
               <Route path="/graph" element={<Graph />} />
               <Route path="/reality" element={<Reality />} />
               <Route path="/jobs" element={<Jobs />} />
+              <Route path="/traces" element={<Traces />} />
               <Route path="/audit" element={<Audit />} />
               <Route path="/" element={<Overview />} />
             </Routes>

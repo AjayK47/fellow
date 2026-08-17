@@ -17,6 +17,7 @@ import httpx
 from toda.config import Settings
 from toda.domain.models import new_id, utcnow
 from toda.harness.models import EventActor, EventScope, NormalizedEvent
+from toda.observability import trace_context
 from toda.storage.db import BrainStore
 
 log = logging.getLogger("toda.slack")
@@ -446,28 +447,51 @@ class SlackGateway:
         }
         if not self.store.upsert_received_event(received):
             return {"accepted": False, "duplicate": True, "event_id": event.id}
-        job = self.queue.enqueue(
+        # Where a trace is born. Everything Toda does in response to this
+        # message -- routing, attention, the agent turn, every tool call,
+        # the reply -- hangs off this one id, because enqueue() stamps the
+        # ambient trace onto each job it creates from here on.
+        with trace_context(
+            trace_id=event.trace_id,
             organization_id=event.organization_id,
-            kind="event.route",
-            payload={"event": event.model_dump(mode="json")},
-            idempotency_key=f"event.route:{event.dedupe_key}",
-        )
-        self.audit.record(
-            event.organization_id,
-            "slack.event.accepted",
-            {
-                "event_id": event.id,
-                "job_id": job["id"],
-                "type": event.type,
-                "channel_id": event.scope.channel_id,
-                "direct": event.is_direct_agent_request,
-            },
+            channel_id=event.scope.channel_id,
             principal_id=event.actor.id,
-        )
+            event_id=event.id,
+        ):
+            job = self.queue.enqueue(
+                organization_id=event.organization_id,
+                kind="event.route",
+                payload={"event": event.model_dump(mode="json")},
+                idempotency_key=f"event.route:{event.dedupe_key}",
+            )
+            self.store.trace.record(
+                "slack.event.accepted",
+                component="slack",
+                phase="completed",
+                input={
+                    "type": event.type,
+                    "text": str(event.payload.get("text") or "")[:2_000],
+                    "direct": event.is_direct_agent_request,
+                },
+                output={"job_id": job["id"]},
+            )
+            self.audit.record(
+                event.organization_id,
+                "slack.event.accepted",
+                {
+                    "event_id": event.id,
+                    "job_id": job["id"],
+                    "type": event.type,
+                    "channel_id": event.scope.channel_id,
+                    "direct": event.is_direct_agent_request,
+                },
+                principal_id=event.actor.id,
+            )
         return {
             "accepted": True,
             "event_id": event.id,
             "job_id": job["id"],
+            "trace_id": event.trace_id,
         }
 
     def accept_interaction(
@@ -777,8 +801,9 @@ class SlackGateway:
         # event ids, so deduplication keys off the underlying message.
         client_message_id = str(inner.get("client_msg_id") or "")
         message_identity = client_message_id or f"{channel_id}:{ts}:{source_user_id}"
-        return NormalizedEvent(
+        event = NormalizedEvent(
             id=event_id,
+            trace_id=str(payload.get("trace_id") or new_id("trace")),
             organization_id=organization_id,
             source="slack",
             type=event_type,
@@ -834,6 +859,12 @@ class SlackGateway:
             bot_mentioned=bot_mentioned,
             raw_event=payload,
         )
+        self.store.trace.record(
+            "slack.event.normalized", component="slack_gateway", phase="completed",
+            input=payload, output=event.model_dump(mode="json"), trace_id=event.trace_id,
+            event_id=event.id,
+        )
+        return event
 
     def _organization_for_workspace(self, workspace_id: str) -> str:
         installation = self.store.slack_installation_by_workspace(workspace_id)

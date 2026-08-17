@@ -24,6 +24,7 @@ from toda.harness.message_sanitization import neutralize_schema_refs
 from toda.harness.prompts import build_agent_messages, frame_untrusted_tool_result
 from toda.harness.task_run_store import TaskRunStore
 from toda.harness.tools import ToolExecutor
+from toda.observability import trace_context
 from toda.services.scope_resolution import resolve_scope
 
 log = logging.getLogger("toda.runtime")
@@ -273,6 +274,11 @@ class CompanyAgent:
             )
         if run["state"] == AgentRunState.FAILED.value:
             run = self.runs.transition(run_id, AgentRunState.QUEUED)
+        self.runs.store.trace.record(
+            "task.execute", component="agent_runtime", phase="started",
+            input={"goal": run.get("goal"), "worker_type": run.get("worker_type")},
+            trace_id=run.get("trace_id"), task_id=run_id, session_id=run.get("session_id"),
+        )
         log.info(
             "Task starting: task_id=%s goal=%r trigger=%s principal=%s",
             run_id,
@@ -297,8 +303,42 @@ class CompanyAgent:
         could hang forever right after a human approved its next step.
         """
         run_id = run["id"]
+        # One binding for the whole Task, so every model call, tool call and
+        # child dispatch underneath lands on this trace and nests under this
+        # span -- TraceSpan takes its parent from whatever span is in force,
+        # so the tree builds itself from here down.
+        with trace_context(
+            trace_id=run.get("trace_id"),
+            task_id=run_id,
+            session_id=run.get("session_id"),
+            organization_id=run.get("organization_id"),
+        ):
+            return self._run_loop_traced(run)
+
+    def _run_loop_traced(self, run: dict[str, Any]) -> AgentOutcome:
+        run_id = run["id"]
         try:
-            return self._loop(run)
+            with self.runs.store.trace.span(
+                "task.execute",
+                component="agent_runtime",
+                task_id=run_id,
+                input={
+                    "goal": str(run.get("goal") or "")[:2_000],
+                    "worker_type": (run.get("metadata") or {}).get("worker_type"),
+                    "trigger_kind": run.get("trigger_kind"),
+                },
+            ) as span:
+                outcome = self._loop(run)
+                final = self.runs.get(run_id) or {}
+                span.output(
+                    {
+                        "state": getattr(outcome.state, "value", str(outcome.state)),
+                        "iterations": final.get("iteration_count"),
+                        "tool_calls": final.get("tool_call_count"),
+                        "answer": (outcome.answer or "")[:2_000] or None,
+                    }
+                )
+                return outcome
         except Exception as exc:
             failed = self.runs.fail(run_id, str(exc))
             self.audit.record(
@@ -676,12 +716,39 @@ class CompanyAgent:
                 self.runs.update(run)
                 response = ModelResponse(**promoted_response)
             else:
-                response = self.model.generate(
-                    messages=messages,
-                    tools=schemas,
-                    temperature=0.1,
-                    max_tokens=self.completion_max_tokens,
-                )
+                # A span rather than two records: this is the single slowest
+                # step in most traces, so its duration is the number worth
+                # having, and a provider error has to land as `failed`
+                # instead of leaving a `started` with nothing after it.
+                with self.runs.store.trace.span(
+                    "model.generate",
+                    component="model_client",
+                    task_id=run.get("id"),
+                    iteration=run.get("iteration_count"),
+                    input={
+                        "model": getattr(self.model, "model", ""),
+                        "message_count": len(messages),
+                        "tool_count": len(schemas),
+                        "messages": messages,
+                    },
+                ) as span:
+                    response = self.model.generate(
+                        messages=messages,
+                        tools=schemas,
+                        temperature=0.1,
+                        max_tokens=self.completion_max_tokens,
+                    )
+                    span.output(
+                        {
+                            "content": response.content,
+                            "tool_calls": [
+                                call.model_dump(mode="json")
+                                for call in response.tool_calls
+                            ],
+                            "usage": response.usage,
+                            "finish_reason": response.finish_reason,
+                        }
+                    )
             if response.tool_calls:
                 response.tool_calls = self._deduplicate_tool_calls(
                     run["id"], response.tool_calls
@@ -877,6 +944,11 @@ class CompanyAgent:
                     len(answer),
                 )
                 completed = self.runs.complete(run["id"], answer)
+                self.runs.store.trace.record(
+                    "task.execute", component="agent_runtime", phase="completed",
+                    output={"answer": answer, "iterations": run.get("iteration_count"), "usage": run.get("usage")},
+                    trace_id=completed.get("trace_id"), task_id=completed.get("id"),
+                )
                 if not completed.get("parent_task_id"):
                     children = self.runs.store.list_tasks(
                         completed["organization_id"],

@@ -22,6 +22,7 @@ class ComposioClient:
         toolkit_versions: str = "latest",
         webhook_secret: str | None = None,
         webhook_tolerance_seconds: int = 300,
+        trace: Any | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -29,6 +30,7 @@ class ComposioClient:
         self.toolkit_versions = toolkit_versions
         self.webhook_secret = webhook_secret
         self.webhook_tolerance_seconds = webhook_tolerance_seconds
+        self.trace = trace
 
     def reconfigure(self, *, api_key: str, webhook_secret: str | None = None) -> None:
         """Apply a newly saved credential to the live client.
@@ -68,18 +70,24 @@ class ComposioClient:
     ) -> dict[str, Any]:
         if not self.api_key:
             raise RuntimeError("Composio API key is not configured")
-        response = httpx.request(
-            method,
-            f"{self.v3_base_url if v3 else self.base_url}/{path.lstrip('/')}",
-            params=params,
-            headers={"x-api-key": self.api_key, "Content-Type": "application/json"},
-            json=body,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        if response.status_code == 204 or not response.content:
-            return {"successful": True}
-        return response.json()
+        url = f"{self.v3_base_url if v3 else self.base_url}/{path.lstrip('/')}"
+        if self.trace:
+            self.trace.record("connector.request", component="composio", phase="started", input={"method": method, "url": url, "params": params, "body": body})
+        try:
+            response = httpx.request(
+                method, url, params=params,
+                headers={"x-api-key": self.api_key, "Content-Type": "application/json"},
+                json=body, timeout=timeout,
+            )
+            response.raise_for_status()
+            result = {"successful": True} if response.status_code == 204 or not response.content else response.json()
+            if self.trace:
+                self.trace.record("connector.request", component="composio", phase="completed", output={"status_code": response.status_code, "response": result})
+            return result
+        except Exception as exc:
+            if self.trace:
+                self.trace.record("connector.request", component="composio", phase="failed", error={"type": type(exc).__name__, "message": str(exc)})
+            raise
 
     def execute(
         self,

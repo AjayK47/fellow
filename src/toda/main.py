@@ -12,6 +12,7 @@ import shutil
 import sys
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
@@ -24,6 +25,7 @@ from toda.config import config_path, settings
 from toda.runtime_owner import DatabaseOwner
 from toda.services.bootstrap import initialize, is_initialized
 from toda.services.container import TodaApp, get_app, reset_app
+from toda.observability import configure_json_logging
 
 log = logging.getLogger("toda")
 
@@ -117,6 +119,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             db = os.environ.get("TODA_DB")
             brain = reset_app(Path(db) if db else settings.storage.db_path)
         app.state.brain = brain
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=settings.observability.retention_days)).isoformat()
+        brain.store.purge_trace_events(before=cutoff, limit=100_000)
         brain.indexing.backfill()
         # Independent lanes keep long agent work and ingestion from
         # delaying infrastructure jobs, while all lanes remain inside
@@ -517,10 +521,7 @@ def reindex_cli(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=settings.server.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_json_logging(settings.server.log_level)
     parser = argparse.ArgumentParser(
         prog="toda",
         description="Toda local control plane and company-agent gateway",

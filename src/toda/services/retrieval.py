@@ -191,6 +191,11 @@ class RetrievalService:
         include_superseded: bool = False,
         as_of: str | None = None,
     ) -> dict[str, Any]:
+        self.store.trace.record(
+            "retrieval.search", component="retrieval", phase="started",
+            input={"query": query, "limit": limit, "entity_ids": entity_ids},
+            organization_id=organization_id,
+        )
         decision = self.authorize(organization_id, acting_principal_id, destination, purpose)
 
         if include_superseded:
@@ -303,13 +308,19 @@ class RetrievalService:
             reality_facts.sort(
                 key=lambda item: item["score"], reverse=True
             )
-        return {
+        result = {
             "results": [r.model_dump(mode="json") for r in results],
             "reality_facts": reality_facts[:limit],
             "permission_decision_id": decision.id,
             "allowed_scope_ids": decision.allowed_scope_ids,
             "count": len(results),
         }
+        self.store.trace.record(
+            "retrieval.search", component="retrieval", phase="completed",
+            output={"count": result["count"], "permission_decision_id": decision.id},
+            organization_id=organization_id,
+        )
+        return result
 
     def search_evidence(
         self,

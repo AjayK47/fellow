@@ -65,13 +65,36 @@ class SessionManagerScheduler:
         if not self.sessions.claim(
             session_id, owner=executor_id, lease_seconds=self.lease_seconds
         ):
+            # Contention is the normal case on a follow-up, not a failure --
+            # recorded so a trace shows the wait rather than an unexplained
+            # gap before the answer.
+            self.store.trace.record(
+                "session.dispatch.contended",
+                component="session",
+                phase="completed",
+                session_id=session_id,
+                output={"claimed": False},
+            )
             return None
         try:
             if not self.sessions.renew(
                 session_id, owner=executor_id, lease_seconds=self.lease_seconds
             ):
                 raise RuntimeError("session manager lease lost before execution")
-            outcome = self._run_once(session_id, executor_id)
+            with self.store.trace.span(
+                "session.dispatch",
+                component="session",
+                session_id=session_id,
+                input={"executor_id": executor_id},
+            ) as span:
+                outcome = self._run_once(session_id, executor_id)
+                span.output(
+                    {
+                        "state": getattr(outcome.state, "value", str(outcome.state)),
+                        "task_id": outcome.task_id,
+                        "kind": getattr(outcome, "kind", None),
+                    }
+                )
         except Exception:
             # Leave it queued (not idle) on an infrastructure failure so a
             # later tick retries rather than silently going quiet.

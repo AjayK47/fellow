@@ -78,6 +78,7 @@ class EventScope(BaseModel):
 
 class NormalizedEvent(BaseModel):
     id: str = Field(default_factory=lambda: new_id("evt"))
+    trace_id: str = Field(default_factory=lambda: new_id("trace"))
     organization_id: str
     source: str
     type: str

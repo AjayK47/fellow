@@ -43,6 +43,11 @@ class MemoryService:
     def learn_from_source(self, source: dict[str, Any]) -> list[dict[str, Any]]:
         """Extract and consolidate memories from a single source evidence item."""
         org = source["organization_id"]
+        self.store.trace.record(
+            "memory.learn", component="memory", phase="started",
+            input={"source_id": source.get("id"), "content": source.get("content")},
+            trace_id=source.get("trace_id"), organization_id=org,
+        )
         entities = self.store.list_entities(org)
         name_map = {e["id"]: e["name"] for e in entities}
 
@@ -76,6 +81,11 @@ class MemoryService:
                 "memory_ids": [m["id"] for m in committed],
                 "extraction_method": getattr(self.extractor, "name", "unknown"),
             },
+        )
+        self.store.trace.record(
+            "memory.learn", component="memory", phase="completed",
+            output={"source_id": source["id"], "memory_ids": [m["id"] for m in committed]},
+            trace_id=source.get("trace_id"), organization_id=org,
         )
         return committed
 

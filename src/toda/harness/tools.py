@@ -2618,6 +2618,12 @@ class ToolExecutor:
         call: ModelToolCall,
         approved: bool = False,
     ) -> ToolResult:
+        self.store.trace.record(
+            "tool.call.proposed", component="tool_executor", phase="started",
+            input={"name": call.name, "arguments": call.arguments, "approved": approved},
+            trace_id=run.get("trace_id"), task_id=run.get("id"),
+            session_id=run.get("session_id"), tool_call_id=call.id,
+        )
         registered = self.registry.get(call.name)
         if not registered:
             return ToolResult(
@@ -2803,6 +2809,47 @@ class ToolExecutor:
         record["status"] = "running"
         record["updated_at"] = utcnow().isoformat()
         self.store.upsert_harness_tool_call(record)
+        # A span, not a bare context bind: a tool call is a step with a
+        # duration and an outcome, and read tools run on a pool thread where
+        # nothing else would carry the trace across. Binding explicitly from
+        # `run` rather than inheriting means a parallel tool call lands on
+        # the right trace instead of starting its own.
+        from toda.observability import trace_context
+
+        with trace_context(
+            trace_id=run.get("trace_id"),
+            task_id=run.get("id"),
+            session_id=run.get("session_id"),
+            tool_call_id=call.id,
+        ), self.store.trace.span(
+            "tool.execute",
+            component="tools",
+            tool_name=call.name,
+            input={"arguments": call.arguments, "risk": definition.risk},
+        ) as trace_span:
+            return self._execute_handler(
+                run=run,
+                call=call,
+                definition=definition,
+                registered=registered,
+                record=record,
+                runtime=runtime,
+                envelope=envelope,
+                trace_span=trace_span,
+            )
+
+    def _execute_handler(
+        self,
+        *,
+        run: dict[str, Any],
+        call: ModelToolCall,
+        definition: Any,
+        registered: Any,
+        record: dict[str, Any],
+        runtime: dict[str, Any],
+        envelope: dict[str, Any],
+        trace_span: Any,
+    ) -> ToolResult:
         try:
             raw_output = registered.handler(call.arguments, runtime)
             output = self._bounded_output(
@@ -2824,6 +2871,7 @@ class ToolExecutor:
                 principal_id=envelope["principal_id"],
                 trace_id=run["trace_id"],
             )
+            trace_span.output({"status": "completed", "output": output})
             return ToolResult(
                 call_id=call.id,
                 tool_name=call.name,
@@ -2834,6 +2882,9 @@ class ToolExecutor:
             record["status"] = "waiting_for_children"
             record["updated_at"] = utcnow().isoformat()
             self.store.upsert_harness_tool_call(record)
+            trace_span.output(
+                {"status": "waiting_for_children", "child_task_ids": exc.child_task_ids}
+            )
             return ToolResult(
                 call_id=call.id,
                 tool_name=call.name,
@@ -2857,6 +2908,7 @@ class ToolExecutor:
                 principal_id=envelope["principal_id"],
                 trace_id=run["trace_id"],
             )
+            trace_span.error({"type": type(exc).__name__, "message": str(exc)})
             return ToolResult(
                 call_id=call.id,
                 tool_name=call.name,
@@ -2875,6 +2927,11 @@ class ToolExecutor:
         approval = self.store.get_harness_record("approvals", approval_id)
         if not approval:
             raise KeyError(f"approval not found: {approval_id}")
+        self.store.trace.record(
+            "approval.decision.received", component="approval", phase="started",
+            input={"approval_id": approval_id, "approved": approved, "decided_by": decided_by},
+            trace_id=approval.get("trace_id"), task_id=approval.get("task_id"),
+        )
         if approval["status"] != "pending":
             raise ValueError("approval has already been resolved")
         allowed_approvers = set(
@@ -2917,6 +2974,11 @@ class ToolExecutor:
             )
 
         if not approved:
+            self.store.trace.record(
+                "approval.decision", component="approval", phase="completed",
+                output={"status": approval["status"], "decided_by": decided_by},
+                trace_id=approval.get("trace_id"), task_id=approval.get("task_id"),
+            )
             return approval, ToolResult(
                 call_id=approval["tool_call_id"],
                 tool_name=approval["tool_name"],
@@ -2956,7 +3018,13 @@ class ToolExecutor:
                     ),
                     approval_id=approval_id,
                 )
-        return approval, self.execute(run=task, call=call, approved=True)
+        result = self.execute(run=task, call=call, approved=True)
+        self.store.trace.record(
+            "approval.decision", component="approval", phase="completed",
+            output={"status": approval["status"], "tool_status": result.status},
+            trace_id=task.get("trace_id"), task_id=task.get("id"),
+        )
+        return approval, result
 
     def _conditional_policy(
         self,

@@ -71,6 +71,30 @@ class BrainStore:
         bootstrap.execute("PRAGMA journal_mode=WAL")
         bootstrap.close()
         self._migrate()
+        from toda.observability import TraceRecorder
+        self.trace = TraceRecorder(self)
+
+    def _drop_stale_trace_events(self) -> None:
+        """Recreate trace_events when it predates the organization_id column.
+
+        The rest of the schema is `CREATE TABLE IF NOT EXISTS` and nothing
+        else in this file alters a table, so a database written before that
+        column existed would silently keep the old shape and every insert
+        would fail. Dropping is acceptable here and nowhere else in this
+        file: trace events are telemetry with a seven-day retention, so the
+        worst case is losing at most a week of debugging history, whereas
+        the alternative is a table nothing can write to.
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='trace_events'"
+            )
+            if not cur.fetchone():
+                return
+            columns = {row[1] for row in cur.execute("PRAGMA table_info(trace_events)")}
+            if "organization_id" not in columns:
+                cur.execute("DROP TABLE trace_events")
 
     def close(self) -> None:
         conn = getattr(self._local, "connection", None)
@@ -114,6 +138,7 @@ class BrainStore:
             cur.close()
 
     def _migrate(self) -> None:
+        self._drop_stale_trace_events()
         with self.cursor() as cur:
             cur.executescript(
                 """
@@ -386,6 +411,27 @@ class BrainStore:
                     updated_at TEXT NOT NULL,
                     UNIQUE (organization_id, idempotency_key)
                 );
+
+                CREATE TABLE IF NOT EXISTS trace_events (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL DEFAULT '',
+                    trace_id TEXT NOT NULL,
+                    span_id TEXT NOT NULL,
+                    parent_span_id TEXT,
+                    component TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    context TEXT NOT NULL,
+                    input_json TEXT,
+                    output_json TEXT,
+                    error_json TEXT,
+                    duration_ms REAL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_trace_events_trace
+                    ON trace_events(trace_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_trace_events_component
+                    ON trace_events(component, operation, created_at);
 
                 CREATE TABLE IF NOT EXISTS approvals (
                     id TEXT PRIMARY KEY,
@@ -2128,6 +2174,130 @@ class BrainStore:
                     _ser(event),
                 ),
             )
+
+    def append_trace_event(self, event: dict[str, Any]) -> None:
+        """Append one redacted, immutable execution-trace event.
+
+        `organization_id` is denormalized out of the context blob because
+        every read of this table is tenant-scoped, and filtering a tenant
+        boundary with a LIKE against serialized JSON is not a boundary.
+        """
+        context = event.get("context") or {}
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT INTO trace_events
+                (id, organization_id, trace_id, span_id, parent_span_id,
+                 component, operation, phase, context, input_json,
+                 output_json, error_json, duration_ms, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event["id"],
+                    str(context.get("organization_id") or ""),
+                    event["trace_id"], event["span_id"],
+                    event.get("parent_span_id"), event["component"],
+                    event["operation"], event["phase"], _ser(context),
+                    _ser(event.get("input")), _ser(event.get("output")),
+                    _ser(event.get("error")), event.get("duration_ms"), event["created_at"],
+                ),
+            )
+
+    def list_traces(
+        self, organization_id: str, *, limit: int = 50, errors_only: bool = False
+    ) -> list[dict[str, Any]]:
+        """One row per trace, newest first — the index for the trace viewer.
+
+        Rolled up in SQL rather than by loading every event and grouping in
+        Python: a single busy trace is thousands of rows, and the list view
+        needs none of their payloads.
+        """
+        having = "HAVING failures > 0" if errors_only else ""
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT trace_id,
+                           MIN(created_at) AS started_at,
+                           MAX(created_at) AS ended_at,
+                           COUNT(*) AS event_count,
+                           SUM(phase = 'failed') AS failures,
+                           (SELECT operation FROM trace_events inner_events
+                             WHERE inner_events.trace_id = trace_events.trace_id
+                             ORDER BY created_at ASC LIMIT 1) AS root_operation,
+                           MAX(duration_ms) AS max_duration_ms
+                    FROM trace_events
+                    WHERE organization_id = ?
+                    GROUP BY trace_id
+                    {having}
+                    ORDER BY started_at DESC
+                    LIMIT ?""",
+                (organization_id, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "trace_id": row["trace_id"],
+                "started_at": row["started_at"],
+                "ended_at": row["ended_at"],
+                "event_count": row["event_count"],
+                "failures": int(row["failures"] or 0),
+                "root_operation": row["root_operation"],
+                "duration_ms": row["max_duration_ms"],
+            }
+            for row in rows
+        ]
+
+    def list_trace_events(
+        self, trace_id: str, *, organization_id: str | None = None,
+        component: str | None = None,
+        operation: str | None = None, errors_only: bool = False, limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        clauses = ["trace_id = ?"]
+        params: list[Any] = [trace_id]
+        if organization_id:
+            clauses.append("organization_id = ?")
+            params.append(organization_id)
+        if component:
+            clauses.append("component = ?")
+            params.append(component)
+        if operation:
+            clauses.append("operation = ?")
+            params.append(operation)
+        if errors_only:
+            clauses.append("phase = 'failed'")
+        params.append(limit)
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT * FROM trace_events WHERE {' AND '.join(clauses)} "
+                "ORDER BY created_at ASC LIMIT ?", params
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "id": row["id"], "trace_id": row["trace_id"], "span_id": row["span_id"],
+                "parent_span_id": row["parent_span_id"], "component": row["component"],
+                "operation": row["operation"], "phase": row["phase"],
+                "context": _de(row["context"]), "input": _de(row["input_json"]),
+                "output": _de(row["output_json"]), "error": _de(row["error_json"]),
+                "duration_ms": row["duration_ms"], "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def purge_trace_events(self, *, before: str, limit: int = 10_000) -> int:
+        """Drop trace events older than `before`, at most `limit` per call.
+
+        `DELETE ... LIMIT` is an optional SQLite compile-time feature
+        (SQLITE_ENABLE_UPDATE_DELETE_LIMIT) and the build CPython ships does
+        not have it, so that spelling is a hard syntax error rather than a
+        slow query. It ran unguarded at gateway startup, which meant the
+        process could not boot at all. The bound belongs in a subquery.
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                "DELETE FROM trace_events WHERE rowid IN ("
+                "  SELECT rowid FROM trace_events WHERE created_at < ? LIMIT ?"
+                ")",
+                (before, limit),
+            )
+            return cur.rowcount
 
     def list_audit(self, organization_id: str, event_type: str | None = None) -> list[dict[str, Any]]:
         with self.cursor() as cur:

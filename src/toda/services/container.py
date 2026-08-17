@@ -89,6 +89,9 @@ class TodaApp:
         path = Path(db_path) if db_path else runtime_settings.storage.db_path
         path.parent.mkdir(parents=True, exist_ok=True)
         self.store = BrainStore(path)
+        self.store.trace.enabled = runtime_settings.observability.enabled
+        self.store.trace.max_payload_bytes = runtime_settings.observability.max_payload_bytes
+        self.store.trace.capture_payloads = runtime_settings.observability.capture_payloads
         self.audit = AuditService(self.store)
         self.graph = GraphService(self.store)
         self.authz = AuthorizationService(self.store, self.audit)
@@ -157,6 +160,7 @@ class TodaApp:
             webhook_tolerance_seconds=(
                 runtime_settings.composio.webhook_tolerance_seconds
             ),
+            trace=self.store.trace,
         )
         self.web_tools = build_web_tools(runtime_settings)
         self.document_tools = DocumentTools(self.artifacts)

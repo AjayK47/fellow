@@ -1148,6 +1148,137 @@ def get_task(task_id: str, request: Request, organization_id: str) -> dict[str, 
     return _task_detail(brain, task)
 
 
+@router.get("/v1/tasks/{task_id}/trace")
+def get_task_trace(
+    task_id: str,
+    request: Request,
+    organization_id: str,
+    component: str | None = None,
+    operation: str | None = None,
+    errors_only: bool = False,
+    limit: int = 5000,
+) -> dict[str, Any]:
+    """Return the redacted, chronological execution trace for one Task."""
+    brain = _app(request)
+    task = _authorized_task(task_id, request, what="task_trace")
+    if task["organization_id"] != organization_id:
+        raise HTTPException(404, "task not found")
+    events = brain.store.list_trace_events(
+        task.get("trace_id") or "",
+        component=component,
+        operation=operation,
+        errors_only=errors_only,
+        limit=min(limit, 10_000),
+    )
+    return {
+        "trace_id": task.get("trace_id"),
+        "task_id": task_id,
+        "events": events,
+        "count": len(events),
+    }
+
+
+def _trace_tree(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold a flat event stream into the nested spans it describes.
+
+    A span appears as two rows sharing a span_id -- `started` when it opened
+    and `completed`/`failed` when it closed, the latter carrying the
+    duration and result. Single `record()` calls appear once and are leaves.
+    Rebuilding the nesting here rather than in the browser keeps the client
+    dumb and means the same shape is available to anything else that asks.
+
+    A span whose parent is missing (trimmed by retention, or still running
+    when the trace was read) is promoted to a root instead of being dropped,
+    because a half-visible trace is still worth reading and a vanished one
+    is not.
+    """
+    spans: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for event in events:
+        span_id = event["span_id"]
+        node = spans.get(span_id)
+        if node is None:
+            node = {
+                "span_id": span_id,
+                "parent_span_id": event.get("parent_span_id"),
+                "operation": event["operation"],
+                "component": event["component"],
+                "phase": event["phase"],
+                "started_at": event["created_at"],
+                "duration_ms": event.get("duration_ms"),
+                "context": event.get("context") or {},
+                "input": event.get("input"),
+                "output": event.get("output"),
+                "error": event.get("error"),
+                "children": [],
+            }
+            spans[span_id] = node
+            order.append(span_id)
+            continue
+        # The closing row wins on everything it actually carries.
+        node["phase"] = event["phase"]
+        node["duration_ms"] = event.get("duration_ms", node["duration_ms"])
+        for field in ("output", "error"):
+            if event.get(field) is not None:
+                node[field] = event[field]
+        if event.get("input") is not None and node.get("input") is None:
+            node["input"] = event["input"]
+        if event.get("context"):
+            node["context"] = {**node["context"], **event["context"]}
+
+    roots: list[dict[str, Any]] = []
+    for span_id in order:
+        node = spans[span_id]
+        parent = spans.get(node["parent_span_id"] or "")
+        if parent is not None and parent is not node:
+            parent["children"].append(node)
+        else:
+            roots.append(node)
+    return roots
+
+
+@router.get("/v1/traces")
+def list_traces(
+    request: Request,
+    organization_id: str,
+    errors_only: bool = False,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Recent traces, newest first.
+
+    Admin-only: a trace spans whatever conversation caused it, so the list
+    would otherwise be a way to see every room in the workspace without
+    being a participant in any of them.
+    """
+    _require_admin(request)
+    traces = _app(request).store.list_traces(
+        organization_id, limit=min(limit, 200), errors_only=errors_only
+    )
+    return {"traces": traces, "count": len(traces)}
+
+
+@router.get("/v1/traces/{trace_id}")
+def get_trace(
+    request: Request,
+    trace_id: str,
+    organization_id: str,
+    limit: int = 5000,
+) -> dict[str, Any]:
+    """One trace as a nested span tree, with its flat events alongside."""
+    _require_admin(request)
+    events = _app(request).store.list_trace_events(
+        trace_id, organization_id=organization_id, limit=min(limit, 10_000)
+    )
+    if not events:
+        raise HTTPException(404, "trace not found")
+    return {
+        "trace_id": trace_id,
+        "tree": _trace_tree(events),
+        "events": events,
+        "count": len(events),
+    }
+
+
 @router.get("/v1/tasks/{task_id}/attempts")
 def list_task_attempts(
     task_id: str, request: Request, organization_id: str

@@ -322,12 +322,29 @@ class MCPClientService:
         server = self._owned(server_id, organization_id)
         if not server.get("enabled") or server.get("status") != "ready":
             raise RuntimeError("MCP server is not ready")
-        result = self._run_async(self._call(server, remote_name, arguments))
-        return {
+        self.store.trace.record(
+            "mcp.tool.call", component="mcp", phase="started",
+            input={"server_id": server_id, "remote_name": remote_name, "arguments": arguments},
+            organization_id=organization_id,
+        )
+        try:
+            result = self._run_async(self._call(server, remote_name, arguments))
+        except Exception as exc:
+            self.store.trace.record(
+                "mcp.tool.call", component="mcp", phase="failed",
+                error={"type": type(exc).__name__, "message": str(exc)}, organization_id=organization_id,
+            )
+            raise
+        output = {
             "server_id": server_id,
             "remote_tool": remote_name,
             "result": _jsonable(result),
         }
+        self.store.trace.record(
+            "mcp.tool.call", component="mcp", phase="completed", output=output,
+            organization_id=organization_id,
+        )
+        return output
 
     async def _call(
         self, server: dict[str, Any], remote_name: str, arguments: dict[str, Any]

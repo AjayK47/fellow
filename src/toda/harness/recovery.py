@@ -19,6 +19,10 @@ class RecoveryHeartbeat:
         self.queue = queue
 
     def tick(self, organization_id: str) -> dict[str, Any]:
+        self.store.trace.record(
+            "recovery.heartbeat", component="recovery", phase="started",
+            input={"organization_id": organization_id}, organization_id=organization_id,
+        )
         now = datetime.now(timezone.utc).isoformat()
         recovered: list[str] = []
         woken: list[str] = []
@@ -73,12 +77,17 @@ class RecoveryHeartbeat:
                 idempotency_key=f"delivery.recover:{task['id']}:{attempt + 1}",
             )
             deliveries.append(task["id"])
-        return {
+        result = {
             "organization_id": organization_id,
             "requeued_task_ids": recovered,
             "woken_parent_task_ids": woken,
             "queued_delivery_task_ids": deliveries,
         }
+        self.store.trace.record(
+            "recovery.heartbeat", component="recovery", phase="completed",
+            output=result, organization_id=organization_id,
+        )
+        return result
 
     def _delivery_recovery_attempts(self, organization_id: str, task_id: str) -> int:
         return self.store.count_jobs_with_key_prefix(

@@ -6,6 +6,7 @@ from datetime import timedelta
 from typing import Any
 
 from toda.domain.models import new_id, utcnow
+from toda.observability import current_trace_id
 from toda.storage.db import BrainStore
 
 # Session and child Task execution can drive CompanyAgent._loop() to completion -- potentially
@@ -107,6 +108,15 @@ class JobQueue:
                     "shedding rather than deepening the backlog"
                 )
         now = utcnow().isoformat()
+        # Stamp the trace in force onto the payload, so the job carries it
+        # across the queue to whichever thread picks it up. Done here rather
+        # than at the ~30 call sites because "remember to pass trace_id" is
+        # a rule that gets followed for a while and then does not: the
+        # previous attempt read `payload.get("trace_id")` on the way out
+        # while nothing ever put one in, so the lookup was always None.
+        ambient_trace_id = current_trace_id()
+        if ambient_trace_id and "trace_id" not in payload:
+            payload = {**payload, "trace_id": ambient_trace_id}
         job = {
             "id": new_id("hjob"),
             "organization_id": organization_id,
@@ -127,7 +137,14 @@ class JobQueue:
         lease_override = _LONG_RUNNING_LEASE_OVERRIDES.get(kind)
         if lease_override:
             job["lease_seconds"] = lease_override
-        return self.store.enqueue_harness_job(job)
+        created = self.store.enqueue_harness_job(job)
+        self.store.trace.record(
+            "job.enqueued", component="queue", phase="completed", input=payload,
+            output={"id": created["id"], "kind": kind, "available_at": created["available_at"]},
+            trace_id=payload.get("trace_id"), job_id=created["id"],
+            organization_id=organization_id,
+        )
+        return created
 
     def lease(
         self,
@@ -150,12 +167,17 @@ class JobQueue:
         *,
         worker_id: str | None = None,
     ) -> dict[str, Any] | None:
-        return self.store.finish_harness_job(
+        finished = self.store.finish_harness_job(
             job_id,
             status="completed",
             result=result or {},
             lease_owner=worker_id,
         )
+        self.store.trace.record(
+            "job.completed", component="queue", phase="completed", output=result or {},
+            trace_id=(result or {}).get("trace_id"), job_id=job_id,
+        )
+        return finished
 
     def fail(
         self,
@@ -172,22 +194,35 @@ class JobQueue:
         attempts = int(job.get("attempts", 0))
         max_attempts = int(job.get("max_attempts", self.max_attempts))
         if permanent or attempts >= max_attempts:
-            return self.store.finish_harness_job(
+            finished = self.store.finish_harness_job(
                 job["id"],
                 status="dead_letter",
                 error=error,
                 lease_owner=job.get("lease_owner"),
             )
+            self.store.trace.record(
+                "job.dead_lettered", component="queue", phase="failed", error=error,
+                trace_id=(job.get("payload") or {}).get("trace_id"), job_id=job["id"],
+                attempt_number=attempts,
+            )
+            return finished
         delay = (
             retry_in_seconds
             if retry_in_seconds is not None
             else min(2**attempts, 300)
         )
         retry_at = (utcnow() + timedelta(seconds=delay)).isoformat()
-        return self.store.finish_harness_job(
+        finished = self.store.finish_harness_job(
             job["id"],
             status="queued",
             error=error,
             retry_at=retry_at,
             lease_owner=job.get("lease_owner"),
         )
+        self.store.trace.record(
+            "job.retry.scheduled", component="queue", phase="event", error=error,
+            output={"retry_at": retry_at, "delay_seconds": delay},
+            trace_id=(job.get("payload") or {}).get("trace_id"), job_id=job["id"],
+            attempt_number=attempts,
+        )
+        return finished

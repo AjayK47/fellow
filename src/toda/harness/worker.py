@@ -10,6 +10,7 @@ from toda.domain.models import new_id
 from toda.harness.jobs import _CONTENTION_RETRY_SECONDS, JobContention
 from toda.harness.retry import is_permanent_task_error, is_retryable_task_error
 from toda.harness.task_run_store import TaskRunStore
+from toda.observability import trace_context
 
 # Job kinds that drive a full agent reasoning loop and can legitimately run
 # for many minutes. Everything else -- Slack event routing, attention,
@@ -293,6 +294,20 @@ class HarnessWorker:
         self._knowledge_pool.shutdown(wait=True)
 
     def _process_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        # Rejoin the trace this job belongs to. A job always runs on a pool
+        # thread, and a fresh thread starts with empty context, so without
+        # this every hop through the queue would begin a new, unrelated
+        # trace -- which is precisely what made a single Slack message
+        # appear as five disconnected ones.
+        with trace_context(
+            trace_id=(job.get("payload") or {}).get("trace_id"),
+            job_id=job["id"],
+            job_kind=job["kind"],
+            organization_id=job.get("organization_id"),
+        ):
+            return self._process_job_traced(job)
+
+    def _process_job_traced(self, job: dict[str, Any]) -> dict[str, Any]:
         handler = self.handlers.get(job["kind"])
         if not handler:
             error = f"no handler for job kind {job['kind']}"

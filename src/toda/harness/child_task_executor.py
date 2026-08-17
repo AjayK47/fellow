@@ -52,13 +52,23 @@ class ChildTaskExecutor:
         task = self.store.get_task(task_id)
         if not task:
             raise KeyError(f"child task not found: {task_id}")
+        self.store.trace.record(
+            "child_task.execute", component="child_tasks", phase="started",
+            input={"task_id": task_id, "worker_type": task.get("worker_type")},
+            trace_id=task.get("trace_id"), task_id=task_id,
+        )
         if task.get("worker_type") == "pi":
             if not self.pi_executor:
                 raise RuntimeError("no PiTaskExecutor configured for worker_type=pi")
             executor_id = new_id("exec")
-            return self.pi_executor.start(
+            result = self.pi_executor.start(
                 task_id, owner=executor_id, enqueue_poll=self._enqueue_poll
             )
+            self.store.trace.record(
+                "child_task.execute", component="child_tasks", phase="completed",
+                output=result, trace_id=task.get("trace_id"), task_id=task_id,
+            )
+            return result
         executor_id = new_id("exec")
         runs = TaskRunStore(
             self.store, owner=executor_id, lease_seconds=self.lease_seconds
@@ -74,7 +84,12 @@ class ChildTaskExecutor:
             # lease, or paused on something this executor doesn't drive
             # (e.g. waiting_for_approval -- Phase 7 links that resume path
             # directly). Nothing to do this tick.
-            return {"task_id": task_id, "state": task["state"]}
+            result = {"task_id": task_id, "state": task["state"]}
+            self.store.trace.record(
+                "child_task.execute", component="child_tasks", phase="skipped",
+                output=result, trace_id=task.get("trace_id"), task_id=task_id,
+            )
+            return result
         if outcome.state == AgentRunState.WAITING and outcome.approval_id:
             self.queue.enqueue(
                 organization_id=task["organization_id"],
@@ -99,7 +114,12 @@ class ChildTaskExecutor:
             self.sessions.notify(
                 session_id, reason=f"child_task.{outcome.state.value}"
             )
-        return outcome.model_dump(mode="json")
+        result = outcome.model_dump(mode="json")
+        self.store.trace.record(
+            "child_task.execute", component="child_tasks", phase="completed",
+            output=result, trace_id=task.get("trace_id"), task_id=task_id,
+        )
+        return result
 
     def poll_pi(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Handler for "task.pi_poll" jobs -- see PiTaskExecutor.poll()."""

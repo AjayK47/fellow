@@ -269,6 +269,21 @@ class DashboardConfig(_Section):
     auto_approve_writes: bool = False
 
 
+class ObservabilityConfig(_Section):
+    """Execution tracing. Every field here is read by something.
+
+    `level` and `otel_endpoint` used to sit alongside these and were read
+    nowhere -- the second in particular promised OpenTelemetry export that
+    did not exist. A setting that does nothing is worse than a missing one,
+    because it is believed.
+    """
+
+    enabled: bool = True
+    capture_payloads: bool = True
+    max_payload_bytes: int = 100_000
+    retention_days: int = 7
+
+
 class Settings(_Section):
     server: ServerConfig = Field(default_factory=ServerConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
@@ -281,6 +296,7 @@ class Settings(_Section):
     agent: AgentConfig = Field(default_factory=AgentConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 
 
 class ConfigError(RuntimeError):
