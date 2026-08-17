@@ -34,9 +34,7 @@ export default function Tasks() {
             <option value="">all states</option>
             <option value="queued">queued</option>
             <option value="running">running</option>
-            <option value="waiting_for_children">waiting for children</option>
-            <option value="waiting_for_approval">approval</option>
-            <option value="waiting_for_human">human</option>
+            <option value="waiting">waiting</option>
             <option value="completed">completed</option>
             <option value="failed">failed</option>
             <option value="cancelled">cancelled</option>

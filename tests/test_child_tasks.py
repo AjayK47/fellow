@@ -19,12 +19,17 @@ import time
 
 import pytest
 
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import ModelResponse, ModelToolCall, ToolDefinition
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import ModelResponse, ModelToolCall, ToolDefinition
 
+# Shaped like a real `pi --mode json` close: an `agent_end` carrying the
+# message list, then a bare `agent_settled`. See test_pi_command.py, which
+# pins this against the actual CLI so the two cannot drift apart.
 _FAKE_PI_SUCCESS_JSON = (
-    '{"type": "result", "status": "success", '
-    '"summary": "Applied and tested a fix for the null timestamp."}'
+    '{"type":"agent_end","messages":[{"role":"assistant","content":'
+    '[{"type":"text","text":"Applied and tested a fix for the null '
+    'timestamp."}],"model":"z-ai/glm-5.2","stopReason":"stop",'
+    '"usage":{"totalTokens":2699}}],"willRetry":false}'
 )
 
 
@@ -40,8 +45,8 @@ def _fake_pi_command(prompt: str) -> list[str]:
     # A real detached subprocess (see pi_task_executor.py's module docstring
     # for why: exit-code-marker durability requires an actual process, not
     # a mocked Popen), just standing in for the real `pi` CLI with an
-    # instant, deterministic success event. Shaped like default_pi_command
-    # (bare executable name, no absolute path argv[0]) so it doesn't trip
+    # instant, deterministic success event. Shaped like pi_command_builder's
+    # output (bare executable name, no absolute path argv[0]) so it doesn't trip
     # the hardline floor's path-escape check the way an explicit /bin/sh
     # invocation would -- PiTaskExecutor.start() does its own /bin/sh -c
     # wrapping internally, after the floor check.
@@ -123,10 +128,11 @@ def test_root_task_delegates_three_children_and_synthesizes_result(brain):
 
     outcome = brain.session_manager.dispatch(wake["session_id"])
     assert outcome is not None
-    assert outcome.state.value == "waiting_for_children"
+    assert outcome.state.value == "waiting"
 
     root_task = brain.store.get_task(outcome.task_id)
-    assert root_task["state"] == "waiting_for_children"
+    assert root_task["state"] == "waiting"
+    assert root_task["waiting_for"]["type"] == "child_task"
     assert root_task["execution_owner"] is None  # released, not held mid-wait
     child_ids = root_task["pending_child_task_ids"]
     assert len(child_ids) == 3
@@ -138,6 +144,8 @@ def test_root_task_delegates_three_children_and_synthesizes_result(brain):
     assert all(child["parent_task_id"] == root_task["id"] for child in children)
     assert all(child["root_task_id"] == root_task["id"] for child in children)
     assert all(child["state"] == "queued" for child in children)
+    assert all(child["max_iterations"] == 200 for child in children)
+    assert all(child["max_tool_calls"] == 500 for child in children)
     assert sorted(child["worker_type"] for child in children) == [
         "general",
         "general",
@@ -177,7 +185,11 @@ def test_root_task_delegates_three_children_and_synthesizes_result(brain):
     final_attempt = brain.store.list_task_attempts(pi_child_id)[-1]
     assert final_attempt["status"] == "succeeded"
     assert final_attempt["exit_code"] == 0
-    assert final_attempt["terminal_event"]["status"] == "success"
+    assert final_attempt["terminal_event"]["type"] == "agent_end"
+    assert (
+        final_attempt["terminal_event"]["text"]
+        == "Applied and tested a fix for the null timestamp."
+    )
 
     # Each child's terminal transition notified the Session -- it must be
     # back to queued (work pending), not still idle.
@@ -227,7 +239,7 @@ def _dispatch_delegation(brain, *, conversation_key: str, tasks: list[dict]):
     )
     outcome = brain.session_manager.dispatch(wake["session_id"])
     assert outcome is not None
-    assert outcome.state.value == "waiting_for_children"
+    assert outcome.state.value == "waiting"
     return wake, brain.store.get_task(outcome.task_id)
 
 
@@ -329,7 +341,7 @@ def test_partial_child_completion_can_wait_then_continue_sequentially(brain):
     )
     waiting = brain.session_manager.dispatch(wake["session_id"])
     assert waiting is not None
-    assert waiting.state.value == "waiting_for_children"
+    assert waiting.state.value == "waiting"
     root = brain.store.get_task(root["id"])
     assert root["pending_child_task_ids"] == [first_id, second_id]
     assert root["execution_owner"] is None
@@ -385,7 +397,7 @@ def test_adding_children_after_partial_result_preserves_running_siblings(brain):
     )
     outcome = brain.session_manager.dispatch(wake["session_id"])
     assert outcome is not None
-    assert outcome.state.value == "waiting_for_children"
+    assert outcome.state.value == "waiting"
     updated = brain.store.get_task(root["id"])
     assert still_running_id in updated["pending_child_task_ids"]
     assert len(updated["pending_child_task_ids"]) == 2

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.conftest import sign_in
+
 
 def test_slack_memory_scope_matrix(brain):
     public = brain.authz.resolve(
@@ -174,19 +176,17 @@ def test_get_source_denies_private_without_authorized_principal(brain):
     assert brain.authz.can_read_source(decision_ok, src)
 
 
-def test_api_get_memory_and_source_require_authz_query_params(client_authz):
-    """HTTP layer returns 404 for private content when principal lacks access."""
+def test_api_get_memory_and_source_are_scoped_to_the_signed_in_principal(client_authz):
+    """HTTP layer returns 404 for private content when the signed-in
+    principal lacks access -- and the principal comes from the session, not
+    from anything the caller can say."""
     client, private_mem_id, private_src_id = client_authz
 
-    # Missing acting_principal_id → 422
-    r = client.get(f"/v1/memories/{private_mem_id}")
-    assert r.status_code == 422
-
     # Unauthorized principal → 404 (fail closed, no leak)
+    sign_in(client, principal_id="person_ravi")
     r = client.get(
         f"/v1/memories/{private_mem_id}",
         params={
-            "acting_principal_id": "person_ravi",
             "destination_type": "slack_channel",
             "destination_id": "channel_eng",
             "destination_is_private": "false",
@@ -197,7 +197,6 @@ def test_api_get_memory_and_source_require_authz_query_params(client_authz):
     r = client.get(
         f"/v1/sources/{private_src_id}",
         params={
-            "acting_principal_id": "person_ravi",
             "destination_type": "slack_channel",
             "destination_id": "channel_eng",
             "destination_is_private": "false",
@@ -206,10 +205,10 @@ def test_api_get_memory_and_source_require_authz_query_params(client_authz):
     assert r.status_code == 404
 
     # Authorized member + private destination → 200
+    sign_in(client, principal_id="person_ajay")
     r = client.get(
         f"/v1/memories/{private_mem_id}",
         params={
-            "acting_principal_id": "person_ajay",
             "destination_type": "private_channel",
             "destination_id": "channel_leadership",
             "destination_is_private": "true",
@@ -222,7 +221,6 @@ def test_api_get_memory_and_source_require_authz_query_params(client_authz):
     r = client.get(
         f"/v1/memories/{private_mem_id}/lineage",
         params={
-            "acting_principal_id": "person_ajay",
             "destination_type": "private_channel",
             "destination_id": "channel_leadership",
             "destination_is_private": "true",
@@ -230,6 +228,44 @@ def test_api_get_memory_and_source_require_authz_query_params(client_authz):
     )
     assert r.status_code == 200
     assert r.json().get("permission_decision_id")
+
+
+def test_api_reads_cannot_be_performed_as_another_principal(client_authz):
+    """`acting_principal_id` used to be a plain request parameter, so a
+    signed-in member could name a colleague's principal and, with a DM
+    destination (which unlocks that actor's ENTIRE membership set), read
+    back every private channel they belong to. It is derived from the
+    session now; naming someone else must change nothing."""
+    client, private_mem_id, private_src_id = client_authz
+    sign_in(client, principal_id="person_ravi")
+
+    impersonation = {
+        "acting_principal_id": "person_ajay",
+        "destination_type": "dm",
+        "destination_id": "dm_ajay",
+        "destination_is_private": "true",
+    }
+    assert client.get(
+        f"/v1/memories/{private_mem_id}", params=impersonation
+    ).status_code == 404
+    assert client.get(
+        f"/v1/sources/{private_src_id}", params=impersonation
+    ).status_code == 404
+
+    search = client.post(
+        "/v1/search",
+        json={
+            "organization_id": "org_acme",
+            "query": "leadership",
+            "acting_principal_id": "person_ajay",
+            "destination": {"type": "dm", "id": "dm_ajay", "is_private": True},
+            "limit": 50,
+        },
+    )
+    assert search.status_code == 200
+    assert private_mem_id not in {
+        (item.get("memory") or {}).get("id") for item in search.json()["results"]
+    }
 
 
 def test_shared_member_of_two_private_channels_does_not_leak_between_them(brain):

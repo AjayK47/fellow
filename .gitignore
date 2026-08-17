@@ -1,7 +1,12 @@
-# Environment and secrets
+# Configuration and secrets. config.json is the only config file Toda
+# reads; config.example.json is the tracked, redacted template.
+config.json
+!config.example.json
+# Toda no longer reads .env, but stray ones still turn up in a working
+# tree and hold real credentials. Keep ignoring them so an `add -A` can
+# never sweep one into a commit.
 .env
 .env.*
-!.env.example
 
 # Python tooling caches and build artifacts
 .venv/
@@ -18,6 +23,71 @@ htmlcov/
 web/node_modules/
 web/dist/
 web/*.tsbuildinfo
+src/toda/static/console/
 
 # macOS
 .DS_Store
+node_modules/
+
+# Toda runtime state and local operator material
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Private research/reference worktrees and generated product experiments
+harnesses/
+build/
+dist/
+imgs/
+landing/
+site/
+
+# Superseded planning docs and research notes. Never tracked; kept on disk
+# only as a record of how the thinking went. See archive/README.md.
+archive/
+
+# Working notes are not part of the community distribution. These are the
+# documents written while building a change -- plans, handoffs, audits, the
+# running understanding of a subsystem. They go stale the moment the code
+# lands, and a reader who trusts one is worse off than a reader who had
+# nothing. What ships is the as-built set: README, ARCHITECTURE, SECURITY,
+# CONTRIBUTING and the guides under docs/.
+#
+# Suffix patterns rather than a list of filenames, because the list only
+# ever caught the notes that already existed. All of these are also
+# deliberately safe against the docs that DO ship: `*_REVIEW.md` cannot
+# match SECURITY.md, `*_ARCHITECTURE.md` cannot match ARCHITECTURE.md.
+*_PLAN.md
+*_HANDOFF.md
+*_TODO.md
+*_REVIEW.md
+*_AUDIT.md
+*_FINDINGS.md
+*_STATUS.md
+*_NOTES.md
+*_ADOPTION.md
+*_UNDERSTANDING.md
+*_ARCHITECTURE.md
+*_architecture.md
+*ANALYSIS*.md
+HARNESS_*.md
+notes/
+scratch/
+
+# Agent and tool state, none of it portable to another machine
+CLAUDE.md
+.claude/
+.commandcode/
+
+# Other harnesses cloned for reference (OpenMausBot and friends). Whole
+# third-party repositories, with their own git history and licences.
+harnesses/
+
+# Eval corpora and results. The generator, cases and scorers are tracked;
+# the generated organization and every run's scores are not -- corpora are
+# model-written and large, and results are per-machine.
+evals/data/
+evals/results/

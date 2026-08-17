@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from docket.domain.models import ProactiveCandidate, ProactiveDecision
-from docket.services.proactive import decide
+from toda.domain.models import ProactiveCandidate, ProactiveDecision
+from toda.services.proactive import decide
 
 
 def test_proactive_silence_when_permission_unsafe():
@@ -157,3 +157,5 @@ def test_skill_store_and_retrieve(brain):
         steps=[{"order": 1, "name": "Build", "description": "CI build"}],
     )
     got = brain.skills.get(skill["id"])
+    assert got is not None
+    assert got["name"] == "Deploy Backend"

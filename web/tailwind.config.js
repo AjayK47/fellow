@@ -4,8 +4,8 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        sans: ['"Manrope"', "system-ui", "sans-serif"],
-        mono: ['"DM Mono"', "ui-monospace", "monospace"],
+        sans: ['"IBM Plex Sans"', "system-ui", "sans-serif"],
+        mono: ['"IBM Plex Mono"', "ui-monospace", "monospace"],
       },
       colors: {
         // Core text/background — same names as before, evolved for a light,

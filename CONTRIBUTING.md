@@ -1,13 +1,13 @@
-# Contributing to Docket
+# Contributing to Toda
 
 ## Development setup
 
 ```bash
 uv sync --extra dev
-cp .env.example .env
+python scripts/bootstrap.py
 ```
 
-No external key is required to run the full stack — `.env.example` defaults
+No external key is required to run the full stack — `config.example.json` defaults
 to deterministic model and embedding providers, which exercise the complete
 ingestion, permission, memory, graph, policy, job, and runtime machinery
 without paid inference.
@@ -23,13 +23,13 @@ npm --prefix web run build
 Start the gateway:
 
 ```bash
-uv run docket gateway
+uv run toda gateway
 ```
 
 Seed a synthetic organization if you want data to look at immediately:
 
 ```bash
-uv run docket-seed
+uv run toda-seed
 ```
 
 ## Running the test suite
@@ -47,6 +47,13 @@ npm run build     # production build
 ```
 
 Both are expected to pass cleanly before a change is considered done.
+
+Run the public-release and provenance gate as well:
+
+```bash
+uv run python scripts/verify_release.py
+uv run ruff check src tests scripts
+```
 
 ## Working principles
 
@@ -69,6 +76,18 @@ Both are expected to pass cleanly before a change is considered done.
 - If you touched an API response shape, check the console pages that read
   it — several past bugs here were exactly this: a frontend field name that
   no longer matched what the backend actually returned.
-- If you touched anything that writes to `.env` or handles a credential,
+- If you touched anything that reads `config.json` or handles a credential,
   double-check it still only writes to the local, gitignored file and never
   logs or echoes a secret value.
+- If you touched a built-in skill, keep its reviewed `license` and `origin`
+  frontmatter accurate. Inspiration, adaptation, and original implementation
+  are different provenance claims.
+- If your change affects a trust boundary, update `SECURITY.md` and include a
+  focused regression test.
+
+## Security and private data
+
+Never use a public issue or pull request for vulnerabilities, credentials,
+real company messages, connector payloads, databases, or workspaces. Follow
+`SECURITY.md` for private vulnerability reporting and use synthetic fixtures
+in tests and examples.

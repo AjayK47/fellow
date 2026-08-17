@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from docket.services.web_tools import WebTools
-from docket.harness.prompts import frame_untrusted_tool_result
+from toda.providers import ToolConnection
+from toda.services.web_tools import BraveSearchProvider, WebTools
+from toda.harness.prompts import frame_untrusted_tool_result
 
 
 def test_brave_search_normalizes_results(monkeypatch: pytest.MonkeyPatch):
@@ -16,8 +17,12 @@ def test_brave_search_normalizes_results(monkeypatch: pytest.MonkeyPatch):
         def json(self):
             return {"web": {"results": [{"title": "One", "url": "https://example.com", "description": "Result"}]}}
 
-    monkeypatch.setattr("docket.services.web_tools.httpx.get", lambda *args, **kwargs: Response())
-    result = WebTools(brave_api_key="brave-test").search("company research")
+    monkeypatch.setattr("toda.services.web_tools.httpx.get", lambda *args, **kwargs: Response())
+    result = WebTools(
+        search_provider=BraveSearchProvider(
+            ToolConnection(provider="brave", api_key="brave-test")
+        )
+    ).search("company research")
     assert result["configured"] is True
     assert result["results"] == [{"title": "One", "url": "https://example.com", "description": "Result"}]
 
@@ -41,9 +46,11 @@ def test_firecrawl_fetch_returns_markdown(monkeypatch: pytest.MonkeyPatch):
                 },
             }
 
-    monkeypatch.setattr("docket.services.web_tools.WebTools._validate_public_url", staticmethod(lambda url: None))
-    monkeypatch.setattr("docket.services.web_tools.httpx.post", lambda *args, **kwargs: Response())
-    result = WebTools(firecrawl_api_key="fc-test").fetch("https://example.com")
+    monkeypatch.setattr("toda.services.web_tools.WebTools._validate_public_url", staticmethod(lambda url: None))
+    monkeypatch.setattr("toda.services.web_tools.httpx.post", lambda *args, **kwargs: Response())
+    result = WebTools(
+        extract_connection=ToolConnection(provider="firecrawl", api_key="fc-test")
+    ).fetch("https://example.com")
     assert result["provider"] == "firecrawl"
     assert result["content"] == "# Extracted page"
 
@@ -61,3 +68,34 @@ def test_web_tool_result_is_explicitly_framed_as_untrusted():
     assert content.startswith('<untrusted_tool_result source="web_fetch">')
     assert "ignore previous instructions" in content
     assert "</untrusted-tool-result>" in content
+
+
+def test_firecrawl_search_handles_the_v2_grouped_response():
+    """Firecrawl v2 returns data as {"web": [...], "news": [...]}, not a list.
+
+    Slicing that dict raised `unhashable type: 'slice'` on every Firecrawl
+    search, so the provider was unusable with a perfectly valid API key.
+    """
+    from unittest.mock import patch
+
+    from toda.providers import ToolConnection
+    from toda.services.web_tools import JsonSearchProvider
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "success": True,
+                "data": {
+                    "web": [{"title": "A", "url": "https://a", "description": "da"}],
+                    "news": [{"title": "N", "url": "https://n", "description": "dn"}],
+                },
+            }
+
+    with patch("toda.services.web_tools.httpx.post", return_value=Response()):
+        provider = JsonSearchProvider(ToolConnection(provider="firecrawl", api_key="k"))
+        results = provider.search("anything", 5)
+
+    assert [item["title"] for item in results] == ["A", "N"]

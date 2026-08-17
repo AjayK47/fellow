@@ -6,6 +6,38 @@ export class ApiError extends Error {
   }
 }
 
+// Every /v1 data route is bound to the signed-in workspace server-side, so
+// an expired or cleared login turns every request into a 401. Without a
+// hook for that the console would sit on a stale page showing empty tables
+// and failed refreshes forever, with nothing telling the person to sign in
+// again. App registers a handler that drops back to the login screen.
+let unauthorizedHandler: (() => void) | null = null;
+
+export function onUnauthorized(handler: () => void): void {
+  unauthorizedHandler = handler;
+}
+
+/** Pull the human-readable sentence out of an error body.
+ *
+ * FastAPI answers with `{"detail": "..."}`, and stringifying that put raw JSON
+ * in front of people ({"detail":"The installation owner already exists"}).
+ * Validation failures use a list of `{loc, msg}` instead, so both shapes are
+ * unwrapped here rather than at every call site. */
+function errorMessage(data: unknown, status: number): string {
+  if (typeof data === "string" && data.trim()) return data;
+  if (data && typeof data === "object") {
+    const detail = (data as { detail?: unknown }).detail;
+    if (typeof detail === "string" && detail.trim()) return detail;
+    if (Array.isArray(detail)) {
+      const first = detail[0] as { msg?: unknown } | undefined;
+      if (typeof first?.msg === "string") return first.msg;
+    }
+    const message = (data as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return `Request failed (${status})`;
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -36,7 +68,11 @@ async function request<T>(
     }
   }
   if (!res.ok) {
-    throw new ApiError(res.status, typeof data === "string" ? data : JSON.stringify(data));
+    // /v1/session is how "am I signed in?" is *asked* — a 401 from it is an
+    // answer, not a session that just expired, so it must not recurse into
+    // the handler that re-asks.
+    if (res.status === 401 && path !== "/v1/session") unauthorizedHandler?.();
+    throw new ApiError(res.status, errorMessage(data, res.status));
   }
   return data as T;
 }
@@ -62,7 +98,18 @@ export interface DashboardSession {
   organization_id: string;
   principal_id: string;
   workspace_name: string | null;
+  user_id: string;
+  email: string;
+  name: string;
+  role: "owner" | "admin" | "member";
   auth_disabled: boolean;
+}
+
+export async function login(email: string, password: string): Promise<DashboardSession> {
+  const session = await request<DashboardSession>("POST", "/v1/auth/login", { email, password });
+  ORG = session.organization_id;
+  PRINCIPAL = session.principal_id;
+  return session;
 }
 
 /** Resolves the signed-in workspace/person from the server session cookie.

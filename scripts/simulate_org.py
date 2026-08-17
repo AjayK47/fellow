@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 ORG = "org_simulated"
 WORKSPACE = "T_DEMO"
-BOT = "U_DOCKET"
+BOT = "U_TODA"
 
 
 def slack_event(
@@ -153,7 +153,7 @@ def seed(brain: Any) -> None:
             "toolkit": "github",
             "connected_account_id": "ca_sim_github",
             "status": "active",
-            "composio_user_id": f"docket:{ORG}",
+            "composio_user_id": f"toda:{ORG}",
             "principal_id": "person_bob",
             "scope_id": "scope_sim_eng",
             "visibility": "team",
@@ -234,12 +234,12 @@ def run_simulation(
     live_models: bool = False,
 ) -> dict[str, Any]:
     if not live_embeddings:
-        os.environ["DOCKET_EMBEDDING_PROVIDER"] = "deterministic"
+        os.environ["TODA_EMBEDDING_PROVIDER"] = "deterministic"
     if not live_models:
-        os.environ["DOCKET_MODEL_PROVIDER"] = "deterministic"
-    from docket.services.container import DocketApp
+        os.environ["TODA_MODEL_PROVIDER"] = "deterministic"
+    from toda.services.container import TodaApp
 
-    brain = DocketApp(db_path)
+    brain = TodaApp(db_path)
     try:
         seed(brain)
         events = [
@@ -297,8 +297,8 @@ def run_simulation(
             headers={},
             allow_unsigned=True,
         )
-        from docket.adapters import normalize_composio_harness_event
-        from docket.domain.models import utcnow
+        from toda.adapters import normalize_composio_harness_event
+        from toda.domain.models import utcnow
 
         connector_payload = {
             "id": "Composio_export_failure",
@@ -308,7 +308,7 @@ def run_simulation(
                 "trigger_slug": "GITHUB_ISSUE_EVENT",
                 "trigger_id": "ti_sim_github_issues",
                 "connected_account_id": "ca_sim_github",
-                "user_id": f"docket:{ORG}",
+                "user_id": f"toda:{ORG}",
             },
             "data": {
                 "title": "Export worker failure after deployment 982",
@@ -635,7 +635,7 @@ def run_simulation(
 
 def markdown(report: dict[str, Any]) -> str:
     output = [
-        "# Docket full-harness simulation",
+        "# Toda full-harness simulation",
         "",
         f"- Database: {report['database']}",
         f"- Embeddings: {report['embedding_provider']}",

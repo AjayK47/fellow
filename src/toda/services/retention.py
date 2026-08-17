@@ -1,0 +1,248 @@
+"""Explicit, auditable retention and tenant-deletion controls."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import Any
+
+from toda.domain.models import utcnow
+
+
+_TIMED_TABLES: dict[str, str] = {
+    "session_messages": "created_at",
+    "task_turns": "created_at",
+    "harness_tool_calls": "created_at",
+    "approvals": "created_at",
+    "attention_evaluations": "created_at",
+    "task_interventions": "created_at",
+    "agent_feedback": "created_at",
+    "deliveries": "created_at",
+    "checkpoints": "created_at",
+    "episodes": "created_at",
+    "received_events": "received_at",
+    "processing_jobs": "created_at",
+    "harness_jobs": "created_at",
+    "connector_objects": "observed_at",
+    "connector_sync_runs": "created_at",
+    "entity_resolution_candidates": "created_at",
+    "fact_conflicts": "created_at",
+    "cases": "created_at",
+    "case_events": "created_at",
+    "judgment_events": "created_at",
+    "policy_versions": "created_at",
+    "action_preconditions": "created_at",
+    "artifacts": "created_at",
+    "task_pattern_signals": "created_at",
+    "task_scratchpads": "created_at",
+}
+
+_TENANT_TABLES = [
+    # Dashboard identity. Deleting a tenant has to remove the people who could
+    # sign into it: leaving these behind left live sessions that still
+    # authenticated against a deleted organization, and made a reinstall
+    # impossible because the owner account outlived its own organization.
+    # dashboard_users and dashboard_login_attempts are NOT here -- an account is
+    # global and only joined to an organization through organization_members,
+    # so they are cleaned up by _delete_orphaned_accounts below.
+    "dashboard_sessions",
+    "dashboard_invitations",
+    "dashboard_access_requests",
+    "organization_members",
+    "chunks_fts",
+    "memories_fts",
+    "episodes_fts",
+    "memory_embeddings",
+    "judgment_embeddings",
+    "task_pattern_signals",
+    "task_scratchpads",
+    "chunks",
+    # The vec0 ANN indexes are org-partitioned (storage/db.py's vec_chunks/
+    # vec_memories/vec_episodes) precisely so a tenant's rows can be found
+    # and deleted without touching another org's -- delete_organization
+    # claims "recoverable: False" and has to mean it for the raw embedding
+    # vectors too, not just their JSON source rows.
+    "vec_chunks",
+    "vec_memories",
+    "vec_episodes",
+    "episode_sources",
+    "principal_memberships",
+    "skill_versions",
+    "agent_feedback",
+    "deliveries",
+    "checkpoints",
+    "approvals",
+    "harness_tool_calls",
+    "task_turns",
+    "session_messages",
+    "sessions",
+    "tasks",
+    "attention_evaluations",
+    "task_interventions",
+    "conversation_states",
+    "harness_jobs",
+    "episodes",
+    "automations",
+    "slack_installations",
+    "channel_policies",
+    "identity_mappings",
+    "connector_accounts",
+    "tool_policies",
+    "action_preconditions",
+    "policy_versions",
+    "judgment_events",
+    "case_events",
+    "cases",
+    "fact_conflicts",
+    "reality_facts",
+    "entity_resolution_candidates",
+    "external_identifiers",
+    "connector_sync_cursors",
+    "connector_sync_runs",
+    "connector_objects",
+    "artifacts",
+    "processing_jobs",
+    "received_events",
+    "idempotency_keys",
+    "profiles",
+    "authz_decisions",
+    "audit_events",
+    "signals",
+    "skills",
+    "scopes",
+    "memories",
+    "edges",
+    "entities",
+    "sources",
+]
+
+
+class RetentionService:
+    """Retention is opt-in and previewable; no cleanup happens silently."""
+
+    def __init__(self, *, store: Any, audit: Any) -> None:
+        self.store = store
+        self.audit = audit
+
+    def preview(
+        self, organization_id: str, *, older_than_days: int
+    ) -> dict[str, Any]:
+        if older_than_days < 1:
+            raise ValueError("older_than_days must be at least 1")
+        cutoff = (utcnow() - timedelta(days=older_than_days)).isoformat()
+        counts: dict[str, int] = {}
+        with self.store.cursor() as cur:
+            for table, column in _TIMED_TABLES.items():
+                cur.execute(
+                    f"""SELECT COUNT(*) AS count FROM {table}
+                    WHERE organization_id = ? AND {column} < ?""",
+                    (organization_id, cutoff),
+                )
+                counts[table] = int(cur.fetchone()["count"])
+        return {
+            "organization_id": organization_id,
+            "older_than_days": older_than_days,
+            "cutoff": cutoff,
+            "counts": counts,
+            "total": sum(counts.values()),
+        }
+
+    def apply(
+        self,
+        organization_id: str,
+        *,
+        older_than_days: int,
+        confirmed_by: str,
+    ) -> dict[str, Any]:
+        preview = self.preview(
+            organization_id, older_than_days=older_than_days
+        )
+        deleted: dict[str, int] = {}
+        with self.store.cursor() as cur:
+            for table, column in _TIMED_TABLES.items():
+                cur.execute(
+                    f"""DELETE FROM {table}
+                    WHERE organization_id = ? AND {column} < ?""",
+                    (organization_id, preview["cutoff"]),
+                )
+                deleted[table] = max(cur.rowcount, 0)
+        result = {
+            **preview,
+            "deleted": deleted,
+            "deleted_total": sum(deleted.values()),
+            "confirmed_by": confirmed_by,
+        }
+        self.audit.record(
+            organization_id,
+            "retention.applied",
+            result,
+            principal_id=confirmed_by,
+        )
+        return result
+
+    @staticmethod
+    def _delete_orphaned_accounts(cur: Any, existing_tables: set[str]) -> dict[str, int]:
+        """Remove dashboard accounts left with no organization to belong to.
+
+        A dashboard account is global and reaches an organization only through
+        organization_members, so it survives the tenant sweep above. An account
+        with no remaining membership can never sign in anywhere and is exactly
+        what blocks a reinstall ("the installation owner already exists"), so it
+        goes with the tenant that was its only home.
+        """
+        counts: dict[str, int] = {}
+        if "dashboard_users" not in existing_tables:
+            return counts
+        orphan_filter = (
+            "SELECT id FROM dashboard_users WHERE id NOT IN "
+            "(SELECT user_id FROM organization_members)"
+            if "organization_members" in existing_tables
+            else "SELECT id FROM dashboard_users"
+        )
+        cur.execute(f"DELETE FROM dashboard_users WHERE id IN ({orphan_filter})")
+        counts["dashboard_users"] = max(cur.rowcount, 0)
+        # Login attempts are transient rate-limiting state keyed by an opaque
+        # attempt_key -- no email, no organization to filter on. Once the
+        # accounts they throttled are gone the rows are meaningless, and
+        # leaving them would rate-limit whoever sets the install up next.
+        if counts["dashboard_users"] and "dashboard_login_attempts" in existing_tables:
+            cur.execute("DELETE FROM dashboard_login_attempts")
+            counts["dashboard_login_attempts"] = max(cur.rowcount, 0)
+        return counts
+
+    def delete_organization(
+        self, organization_id: str, *, confirmation: str
+    ) -> dict[str, Any]:
+        if confirmation != organization_id:
+            raise ValueError(
+                "confirmation must exactly match organization_id"
+            )
+        counts: dict[str, int] = {}
+        with self.store.cursor() as cur:
+            # A handful of tables (the vec0 ANN indexes) are created lazily
+            # on first write, not at bootstrap -- an org that never
+            # ingested anything with an embedding legitimately has none of
+            # them yet. Deletion must still succeed for every table that
+            # DOES exist rather than failing whole on the first one that
+            # doesn't.
+            cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            existing_tables = {row["name"] for row in cur.fetchall()}
+            for table in _TENANT_TABLES:
+                if table not in existing_tables:
+                    counts[table] = 0
+                    continue
+                cur.execute(
+                    f"DELETE FROM {table} WHERE organization_id = ?",
+                    (organization_id,),
+                )
+                counts[table] = max(cur.rowcount, 0)
+            cur.execute(
+                "DELETE FROM organizations WHERE id = ?", (organization_id,)
+            )
+            counts["organizations"] = max(cur.rowcount, 0)
+            counts.update(self._delete_orphaned_accounts(cur, existing_tables))
+        return {
+            "organization_id": organization_id,
+            "deleted": counts,
+            "deleted_total": sum(counts.values()),
+            "recoverable": False,
+        }

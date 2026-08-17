@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from docket.harness.models import (
+from tests.conftest import sign_in
+from toda.harness.models import (
     DestinationEnvelope,
     InvocationEnvelope,
     ModelToolCall,
 )
-from docket.services.policy import PolicyEngine
+from toda.services.policy import PolicyEngine
 
 
 def _account(brain):
@@ -17,7 +18,7 @@ def _account(brain):
         "toolkit": "linear",
         "connected_account_id": "ca_test_linear",
         "status": "active",
-        "composio_user_id": "docket:org_acme",
+        "composio_user_id": "toda:org_acme",
         "principal_id": "connector:ca_test_linear",
         "scope_id": "scope_org_public",
         "learn": True,
@@ -35,17 +36,17 @@ def test_ingestion_materializes_object_identity_fact_and_case(brain):
         source_system="linear",
         source_type="issue.updated",
         external_id="LIN-501",
-        content="Issue: Docket status is investigating. Ajay owns the incident.",
+        content="Issue: Toda status is investigating. Ajay owns the incident.",
         scope_id="scope_org_public",
         author_entity_id="person_ajay",
-        entity_ids=["project_docket"],
+        entity_ids=["project_toda"],
         metadata={
             "object_type": "issue",
             "object_id": "LIN-501",
             "connected_account_id": "ca_test_linear",
             "raw_data": {
                 "id": "LIN-501",
-                "title": "Docket incident",
+                "title": "Toda incident",
                 "status": "investigating",
                 "owner_id": "ajay-linear",
                 "owner_email": "ajay@example.com",
@@ -191,7 +192,7 @@ def _connector_objects(brain, external_id):
 def test_bitemporal_facts_preserve_history_and_resolve_conflicts(brain):
     first = brain.reality.assert_fact(
         organization_id="org_acme",
-        subject_id="project_docket",
+        subject_id="project_toda",
         predicate="status",
         object_value="planning",
         scope_id="scope_org_public",
@@ -203,7 +204,7 @@ def test_bitemporal_facts_preserve_history_and_resolve_conflicts(brain):
     known_before = first["system_from"]
     second = brain.reality.assert_fact(
         organization_id="org_acme",
-        subject_id="project_docket",
+        subject_id="project_toda",
         predicate="status",
         object_value="active",
         scope_id="scope_org_public",
@@ -214,14 +215,14 @@ def test_bitemporal_facts_preserve_history_and_resolve_conflicts(brain):
     )
     current = brain.reality.current_facts(
         "org_acme",
-        subject_id="project_docket",
+        subject_id="project_toda",
         predicate="status",
         valid_at="2026-03-01T00:00:00+00:00",
     )
     assert [fact["object_value"] for fact in current] == ["active"]
     historical = brain.reality.current_facts(
         "org_acme",
-        subject_id="project_docket",
+        subject_id="project_toda",
         predicate="status",
         valid_at="2026-01-15T00:00:00+00:00",
         known_at=known_before,
@@ -290,7 +291,7 @@ def test_conditional_policy_default_deny_and_forbid_precedence(brain):
         organization_id="org_acme",
         policy_key="linear-writes",
         effect="permit",
-        actions=["linear_update_issue"],
+        actions=["COMPOSIO_EXECUTE"],
         conditions={"destination.type": "dm"},
         approval_required=True,
         created_by="person_ajay",
@@ -298,12 +299,12 @@ def test_conditional_policy_default_deny_and_forbid_precedence(brain):
     )
     allowed = brain.policy.evaluate(
         organization_id="org_acme",
-        action="linear_update_issue",
+        action="COMPOSIO_EXECUTE",
         context={"destination": {"type": "dm"}},
     )
     denied_by_default = brain.policy.evaluate(
         organization_id="org_acme",
-        action="linear_update_issue",
+        action="COMPOSIO_EXECUTE",
         context={"destination": {"type": "slack_channel"}},
     )
     assert allowed["decision"] == "allow"
@@ -314,14 +315,14 @@ def test_conditional_policy_default_deny_and_forbid_precedence(brain):
         organization_id="org_acme",
         policy_key="incident-freeze",
         effect="forbid",
-        actions=["linear_update_issue"],
+        actions=["COMPOSIO_EXECUTE"],
         conditions={"action.arguments.status": "closed"},
         created_by="person_ajay",
         status="active",
     )
     forbidden = brain.policy.evaluate(
         organization_id="org_acme",
-        action="linear_update_issue",
+        action="COMPOSIO_EXECUTE",
         context={
             "destination": {"type": "dm"},
             "action": {"arguments": {"status": "closed"}},
@@ -430,7 +431,7 @@ def test_reality_api_exposes_permission_filtered_facts_and_artifacts(api_client)
         "/v1/facts",
         json={
             "organization_id": "org_acme",
-            "subject_id": "project_docket",
+            "subject_id": "project_toda",
             "predicate": "status",
             "object_value": "active",
             "scope_id": "scope_org_public",
@@ -443,7 +444,7 @@ def test_reality_api_exposes_permission_filtered_facts_and_artifacts(api_client)
         params={
             "organization_id": "org_acme",
             "acting_principal_id": "person_ajay",
-            "subject_id": "project_docket",
+            "subject_id": "project_toda",
         },
     )
     assert facts.status_code == 200
@@ -498,25 +499,37 @@ def test_reality_api_exposes_permission_filtered_facts_and_artifacts(api_client)
             "created_by": "person_ajay",
         },
     ).json()
+    # Who is asking comes from the signed-in session, never from a request
+    # parameter -- so seeing the API as a different person means signing in
+    # as them, exactly as a real second user would.
+    sign_in(api_client, principal_id="person_ravi")
     ravi_facts = api_client.get(
-        "/v1/facts",
-        params={
-            "organization_id": "org_acme",
-            "acting_principal_id": "person_ravi",
-        },
+        "/v1/facts", params={"organization_id": "org_acme"}
     ).json()["facts"]
     ravi_artifacts = api_client.get(
-        "/v1/artifacts",
-        params={
-            "organization_id": "org_acme",
-            "acting_principal_id": "person_ravi",
-        },
+        "/v1/artifacts", params={"organization_id": "org_acme"}
     ).json()["artifacts"]
     assert private_fact["id"] not in {item["id"] for item in ravi_facts}
     assert private_artifact["id"] not in {item["id"] for item in ravi_artifacts}
     assert api_client.get(
+        f"/v1/artifacts/{private_artifact['id']}"
+    ).status_code == 404
+
+    # The parameter this route used to take is now inert. Ravi naming the
+    # principal who CAN see the private scope must change nothing -- that
+    # self-assertion was readable-as-anyone, since a DM destination unlocks
+    # the named actor's entire membership set.
+    still_hidden = api_client.get(
+        "/v1/facts",
+        params={
+            "organization_id": "org_acme",
+            "acting_principal_id": "person_ajay",
+        },
+    ).json()["facts"]
+    assert private_fact["id"] not in {item["id"] for item in still_hidden}
+    assert api_client.get(
         f"/v1/artifacts/{private_artifact['id']}",
-        params={"acting_principal_id": "person_ravi"},
+        params={"acting_principal_id": "person_ajay"},
     ).status_code == 404
 
 
@@ -527,7 +540,7 @@ def test_policy_changes_are_pending_until_explicit_activation(api_client):
             "organization_id": "org_acme",
             "policy_key": "company-writes",
             "effect": "permit",
-            "actions": ["linear_create_issue"],
+            "actions": ["COMPOSIO_EXECUTE"],
             "conditions": {"destination.type": "dm"},
             "approval_required": True,
             "created_by": "person_ajay",
@@ -620,3 +633,124 @@ def test_long_distinctive_label_still_fuzzy_resolves(brain):
     )
     assert match is not None
     assert match["id"] == "person_sarah"
+
+
+# ---------------------------------------------------------------------
+# propose_entity_mention: the missing half of graph population.
+#
+# resolve_source_entities only ever creates a business entity from a "hard"
+# identifier in a structured connector payload (an email, a customer_id).
+# An ordinary Slack conversation has none of that -- a name mentioned in
+# free text is the only signal chat-based extraction ever gets. Before this
+# method existed, the graph could only ever grow person/conversation/
+# source/task entities: every project, team, customer and incident anyone
+# ever talked about was invisible to it.
+# ---------------------------------------------------------------------
+
+
+def test_propose_entity_mention_with_no_match_creates_a_new_entity(brain):
+    org = "org_acme"
+    entity_id, decision = brain.reality.propose_entity_mention(
+        org,
+        name="Project Atlas",
+        entity_type="project",
+        source_id="src_test",
+    )
+    assert decision == "created"
+    assert entity_id is not None
+    entity = brain.graph.get_entity(entity_id)
+    assert entity["name"] == "Project Atlas"
+    assert entity["entity_type"] == "project"
+    assert entity["attributes"]["created_by_extraction"] is True
+
+
+def test_propose_entity_mention_with_an_exact_match_links_directly(brain):
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {
+            "id": "customer_acme_corp",
+            "organization_id": org,
+            "entity_type": "customer",
+            "name": "Acme Corp",
+        }
+    )
+    before = len(brain.store.list_entities(org, entity_types=["customer"]))
+    entity_id, decision = brain.reality.propose_entity_mention(
+        org, name="Acme Corp", entity_type="customer", source_id="src_test"
+    )
+    assert decision == "matched"
+    assert entity_id == "customer_acme_corp"
+    # No duplicate was created for an exact match.
+    assert len(brain.store.list_entities(org, entity_types=["customer"])) == before
+
+
+def test_propose_entity_mention_with_a_fuzzy_match_queues_review_not_a_link(brain):
+    """A merely-similar name might be a DIFFERENT real entity -- auto-
+    linking it would silently merge two distinct things. This must queue a
+    pending resolution candidate (the same review flow a soft identifier
+    match already uses) and leave the mention unresolved, never invent a
+    new duplicate entity, and never guess by auto-linking either."""
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {
+            "id": "project_atlas_v1",
+            "organization_id": org,
+            "entity_type": "project",
+            "name": "Project Atlas",
+        }
+    )
+    before = len(brain.store.list_entities(org, entity_types=["project"]))
+    entity_id, decision = brain.reality.propose_entity_mention(
+        org, name="Project Atlas Two", entity_type="project", source_id="src_test"
+    )
+    assert decision == "candidate"
+    assert entity_id is None
+    # No new entity was created for a merely-similar match either.
+    assert len(brain.store.list_entities(org, entity_types=["project"])) == before
+    candidates = brain.reality.list_resolution_candidates(org, status="pending")
+    assert any(c["left_entity_id"] == "project_atlas_v1" for c in candidates)
+
+
+def test_approving_a_mention_candidate_lets_the_next_mention_resolve_fast(brain):
+    """Confirming the candidate must actually close the loop: the next time
+    this exact name comes up, it should hit the fast exact/identifier path
+    instead of queuing another candidate."""
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {
+            "id": "project_atlas_v1",
+            "organization_id": org,
+            "entity_type": "project",
+            "name": "Project Atlas",
+        }
+    )
+    brain.reality.propose_entity_mention(
+        org, name="Project Atlas Two", entity_type="project", source_id="src_test"
+    )
+    [candidate] = brain.reality.list_resolution_candidates(org, status="pending")
+    brain.reality.decide_resolution_candidate(
+        candidate["id"], approved=True, decided_by="person_ajay"
+    )
+
+    entity_id, decision = brain.reality.propose_entity_mention(
+        org, name="Project Atlas Two", entity_type="project", source_id="src_test_2"
+    )
+    assert decision == "matched"
+    assert entity_id == "project_atlas_v1"
+
+
+def test_propose_entity_mention_reuses_the_established_matching_logic(brain):
+    """_candidate_entity's short/generic-label entropy gate must apply here
+    too, via the shared _match_entity helper -- otherwise this new path
+    would be looser than the one it was modeled on."""
+    org = "org_acme"
+    brain.graph.upsert_entity(
+        {"id": "person_al", "organization_id": org, "entity_type": "person", "name": "Al Chen"}
+    )
+    entity_id, decision = brain.reality.propose_entity_mention(
+        org, name="al", entity_type="person", source_id="src_test"
+    )
+    # Too short/low-entropy to trust a fuzzy ratio -- must not silently
+    # merge into "Al Chen", so a new entity is created instead.
+    assert decision == "created"
+    assert entity_id != "person_al"

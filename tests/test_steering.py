@@ -16,17 +16,17 @@ from __future__ import annotations
 
 import time
 
-from docket.domain.models import new_id, utcnow
-from docket.harness.model_client import ScriptedModelClient
-from docket.harness.models import AgentRunState, DestinationEnvelope, InvocationEnvelope
-from docket.harness.models import ModelResponse
+from toda.domain.models import new_id, utcnow
+from toda.harness.model_client import ScriptedModelClient
+from toda.harness.models import AgentRunState, DestinationEnvelope, InvocationEnvelope
+from toda.harness.models import ModelResponse
 
 
 def _envelope() -> dict:
     return InvocationEnvelope(
         organization_id="org_acme",
         principal_id="person_ajay",
-        application_id="slack_docket",
+        application_id="slack_toda",
         conversation_id="slack:dm:person_ajay:steering",
         destination=DestinationEnvelope(type="dm", id="D1", is_private=True),
         purpose="reactive_agent",
@@ -43,6 +43,7 @@ def _session_id(brain, key: str) -> str:
         role="user",
         content="start the work",
         principal_id="person_ajay",
+        may_join=True,
     )
     return wake["session_id"]
 
@@ -56,6 +57,7 @@ def _make_task(
     parent_task_id: str | None = None,
     root_task_id: str | None = None,
     prompt: str = "do the work",
+    waiting_for_type: str = "child_task",
 ) -> dict:
     now = utcnow().isoformat()
     task_id = new_id("task")
@@ -85,6 +87,11 @@ def _make_task(
         "created_at": now,
         "updated_at": now,
     }
+    if state == AgentRunState.WAITING.value:
+        task["waiting_for"] = {
+            "type": waiting_for_type,
+            "ids": [],
+        }
     brain.store.create_task(task)
     if state == AgentRunState.RUNNING.value:
         brain.store.claim_task(task_id, owner="exec_seed", lease_seconds=1800)
@@ -118,7 +125,7 @@ def test_explicit_stop_cancels_root_and_active_children_without_a_model_call(bra
     session_id = _session_id(brain, "slack:dm:person_ajay:stop")
     root = _make_task(
         brain, session_id=session_id, worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
     general_child = _make_task(
         brain, session_id=session_id, worker_type="general", state=AgentRunState.RUNNING.value,
@@ -142,6 +149,7 @@ def test_explicit_stop_cancels_root_and_active_children_without_a_model_call(bra
         role="user",
         content="stop",
         principal_id="person_ajay",
+        may_join=True,
     )
     assert result["steer_signal"] == "abort"
 
@@ -178,6 +186,7 @@ def test_ordinary_steer_message_is_injected_into_the_active_roots_next_iteration
         role="user",
         content="also check the billing channel while you're at it",
         principal_id="person_ajay",
+        may_join=True,
     )
     assert result["steer_signal"] == "steer"
 
@@ -198,7 +207,7 @@ def test_ordinary_steer_message_is_injected_into_the_active_roots_next_iteration
 
 
 def test_wake_with_no_active_root_task_does_not_signal_anything(brain):
-    session_id = _session_id(brain, "slack:dm:person_ajay:idle")
+    _session_id(brain, "slack:dm:person_ajay:idle")
     result = brain.sessions.wake(
         organization_id="org_acme",
         conversation_key="slack:dm:person_ajay:idle",
@@ -206,6 +215,7 @@ def test_wake_with_no_active_root_task_does_not_signal_anything(brain):
         role="user",
         content="stop",
         principal_id="person_ajay",
+        may_join=True,
     )
     assert result["steer_signal"] is None
 
@@ -226,6 +236,7 @@ def test_actor_change_interrupts_active_root_for_fresh_authorization(brain):
         role="user",
         content="now check my request",
         principal_id="person_maya",
+        may_join=True,
     )
 
     assert result["steer_signal"] == "reauthorize"
@@ -240,7 +251,7 @@ def test_actor_change_on_waiting_root_does_not_leave_a_stale_pause_signal(brain)
         brain,
         session_id=session_id,
         worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
 
     result = brain.sessions.wake(
@@ -250,6 +261,7 @@ def test_actor_change_on_waiting_root_does_not_leave_a_stale_pause_signal(brain)
         role="user",
         content="use my permissions for this update",
         principal_id="person_maya",
+        may_join=True,
     )
 
     assert result["steer_signal"] == "reauthorize"
@@ -262,7 +274,8 @@ def test_waiting_root_resumes_under_current_actor_envelope(brain):
         brain,
         session_id=session_id,
         worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_HUMAN.value,
+        state=AgentRunState.WAITING.value,
+        waiting_for_type="user",
     )
     brain.company_agent.model = ScriptedModelClient(
         [ModelResponse(content="Handled using the current actor.")]
@@ -274,6 +287,7 @@ def test_waiting_root_resumes_under_current_actor_envelope(brain):
         role="user",
         content="continue as me",
         principal_id="person_maya",
+        may_join=True,
     )
 
     outcome = brain.session_manager.dispatch(session_id)
@@ -296,7 +310,7 @@ def test_session_manager_can_start_unrelated_root_in_same_session(brain):
         brain,
         session_id=session_id,
         worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
 
     created = brain.child_tasks.start_root(
@@ -313,7 +327,7 @@ def test_session_manager_can_start_unrelated_root_in_same_session(brain):
     assert parallel["root_task_id"] == parallel["id"]
     assert parallel["state"] == AgentRunState.QUEUED.value
     assert parallel["prompt"] == "Investigate the unrelated invoice question"
-    assert brain.store.get_task(original["id"])["state"] == "waiting_for_children"
+    assert brain.store.get_task(original["id"])["state"] == "waiting"
     assert brain.sessions.get(session_id)["manager_state"] == "queued"
 
 
@@ -321,7 +335,7 @@ def test_manage_child_task_cancels_a_general_child(brain):
     session_id = _session_id(brain, "slack:dm:person_ajay:cancel-child")
     root = _make_task(
         brain, session_id=session_id, worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
     child = _make_task(
         brain, session_id=session_id, worker_type="general", state=AgentRunState.RUNNING.value,
@@ -340,7 +354,7 @@ def test_manage_child_task_rejects_a_task_that_is_not_actually_a_child(brain):
     session_id = _session_id(brain, "slack:dm:person_ajay:not-a-child")
     root = _make_task(
         brain, session_id=session_id, worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
     unrelated = _make_task(
         brain, session_id=session_id, worker_type="general", state=AgentRunState.RUNNING.value,
@@ -363,7 +377,12 @@ def test_manage_child_task_revises_a_pi_child_and_restarts_with_new_prompt_same_
 
     def fake_command(prompt: str) -> list[str]:
         if prompt == revised_prompt:
-            return ["echo", '{"type": "result", "status": "success", "summary": "skipped it"}']
+            return [
+                "echo",
+                '{"type":"agent_end","messages":[{"role":"assistant",'
+                '"content":[{"type":"text","text":"skipped it"}]}],'
+                '"willRetry":false}',
+            ]
         return ["sleep", "5"]
 
     brain.pi_task_executor.command_builder = fake_command
@@ -373,7 +392,7 @@ def test_manage_child_task_revises_a_pi_child_and_restarts_with_new_prompt_same_
     session_id = _session_id(brain, "slack:dm:person_ajay:revise-pi")
     root = _make_task(
         brain, session_id=session_id, worker_type="session_manager",
-        state=AgentRunState.WAITING_FOR_CHILDREN.value,
+        state=AgentRunState.WAITING.value,
     )
     child = _make_task(
         brain, session_id=session_id, worker_type="pi", state=AgentRunState.QUEUED.value,

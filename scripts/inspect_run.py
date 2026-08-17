@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Inspect a Docket agent run: print the full transcript showing, per turn,
-which tools were offered, whether Docket answered from retrieved context
+"""Inspect a Toda agent run: print the full transcript showing, per turn,
+which tools were offered, whether Toda answered from retrieved context
 (no tool calls) or invoked tools, and what each tool returned.
 
 Usage:
@@ -19,11 +19,11 @@ import sys
 from pathlib import Path
 
 DB_PATH = Path(
-    os.environ.get("DOCKET_DB")
+    os.environ.get("TODA_DB")
     or Path(
-        os.environ.get("DOCKET_DATA_DIR", Path.cwd() / "data")
+        os.environ.get("TODA_DATA_DIR", Path.cwd() / "data")
     )
-    / os.environ.get("DOCKET_DB_NAME", "brain.db")
+    / os.environ.get("TODA_DB_NAME", "brain.db")
 )
 
 
@@ -162,7 +162,7 @@ def print_turn(turn: dict, idx: int, calls_by_id: dict[str, dict]) -> None:
     )
     tool_calls = resp.get("tool_calls") or []
     if not tool_calls:
-        print("  >> NO TOOL CALLS — Docket answered from retrieved context/memory alone")
+        print("  >> NO TOOL CALLS — Toda answered from retrieved context/memory alone")
         content = resp.get("content") or ""
         if content:
             print("  assistant content:")
@@ -265,9 +265,9 @@ def inspect(conn: sqlite3.Connection, run_id: str, msg_limit: int) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Inspect a Docket agent run.")
+    parser = argparse.ArgumentParser(description="Inspect a Toda agent run.")
     parser.add_argument("run_id", nargs="?", help="run id to inspect; omit to list recent runs")
-    parser.add_argument("--org", default=os.environ.get("DOCKET_DEFAULT_ORG_ID", "org_acme"))
+    parser.add_argument("--org", default=os.environ.get("TODA_DEFAULT_ORG_ID", "org_acme"))
     parser.add_argument("--limit", type=int, default=20, help="number of recent runs to list")
     parser.add_argument("-n", "--messages", type=int, default=40, help="message history limit")
     args = parser.parse_args()
@@ -288,7 +288,7 @@ def main() -> int:
                 f"{r.get('created_at','')}  "
                 f"{_trim(r.get('goal'), 80)}"
             )
-        print(f"\nInspect with: python scripts/inspect_run.py <run_id>")
+        print("\nInspect with: python scripts/inspect_run.py <run_id>")
         return 0
     finally:
         conn.close()

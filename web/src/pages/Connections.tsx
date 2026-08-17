@@ -159,7 +159,7 @@ function OAuthConnectBody({
     return (
       <>
         <p className="text-[13px] leading-relaxed text-muted">
-          Opens {label} in a new tab so you can sign in and authorize Docket via
+          Opens {label} in a new tab so you can sign in and authorize Toda via
           Composio. Come back here once you've approved it — this page picks it up
           automatically.
         </p>
@@ -456,6 +456,43 @@ function BrowseToolkits({
   );
 }
 
+/** Shown in place of the catalog when no Composio key is configured.
+ *
+ * Composio is the only thing standing between this page and every integration
+ * on it, so an unconfigured install used to render the whole catalog as the
+ * bare string "error: Composio API key is not configured" with nothing to do
+ * about it. Credentials live in config.json and are never written at runtime,
+ * so this reports what to set rather than offering a form. */
+function ConnectComposio() {
+  return (
+    <Card>
+      <div className="p-6">
+        <h2 className="text-[15px] font-semibold text-ink">Connect Composio</h2>
+        <p className="mt-1.5 max-w-[62ch] text-[13px] leading-relaxed text-muted">
+          Composio brokers the OAuth for every tool on this page. Set its API key in
+          this machine's <code className="font-mono text-[12px]">config.json</code> and
+          restart the gateway; the catalog, connections, and triggers then become
+          available.
+        </p>
+        <pre className="mt-4 max-w-[520px] overflow-x-auto rounded-lg border border-line bg-paper p-4 text-[12px] leading-relaxed text-ink">
+{`"composio": {
+  "api_key": "your-composio-api-key",
+  "webhook_secret": null
+}`}
+        </pre>
+        <div className="mt-4">
+          <a
+            className="inline-flex items-center gap-1 text-[12.5px] font-medium text-brand no-underline hover:underline"
+            href="https://app.composio.dev/developers" target="_blank" rel="noreferrer"
+          >
+            Get an API key <ExternalLink size={12} />
+          </a>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 export default function Connections() {
   const [tick, setTick] = useState(0);
   const [syncing, setSyncing] = useState(false);
@@ -481,6 +518,12 @@ export default function Connections() {
     }
   }
 
+  const { data: composio } = useAsync<{ api_key_configured: boolean }>(
+    () => api.get("/v1/composio/status"),
+    [tick]
+  );
+  const composioReady = composio?.api_key_configured !== false;
+
   const { data: accts, error: e1, loading: l1 } = useAsync<{ accounts: ConnectorAccount[] }>(
     () => api.get("/v1/connector-accounts", { organization_id: ORG }),
     [tick]
@@ -505,161 +548,173 @@ export default function Connections() {
         title="Integrations"
         subtitle="Sign in to a tool via Composio to start ingesting it. Tenant resolution happens server-side from the connected-account registry — nothing here trusts a client-supplied org id."
         actions={
-          <button
-            className="btn-ghost flex items-center gap-2"
-            onClick={syncAndRefresh}
-            disabled={syncing}
-          >
-            <RefreshCw size={14} className={syncing ? "animate-spin" : ""} />
-            {syncing ? "Syncing…" : "Refresh"}
-          </button>
+          composioReady ? (
+            <button
+              className="btn-ghost flex items-center gap-2"
+              onClick={syncAndRefresh}
+              disabled={syncing}
+            >
+              <RefreshCw size={14} className={syncing ? "animate-spin" : ""} />
+              {syncing ? "Syncing…" : "Refresh"}
+            </button>
+          ) : null
         }
       />
 
-      <Section>
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          {CURATED_INTEGRATIONS.map((it) => {
-            const connected = connectedToolkits.has(it.toolkit);
-            return (
-              <div key={it.toolkit} className="card flex flex-col justify-between p-5">
-                <div className="flex items-start justify-between">
-                  <ToolkitLogo toolkit={it.toolkit} label={it.label} bubble={it.bubble} />
-                  {connected && (
-                    <span className="flex items-center gap-1 text-good">
-                      <CheckCircle2 size={16} />
-                    </span>
-                  )}
-                </div>
-                <div className="mt-4">
-                  <div className="text-[14px] font-semibold text-ink">{it.label}</div>
-                  <p className="mt-1 text-[12px] leading-relaxed text-muted">{it.blurb}</p>
-                </div>
-                <div className="mt-4 flex items-center justify-between gap-2">
-                  <Pill tone={connected ? "good" : "muted"}>
-                    {connected ? "Connected" : "Not connected"}
-                  </Pill>
-                  <button
-                    className={connected ? "btn-ghost" : "btn"}
-                    onClick={() => setActiveToolkit({ toolkit: it.toolkit, label: it.label })}
-                  >
-                    {connected ? "Reconnect" : "Sign in"}
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </Section>
-
-      <Section>
-        <BrowseToolkits
-          connectedToolkits={connectedToolkits}
-          onPick={(toolkit, label) => setActiveToolkit({ toolkit, label })}
-        />
-      </Section>
-
-      {activeToolkit && (
-        <ConnectFlowModal
-          toolkit={activeToolkit.toolkit}
-          label={activeToolkit.label}
-          onClose={() => setActiveToolkit(null)}
-          onConnected={() => setTick((t) => t + 1)}
-        />
+      {!composioReady && (
+        <Section>
+          <ConnectComposio />
+        </Section>
       )}
 
-      <Section>
-        <Card title="Connected accounts" meta={String(accounts.length)}>
-          {l1 && <Empty>loading…</Empty>}
-          {e1 && <Empty>error: {e1}</Empty>}
-          {accts && accounts.length === 0 && !l1 && (
-            <Empty>No accounts yet — sign in to an integration above to connect one.</Empty>
-          )}
-          {accounts.length > 0 && (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th className="w-full">id</th>
-                  <th className="whitespace-nowrap">provider</th>
-                  <th className="whitespace-nowrap">org</th>
-                  <th className="whitespace-nowrap">principal</th>
-                  <th className="whitespace-nowrap">scope</th>
-                </tr>
-              </thead>
-              <tbody>
-                {accounts.map((a) => (
-                  <tr key={String(a.id)}>
-                    <td className="font-mono text-[12px]">{String(a.id)}</td>
-                    <td>{String(a.provider ?? a.toolkit)}</td>
-                    <td className="text-muted">{String(a.organization_id)}</td>
-                    <td className="text-muted">{String(a.principal_id)}</td>
-                    <td className="text-muted">{String(a.scope_id)}</td>
+      {composioReady && (
+        <>
+        <Section>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {CURATED_INTEGRATIONS.map((it) => {
+              const connected = connectedToolkits.has(it.toolkit);
+              return (
+                <div key={it.toolkit} className="card flex flex-col justify-between p-5">
+                  <div className="flex items-start justify-between">
+                    <ToolkitLogo toolkit={it.toolkit} label={it.label} bubble={it.bubble} />
+                    {connected && (
+                      <span className="flex items-center gap-1 text-good">
+                        <CheckCircle2 size={16} />
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-4">
+                    <div className="text-[14px] font-semibold text-ink">{it.label}</div>
+                    <p className="mt-1 text-[12px] leading-relaxed text-muted">{it.blurb}</p>
+                  </div>
+                  <div className="mt-4 flex items-center justify-between gap-2">
+                    <Pill tone={connected ? "good" : "muted"}>
+                      {connected ? "Connected" : "Not connected"}
+                    </Pill>
+                    <button
+                      className={connected ? "btn-ghost" : "btn"}
+                      onClick={() => setActiveToolkit({ toolkit: it.toolkit, label: it.label })}
+                    >
+                      {connected ? "Reconnect" : "Sign in"}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Section>
+
+        <Section>
+          <BrowseToolkits
+            connectedToolkits={connectedToolkits}
+            onPick={(toolkit, label) => setActiveToolkit({ toolkit, label })}
+          />
+        </Section>
+
+        {activeToolkit && (
+          <ConnectFlowModal
+            toolkit={activeToolkit.toolkit}
+            label={activeToolkit.label}
+            onClose={() => setActiveToolkit(null)}
+            onConnected={() => setTick((t) => t + 1)}
+          />
+        )}
+
+        <Section>
+          <Card title="Connected accounts" meta={String(accounts.length)}>
+            {l1 && <Empty>loading…</Empty>}
+            {e1 && <Empty>error: {e1}</Empty>}
+            {accts && accounts.length === 0 && !l1 && (
+              <Empty>No accounts yet — sign in to an integration above to connect one.</Empty>
+            )}
+            {accounts.length > 0 && (
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th className="w-full">id</th>
+                    <th className="whitespace-nowrap">provider</th>
+                    <th className="whitespace-nowrap">org</th>
+                    <th className="whitespace-nowrap">principal</th>
+                    <th className="whitespace-nowrap">scope</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </Card>
-      </Section>
-      <Section>
-        <Card title="Auth configurations" meta={String(auths?.auth_configs?.length ?? 0)}>
-          {l2 && <Empty>loading…</Empty>}
-          {e2 && <Empty>error: {e2}</Empty>}
-          {auths && (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th className="whitespace-nowrap">name</th>
-                  <th className="whitespace-nowrap">mode</th>
-                  <th className="w-full">auth schema</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(auths.auth_configs || []).map((a, i) => {
-                  const ao = a as Record<string, unknown>;
-                  return (
-                    <tr key={i}>
-                      <td className="font-medium">{String(ao.name)}</td>
-                      <td className="text-muted">{String(ao.mode)}</td>
-                      <td className="text-muted">{fmt(ao.auth_scheme, 100)}</td>
+                </thead>
+                <tbody>
+                  {accounts.map((a) => (
+                    <tr key={String(a.id)}>
+                      <td className="font-mono text-[12px]">{String(a.id)}</td>
+                      <td>{String(a.provider ?? a.toolkit)}</td>
+                      <td className="text-muted">{String(a.organization_id)}</td>
+                      <td className="text-muted">{String(a.principal_id)}</td>
+                      <td className="text-muted">{String(a.scope_id)}</td>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
-        </Card>
-      </Section>
-      <Section>
-        <Card title="Triggers" meta={String(triggers?.count ?? 0)}>
-          {l3 && <Empty>loading…</Empty>}
-          {e3 && <Empty>error: {e3}</Empty>}
-          {triggers && (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th className="w-full">id</th>
-                  <th className="whitespace-nowrap">type</th>
-                  <th className="whitespace-nowrap">status</th>
-                  <th className="whitespace-nowrap">account</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(triggers.triggers || []).map((t) => {
-                  const to = t as Record<string, unknown>;
-                  return (
-                    <tr key={String(to.id)}>
-                      <td className="font-mono text-[12px]">{String(to.id)}</td>
-                      <td>{String(to.trigger_type)}</td>
-                      <td>{to.enabled ? <Pill tone="good">on</Pill> : <Pill tone="muted">off</Pill>}</td>
-                      <td className="text-muted">{String(to.connected_account_id)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
-        </Card>
-      </Section>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </Card>
+        </Section>
+        <Section>
+          <Card title="Auth configurations" meta={String(auths?.auth_configs?.length ?? 0)}>
+            {l2 && <Empty>loading…</Empty>}
+            {e2 && <Empty>error: {e2}</Empty>}
+            {auths && (
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th className="whitespace-nowrap">name</th>
+                    <th className="whitespace-nowrap">mode</th>
+                    <th className="w-full">auth schema</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(auths.auth_configs || []).map((a, i) => {
+                    const ao = a as Record<string, unknown>;
+                    return (
+                      <tr key={i}>
+                        <td className="font-medium">{String(ao.name)}</td>
+                        <td className="text-muted">{String(ao.mode)}</td>
+                        <td className="text-muted">{fmt(ao.auth_scheme, 100)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </Card>
+        </Section>
+        <Section>
+          <Card title="Triggers" meta={String(triggers?.count ?? 0)}>
+            {l3 && <Empty>loading…</Empty>}
+            {e3 && <Empty>error: {e3}</Empty>}
+            {triggers && (
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th className="w-full">id</th>
+                    <th className="whitespace-nowrap">type</th>
+                    <th className="whitespace-nowrap">status</th>
+                    <th className="whitespace-nowrap">account</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(triggers.triggers || []).map((t) => {
+                    const to = t as Record<string, unknown>;
+                    return (
+                      <tr key={String(to.id)}>
+                        <td className="font-mono text-[12px]">{String(to.id)}</td>
+                        <td>{String(to.trigger_type)}</td>
+                        <td>{to.enabled ? <Pill tone="good">on</Pill> : <Pill tone="muted">off</Pill>}</td>
+                        <td className="text-muted">{String(to.connected_account_id)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </Card>
+        </Section>
+        </>
+      )}
     </>
   );
 }

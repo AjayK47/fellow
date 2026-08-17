@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import base64
 import hashlib
 import hmac
 import json
 import time
+
+from tests.conftest import sign_in
 
 
 def _signature(
@@ -80,7 +84,10 @@ def test_signed_trigger_becomes_retrievable_evidence_and_wakes_agent(
             "author": "Ajay",
             "repository": "acme/export-worker",
         },
-        "timestamp": "2026-07-30T04:00:00Z",
+        # Must be recent: connector events older than the attention cutoff
+        # are deliberately stored without a model call, so a hardcoded past
+        # date would silently stop exercising the wake path this asserts.
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
     accepted = _deliver(api_client, payload, secret=secret)
@@ -293,7 +300,7 @@ def test_connection_sync_link_and_trigger_creation_are_org_scoped(
     )
     assert linked.status_code == 200
     assert linked_args == {
-        "user_id": "docket:org_acme",
+        "user_id": "toda:org_acme",
         "auth_config_id": "ac_github",
         "callback_url": "https://brain.test/integrations",
         "alias": None,
@@ -317,7 +324,7 @@ def test_connection_sync_link_and_trigger_creation_are_org_scoped(
     )
     assert created.status_code == 200, created.text
     assert trigger_args["connected_account_id"] == "ca_synced_github"
-    assert trigger_args["user_id"] == "docket:org_acme"
+    assert trigger_args["user_id"] == "toda:org_acme"
 
     wrong_org = api_client.post(
         "/v1/composio/triggers",
@@ -327,7 +334,9 @@ def test_connection_sync_link_and_trigger_creation_are_org_scoped(
             "trigger_slug": "GITHUB_ISSUE_EVENT",
         },
     )
-    assert wrong_org.status_code == 404
+    # The tenant guard (api/routes.py:enforce_tenant) rejects a request
+    # naming another organization before the handler ever runs.
+    assert wrong_org.status_code == 403
 
 
 def test_toolkit_browsing_is_not_limited_to_the_curated_four(api_client, monkeypatch):
@@ -545,4 +554,163 @@ def test_credential_connect_rejects_an_unknown_organization(api_client, monkeypa
             "credentials": {"generic_api_key": "sk_test_dummy"},
         },
     )
+    assert response.status_code == 403  # rejected by the tenant guard first
+
+    # Signed in AS that organization, the route's own existence check is
+    # what rejects it -- both layers are load-bearing.
+    sign_in(api_client, organization_id="org_does_not_exist")
+    response = api_client.post(
+        "/v1/composio/connections:credentials",
+        json={
+            "organization_id": "org_does_not_exist",
+            "toolkit": "stripe",
+            "auth_scheme": "API_KEY",
+            "credentials": {"generic_api_key": "sk_test_dummy"},
+        },
+    )
     assert response.status_code == 404
+
+
+def _client():
+    from toda.harness.composio import ComposioClient
+
+    return ComposioClient(
+        api_key="k",
+        base_url="https://example.invalid",
+        connected_account_id=None,
+    )
+
+
+def test_auth_config_id_is_read_from_every_shape_composio_returns():
+    """Reading only the top-level id turned a successful creation into a
+    failure: the config was created on Composio's side, Toda raised
+    "Composio did not return an auth config id", and the user got a broken
+    dialog for an app that was now half set up. Reproduced with HubSpot,
+    which left an ENABLED config with zero connections behind."""
+    client = _client()
+    assert client._auth_config_id({"id": "ac_1"}) == "ac_1"
+    assert client._auth_config_id({"auth_config_id": "ac_2"}) == "ac_2"
+    assert client._auth_config_id({"auth_config": {"id": "ac_3"}}) == "ac_3"
+    assert client._auth_config_id({"data": {"id": "ac_4"}}) == "ac_4"
+    assert client._auth_config_id({"data": {"auth_config": {"id": "ac_5"}}}) == "ac_5"
+    assert client._auth_config_id({"nothing": "useful"}) is None
+
+
+def test_ensure_auth_config_never_returns_another_toolkits_config():
+    """`items[0]["id"]` would hand back whatever came first, which for an
+    unfiltered or loosely-filtered response is an OAuth link to the wrong
+    application entirely."""
+    client = _client()
+    client.list_auth_configs = lambda *, toolkit=None: {  # type: ignore[method-assign]
+        "items": [
+            {"id": "ac_github", "toolkit": {"slug": "github"}},
+            {"id": "ac_hubspot", "toolkit": {"slug": "hubspot"}},
+        ]
+    }
+    assert client.ensure_auth_config(toolkit="hubspot") == "ac_hubspot"
+
+
+def test_ensure_auth_config_recovers_when_create_response_is_unreadable():
+    """Creation can succeed server-side even when the response cannot be
+    parsed, so look again before failing -- that is the exact case that
+    stranded HubSpot."""
+    client = _client()
+    calls = {"n": 0}
+
+    def _list(*, toolkit=None):
+        calls["n"] += 1
+        # Empty first, populated after the create landed.
+        return {"items": []} if calls["n"] == 1 else {
+            "items": [{"id": "ac_new", "toolkit": {"slug": toolkit}}]
+        }
+
+    client.list_auth_configs = _list  # type: ignore[method-assign]
+    client.create_auth_config = lambda **_kw: {"unexpected": "shape"}  # type: ignore[method-assign]
+    assert client.ensure_auth_config(toolkit="hubspot") == "ac_new"
+
+
+def test_a_genuine_failure_says_what_composio_returned():
+    client = _client()
+    client.list_auth_configs = lambda *, toolkit=None: {"items": []}  # type: ignore[method-assign]
+    client.create_auth_config = lambda **_kw: {"error": "quota", "detail": "x"}  # type: ignore[method-assign]
+    try:
+        client.ensure_auth_config(toolkit="hubspot")
+    except RuntimeError as exc:
+        assert "hubspot" in str(exc)
+        assert "detail" in str(exc) and "error" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_disconnecting_removes_the_triggers_it_created():
+    """Otherwise Composio keeps delivering events for a connection the
+    organization believes it removed."""
+    client = _client()
+    client.list_active_triggers = lambda *, connected_account_ids=None: {  # type: ignore[method-assign]
+        "items": [{"id": "ti_1"}, {"id": "ti_2"}]
+    }
+    deleted: list[str] = []
+    client.delete_trigger = lambda tid: deleted.append(tid) or {}  # type: ignore[method-assign]
+    result = client.unsubscribe_all_triggers(connected_account_id="ca_1")
+    assert deleted == ["ti_1", "ti_2"]
+    assert result["removed"] == ["ti_1", "ti_2"]
+
+
+def test_unsubscribe_reports_rather_than_raises_when_composio_is_unreachable():
+    client = _client()
+
+    def _boom(*, connected_account_ids=None):
+        raise RuntimeError("connection refused")
+
+    client.list_active_triggers = _boom  # type: ignore[method-assign]
+    result = client.unsubscribe_all_triggers(connected_account_id="ca_1")
+    assert result["removed"] == []
+    assert result["failed"] and "connection refused" in result["failed"][0]["error"]
+
+
+def test_only_webhook_triggers_subscribe_automatically():
+    """A poll trigger's first run has seen nothing, so it emits the whole
+    account history as "new" -- one GitHub PR poll produced 6,525 events in
+    under an hour, every one billed. Webhooks only fire on things that
+    happen after subscription, which is the point of subscribing at all."""
+    client = _client()
+    # `type` and `config` come back on the list item itself -- asking again
+    # per slug was 46 pointless round trips per GitHub connect.
+    client.list_trigger_types = lambda *, toolkit=None, limit=100: {  # type: ignore[method-assign]
+        "items": [
+            {"slug": "A_WEBHOOK", "type": "webhook", "config": {}},
+            {"slug": "B_POLL", "type": "poll", "config": {}},
+            {"slug": "C_WEBHOOK_NEEDS_CONFIG", "type": "webhook",
+             "config": {"required": ["repo"]}},
+        ]
+    }
+
+    def _must_not_describe(_slug):
+        raise AssertionError("subscribe must not re-describe what the list already returned")
+
+    client.describe_trigger = _must_not_describe  # type: ignore[method-assign]
+    created: list[str] = []
+    client.create_trigger = lambda **kw: created.append(kw["slug"]) or {"id": "ti"}  # type: ignore[method-assign]
+
+    result = client.subscribe_all_triggers(toolkit="github", connected_account_id="ca_1")
+    assert created == ["A_WEBHOOK"]
+    assert result["skipped_poll"] == ["B_POLL"]
+    assert [i["slug"] for i in result["needs_config"]] == ["C_WEBHOOK_NEEDS_CONFIG"]
+
+
+def test_subscribing_nothing_is_an_acceptable_outcome():
+    """Today every no-config trigger GitHub, Gmail and HubSpot offer is a
+    poll, and every webhook they offer needs configuration -- so automatic
+    subscription correctly does nothing rather than starting a firehose."""
+    client = _client()
+    client.list_trigger_types = lambda *, toolkit=None, limit=100: {  # type: ignore[method-assign]
+        "items": [{"slug": "ONLY_POLL", "type": "poll", "config": {}}]
+    }
+
+    def _must_not_create(**_kw):
+        raise AssertionError("a poll trigger must never be auto-subscribed")
+
+    client.create_trigger = _must_not_create  # type: ignore[method-assign]
+    result = client.subscribe_all_triggers(toolkit="gmail", connected_account_id="ca_1")
+    assert result["subscribed"] == []
+    assert result["skipped_poll"] == ["ONLY_POLL"]

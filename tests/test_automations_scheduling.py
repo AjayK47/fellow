@@ -3,15 +3,16 @@ and overlap policy, and the automation-trigger prompt guidance."""
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from docket.harness.automations import (
+from toda.harness.automations import (
     compute_next_run_at,
     next_cron_fire,
 )
-from docket.harness.prompts import AUTOMATION_TRIGGER_GUIDANCE, build_agent_messages
+from toda.harness.prompts import AUTOMATION_TRIGGER_GUIDANCE, build_agent_messages
 
 
 def _destination() -> dict:
@@ -98,6 +99,72 @@ def test_create_validates_cron_expression_eagerly(brain):
             destination=_destination(),
             cron_expression="garbage",
         )
+
+
+def test_update_changes_schedule_and_run_now_only_fires_selected_automation(brain):
+    first = brain.automations.create(
+        organization_id="org_acme", name="First", goal="first",
+        principal_id="person_ajay", conversation_id="automation:first",
+        destination=_destination(), interval_seconds=3600,
+    )
+    second = brain.automations.create(
+        organization_id="org_acme", name="Second", goal="second",
+        principal_id="person_ajay", conversation_id="automation:second",
+        destination=_destination(), interval_seconds=3600,
+    )
+    second["next_run_at"] = "2000-01-01T00:00:00+00:00"
+    brain.automations._upsert(second)
+
+    updated = brain.automations.update(
+        first["id"], organization_id="org_acme", name="Renamed",
+        cron_expression="0 9 * * 1-5", timezone="UTC",
+    )
+    assert updated["name"] == "Renamed"
+    assert updated["schedule_kind"] == "cron"
+    assert updated["interval_seconds"] is None
+
+    result = brain.automations.run_now(first["id"], "org_acme")
+    assert result["fired"] == 1
+    refreshed_second = brain.store.get_harness_record("automations", second["id"])
+    assert refreshed_second["last_session_id"] is None
+
+
+def test_automation_admin_api_edit_run_and_delete(api_client):
+    created_response = api_client.post("/v1/automations", json={
+        "organization_id": "org_acme",
+        "name": "Daily check",
+        "goal": "Check status",
+        "principal_id": "person_ajay",
+        "conversation_id": "automation:api-test",
+        "destination": _destination(),
+        "interval_seconds": 3600,
+    })
+    assert created_response.status_code == 200
+    created = created_response.json()
+
+    updated = api_client.put(f"/v1/automations/{created['id']}", json={
+        "organization_id": "org_acme",
+        "name": "Weekday check",
+        "cron_expression": "0 9 * * 1-5",
+        "timezone": "UTC",
+    })
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "Weekday check"
+    assert updated.json()["schedule_kind"] == "cron"
+
+    fired = api_client.post(
+        f"/v1/automations/{created['id']}:run",
+        json={"organization_id": "org_acme"},
+    )
+    assert fired.status_code == 200
+    assert fired.json()["fired"] == 1
+
+    deleted = api_client.delete(
+        f"/v1/automations/{created['id']}",
+        params={"organization_id": "org_acme"},
+    )
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
 
 
 def test_misfire_skip_reschedules_without_firing_when_badly_overdue(brain):
@@ -197,3 +264,95 @@ def test_automation_trigger_guidance_only_appears_for_automation_runs():
     assert any(
         AUTOMATION_TRIGGER_GUIDANCE in m["content"] for m in automation_messages
     )
+
+
+def test_a_pure_notification_automation_firing_writes_no_durable_memory(brain):
+    """A scheduled firing that made no tool calls observed nothing -- its
+    whole content is text Toda generated for itself, so there is no new
+    company fact to remember. Capturing it anyway is how a 3-minute
+    reminder automation silently wrote ~480 worthless memories a day
+    ("Task task_x has final answer: 'Time for a hydration check...'"),
+    permanently degrading retrieval. Delivery must still be enqueued --
+    the reminder itself is the entire point of the run."""
+    enqueued: list[str] = []
+    brain.company_agent.enqueue_job = lambda **kwargs: enqueued.append(kwargs["kind"])
+
+    brain.company_agent._enqueue_post_run_jobs(
+        {
+            "id": "task_reminder",
+            "organization_id": "org_acme",
+            "trigger_kind": "automation",
+            "tool_call_count": 0,
+        }
+    )
+    assert enqueued == ["delivery.send"]
+
+    # An automation that actually went and looked at something DID observe
+    # real state, so it still gets captured.
+    enqueued.clear()
+    brain.company_agent._enqueue_post_run_jobs(
+        {
+            "id": "task_metrics_check",
+            "organization_id": "org_acme",
+            "trigger_kind": "automation",
+            "tool_call_count": 3,
+        }
+    )
+    assert enqueued == ["memory.capture_task", "delivery.send", "skill.curate_task"]
+
+    # And an ordinary user-triggered reply is untouched by this rule.
+    enqueued.clear()
+    brain.company_agent._enqueue_post_run_jobs(
+        {
+            "id": "task_reactive",
+            "organization_id": "org_acme",
+            "trigger_kind": "reactive",
+            "tool_call_count": 0,
+        }
+    )
+    assert enqueued == ["memory.capture_task", "delivery.send"]
+
+
+def test_session_manager_root_task_is_never_framed_as_a_specialist_worker():
+    """Regression test for a real production bug: every root Task's own
+    metadata sets worker_type="session_manager" (session_manager.py,
+    child_tasks.py) -- a bare truthiness check on that field wrongly treated
+    the root Task itself as a child specialist assignment, injecting
+    must_not_address_user/external_writes_forbidden/<specialist_assignment>
+    into the ONE Task that's actually supposed to talk to Slack directly and
+    own the conversation. Confirmed live: this produced replies like
+    "...should be handled by the parent Session Manager" and "No action
+    taken in this worker: outbound Slack delivery is restricted here" from
+    a root session_manager Task reacting to a scheduled automation firing.
+    Only "general"/"pi" child worker_types (the actual _SUPPORTED_WORKER_TYPES
+    in child_tasks.py) should ever get that framing."""
+    base_run = {
+        "id": "arun_sm",
+        "goal": "hey",
+        "trigger_kind": "reactive",
+        "max_iterations": 12,
+        "max_tool_calls": 24,
+        "envelope": {
+            "principal_id": "person_ajay",
+            "destination": _destination(),
+            "purpose": "reactive_agent",
+            "allowed_scope_ids": ["scope_org_public"],
+        },
+        "metadata": {"worker_type": "session_manager"},
+    }
+    messages = build_agent_messages(run=base_run, context={}, history=[])
+    assert not any("specialist_assignment" in m["content"] for m in messages)
+    invocation = json.loads(
+        next(
+            m["content"]
+            for m in messages
+            if m["content"].startswith("<trusted_invocation>")
+        )
+        .removeprefix("<trusted_invocation>\n")
+        .removesuffix("\n</trusted_invocation>")
+    )
+    assert "worker" not in invocation
+
+    child_run = {**base_run, "metadata": {"worker_type": "general"}}
+    child_messages = build_agent_messages(run=child_run, context={}, history=[])
+    assert any("specialist_assignment" in m["content"] for m in child_messages)

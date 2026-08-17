@@ -16,7 +16,7 @@ export default function Channels() {
     <>
       <PageHeader
         title="Channels"
-        subtitle="Docket is proactive by default in every observed Slack channel. Use a channel policy to opt out or enable free response."
+        subtitle="Toda is proactive by default in every observed Slack channel. Use a channel policy to opt out or enable free response."
       />
       <Section>
         <Card title="Installations" meta={String(installations.length)}>
@@ -31,7 +31,7 @@ export default function Channels() {
                 <div className="text-[13px] font-medium text-ink">No Slack workspace registered</div>
                 <p className="mx-auto mt-1 max-w-[420px] text-[12px] text-muted">
                   If Slack was configured by hand in <code className="rounded bg-paper px-1 py-0.5 font-mono text-[11px]">.env</code> rather
-                  than through onboarding, the bot can still be live-connected while Docket has no
+                  than through onboarding, the bot can still be live-connected while Toda has no
                   record of the workspace — org resolution silently falls back to the default
                   organization instead of a real mapping. Connect it properly on the{" "}
                   <Link to="/setup" className="font-medium text-brand hover:underline">Setup</Link> page.

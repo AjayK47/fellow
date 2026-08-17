@@ -140,7 +140,7 @@ export default function Overview() {
     <>
       <PageHeader
         title="Dashboard"
-        subtitle="What Docket is doing right now — active Tasks, pending approvals, and recent activity."
+        subtitle="What Toda is doing right now — active Tasks, pending approvals, and recent activity."
         actions={
           <span className="text-[11px] font-medium text-muted">
             Refreshed {reltime(lastRefreshed.toISOString())}
@@ -156,7 +156,7 @@ export default function Overview() {
                 <Plug size={17} />
               </span>
               <div>
-                <div className="text-[14px] font-semibold">Give Docket something to work with</div>
+                <div className="text-[14px] font-semibold">Give Toda something to work with</div>
                 <div className="mt-0.5 text-[12px] text-white/80">
                   Connect Slack or a Composio integration so retrieval and tools have real company context.
                 </div>

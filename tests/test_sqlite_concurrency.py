@@ -5,8 +5,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
-from docket.harness.jobs import JobQueue
-from docket.storage.db import BrainStore
+from toda.harness.jobs import JobQueue
+from toda.storage.db import BrainStore
 
 
 def test_one_store_does_not_lock_all_operations_behind_an_active_reader(tmp_path):

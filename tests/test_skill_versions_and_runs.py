@@ -9,11 +9,11 @@ def test_skill_proposal_approval_and_deprecation_keep_versions(brain):
     assert proposal and proposal["version"] == 2 and proposal["status"] == "draft"
     assert brain.skills.get(skill["id"])["version"] == 1
     approved = brain.skills.approve(skill["id"], 2)
-    assert approved and approved["status"] == "approved"
+    assert approved and approved["status"] == "active"
     assert brain.skills.get(skill["id"])["version"] == 2
     assert len(brain.skills.versions(skill["id"])) == 2
     deprecated = brain.skills.deprecate(skill["id"])
-    assert deprecated and deprecated["status"] == "deprecated"
+    assert deprecated and deprecated["status"] == "disabled"
 
 
 def test_search_and_prepare_hide_unapproved_skills(brain):

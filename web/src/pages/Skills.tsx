@@ -106,7 +106,7 @@ export default function Skills() {
     <>
       <PageHeader
         title="Skills"
-        subtitle="Reusable, versioned procedures Docket can prepare and apply — built-in packages plus agent-proposed drafts pending your approval."
+        subtitle="Reusable, versioned procedures Toda can prepare and apply — built-in packages plus agent-proposed drafts pending your approval."
         actions={
           <div className="relative">
             <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted" />

@@ -8,7 +8,7 @@ approves the skill version (services/skills.py).
 
 from __future__ import annotations
 
-from docket.harness.models import InvocationEnvelope, ModelToolCall
+from toda.harness.models import InvocationEnvelope, ModelToolCall
 
 
 def _envelope(brain, *, conversation: str) -> InvocationEnvelope:

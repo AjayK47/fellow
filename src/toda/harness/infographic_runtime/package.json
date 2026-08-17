@@ -1,0 +1,11 @@
+{
+  "name": "toda-infographic-runtime",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@antv/infographic": "0.2.19",
+    "@resvg/resvg-js": "2.6.2",
+    "linkedom": "0.18.13"
+  }
+}

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from docket.services.skill_packages import SkillPackageCatalog
+from toda.services.skill_packages import SkillPackageCatalog
 
 
 def test_catalog_loads_adopted_skill_surface_with_hashes():

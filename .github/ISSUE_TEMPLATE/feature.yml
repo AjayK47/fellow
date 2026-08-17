@@ -1,0 +1,22 @@
+name: Feature proposal
+description: Propose a scoped user outcome
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Organizational problem
+      description: "What cannot the team accomplish today?"
+    validations: {required: true}
+  - type: textarea
+    id: outcome
+    attributes: {label: Desired outcome}
+    validations: {required: true}
+  - type: textarea
+    id: boundaries
+    attributes: {label: Permission, privacy, and approval implications}
+    validations: {required: true}
+  - type: textarea
+    id: alternatives
+    attributes: {label: Alternatives considered}

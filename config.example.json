@@ -1,0 +1,99 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "log_level": "info",
+    "public_url": "https://vastly-concise-hamster.ngrok-free.app",
+    "api_keys": []
+  },
+  "organization": {
+    "id": "org_acme",
+    "name": "Acme",
+    "owner_email": "you@example.com"
+  },
+  "models": {
+    "providers": {
+      "concentrate": {
+        "provider": "concentrate",
+        "api_key": "<your-concentrate-key>",
+        "base_url": null
+      },
+      "openrouter": {
+        "provider": "openrouter",
+        "api_key": "<your-openrouter-key>",
+        "base_url": null
+      }
+    },
+    "assignments": {
+      "main": {
+        "connection": "concentrate",
+        "model": "auto"
+      },
+      "attention": {
+        "connection": "concentrate",
+        "model": "auto"
+      },
+      "extraction": {
+        "connection": "concentrate",
+        "model": "auto"
+      },
+      "embedding": {
+        "connection": "openrouter",
+        "model": "qwen/qwen3-embedding-8b"
+      }
+    },
+    "embedding_dimensions": 96,
+    "timeout_seconds": 600.0,
+    "main_reasoning_effort": "medium",
+    "main_supports_vision": false
+  },
+  "slack": {
+    "signing_secret": "<your-api-key>",
+    "bot_token": "<your-api-key>",
+    "app_token": "<your-api-key>",
+    "bot_user_id": "U0BMF6BL20J",
+    "require_mention": true,
+    "free_response_channels": [],
+    "allowed_channels": [],
+    "proactive_channels": [],
+    "signature_tolerance_seconds": 300
+  },
+  "composio": {
+    "api_key": "<your-api-key>",
+    "base_url": "https://backend.composio.dev/api/v3.1",
+    "connected_account_id": null,
+    "toolkit_versions": "latest",
+    "webhook_secret": null,
+    "webhook_tolerance_seconds": 300
+  },
+  "tools": {
+    "connections": {
+      "brave": {
+        "provider": "brave",
+        "api_key": "<your-api-key>",
+        "base_url": null
+      },
+      "firecrawl": {
+        "provider": "firecrawl",
+        "api_key": "<your-api-key>",
+        "base_url": null
+      }
+    },
+    "web_search_connection": "brave",
+    "web_extract_connection": "firecrawl",
+    "web_fetch_enabled": true,
+    "web_fetch_max_chars": 18000,
+    "run_code_enabled": false,
+    "run_code_timeout_seconds": 900,
+    "run_code_max_tool_calls": 100,
+    "browser_enabled": false,
+    "browser_allowed_domains": [],
+    "browser_cdp_enabled": false
+  },
+  "media": {
+    "transcription_language": null,
+    "tts_voice": "default",
+    "tts_format": "mp3",
+    "max_bytes": 26214400
+  }
+}

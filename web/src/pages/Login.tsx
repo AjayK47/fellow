@@ -1,40 +1,79 @@
-import { Slack } from "lucide-react";
+import { useState } from "react";
+import { ArrowRight } from "lucide-react";
+import { ApiError, login } from "../api";
 
 export default function Login({ error }: { error?: string | null }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [localError, setLocalError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  async function signIn(event: React.FormEvent) {
+    event.preventDefault();
+    setSubmitting(true);
+    setLocalError(null);
+    try {
+      await login(email, password);
+      window.location.assign("/");
+    } catch (cause) {
+      setLocalError(cause instanceof ApiError && cause.status === 403
+        ? "This account is still waiting for access."
+        : "That email and password were not accepted.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   const message =
     error === "invalid_state"
-      ? "That sign-in link expired or was already used — try again."
-      : error === "token_exchange_failed" || error === "incomplete_userinfo"
-      ? "Slack didn't return what we needed to sign you in. Try again."
+      ? "That link expired or was already used. Sign in again."
+      : error === "session_expired"
+      ? "You were signed out. Sign in again to continue."
       : error
-      ? "Sign-in was cancelled or failed."
+      ? "Sign-in did not complete. Try again."
       : null;
 
   return (
-    <div className="flex h-screen items-center justify-center bg-paper">
-      <div className="card w-full max-w-[380px] p-8 text-center">
-        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-brand-soft text-brand">
-          <Slack size={22} />
-        </div>
-        <h1 className="mt-4 text-[20px] font-semibold tracking-tight text-ink">
-          Sign in to Docket
-        </h1>
-        <p className="mt-2 text-[13px] leading-relaxed text-muted">
-          Sign in with the Slack workspace this dashboard belongs to. Anyone in
-          that workspace can sign in — there's nothing else to set up.
-        </p>
-        {message && (
-          <p className="mt-3 rounded-lg bg-bad-soft px-3 py-2 text-[12.5px] text-bad">
-            {message}
-          </p>
-        )}
-        <a
-          href="/slack/login"
-          className="btn mt-6 flex w-full items-center justify-center gap-2"
-        >
-          <Slack size={15} /> Sign in with Slack
+    <main className="ob ob--auth">
+      <section className="ob__card">
+        <a href="/" className="ob__mark" aria-label="Toda home">toda</a>
+        <h1>Sign in</h1>
+        <p>Use your organization account. Slack connects your data — it does not control who gets in here.</p>
+
+        {message && <div className="ob__note is-bad">{message}</div>}
+
+        <form onSubmit={signIn} className="ob__form">
+          <label className="ob__field">
+            <span>Work email</span>
+            <input
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              placeholder="you@company.com"
+              required
+            />
+          </label>
+          <label className="ob__field">
+            <span>Password</span>
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              required
+            />
+          </label>
+          {localError && <span className="ob__feedback is-bad">{localError}</span>}
+          <button className="ob__primary" disabled={submitting}>
+            {submitting ? "Signing in…" : "Sign in"}
+          </button>
+        </form>
+
+        <a href="/request-access" className="ob__link">
+          Request access <ArrowRight size={13} />
         </a>
-      </div>
-    </div>
+      </section>
+    </main>
   );
 }
