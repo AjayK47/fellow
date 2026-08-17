@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM node:22-alpine AS console
+FROM node:26-alpine AS console
 WORKDIR /web
 # pnpm, matching the tracked lockfile. This stage used to run `npm ci`
 # against web/package-lock.json, which had been deleted when the local
