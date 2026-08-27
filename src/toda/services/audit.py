@@ -6,6 +6,7 @@ from typing import Any
 
 from toda.domain.models import AuditEvent, new_id, utcnow
 from toda.storage.db import BrainStore
+from toda.telemetry.context import current_otel_trace_id
 
 
 class AuditService:
@@ -19,15 +20,19 @@ class AuditService:
         payload: dict[str, Any],
         principal_id: str | None = None,
         application_id: str | None = None,
-        trace_id: str | None = None,
+        correlation_id: str | None = None,
     ) -> AuditEvent:
+        # The durable trace field is reserved for the real active OTel trace.
+        # Application-level continuity belongs in ``correlation_id`` and must
+        # never be mistaken for a distributed trace identifier.
         event = AuditEvent(
             id=new_id("audit"),
             organization_id=organization_id,
             event_type=event_type,
             principal_id=principal_id,
             application_id=application_id,
-            trace_id=trace_id,
+            trace_id=current_otel_trace_id(),
+            correlation_id=correlation_id,
             payload=payload,
             created_at=utcnow(),
         )

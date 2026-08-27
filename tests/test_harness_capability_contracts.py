@@ -54,10 +54,9 @@ def test_workspace_scope_is_enforced(brain):
 def test_external_apps_share_one_dynamic_composio_surface(brain):
     names = {definition.name for definition in brain.tool_registry.definitions()}
     assert {
-        "composio_list_integrations",
-        "COMPOSIO_SEARCH_TOOLS",
-        "COMPOSIO_GET_TOOL_SCHEMAS",
-        "COMPOSIO_EXECUTE",
+        "integration_search",
+        "integration_describe",
+        "integration_execute",
         "request_app_connection",
     } <= names
     assert not any(name.startswith(("github_", "linear_", "clickup_")) for name in names)
@@ -70,8 +69,8 @@ def test_external_apps_share_one_dynamic_composio_surface(brain):
     ):
         package = brain.skills.package_catalog.get(skill_name)
         assert package is not None
-        assert "COMPOSIO_SEARCH_TOOLS" in package.body
-        assert "COMPOSIO_EXECUTE" in package.body
+        assert "integration_search" in package.body
+        assert "integration_execute" in package.body
         assert "github_get_pull_request" not in package.body
         assert "github_list_commits" not in package.body
 

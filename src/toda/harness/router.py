@@ -9,7 +9,6 @@ from typing import Any
 
 from toda.harness.event_policy import resolve_event_policy
 from toda.harness.models import NormalizedEvent
-from toda.observability import trace_context
 
 log = logging.getLogger("toda.router")
 
@@ -76,27 +75,21 @@ class EventRouter:
 
     def route(self, event_payload: dict[str, Any]) -> dict[str, Any]:
         event = NormalizedEvent(**event_payload)
-        # An event can reach here without having passed through the Slack
-        # gateway (the API injects them directly), in which case the event's
-        # own id starts the trace instead.
-        with trace_context(
-            trace_id=event_payload.get("trace_id") or event.trace_id,
+        with self.store.telemetry.span(
+            "event.route",
+            component="router",
             event_id=event.id,
             organization_id=event.organization_id,
             channel_id=event.scope.channel_id,
-        ):
-            with self.store.trace.span(
-                "event.route",
-                component="router",
-                input={
-                    "type": event.type,
-                    "source": event.source,
-                    "direct": event.is_direct_agent_request,
-                },
-            ) as span:
-                result = self._route(event)
-                span.output(result)
-                return result
+            input={
+                "type": event.type,
+                "source": event.source,
+                "direct": event.is_direct_agent_request,
+            },
+        ) as span:
+            result = self._route(event)
+            span.output(result)
+            return result
 
     def _route(self, event: NormalizedEvent) -> dict[str, Any]:
         if not event.payload.get("observe_enabled", True):
@@ -113,20 +106,20 @@ class EventRouter:
                     part for part in [str(event.payload.get("text") or "").strip(), "Slack attachments were present but could not be ingested."] if part
                 )
         policy = resolve_event_policy(event)
-        self.store.trace.record(
+        self.store.telemetry.record(
             "event.policy.resolved", component="router", phase="completed",
             output={"wake_policy": policy.wake_policy, "memory_policy": policy.memory_policy,
-                    "group_key": policy.group_key}, trace_id=event.trace_id, event_id=event.id,
+                    "group_key": policy.group_key}, event_id=event.id,
         )
         # Fast path only: redact, hash, version, write the Source row. No
         # embedding call, no model extraction, no reality/graph expansion —
         # those are slow/remote and must never sit ahead of wake (plan §2
         # Phase A). They run in the knowledge lane, enqueued below.
         source = self._persist_evidence(event, policy)
-        self.store.trace.record(
+        self.store.telemetry.record(
             "evidence.persisted", component="ingestion", phase="completed",
             output={"source_id": source.get("id"), "content_hash": source.get("content_hash")},
-            trace_id=event.trace_id, event_id=event.id,
+            event_correlation_id=event.event_correlation_id, event_id=event.id,
         )
         # The one inbound write into the conversation log. Every Slack
         # message passes through here -- direct requests and ambient
@@ -142,10 +135,10 @@ class EventRouter:
             message_id=event.id,
             at=event.occurred_at.isoformat(),
         )
-        self.store.trace.record(
+        self.store.telemetry.record(
             "conversation.message.appended", component="router", phase="completed",
             output={"event_id": event.id, "channel_id": event.scope.channel_id},
-            trace_id=event.trace_id, event_id=event.id,
+            event_correlation_id=event.event_correlation_id, event_id=event.id,
         )
         if event.is_approval_action:
             return {"route": "approval", "source_id": source["id"]}
@@ -320,20 +313,20 @@ class EventRouter:
             # say that -- see SessionJoinDenied.
             may_join=True,
         )
-        self.store.trace.record(
+        self.store.telemetry.record(
             "session.woken", component="sessions", phase="completed",
-            output=wake, trace_id=event.trace_id, event_id=event.id,
+            output=wake, event_correlation_id=event.event_correlation_id, event_id=event.id,
             session_id=wake.get("session_id"),
         )
         job = self.queue.enqueue(
             organization_id=event.organization_id,
             kind="session.dispatch",
-            payload={"session_id": wake["session_id"], "trace_id": event.trace_id},
+            payload={"session_id": wake["session_id"], "event_correlation_id": event.event_correlation_id},
             idempotency_key=f"session.dispatch:{wake['session_id']}:{wake['revision']}",
         )
-        self.store.trace.record(
+        self.store.telemetry.record(
             "job.enqueued", component="queue", phase="completed", output=job,
-            trace_id=event.trace_id, event_id=event.id, session_id=wake.get("session_id"),
+            event_correlation_id=event.event_correlation_id, event_id=event.id, session_id=wake.get("session_id"),
             job_id=job.get("id"),
         )
         log.info(

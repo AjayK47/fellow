@@ -41,14 +41,14 @@ re-runs the same check-compare-notify loop each time it fires.
   interval). It pauses for human approval before it takes effect -- say so
   plainly rather than implying the watch is already live the moment you call
   it.
-- **`workspace_read` / `workspace_write`** hold the durable baseline between
+- **`read_file` / `write_file`** hold the durable baseline between
   runs. The team workspace is shared across the whole Slack workspace and
   persists across runs, so a value written by one automation firing is still
   there the next time it fires.
-- **`web_fetch`**, **`brain_search`** / **`brain_query_facts`**, or a
+- **`web_fetch`**, **`memory_search`** / **`memory_query_facts`**, or a
   connected-app read through Composio are the actual "check" step, depending
   on what's being watched.
-- **`brain_create_artifact`** is worth using when the watch should also keep
+- **`artifact_create`** is worth using when the watch should also keep
   a durable log of what changed over time, not just a one-off Slack
   notification.
 

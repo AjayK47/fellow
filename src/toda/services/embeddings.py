@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from typing import Protocol
 
 import httpx
+from opentelemetry.trace import SpanKind
 
 from toda.config import Settings, settings as _loaded_settings
 from toda.providers import ProviderResolver
@@ -17,6 +19,48 @@ class EmbeddingProvider(Protocol):
     model: str
 
     def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+
+class InstrumentedEmbeddingProvider:
+    """Metadata-only OTel wrapper for embedding calls."""
+
+    def __init__(self, provider: EmbeddingProvider, *, telemetry: object) -> None:
+        self.provider = provider
+        self.telemetry = telemetry
+        self.model = getattr(provider, "model", "unknown")
+        self.provider_id = str(
+            getattr(provider, "provider_id", None)
+            or type(provider).__name__.removesuffix("EmbeddingProvider").lower()
+        )
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        with self.telemetry.span(
+            "model.embed",
+            component="model",
+            kind=SpanKind.CLIENT,
+            attributes={
+                "toda.provider.id": self.provider_id,
+                "gen_ai.request.model": self.model,
+                "toda.input.count": len(texts),
+                "toda.input.chars": sum(len(text) for text in texts),
+                "toda.input.sha256": hashlib.sha256(
+                    json.dumps(texts, sort_keys=True).encode()
+                ).hexdigest(),
+            },
+        ) as span:
+            try:
+                vectors = self.provider.embed(texts)
+                span.output({"count": len(vectors), "dimensions": len(vectors[0]) if vectors else 0})
+                return vectors
+            except Exception as exc:
+                span.error(exc)
+                raise
+
+
+def instrument_embedding(provider: EmbeddingProvider, *, telemetry: object) -> EmbeddingProvider:
+    if isinstance(provider, InstrumentedEmbeddingProvider):
+        return provider
+    return InstrumentedEmbeddingProvider(provider, telemetry=telemetry)
 
 
 class DeterministicEmbeddingProvider:
@@ -86,10 +130,12 @@ def build_embedding_provider(config: Settings | None = None) -> EmbeddingProvide
             raise ValueError(
                 f"Provider {resolved.profile.name!r} does not expose OpenAI-compatible embeddings"
             )
-        return OpenAICompatibleEmbeddingProvider(
+        provider = OpenAICompatibleEmbeddingProvider(
             resolved.connection.api_key or "local",
             resolved.assignment.model,
             resolved.profile.endpoint(resolved.connection),
             timeout_seconds=config.models.timeout_seconds,
         )
+        provider.provider_id = resolved.connection.provider
+        return provider
     return DeterministicEmbeddingProvider(config.models.embedding_dimensions)

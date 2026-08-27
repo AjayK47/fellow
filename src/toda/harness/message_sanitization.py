@@ -89,9 +89,9 @@ def needs_reasoning_echo(provider: Any, model: Any, base_url: Any) -> bool:
 #   function_response.response does not match to a display_name in the
 #   function_response.parts.
 #
-# Any tool that returns a schema hits this -- `composio_describe`,
-# COMPOSIO_GET_TOOL_SCHEMAS, MCP tool listings. Observed live: one
-# `composio_describe` of a HubSpot action poisoned every subsequent request
+# Any tool that returns a schema hits this -- `integration_describe`,
+# integration_schema, MCP tool listings. Observed live: one
+# `integration_describe` of a HubSpot action poisoned every subsequent request
 # in the Task with a permanent 400, and because the retry re-ran discovery
 # from the top it reproduced the same 400 on every attempt.
 _SCHEMA_REF_KEYS = ("$defs", "$ref", "$schema", "$id")

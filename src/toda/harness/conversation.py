@@ -14,6 +14,7 @@ import logging
 from typing import Any, Callable
 
 from toda.domain.models import new_id
+from toda.harness.model_client import instrument_model
 from toda.harness.models import (
     AgentOutcome,
     AgentRunState,
@@ -21,7 +22,8 @@ from toda.harness.models import (
     ToolDefinition,
     TriggerKind,
 )
-from toda.harness.prompt_library import load
+from toda.harness.prompting.catalog import load
+from toda.services.readiness import enforce_real_world_readiness
 
 log = logging.getLogger("toda.conversation")
 
@@ -38,7 +40,7 @@ _START_TASK = ToolDefinition(
         "compare, and write up\n"
         "- Anything needing delegation, approval, waiting, or a timer\n"
         "- ANY work through a connected app (CRM, email, GitHub, calendar). "
-        "You can see what is connected with composio_list_integrations, but "
+        "You can see what is connected with integration_list, but "
         "finding the right action and running it belongs in a Task -- never "
         "search the web to work out what a connected app can do.\n"
         "- A consequential external write, or a durable artifact "
@@ -47,7 +49,7 @@ _START_TASK = ToolDefinition(
         "WHEN NOT TO USE (answer here instead):\n"
         "- A greeting, a thank-you, or a question you can already answer\n"
         "- One lookup that settles it — a single web_search, web_fetch, or "
-        "brain_search, then a reply\n"
+        "memory_search, then a reply\n"
         "- A clarifying question back to the person\n\n"
         "Prefer a Task when genuinely unsure: a short answer arriving from a "
         "Task costs a few seconds, whereas a long investigation stuck in a "
@@ -86,38 +88,32 @@ _START_TASK = ToolDefinition(
 # two or three calls became a long inline grind with no Task ever created.
 #
 # The actual bug that inversion was fixing was one missing tool:
-# `composio_list_integrations`. Without it the model could not see that
+# `integration_list`. Without it the model could not see that
 # HubSpot was connected and told a user there was no CRM. That one is back,
 # deliberately -- knowing *what exists* is discovery, and it is exactly what
 # decides whether to promote. Searching for a specific connector action and
 # reading its schema is the preamble to doing the work, so it is not.
 _CONVERSATION_READ_TOOLS = {
     # Company memory: usually one lookup settles it.
-    "brain_search",
-    "brain_read_source",
-    "brain_query_facts",
-    "brain_list_cases",
-    "brain_judgment_guidance",
-    "brain_resolve_owner",
-    "brain_find_skills",
-    "brain_list_artifacts",
-    "brain_read_artifact",
+    "memory_search",
+    "memory_read_source",
+    "memory_query_facts",
+    "case_list",
+    "judgment_guidance",
+    "owner_resolve",
+    "procedure_find",
+    "artifact_list",
+    "artifact_read",
     # What Toda can do, and what it has already done.
-    "skills_list",
-    "skill_view",
+    "skill_list",
+    "skill_read",
     "task_search",
     "task_get",
     "session_search",
-    # Connector discovery. All of it, deliberately: withholding the search
-    # and schema tools did not make the model promote -- it made it search
-    # docs.composio.dev with Brave and scrape the results with Firecrawl to
-    # work out which HubSpot action to call. A model denied the right tool
-    # improvises with the wrong one. Executing is still Task-only
-    # (COMPOSIO_EXECUTE is a write), so the shape holds: it can find out
-    # what is possible here, and must start a Task to actually do it.
-    "composio_list_integrations",
-    "composio_search",
-    "composio_describe",
+    # Connector inventory is safe in the conversation lane. Action discovery,
+    # schema loading, and execution belong to a durable Task so the lane does
+    # not accumulate an integration workflow without a durable owner.
+    "integration_list",
     "automation_list",
     # One external lookup that settles a question.
     "web_search",
@@ -142,6 +138,7 @@ class ConversationAgent:
         # model reach for start_task instead of grinding inline.
         max_iterations: int = 5,
         max_tokens: int = 8_000,
+        readiness_target: Any | None = None,
     ) -> None:
         self.store = store
         self.model = model
@@ -151,6 +148,15 @@ class ConversationAgent:
         self.delivery_enqueue = delivery_enqueue
         self.max_iterations = max_iterations
         self.max_tokens = max_tokens
+        self.readiness_target = readiness_target
+
+    def _ensure_task_start_allowed(self, envelope: InvocationEnvelope, trigger_kind: TriggerKind) -> None:
+        if self.readiness_target is not None:
+            enforce_real_world_readiness(
+                self.readiness_target,
+                principal_id=envelope.principal_id,
+                trigger_kind=str(trigger_kind),
+            )
 
 
     def _acknowledge(self, task: dict[str, Any]) -> None:
@@ -195,6 +201,7 @@ class ConversationAgent:
         )
         user_text = str((latest_user or {}).get("content") or "")
         if task_metadata.get("force_task") or trigger_kind is not TriggerKind.REACTIVE:
+            self._ensure_task_start_allowed(envelope, trigger_kind)
             task_agent = self.task_agent_factory(runs)
             root = runs.create_run(
                 session_id=session["id"],
@@ -204,6 +211,10 @@ class ConversationAgent:
                 trigger_event_id=trigger_event_id,
                 max_iterations=task_agent.max_iterations,
                 max_tool_calls=task_agent.max_tool_calls,
+                max_model_calls=getattr(task_agent, "max_model_calls", 100),
+                max_cost_usd=getattr(task_agent, "max_cost_usd", 10.0),
+                max_duration_seconds=getattr(task_agent, "max_duration_seconds", 3_600),
+                max_total_tokens=getattr(task_agent, "max_total_tokens", 100_000),
                 metadata=task_metadata,
             )
             self._acknowledge(root)
@@ -230,9 +241,10 @@ class ConversationAgent:
             "trigger_kind": trigger_kind.value,
             "goal": user_text,
             "envelope": envelope.model_dump(mode="json"),
-            "trace_id": envelope.trace_id,
+            "event_correlation_id": envelope.correlation_id,
             "metadata": {**task_metadata, "conversation_turn": True},
         }
+        pseudo_run["metadata"]["tool_profile"] = "conversation"
         definitions = [
             definition
             for definition in self.tools.allowed_definitions(pseudo_run)
@@ -246,7 +258,7 @@ class ConversationAgent:
         conversation_tools = {item.name for item in definitions}
         schemas = [_START_TASK.openai_schema(), *[item.openai_schema() for item in definitions]]
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": load("stable_system")},
+            {"role": "system", "content": load("core")},
             {"role": "system", "content": load("conversation_manager")},
             {
                 "role": "system",
@@ -269,6 +281,12 @@ class ConversationAgent:
             active_model = model or self.model
             if active_model is None:
                 raise RuntimeError("conversation model is not configured")
+            active_model = instrument_model(
+                active_model,
+                telemetry=self.store.telemetry,
+                role="conversation",
+                catalog=getattr(active_model, "catalog", None),
+            )
             response = active_model.generate(
                 messages=messages,
                 tools=schemas,
@@ -297,7 +315,7 @@ class ConversationAgent:
                     kind="conversation",
                     state=AgentRunState.COMPLETED,
                     answer=answer,
-                    trace_id=envelope.trace_id,
+                    correlation_id=envelope.correlation_id,
                 )
 
             messages.append(
@@ -319,6 +337,7 @@ class ConversationAgent:
             )
             for call in response.tool_calls:
                 if call.name == "start_task":
+                    self._ensure_task_start_allowed(envelope, trigger_kind)
                     goal = str(call.arguments.get("goal") or user_text).strip()
                     task_agent = self.task_agent_factory(runs)
                     root = runs.create_run(
@@ -329,6 +348,10 @@ class ConversationAgent:
                         trigger_event_id=trigger_event_id,
                         max_iterations=task_agent.max_iterations,
                         max_tool_calls=task_agent.max_tool_calls,
+                        max_model_calls=getattr(task_agent, "max_model_calls", 100),
+                        max_cost_usd=getattr(task_agent, "max_cost_usd", 10.0),
+                        max_duration_seconds=getattr(task_agent, "max_duration_seconds", 3_600),
+                        max_total_tokens=getattr(task_agent, "max_total_tokens", 100_000),
                         metadata=task_metadata,
                     )
                     self._acknowledge(root)
@@ -340,6 +363,7 @@ class ConversationAgent:
                     # and replay the already-selected calls as the Task's first
                     # reasoning response instead of discarding or duplicating
                     # them.
+                    self._ensure_task_start_allowed(envelope, trigger_kind)
                     task_agent = self.task_agent_factory(runs)
                     metadata = dict(task_metadata)
                     metadata["promoted_model_response"] = response.model_dump(mode="json")
@@ -351,6 +375,10 @@ class ConversationAgent:
                         trigger_event_id=trigger_event_id,
                         max_iterations=task_agent.max_iterations,
                         max_tool_calls=task_agent.max_tool_calls,
+                        max_model_calls=getattr(task_agent, "max_model_calls", 100),
+                        max_cost_usd=getattr(task_agent, "max_cost_usd", 10.0),
+                        max_duration_seconds=getattr(task_agent, "max_duration_seconds", 3_600),
+                        max_total_tokens=getattr(task_agent, "max_total_tokens", 100_000),
                         metadata=metadata,
                     )
                     self._acknowledge(root)
@@ -375,13 +403,14 @@ class ConversationAgent:
         # the whole turn from scratch -- so a request the conversation lane
         # could not finish became a loop rather than a Task. Observed live:
         # the model wanted HubSpot's action list, could not reach
-        # composio_search from this lane, improvised with Brave and
+        # integration_search from this lane, improvised with Brave and
         # Firecrawl against Composio's own docs, exhausted its budget, and
         # started over.
         log.info(
             "Conversation turn exhausted its budget; promoting to a Task: session=%s",
             session["id"],
         )
+        self._ensure_task_start_allowed(envelope, trigger_kind)
         task_agent = self.task_agent_factory(runs)
         root = runs.create_run(
             session_id=session["id"],
@@ -391,6 +420,10 @@ class ConversationAgent:
             trigger_event_id=trigger_event_id,
             max_iterations=task_agent.max_iterations,
             max_tool_calls=task_agent.max_tool_calls,
+            max_model_calls=getattr(task_agent, "max_model_calls", 100),
+            max_cost_usd=getattr(task_agent, "max_cost_usd", 10.0),
+            max_duration_seconds=getattr(task_agent, "max_duration_seconds", 3_600),
+            max_total_tokens=getattr(task_agent, "max_total_tokens", 100_000),
             metadata={**task_metadata, "promoted_reason": "conversation_budget_exhausted"},
         )
         self._acknowledge(root)

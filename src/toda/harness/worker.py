@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import threading
+import time
+import logging
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from toda.domain.models import new_id
 from toda.harness.jobs import _CONTENTION_RETRY_SECONDS, JobContention
 from toda.harness.retry import is_permanent_task_error, is_retryable_task_error
 from toda.harness.task_run_store import TaskRunStore
-from toda.observability import trace_context
+from opentelemetry.trace import SpanKind
+
+from toda.telemetry.context import link_from_carrier, use_carrier
+
+
+log = logging.getLogger("toda.harness.worker")
 
 # Job kinds that drive a full agent reasoning loop and can legitimately run
 # for many minutes. Everything else -- Slack event routing, attention,
@@ -88,6 +96,7 @@ class HarnessWorker:
         task_agent_factory: Any,
         session_manager: Any,
         sessions: Any,
+        run_inspection: Any | None = None,
     ) -> None:
         self.queue = queue
         self.router = router
@@ -128,9 +137,15 @@ class HarnessWorker:
         self._agent_inflight_lock = threading.Lock()
         self._knowledge_inflight: set[Future[dict[str, Any]]] = set()
         self._knowledge_inflight_lock = threading.Lock()
+        self._lane_heartbeat: dict[str, float | None] = {
+            "infrastructure": None,
+            "agent": None,
+            "knowledge": None,
+        }
         self.task_agent_factory = task_agent_factory
         self.session_manager = session_manager
         self.sessions = sessions
+        self.run_inspection = run_inspection
         self.handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
             "event.route": lambda payload: self.router.route(payload["event"]),
             "attention.evaluate": lambda payload: self.attention.process_event_payload(
@@ -254,6 +269,16 @@ class HarnessWorker:
         knowledge) the batch runs on, so a knowledge-lane call can never
         consume the main lane's capacity or vice versa.
         """
+        lane_name = (
+            "knowledge" if self._is_knowledge_lane(kinds)
+            else "agent" if self._is_agent_lane(kinds)
+            else "infrastructure"
+        )
+        self._lane_heartbeat[lane_name] = time.monotonic()
+        try:
+            self.queue.observe_metrics()
+        except Exception:
+            log.debug("queue.metrics_failed", exc_info=True)
         capacity = min(self.available_capacity(kinds=kinds), self.batch_size)
         if capacity <= 0:
             return {"leased": 0, "saturated": True}
@@ -266,6 +291,22 @@ class HarnessWorker:
                 for job in jobs:
                     inflight.add(pool.submit(self._process_job, job))
         return {"leased": len(jobs), "saturated": False}
+
+    def health(self, *, max_age_seconds: float = 10.0) -> dict[str, Any]:
+        now = time.monotonic()
+        lanes = {
+            name: {
+                "last_heartbeat_age_seconds": (
+                    None if stamp is None else max(0.0, now - stamp)
+                ),
+                "running": stamp is not None and now - stamp <= max_age_seconds,
+            }
+            for name, stamp in self._lane_heartbeat.items()
+        }
+        return {
+            "ok": bool(lanes) and all(item["running"] for item in lanes.values()),
+            "lanes": lanes,
+        }
 
     def drain_once(self, *, kinds: list[str] | None = None) -> dict[str, Any]:
         """Lease a batch and wait for all of it. Used by tests and by
@@ -294,18 +335,83 @@ class HarnessWorker:
         self._knowledge_pool.shutdown(wait=True)
 
     def _process_job(self, job: dict[str, Any]) -> dict[str, Any]:
-        # Rejoin the trace this job belongs to. A job always runs on a pool
-        # thread, and a fresh thread starts with empty context, so without
-        # this every hop through the queue would begin a new, unrelated
-        # trace -- which is precisely what made a single Slack message
-        # appear as five disconnected ones.
-        with trace_context(
-            trace_id=(job.get("payload") or {}).get("trace_id"),
-            job_id=job["id"],
-            job_kind=job["kind"],
-            organization_id=job.get("organization_id"),
-        ):
-            return self._process_job_traced(job)
+        # Pool threads start with empty context. Reattach the W3C carrier
+        # persisted by JobQueue, then make the dequeue/handler interval a
+        # consumer span so queue delay and execution are queryable together.
+        with use_carrier(job.get("telemetry")):
+            started = time.perf_counter()
+            delay_ms = 0.0
+            with self.store.telemetry.span(
+                "queue.process",
+                component="queue",
+                kind=SpanKind.CONSUMER,
+                organization_id=job.get("organization_id"),
+                job_id=job["id"],
+                job_kind=job["kind"],
+                attempt_number=int(job.get("attempts") or 0),
+                links=[
+                    link
+                    for link in (
+                        link_from_carrier(carrier)
+                        for carrier in job.get("telemetry_links") or []
+                    )
+                    if link is not None
+                ],
+            ) as span:
+                created_at = job.get("created_at")
+                if created_at:
+                    try:
+                        created = datetime.fromisoformat(str(created_at))
+                        if created.tzinfo is None:
+                            created = created.replace(tzinfo=timezone.utc)
+                        delay_ms = (
+                            datetime.now(timezone.utc) - created
+                        ).total_seconds() * 1000
+                        span.set_attribute("toda.queue.delay_ms", round(max(0.0, delay_ms), 3))
+                    except (TypeError, ValueError):
+                        pass
+                result = self._process_job_traced(job)
+                outcome = "failed" if result.get("error") else "completed"
+                span.set_attribute("toda.queue.outcome", outcome)
+                if result.get("error"):
+                    span.error(result["error"])
+                span.output({"kind": job["kind"], "outcome": outcome})
+                metrics = self.store.telemetry.metrics
+                if metrics is not None:
+                    try:
+                        metrics.counter(
+                            "toda_queue_jobs_total",
+                            labels={"operation": job["kind"], "outcome": outcome},
+                        )
+                        metrics.histogram(
+                            "toda_queue_process_duration_ms",
+                            (time.perf_counter() - started) * 1000,
+                            labels={"operation": job["kind"]},
+                        )
+                        if created_at:
+                            metrics.histogram(
+                                "toda_queue_wait_duration_ms",
+                                max(0.0, delay_ms),
+                                labels={"operation": job["kind"]},
+                            )
+                    except Exception:
+                        pass
+                pass
+            if self.run_inspection:
+                task_id = (job.get("payload") or {}).get("task_id")
+                if not task_id and (job.get("payload") or {}).get("approval_id"):
+                    approval = self.store.get_harness_record(
+                        "approvals", str(job["payload"]["approval_id"])
+                    )
+                    task_id = approval.get("task_id") if approval else None
+                if task_id:
+                    try:
+                        self.run_inspection.reconcile_task(str(task_id))
+                    except Exception:
+                        # Inspection is a projection; it cannot make a
+                        # successfully completed delivery fail.
+                        log.exception("run_inspection.reconcile_failed", extra={"task_id": task_id})
+            return result
 
     def _process_job_traced(self, job: dict[str, Any]) -> dict[str, Any]:
         handler = self.handlers.get(job["kind"])

@@ -80,12 +80,12 @@ class EventService:
             scope_id=event.get("scope_id") or "scope_org_public",
             author_entity_id=event.get("principal_id"),
             entity_ids=list(data.get("entity_ids") or self._event_entities(data)),
-            metadata={"cloudevent": event, "subject": event.get("subject"), "trace_id": event.get("trace_id")},
+            metadata={"cloudevent": event, "subject": event.get("subject"), "event_correlation_id": event.get("event_correlation_id")},
             learn=event.get("processing_mode", "memory") == "memory",
             processing_mode=event.get("processing_mode", "memory"),
             occurred_at=event.get("time") or event.get("occurred_at"),
         )
-        self.audit.record(org, "event.accepted", {"event_id": event["id"], "source_id": source["source"]["id"], "type": event["type"]}, principal_id=event.get("principal_id"), trace_id=event.get("trace_id"))
+        self.audit.record(org, "event.accepted", {"event_id": event["id"], "source_id": source["source"]["id"], "type": event["type"], "event_correlation_id": event.get("event_correlation_id")}, principal_id=event.get("principal_id"))
         return {"event_id": event["id"], "status": "accepted", "accepted": True, "source": source["source"], "memory_count": len(source["memories"])}
 
     @staticmethod

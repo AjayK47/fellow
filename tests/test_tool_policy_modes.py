@@ -63,7 +63,7 @@ def test_tools_api_exposes_real_readiness_and_autonomous_defaults(api_client):
     # direct, so picking whichever write tool sorts first would test the
     # rule rather than the mode.
     write_tool = next(
-        tool for tool in body["tools"] if tool["name"] == "COMPOSIO_EXECUTE"
+        tool for tool in body["tools"] if tool["name"] == "integration_execute"
     )
     assert read_tool["policy"]["execution"] == "direct"
     assert write_tool["policy"]["execution"] == "ai_review"
@@ -83,10 +83,10 @@ def test_mode_and_tool_override_updates_are_visible_immediately(api_client):
     # restricted -- see the approval rule in harness/tools.py. Work that
     # leaves Toda is gated by the mode like everything else.
     by_name = {tool["name"]: tool["policy"]["execution"] for tool in tools["tools"]}
-    for contained in ("automation_create", "pdf_create", "workspace_write"):
+    for contained in ("automation_create", "pdf_create", "write_file"):
         if contained in by_name:
             assert by_name[contained] == "direct", contained
-    for external in ("COMPOSIO_EXECUTE", "skill_propose_create"):
+    for external in ("integration_execute", "skill_propose_create"):
         if external in by_name:
             assert by_name[external] in {"ask", "deny"}, external
 

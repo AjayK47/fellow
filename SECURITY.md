@@ -99,9 +99,15 @@ only where the host account itself is expendable -- a disposable container
 with no credentials, no database mount and no network egress.
 
 The same reasoning applies to `agent.pi_coding_enabled`, which runs the `pi`
-CLI as a full-trust subprocess with network access and no approval gate at
-all, and to `tools.browser_enabled`, which drives a real browser against
-live sites carrying whatever credentials that browser holds.
+CLI with network access. With the default `agent.pi_isolation_required: true`,
+Toda refuses to launch it until `agent.pi_execution_user` names a dedicated
+low-privilege Unix account. That account and the separate agent workspace keep
+the control-plane files private by filesystem permissions, but they are still
+not a VM/container boundary: absolute paths and network access remain available
+to that account. Routine Pi launches do not pause for a human; hazardous
+launches can be reviewed or escalated. `tools.browser_enabled` likewise drives
+a real browser against live sites carrying whatever credentials that browser
+holds.
 
 ## Secrets
 

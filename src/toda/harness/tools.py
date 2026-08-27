@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -15,11 +16,15 @@ from toda.harness.child_tasks import AwaitingChildren
 from toda.harness.composio import ComposioClient
 from toda.harness.hazard import hazard_reason
 from toda.harness.models import ModelToolCall, ToolDefinition, ToolResult
+from toda.telemetry.context import inject_carrier
 from toda.harness.slack_markdown import to_slack_mrkdwn
 from toda.services.artifacts import artifact_payload
+from toda.services.redaction import redact
 from toda.harness.calculator import calculate
 from toda.harness.typed_tools import BrowserTools, DocumentTools, VisionMediaTools
 from toda.harness.visual_tools import VisualTools
+from toda.harness.workspace_filesystem import WorkspaceFilesystem
+from toda.harness.tool_profiles import resolve as resolve_tool_profile
 from toda.storage.db import BrainStore
 
 
@@ -31,22 +36,23 @@ ToolHandler = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
 # enforces a single-level Task tree without making workers artificially
 # read-only.
 _CHILD_COORDINATOR_TOOLS = {
-    "delegate_tasks",
-    "manage_child_task",
-    "start_parallel_task",
-    "wait_for_children",
+    "task_delegate",
+    "task_delegate_parallel",
+    "task_manage",
+    "task_wait",
     "plan_create",
     "plan_update",
     "skill_propose_create",
     "skill_propose_update",
+    "workspace_publish",
 }
 
 
 def _infer_capability_id(name: str, risk: str = "read") -> str:
-    """Map legacy tool names to stable capability IDs.
+    """Map model-facing tool names to stable capability IDs.
 
-    Explicit capability IDs can override this mapping, but registering legacy
-    tools still produces a complete capability contract for readiness and run
+    Explicit capability IDs can override this mapping, but every registered
+    tool still produces a complete capability contract for readiness and run
     traces.
 
     ``risk`` is taken into account because the ``brain_*`` fallback used to
@@ -60,10 +66,15 @@ def _infer_capability_id(name: str, risk: str = "read") -> str:
         return "web.search"
     if name == "web_fetch":
         return "web.fetch"
-    if name in {"workspace_read", "workspace_search", "workspace_list", "workspace_diff"}:
-        return f"workspace.{name.removeprefix('workspace_')}"
-    if name in {"workspace_write", "workspace_patch"}:
-        return "workspace.write" if name == "workspace_write" else "workspace.patch"
+    if name in {"read_file", "search_files", "list_files", "file_diff"}:
+        return {
+            "read_file": "workspace.read",
+            "search_files": "workspace.search",
+            "list_files": "workspace.list",
+            "file_diff": "workspace.diff",
+        }[name]
+    if name in {"write_file", "edit_file", "move_file", "delete_file", "workspace_publish"}:
+        return "workspace.write"
     if name == "run_code":
         return "code.execute"
     if name in {"session_search"}:
@@ -72,19 +83,29 @@ def _infer_capability_id(name: str, risk: str = "read") -> str:
         return f"task.{name.removeprefix('task_')}"
     if name in {"plan_create", "plan_get", "plan_update"}:
         return "plan.manage"
-    if name == "delegate_tasks":
+    if name == "task_delegate":
         return "task.delegate"
     if name.startswith("automation_"):
         return "automation.manage"
-    if name in {"brain_create_artifact", "slack_send_artifact"}:
+    if name in {"artifact_create", "slack_send_artifact"}:
         return "artifact.preview"
-    if name in {"brain_list_artifacts", "brain_read_artifact"}:
+    if name in {"artifact_list", "artifact_read"}:
         return "artifact.read"
     if name.startswith("scratchpad_"):
         return "task.scratchpad"
     if name.startswith("slack_"):
         return "slack.react" if name == "slack_react" else "slack.actions"
     if name.lower().startswith("composio_"):
+        return "connector.composio.action"
+    if name in {
+        "integration_list",
+        "integration_search",
+        "integration_describe",
+        "integration_discover",
+        "integration_schema",
+    }:
+        return "connector.composio.discovery"
+    if name == "integration_execute":
         return "connector.composio.action"
     if name.startswith("pdf_"):
         return f"document.pdf.{name.removeprefix('pdf_')}"
@@ -102,9 +123,9 @@ def _infer_capability_id(name: str, risk: str = "read") -> str:
         return "vision.analyze"
     if name == "image_generate":
         return "image.generate"
-    if name.startswith("skill_") or name == "skills_list":
+    if name.startswith("skill_") or name == "skill_list":
         return "skill.manage"
-    if name.startswith("brain_"):
+    if name.startswith(("brain_", "memory_", "case_", "judgment_", "owner_", "procedure_")):
         return "memory.write" if risk != "read" else "memory.read"
     return f"tool.{name}"
 
@@ -271,7 +292,7 @@ def _requires_dynamic_high_stakes_approval(
     call_name: str, arguments: dict[str, Any]
 ) -> bool:
     """Classify a dynamically discovered Composio action at call time."""
-    if call_name != "COMPOSIO_EXECUTE":
+    if call_name != "integration_execute":
         return False
     slug = str(arguments.get("tool_slug") or "")
     if not slug:
@@ -346,10 +367,11 @@ _CONTAINED_CAPABILITY_PREFIXES = (
 # named individually instead.
 _CONTAINED_TOOL_NAMES = frozenset(
     {
-        "request_human_input",
-        "start_parallel_task",
-        "manage_child_task",
-        "wait_for_children",
+        "ask_user",
+        "task_delegate",
+        "task_delegate_parallel",
+        "task_manage",
+        "task_wait",
     }
 )
 
@@ -362,10 +384,12 @@ _APPROVAL_TOOL_NAMES = frozenset(
         "skill_propose_create",
         "skill_propose_update",
         "run_code",
+        "delete_file",
+        "workspace_publish",
         # Grants Toda an OAuth connection to an external account.
         "request_app_connection",
         # This IS the approval mechanism; waiving it would be circular.
-        "request_batch_approval",
+        "request_approval",
     }
 )
 
@@ -395,6 +419,8 @@ def build_tool_registry(
     run_code_enabled: bool = False,
     run_code_timeout_seconds: int = 60,
     run_code_max_tool_calls: int = 20,
+    run_code_runner: Any | None = None,
+    run_code_isolation_required: bool = True,
     workspace_root: Path | str | None = None,
     workspace_service: Any | None = None,
     document_tools: DocumentTools | None = None,
@@ -423,14 +449,38 @@ def build_tool_registry(
 
     workspace = Path(workspace_root or Path.cwd()).expanduser().resolve()
 
+    def _runtime_metadata(runtime: dict[str, Any] | None) -> dict[str, Any]:
+        """Return the persisted Task metadata for both runtime call shapes.
+
+        ToolExecutor normally receives the full Task as ``run`` (with an
+        ``id`` and nested ``metadata``).  A few narrow callers pass the
+        metadata under ``task_metadata`` instead.  Keeping this normalization
+        here prevents workspace authorization from silently falling back to a
+        shared durable directory when the private task path was actually
+        recorded under the other key.
+        """
+        if not runtime:
+            return {}
+        metadata: dict[str, Any] = {}
+        if isinstance(runtime.get("metadata"), dict):
+            metadata.update(runtime["metadata"])
+        if isinstance(runtime.get("task_metadata"), dict):
+            metadata.update(runtime["task_metadata"])
+        return metadata
+
     def _workspace_root(runtime: dict[str, Any] | None = None) -> Path:
-        task_id = str((runtime or {}).get("task_id") or "shared")
+        task_id = str((runtime or {}).get("task_id") or (runtime or {}).get("id") or "shared")
+        task_metadata = _runtime_metadata(runtime)
         record = None
-        if workspace_service and runtime and runtime.get("organization_id"):
-            pseudo_task = {"metadata": (runtime.get("task_metadata") or {})}
+        if workspace_service:
+            if not runtime or not runtime.get("organization_id"):
+                raise PermissionError("workspace tools require an organization-bound task")
+            pseudo_task = {"metadata": task_metadata}
             record = workspace_service.get_for_task(
                 str(runtime["organization_id"]), pseudo_task
             )
+            if not record:
+                raise PermissionError("no authorized workspace is resolved for this task")
             if record and record.get("status") != "active":
                 raise PermissionError("task workspace is not active")
             if record:
@@ -443,25 +493,88 @@ def build_tool_registry(
                 scope = store.get_scope(scope_id) if scope_id else None
                 if scope_id not in allowed_scopes and not bool((scope or {}).get("is_public")):
                     raise PermissionError("workspace scope is outside this task's allowed scopes")
-        root = Path(record["path"]).resolve() if record else (workspace / ".toda-workspaces" / task_id).resolve()
+                runtime["workspace_quota_bytes"] = int(record.get("quota_bytes") or 10_000_000)
+        explicit = str(task_metadata.get("workspace_path") or "")
+        if explicit and workspace_service:
+            try:
+                expected = workspace_service.task_root(
+                    str(runtime["organization_id"]),
+                    {"id": task_id, "metadata": task_metadata},
+                )
+            except (KeyError, ValueError) as exc:
+                raise PermissionError("task workspace path is not authorized") from exc
+            raw_candidate = Path(explicit).expanduser()
+            if raw_candidate.is_symlink():
+                raise PermissionError("task workspace path cannot be a symlink")
+            current = Path(raw_candidate.anchor or "/")
+            for part in raw_candidate.parts[1:]:
+                current = current / part
+                if current.is_symlink():
+                    raise PermissionError("task workspace path cannot traverse symlinks")
+            candidate = raw_candidate.resolve()
+            if candidate != expected:
+                raise PermissionError("task workspace path does not match this task")
+            root = candidate
+        elif workspace_service:
+            # Never expose the shared durable organization workspace to a
+            # model-driven Task.  The executor must first prepare a private
+            # copy and persist its path in Task metadata.
+            raise PermissionError("private task workspace has not been prepared")
+        else:
+            # Minimal/offline registry callers may omit WorkspaceService, but
+            # the fallback is still a model-facing filesystem boundary. Keep
+            # it confined to the configured workspace and reject aliases or
+            # traversal instead of trusting Path.resolve() alone.
+            if Path(task_id).name != task_id or task_id in {"", ".", ".."}:
+                raise PermissionError("invalid task id for workspace tools")
+            raw_root = workspace / ".toda-workspaces" / task_id
+            if raw_root.is_symlink():
+                raise PermissionError("workspace task root cannot be a symlink")
+            current = workspace
+            for part in Path(".toda-workspaces", task_id).parts:
+                current = current / part
+                if current.is_symlink():
+                    raise PermissionError("workspace task root cannot traverse symlinks")
+            root = raw_root.resolve()
+            if root != raw_root or (root != workspace and workspace not in root.parents):
+                raise PermissionError("workspace task root escaped the configured root")
         root.mkdir(parents=True, exist_ok=True)
         return root
 
     def _workspace_path(relative_path: str, runtime: dict[str, Any] | None = None) -> Path:
         root = _workspace_root(runtime)
-        candidate = (root / relative_path).resolve()
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("workspace paths must be relative")
+        if WorkspaceFilesystem._sensitive_relative(relative_path):
+            raise PermissionError("sensitive control or credential paths are not workspace-tool accessible")
+        raw = root / relative
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise PermissionError("workspace paths cannot traverse symlinks")
+        candidate = raw.resolve()
         if candidate != root and root not in candidate.parents:
             raise ValueError("workspace path escapes the configured workspace root")
         return candidate
+    filesystem = WorkspaceFilesystem(root=_workspace_root, path=_workspace_path)
 
     registry.register(
         ToolDefinition(
-            name="workspace_list",
-            description="List files under the configured workspace root.",
+            name="list_files",
+            description=(
+                "List files and directories inside the active workspace. "
+                "WHEN TO USE: discover project structure. WHEN NOT TO USE: "
+                "searching file contents; use search_files. EFFECT: read-only. "
+                "RETURNS: bounded relative paths, types, sizes and truncation state."
+            ),
             input_schema=_object_schema(
                 {
                     "path": {"type": "string"},
+                    "glob": {"type": "string"},
                     "recursive": {"type": "boolean"},
+                    "include_hidden": {"type": "boolean"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500},
                 },
                 [],
@@ -469,141 +582,207 @@ def build_tool_registry(
             risk="read",
             capability_id="workspace.list",
         ),
-        lambda args, _runtime: {
-            "root": str(_workspace_root(_runtime)),
-            "files": [
-                str(path.relative_to(_workspace_root(_runtime)))
-                for path in sorted(
-                    (_workspace_path(args.get("path", ""), _runtime)).rglob("*")
-                    if args.get("recursive")
-                    else (_workspace_path(args.get("path", ""), _runtime)).glob("*")
-                )
-                if path.is_file()
-            ][: min(int(args.get("limit", 100)), 500)],
-        },
+        lambda args, runtime: filesystem.list_files(args, runtime),
     )
 
     registry.register(
         ToolDefinition(
-            name="workspace_read",
-            description="Read a UTF-8 text file under the configured workspace root.",
+            name="read_file",
+            description=(
+                "Read a bounded line range from one UTF-8 file in the active workspace. "
+                "WHEN TO USE: you know the file path. WHEN NOT TO USE: locating text "
+                "across files; use search_files. EFFECT: read-only. RETURNS: numbered "
+                "lines and truncation metadata."
+            ),
             input_schema=_object_schema(
-                {"path": {"type": "string"}, "max_chars": {"type": "integer", "minimum": 1, "maximum": 200000}},
+                {
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2_000},
+                    "max_chars": {"type": "integer", "minimum": 1, "maximum": 200_000},
+                },
                 ["path"],
             ),
             risk="read",
             capability_id="workspace.read",
         ),
-        lambda args, _runtime: {
-            "path": args["path"],
-            "content": _workspace_path(args["path"], _runtime).read_text(encoding="utf-8")[: int(args.get("max_chars", 50000))],
-        },
+        lambda args, runtime: filesystem.read_file(args, runtime),
     )
-
-    def _workspace_write(args: dict[str, Any], _runtime: dict[str, Any]) -> dict[str, Any]:
-        path = _workspace_path(args["path"], _runtime)
-        content = str(args["content"])
-        if len(content.encode("utf-8")) > 1_000_000:
-            raise ValueError("workspace writes are limited to 1 MB")
-        run_root = _workspace_root(_runtime)
-        current_bytes = sum(item.stat().st_size for item in run_root.rglob("*") if item.is_file()) if run_root.exists() else 0
-        if current_bytes - (path.stat().st_size if path.exists() else 0) + len(content.encode("utf-8")) > 10_000_000:
-            raise ValueError("per-run workspace quota exceeded (10 MB)")
-        if any(marker in content for marker in ("OPENAI_API_KEY=", "SLACK_BOT_TOKEN=", "xoxb-", "-----BEGIN PRIVATE KEY-----")):
-            raise ValueError("workspace writes cannot contain obvious secrets")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return {"path": args["path"], "bytes": len(content.encode("utf-8"))}
 
     registry.register(
         ToolDefinition(
-            name="workspace_write",
-            description="Write a UTF-8 text file under the configured workspace root.",
-            input_schema=_object_schema({"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
-            risk="write",
-            capability_id="workspace.write",
-        ),
-        _workspace_write,
-    )
-
-    def _workspace_search(args: dict[str, Any], _runtime: dict[str, Any]) -> dict[str, Any]:
-        query = str(args["query"])
-        if not query:
-            raise ValueError("query is required")
-        base = _workspace_path(args.get("path", ""), _runtime)
-        suffix = args.get("extension")
-        matches: list[dict[str, Any]] = []
-        for path in sorted(base.rglob("*") if base.is_dir() else [base]):
-            if not path.is_file() or (suffix and path.suffix != suffix):
-                continue
-            try:
-                lines = path.read_text(encoding="utf-8").splitlines()
-            except (UnicodeDecodeError, OSError):
-                continue
-            for line_no, line in enumerate(lines, 1):
-                if query.lower() in line.lower():
-                    matches.append({"path": str(path.relative_to(_workspace_root(_runtime))), "line": line_no, "text": line[:500]})
-                    if len(matches) >= min(int(args.get("limit", 50)), 200):
-                        return {"matches": matches}
-        return {"matches": matches}
-
-    registry.register(
-        ToolDefinition(
-            name="workspace_search",
-            description="Search UTF-8 text files under the configured workspace root.",
+            name="search_files",
+            description=(
+                "Search UTF-8 files inside the active workspace. WHEN TO USE: locate "
+                "symbols, text or files you have not identified. WHEN NOT TO USE: reading "
+                "one known file; use read_file. EFFECT: read-only. RETURNS: bounded matches "
+                "with paths, line numbers and optional context."
+            ),
             input_schema=_object_schema(
-                {"query": {"type": "string"}, "path": {"type": "string"}, "extension": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}},
+                {
+                    "query": {"type": "string"},
+                    "path": {"type": "string"},
+                    "glob": {"type": "string"},
+                    "regex": {"type": "boolean"},
+                    "case_sensitive": {"type": "boolean"},
+                    "context_lines": {"type": "integer", "minimum": 0, "maximum": 5},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                },
                 ["query"],
             ),
             risk="read",
             capability_id="workspace.read",
         ),
-        _workspace_search,
+        lambda args, runtime: filesystem.search_files(args, runtime),
     )
-
-    def _workspace_patch(args: dict[str, Any], _runtime: dict[str, Any]) -> dict[str, Any]:
-        path = _workspace_path(args["path"], _runtime)
-        original = path.read_text(encoding="utf-8")
-        old = str(args["old_text"])
-        new = str(args["new_text"])
-        if original.count(old) != 1:
-            raise ValueError("old_text must match exactly once")
-        updated = original.replace(old, new, 1)
-        if any(marker in updated for marker in ("OPENAI_API_KEY=", "SLACK_BOT_TOKEN=", "xoxb-", "-----BEGIN PRIVATE KEY-----")):
-            raise ValueError("workspace patches cannot contain obvious secrets")
-        path.write_text(updated, encoding="utf-8")
-        return {"path": args["path"], "changed": True}
 
     registry.register(
         ToolDefinition(
-            name="workspace_patch",
-            description="Apply one exact text replacement inside a workspace file.",
-            input_schema=_object_schema({"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, ["path", "old_text", "new_text"]),
+            name="write_file",
+            description=(
+                "Create or replace one UTF-8 file in the active workspace. WHEN TO USE: "
+                "create a new file or intentionally replace the complete contents. WHEN "
+                "NOT TO USE: a small targeted change; use edit_file. EFFECT: workspace write. "
+                "RETURNS: path, operation and byte count."
+            ),
+            input_schema=_object_schema(
+                {"path": {"type": "string"}, "content": {"type": "string"}},
+                ["path", "content"],
+            ),
             risk="write",
             capability_id="workspace.write",
         ),
-        _workspace_patch,
+        lambda args, runtime: filesystem.write_file(args, runtime),
     )
 
     registry.register(
         ToolDefinition(
-            name="workspace_diff",
-            description="Compare two workspace text files and return a bounded unified diff.",
-            input_schema=_object_schema({"before": {"type": "string"}, "after": {"type": "string"}}, ["before", "after"]),
-            risk="read",
+            name="edit_file",
+            description=(
+                "Apply one exact text replacement in a workspace file. WHEN TO USE: a "
+                "specific unique change is known. WHEN NOT TO USE: multiple ambiguous "
+                "matches or a complete rewrite. EFFECT: workspace write. RETURNS: changed "
+                "path and byte count."
+            ),
+            input_schema=_object_schema(
+                {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                ["path", "old_text", "new_text"],
+            ),
+            risk="write",
+            capability_id="workspace.write",
         ),
-        lambda args, _runtime: {
-            "diff": "\n".join(__import__("difflib").unified_diff(
-                _workspace_path(args["before"], _runtime).read_text(encoding="utf-8").splitlines(),
-                _workspace_path(args["after"], _runtime).read_text(encoding="utf-8").splitlines(),
-                fromfile=args["before"], tofile=args["after"], lineterm=""
-            ))[:100_000]
-        },
+        lambda args, runtime: filesystem.edit_file(args, runtime),
     )
 
     registry.register(
         ToolDefinition(
-            name="request_human_input",
+            name="move_file",
+            description=(
+                "Move one file inside the active workspace. WHEN TO USE: rename or relocate "
+                "a workspace file. WHEN NOT TO USE: moving outside the workspace. EFFECT: "
+                "workspace write. RETURNS: source and destination."
+            ),
+            input_schema=_object_schema(
+                {
+                    "source": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "overwrite": {"type": "boolean"},
+                },
+                ["source", "destination"],
+            ),
+            risk="write",
+            capability_id="workspace.write",
+        ),
+        lambda args, runtime: filesystem.move_file(args, runtime),
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="delete_file",
+            description=(
+                "Move one workspace file into the task trash area. WHEN TO USE: remove an "
+                "obsolete file after checking references. WHEN NOT TO USE: deleting a "
+                "directory or anything outside the workspace. EFFECT: destructive workspace "
+                "write, recoverable through .trash. RETURNS: original and trashed paths."
+            ),
+            input_schema=_object_schema({"path": {"type": "string"}}, ["path"]),
+            risk="destructive",
+            capability_id="workspace.write",
+        ),
+        lambda args, runtime: filesystem.delete_file(args, runtime),
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="file_diff",
+            description=(
+                "Compare two UTF-8 workspace files and return a bounded unified diff. "
+                "WHEN TO USE: inspect a file-level change. EFFECT: read-only."
+            ),
+            input_schema=_object_schema(
+                {"before": {"type": "string"}, "after": {"type": "string"}},
+                ["before", "after"],
+            ),
+            risk="read",
+            capability_id="workspace.read",
+        ),
+        lambda args, runtime: filesystem.diff(args, runtime),
+    )
+
+    def _publish_workspace(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        if workspace_service is None:
+            raise RuntimeError("workspace publishing is unavailable")
+        current = store.get_task(runtime["task_id"])
+        if not current or current.get("parent_task_id") or (current.get("metadata") or {}).get("worker_type") != "session_manager":
+            raise PermissionError("only a root Session Manager may publish workspace changes")
+        target_id = str(args.get("task_id") or current["id"])
+        target = store.get_task(target_id)
+        if (
+            not target
+            or target.get("organization_id") != runtime["organization_id"]
+            or (target_id != current["id"] and target.get("parent_task_id") != current["id"])
+        ):
+            raise PermissionError("target Task is outside this manager's workspace tree")
+        return workspace_service.publish_task_workspace(
+            runtime["organization_id"],
+            target,
+            dry_run=bool(args.get("dry_run", False)),
+        )
+
+    registry.register(
+        ToolDefinition(
+            name="workspace_publish",
+            description=(
+                "Publish verified edits from this root Task or one of its direct child Tasks "
+                "into the durable organization workspace. WHEN TO USE: after reviewing the "
+                "child result and its file changes; pass dry_run=true to preview the exact "
+                "files and deletions first. WHEN NOT TO USE: unresolved conflicts or "
+                "a guessed Task ID. EFFECT: conflict-checked workspace write with recoverable "
+                "deletions. RETURNS: published files, conflicts, and trash paths."
+            ),
+            input_schema=_object_schema(
+                {
+                    "task_id": {"type": "string"},
+                    "dry_run": {"type": "boolean"},
+                },
+                [],
+            ),
+            risk="destructive",
+            capability_id="workspace.publish",
+            approval_required=True,
+            runtime_ready=workspace_service is not None,
+            setup_needed=[] if workspace_service is not None else ["workspace_service"],
+        ),
+        _publish_workspace,
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="ask_user",
             description=(
                 "Pause the current run and ask the Slack user for information "
                 "that is genuinely required to continue. Provide `choices` "
@@ -790,10 +969,12 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="brain_search",
+            name="memory_search",
             description=(
-                "Search permission-safe organizational memories, episode summaries, "
-                "and raw evidence. Use this when the supplied context is insufficient. "
+                "Search permission-safe organizational memories, episode summaries, and raw evidence. "
+                "WHEN TO USE: the supplied context is insufficient and you need company facts or provenance. "
+                "WHEN NOT TO USE: public-web research or an already-known source ID. EFFECT: read-only. "
+                "RETURNS: ranked results with source IDs and permission metadata. "
                 "`kind` narrows to one result type (memory: extracted facts/decisions/"
                 "commitments; episode: a summarized window of related conversation or "
                 "connector activity; evidence: raw source chunks) — omit it to search all three."
@@ -886,11 +1067,12 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="brain_read_source",
+            name="memory_read_source",
             description=(
-                "Read one permission-visible evidence source by trusted source ID "
-                "in bounded text slices. Use for a source attachment or a source "
-                "returned by company search."
+                "Read one permission-visible evidence source by trusted source ID in bounded text slices. "
+                "WHEN TO USE: inspect a source returned by memory_search or an authorized attachment. "
+                "WHEN NOT TO USE: searching for an unknown source. EFFECT: read-only. RETURNS: text, "
+                "provenance and pagination metadata."
             ),
             input_schema=_object_schema(
                 {
@@ -932,11 +1114,12 @@ def build_tool_registry(
 
         registry.register(
             ToolDefinition(
-                name="brain_query_facts",
-                description=(
-                    "Query permission-safe bi-temporal company facts. Use "
-                    "valid_at for what was true in the company then and known_at "
-                    "for what Toda knew at that time."
+            name="memory_query_facts",
+            description=(
+                    "Query permission-safe bi-temporal company facts. WHEN TO USE: you need a structured "
+                    "claim and its validity or knowledge time. WHEN NOT TO USE: raw source text; use "
+                    "memory_search or memory_read_source. EFFECT: read-only. RETURNS: facts with scope "
+                    "and permission metadata."
                 ),
                 input_schema=_object_schema(
                     {
@@ -979,10 +1162,11 @@ def build_tool_registry(
 
         registry.register(
             ToolDefinition(
-                name="brain_list_cases",
-                description=(
-                    "List permission-safe cross-tool company cases that correlate "
-                    "events from Slack, tickets, code, CRM, and other sources."
+            name="case_list",
+            description=(
+                    "List permission-safe cross-tool company cases. WHEN TO USE: investigate correlated "
+                    "incidents spanning Slack, tickets, code, CRM or other sources. EFFECT: read-only. "
+                    "RETURNS: bounded cases and statuses."
                 ),
                 input_schema=_object_schema(
                     {
@@ -1002,10 +1186,11 @@ def build_tool_registry(
 
         registry.register(
             ToolDefinition(
-                name="brain_update_case",
-                description=(
-                    "Update the lifecycle state or summary of an existing "
-                    "company case."
+            name="case_update",
+            description=(
+                    "Update the lifecycle state or summary of an existing company case. WHEN TO USE: "
+                    "you have evidence and authorization to record a correction. EFFECT: durable internal "
+                    "write. RETURNS: the updated case."
                 ),
                 input_schema=_object_schema(
                     {
@@ -1040,7 +1225,7 @@ def build_tool_registry(
 
         registry.register(
             ToolDefinition(
-                name="brain_judgment_guidance",
+                name="judgment_guidance",
                 description=(
                     "Read durable human corrections, approvals, rejections, and "
                     "preferences applicable to the acting principal."
@@ -1200,10 +1385,13 @@ def build_tool_registry(
 
         registry.register(
             ToolDefinition(
-                name="brain_list_artifacts",
+                name="artifact_list",
                 description=(
                     "List durable reports, plans, briefs, tables, and child Task "
-                    "results visible to the acting principal."
+                    "results visible to the acting principal. WHEN TO USE: locate "
+                    "an existing artifact before creating a duplicate. WHEN NOT TO "
+                    "USE: inspect known content; use artifact_read. EFFECT: read-only. "
+                    "RETURNS: bounded metadata and IDs."
                 ),
                 input_schema=_object_schema(
                     {
@@ -1224,11 +1412,13 @@ def build_tool_registry(
 
         registry.register(
             ToolDefinition(
-                name="brain_read_artifact",
+                name="artifact_read",
                 description=(
                     "Read one permission-visible artifact by ID. Text and structured "
                     "content is returned in bounded slices; binary/base64 content is "
-                    "never inserted into context and must be opened with its typed tool."
+                    "never inserted into context and must be opened with its typed tool. "
+                    "WHEN TO USE: inspect an artifact returned by artifact_list or a "
+                    "trusted task result. EFFECT: read-only. RETURNS: content and pagination."
                 ),
                 input_schema=_object_schema(
                     {
@@ -1248,10 +1438,13 @@ def build_tool_registry(
 
         registry.register(
             ToolDefinition(
-                name="brain_create_artifact",
+                name="artifact_create",
                 description=(
                     "Create a durable permission-scoped report, plan, brief, "
-                    "table, or other structured artifact from completed work."
+                    "table, or other structured artifact from completed work. WHEN TO USE: "
+                    "a result must survive the current response or be shared as a file. "
+                    "WHEN NOT TO USE: temporary notes; use scratchpad_update. EFFECT: "
+                    "durable internal write. RETURNS: artifact ID and metadata."
                 ),
                 input_schema=_object_schema(
                     {
@@ -1324,8 +1517,13 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="brain_resolve_owner",
-            description="Resolve the current owner and on-call person with evidence.",
+            name="owner_resolve",
+            description=(
+                "Resolve the current owner and on-call person with evidence. "
+                "WHEN TO USE: route an issue or responsibility question. WHEN NOT TO USE: "
+                "guess from names or stale conversation. EFFECT: read-only. RETURNS: "
+                "authorized people, confidence, and supporting evidence."
+            ),
             input_schema=_object_schema(
                 {
                     "issue_text": {"type": "string"},
@@ -1352,8 +1550,13 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="brain_find_skills",
-            description="Find approved organizational procedures relevant to a task.",
+            name="procedure_find",
+            description=(
+                "Find approved organizational procedures relevant to a task. WHEN TO USE: "
+                "a repeatable internal workflow may already exist. WHEN NOT TO USE: public "
+                "research or drafting a new procedure. EFFECT: read-only. RETURNS: "
+                "approved procedure summaries and required capabilities."
+            ),
             input_schema=_object_schema(
                 {
                     "query": {"type": "string"},
@@ -1374,10 +1577,13 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="skills_list",
+            name="skill_list",
             description=(
                 "List approved Toda skills available to this organization, "
-                "including immutable built-in and connector packages."
+                "including immutable built-in and connector packages. WHEN TO USE: "
+                "inspect available procedures/capabilities before acting. WHEN NOT TO USE: "
+                "read the full instructions; use skill_read. EFFECT: read-only. RETURNS: "
+                "bounded skill metadata and activation requirements."
             ),
             input_schema=_object_schema(
                 {
@@ -1477,7 +1683,7 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="skill_view",
+            name="skill_read",
             description="View the trusted instructions and metadata for one skill.",
             input_schema=_object_schema({"name": {"type": "string"}, "resource_path": {"type": "string"}}, ["name"]),
             risk="read",
@@ -1613,19 +1819,19 @@ def build_tool_registry(
         return {"task_id": task["id"], "cancelled": store.cancel_task(task["id"])}
 
     registry.register(
-        ToolDefinition(name="task_search", description="Search authorized completed or active root Tasks across Sessions.", input_schema=_object_schema({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}, ["query"]), risk="read"),
+        ToolDefinition(name="task_search", description="Search authorized completed or active root Tasks across Sessions. WHEN TO USE: locate prior work or a running task. EFFECT: read-only. RETURNS: bounded task summaries.", input_schema=_object_schema({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}, ["query"]), risk="read"),
         _task_search,
     )
     registry.register(
-        ToolDefinition(name="task_get", description="Load one authorized root Task, its child summaries, and artifacts.", input_schema=_object_schema({"task_id": {"type": "string"}}, ["task_id"]), risk="read"),
+        ToolDefinition(name="task_get", description="Load one authorized root Task, its child summaries, and artifacts. WHEN TO USE: inspect progress or evidence for a known task ID. WHEN NOT TO USE: guess IDs. EFFECT: read-only. RETURNS: current state, children, and visible artifacts.", input_schema=_object_schema({"task_id": {"type": "string"}}, ["task_id"]), risk="read"),
         _task_get,
     )
     registry.register(
-        ToolDefinition(name="task_continue", description="Steer an authorized active Task from another Session.", input_schema=_object_schema({"task_id": {"type": "string"}, "message": {"type": "string"}}, ["task_id"]), risk="write", idempotency_required=True),
+        ToolDefinition(name="task_continue", description="Steer an authorized active Task from another Session. WHEN TO USE: provide new direction to work already in progress. WHEN NOT TO USE: terminal tasks; start a new task. EFFECT: durable task signal. RETURNS: task ID and acknowledgement.", input_schema=_object_schema({"task_id": {"type": "string"}, "message": {"type": "string"}}, ["task_id"]), risk="write", idempotency_required=True),
         _task_continue,
     )
     registry.register(
-        ToolDefinition(name="task_cancel", description="Cancel an authorized active root Task.", input_schema=_object_schema({"task_id": {"type": "string"}}, ["task_id"]), risk="write", idempotency_required=True),
+        ToolDefinition(name="task_cancel", description="Cancel an authorized active root Task. WHEN TO USE: stop work that is no longer wanted. WHEN NOT TO USE: pause for a temporary question; use ask_user. EFFECT: durable cancellation request. RETURNS: task ID and resulting state.", input_schema=_object_schema({"task_id": {"type": "string"}}, ["task_id"]), risk="write", idempotency_required=True),
         _task_cancel,
     )
 
@@ -1732,11 +1938,11 @@ def build_tool_registry(
         return {"plan": plan}
 
     registry.register(
-        ToolDefinition(name="plan_create", description="Create a lightweight durable checklist for this root Task when substantial work benefits from coordination. Not required for small work; child Tasks cannot modify it.", input_schema=_object_schema({"title": {"type": "string"}, "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, ["title"]), risk="read"),
+        ToolDefinition(name="plan_create", description="Create a lightweight durable checklist for this root Task. WHEN TO USE: substantial work has dependent steps or multiple workers. WHEN NOT TO USE: a small one-step request. EFFECT: durable internal plan. RETURNS: normalized step IDs and dependencies.", input_schema=_object_schema({"title": {"type": "string"}, "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, ["title"]), risk="write"),
         _plan_create,
     )
 
-    def _request_batch_approval(
+    def _request_approval(
         args: dict[str, Any], runtime: dict[str, Any]
     ) -> dict[str, Any]:
         run = _plan_record(runtime)
@@ -1746,8 +1952,14 @@ def build_tool_registry(
         )
         for action in declared:
             name = str(action.get("tool_name") or "")
-            if name:
-                pre_approved[name] = pre_approved.get(name, 0) + 1
+            if not name:
+                raise ValueError("each approval action needs a tool_name")
+            definition = registry.get(name)
+            if definition is None:
+                raise ValueError(f"unknown approval tool: {name}")
+            if runs_without_approval(definition.definition):
+                raise ValueError(f"tool does not require approval: {name}")
+            pre_approved[name] = pre_approved.get(name, 0) + 1
         run_metadata = dict(run.get("metadata") or {})
         run_metadata["pre_approved_tool_names"] = pre_approved
         run["metadata"] = run_metadata
@@ -1757,7 +1969,7 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="request_batch_approval",
+            name="request_approval",
             description=(
                 "Declare the full set of gated actions this task will take, in "
                 "one call, so a human decides the whole plan once instead of "
@@ -1788,14 +2000,14 @@ def build_tool_registry(
             risk="write",
             approval_required=True,
         ),
-        _request_batch_approval,
+        _request_approval,
     )
     registry.register(
-        ToolDefinition(name="plan_get", description="Read the root Task's current durable plan. Children may read it but cannot update it.", input_schema=_object_schema({}, []), risk="read"),
+        ToolDefinition(name="plan_get", description="Read the root Task's current durable plan. WHEN TO USE: coordinate dependent work or report progress. EFFECT: read-only. RETURNS: step status and dependency metadata.", input_schema=_object_schema({}, []), risk="read"),
         _plan_get,
     )
     registry.register(
-        ToolDefinition(name="plan_update", description="Update the root Task's lightweight checklist. Each item has only id, title, status, and depends_on. Child Tasks cannot modify it.", input_schema=_object_schema({"title": {"type": "string"}, "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, []), risk="read"),
+        ToolDefinition(name="plan_update", description="Update the root Task's lightweight checklist. WHEN TO USE: a step changed state or dependencies were clarified. EFFECT: durable internal write. RETURNS: normalized plan. Child Tasks cannot modify it.", input_schema=_object_schema({"title": {"type": "string"}, "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}}}, []), risk="write"),
         _plan_update,
     )
 
@@ -1867,7 +2079,7 @@ def build_tool_registry(
                 "open questions, calculations, and durable source/artifact IDs."
             ),
             input_schema=_object_schema({"text": {"type": "string"}}, ["text"]),
-            risk="read",
+            risk="write",
         ),
         _scratchpad_update,
     )
@@ -1915,7 +2127,7 @@ def build_tool_registry(
                 "Propose a new reusable organizational procedure after a "
                 "non-trivial multi-tool task or a discovered workflow. This "
                 "always creates a draft — it has no effect on any run and is "
-                "not returned by brain_find_skills until a human reviews and "
+                "not returned by procedure_find until a human reviews and "
                 "approves it."
             ),
             input_schema=_object_schema(
@@ -1992,10 +2204,13 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="composio_list_integrations",
+            name="integration_list",
             description=(
-                "List the external applications connected to this organization. "
-                "Use this before searching for external actions."
+                "List external applications connected to this organization. "
+                "WHEN TO USE: confirm an app/account exists before discovery. "
+                "WHEN NOT TO USE: discover unsupported apps or action slugs. "
+                "EFFECT: read-only. RETURNS: connected toolkit names, account IDs, "
+                "status, and whether the provider client is configured."
             ),
             input_schema=_object_schema({}, []),
             risk="read",
@@ -2066,7 +2281,7 @@ def build_tool_registry(
                 "connected_account_id": link.get("connected_account_id"),
                 "instruction": (
                     "Ask the user to open the exact redirect_url. After they return, "
-                    "call composio_list_integrations again; do not assume success."
+                    "call integration_list again; do not assume success."
                 ),
             }
         if audit:
@@ -2152,10 +2367,13 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="composio_search",
+            name="integration_search",
             description=(
-                "Search actions available only in this organization's connected "
-                "external applications. Never guess an action slug."
+                "Search actions available in this organization's connected external applications. "
+                "WHEN TO USE: discover the exact action slug for a requested integration task. "
+                "WHEN NOT TO USE: ordinary web research or an action already identified. "
+                "EFFECT: read-only discovery. RETURNS: verified action slugs and descriptions; "
+                "never guess a slug."
             ),
             input_schema=_object_schema(
                 {
@@ -2191,10 +2409,12 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="composio_describe",
+            name="integration_describe",
             description=(
-                "Fetch the exact input schema for a Composio action returned by "
-                "composio_search."
+                "Fetch the exact input schema for one action returned by integration_search. "
+                "WHEN TO USE: immediately before preparing an integration action. "
+                "WHEN NOT TO USE: guessed or unverified slugs. EFFECT: read-only discovery. "
+                "RETURNS: the provider schema and required arguments."
             ),
             input_schema=_object_schema(
                 {"tool_slug": {"type": "string"}}, ["tool_slug"]
@@ -2204,15 +2424,16 @@ def build_tool_registry(
         _describe_composio,
     )
 
-    # Composio's own Tool Router meta-tools (COMPOSIO_SEARCH_TOOLS,
-    # COMPOSIO_GET_TOOL_SCHEMAS) — richer than composio_search/composio_describe
+    # Composio's own Tool Router meta-tools (exposed to workers as
+    # integration_discover/integration_schema) — richer than
+    # integration_search/integration_describe
     # above (guided plan, known pitfalls, dependency-aware suggestions across
     # all of Composio's toolkits, not just this org's connected ones). The
     # session backing them is opened with execute/workbench/manage_connections
     # explicitly disabled (confirmed against the live API: execute defaults ON
     # otherwise), so this session structurally cannot execute anything or run
     # code — discovery only. Actual execution always goes through
-    # COMPOSIO_EXECUTE, this codebase's own approval-gated path.
+    # integration_execute, this codebase's own approval-gated path.
     _tool_router_sessions: dict[str, str] = {}
 
     def _tool_router_session_id(organization_id: str, *, refresh: bool = False) -> str:
@@ -2258,12 +2479,12 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="COMPOSIO_SEARCH_TOOLS",
+            name="integration_discover",
             description=(
                 "Composio's own tool-discovery meta-tool: describe a use case in "
                 "plain English and get back matching actions across ALL of "
                 "Composio's connected toolkits, plus a recommended step-by-step "
-                "plan and known pitfalls. Call this before COMPOSIO_EXECUTE "
+                "plan and known pitfalls. Call this before integration_execute "
                 "whenever the right action isn't already known, and before "
                 "asking the user to supply information (a repo, a ticket, an "
                 "item) that a listing/discovery action might find instead."
@@ -2276,6 +2497,8 @@ def build_tool_registry(
                 ["use_case"],
             ),
             risk="read",
+            main_agent_visible=False,
+            child_worker_only=True,
         ),
         lambda args, runtime: _call_tool_router(
             runtime["organization_id"],
@@ -2298,10 +2521,10 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="COMPOSIO_GET_TOOL_SCHEMAS",
+            name="integration_schema",
             description=(
                 "Fetch exact input schemas for action slugs returned by "
-                "COMPOSIO_SEARCH_TOOLS. Only pass slugs it actually returned — "
+                "integration_discover. Only pass slugs it actually returned — "
                 "never guess or fabricate one."
             ),
             input_schema=_object_schema(
@@ -2315,6 +2538,8 @@ def build_tool_registry(
                 ["tool_slugs"],
             ),
             risk="read",
+            main_agent_visible=False,
+            child_worker_only=True,
         ),
         lambda args, runtime: _call_tool_router(
             runtime["organization_id"],
@@ -2365,19 +2590,14 @@ def build_tool_registry(
 
     registry.register(
         ToolDefinition(
-            name="COMPOSIO_EXECUTE",
+            name="integration_execute",
             description=(
-                "Execute an exact action slug previously found via "
-                "COMPOSIO_SEARCH_TOOLS/composio_search and inspected with "
-                "COMPOSIO_GET_TOOL_SCHEMAS/composio_describe. This is this "
-                "codebase's own governed executor — the only path any "
-                "Composio action ever actually runs through. Every call is "
-                "assessed by an automated risk review that can approve, "
-                "deny, or escalate it to a person; an action whose slug is "
-                "destructive (delete/remove), financial (payment/invoice/"
-                "charge/refund/transfer/payout), or reaches an external/"
-                "customer-facing surface is the kind most likely to be "
-                "escalated, so state clearly what you are doing and why."
+                "Execute one exact integration action after discovery and schema inspection. "
+                "WHEN TO USE: the slug came from integration_search and its inputs came from "
+                "integration_describe. WHEN NOT TO USE: guessed slugs, missing required fields, "
+                "or an action the user did not authorize. EFFECT: external write or read, governed "
+                "by Toda policy, review and approval. RETURNS: the provider result and execution "
+                "status."
             ),
             input_schema=_object_schema(
                 {
@@ -2391,7 +2611,7 @@ def build_tool_registry(
                 ["tool_slug", "arguments"],
             ),
             risk="write",
-            capability_id="connectors.composio",
+            capability_id="connector.composio.action",
         ),
         _execute_composio,
     )
@@ -2424,7 +2644,10 @@ def build_tool_registry(
         lambda args, _runtime: calculate(str(args["expression"])),
     )
 
-    if run_code_enabled:
+    if run_code_enabled and (
+        not run_code_isolation_required
+        or (run_code_runner is not None and getattr(run_code_runner, "execution_user", None))
+    ):
         from toda.harness.run_code import (
             RUN_CODE_CANDIDATE_TOOLS,
             RunCodeSandbox,
@@ -2440,6 +2663,14 @@ def build_tool_registry(
             allowed_tools=allowed_read_tools,
             timeout_seconds=run_code_timeout_seconds,
             max_tool_calls=run_code_max_tool_calls,
+            runner=run_code_runner,
+        )
+        isolation_note = (
+            "The script runs under the configured low-privilege agent account "
+            "inside a temporary task directory; it cannot read control-plane "
+            "files unless the deployment grants that account access."
+            if run_code_runner is not None and getattr(run_code_runner, "execution_user", None)
+            else "This is NOT an OS sandbox and runs under Toda's host account."
         )
         registry.register(
             ToolDefinition(
@@ -2452,21 +2683,35 @@ def build_tool_registry(
                     f"via the `toda_tools` module: {', '.join(allowed_read_tools) or 'none configured'}. "
                     "Only the script's printed output is returned to you — "
                     "intermediate tool results never enter your context. "
-                    "IMPORTANT: this is NOT a sandbox. The script runs as an "
-                    "ordinary process on the host, with that host's full "
-                    "filesystem and network access, under the same operating "
-                    "system account as Toda itself. Write only what the task "
-                    "actually requires: never read files outside your working "
-                    "directory, never make network requests, and never touch "
-                    "credentials or the database. Every call is assessed by an "
-                    "automated risk review before it runs, and may be "
-                    "escalated to a person."
+                    f"{isolation_note} Write only what the task actually "
+                    "requires: never read files outside your working directory, "
+                    "never make network requests, and never touch credentials or "
+                    "the database. Every call is assessed by an automated risk "
+                    "review before it runs, and may be escalated to a person."
                 ),
                 input_schema=_object_schema({"code": {"type": "string"}}, ["code"]),
                 risk="write",
                 approval_required=True,
             ),
             lambda args, runtime: sandbox.run(args["code"], runtime=runtime),
+        )
+    elif run_code_enabled:
+        # Keep the capability visible to readiness/catalog consumers while
+        # withholding it from model schemas until an agent account exists.
+        registry.register(
+            ToolDefinition(
+                name="run_code",
+                description=(
+                    "Run short Python transformations through the agent runner. "
+                    "Unavailable until a dedicated pi_execution_user is configured."
+                ),
+                input_schema=_object_schema({"code": {"type": "string"}}, ["code"]),
+                risk="write",
+                runtime_ready=False,
+                setup_needed=["dedicated_agent_account"],
+                approval_required=True,
+            ),
+            lambda _args, _runtime: {"status": "setup_needed"},
         )
 
     # A separate typed contract keeps test execution distinguishable from
@@ -2527,7 +2772,10 @@ class ToolExecutor:
         trigger_kind = str(run.get("trigger_kind") or "")
         definitions: list[ToolDefinition] = []
         is_child = bool(run.get("parent_task_id"))
+        profile = resolve_tool_profile(metadata.get("tool_profile"))
         for definition in self.registry.definitions():
+            if profile is not None and definition.name not in profile:
+                continue
             if (
                 definition.allowed_organization_ids
                 and org not in definition.allowed_organization_ids
@@ -2618,10 +2866,81 @@ class ToolExecutor:
         call: ModelToolCall,
         approved: bool = False,
     ) -> ToolResult:
-        self.store.trace.record(
+        """Resolve and execute one tool call inside one terminal span.
+
+        The span covers denials, validation failures, approval waits,
+        idempotent replays, and handler execution. That makes a decision
+        observable even when no external handler is entered.
+        """
+        safe_arguments = self._redact_output(call.arguments)
+        started = time.perf_counter()
+        with self.store.telemetry.span(
+            "tool.execute",
+            component="tools",
+            task_id=run.get("id"),
+            session_id=run.get("session_id"),
+            tool_call_id=call.id,
+            tool_name=call.name,
+            attributes={
+                "toda.operation.risk": "unknown",
+                "toda.tool.name": call.name,
+                "toda.tool.call_id": call.id,
+            },
+            input={"arguments": safe_arguments},
+        ) as trace_span:
+            result = self._execute(
+                run=run,
+                call=call,
+                approved=approved,
+                trace_span=trace_span,
+            )
+            trace_span.set_attribute("toda.operation.outcome", result.status)
+            trace_span.output(
+                {
+                    "status": result.status,
+                    "has_output": result.output is not None,
+                    "approval_required": bool(result.approval_id),
+                }
+            )
+            metrics = self.store.telemetry.metrics
+            if metrics is not None:
+                try:
+                    metrics.counter(
+                        "toda_tool_requests_total",
+                        labels={"tool": call.name, "outcome": result.status},
+                    )
+                    metrics.histogram(
+                        "toda_tool_duration_ms",
+                        (time.perf_counter() - started) * 1000,
+                        labels={"tool": call.name},
+                    )
+                    if result.status in {"denied", "disabled"}:
+                        metrics.counter(
+                            "toda_tool_denied_total",
+                            labels={"tool": call.name, "outcome": result.status},
+                        )
+                    if result.approval_id:
+                        metrics.counter(
+                            "toda_tool_approval_required_total",
+                            labels={"tool": call.name, "outcome": "required"},
+                        )
+                except Exception:
+                    pass
+            return result
+
+    def _execute(
+        self,
+        *,
+        run: dict[str, Any],
+        call: ModelToolCall,
+        approved: bool = False,
+        trace_span: Any,
+    ) -> ToolResult:
+        safe_arguments = self._redact_output(call.arguments)
+        self.store.telemetry.record(
             "tool.call.proposed", component="tool_executor", phase="started",
-            input={"name": call.name, "arguments": call.arguments, "approved": approved},
-            trace_id=run.get("trace_id"), task_id=run.get("id"),
+            input={"name": call.name, "arguments": safe_arguments, "approved": approved},
+            task_id=run.get("id"),
             session_id=run.get("session_id"), tool_call_id=call.id,
         )
         registered = self.registry.get(call.name)
@@ -2714,7 +3033,7 @@ class ToolExecutor:
             execution = "ai_review"
         requires_approval = execution in {"ai_review", "ask"}
 
-        # request_batch_approval lets a task front-load its whole plan and
+        # request_approval lets a task front-load its whole plan and
         # get one combined human decision instead of one pause per action --
         # a declared action consumes one unit here instead of re-triggering
         # the gate. Anything not declared there still goes through the
@@ -2743,7 +3062,7 @@ class ToolExecutor:
                 verdict = self.action_reviewer.review(
                     tool_name=definition.name,
                     description=definition.description,
-                    arguments=call.arguments,
+                    arguments=safe_arguments,
                     hazard=hazard,
                 )
             if verdict == "deny":
@@ -2809,34 +3128,17 @@ class ToolExecutor:
         record["status"] = "running"
         record["updated_at"] = utcnow().isoformat()
         self.store.upsert_harness_tool_call(record)
-        # A span, not a bare context bind: a tool call is a step with a
-        # duration and an outcome, and read tools run on a pool thread where
-        # nothing else would carry the trace across. Binding explicitly from
-        # `run` rather than inheriting means a parallel tool call lands on
-        # the right trace instead of starting its own.
-        from toda.observability import trace_context
-
-        with trace_context(
-            trace_id=run.get("trace_id"),
-            task_id=run.get("id"),
-            session_id=run.get("session_id"),
-            tool_call_id=call.id,
-        ), self.store.trace.span(
-            "tool.execute",
-            component="tools",
-            tool_name=call.name,
-            input={"arguments": call.arguments, "risk": definition.risk},
-        ) as trace_span:
-            return self._execute_handler(
-                run=run,
-                call=call,
-                definition=definition,
-                registered=registered,
-                record=record,
-                runtime=runtime,
-                envelope=envelope,
-                trace_span=trace_span,
-            )
+        trace_span.set_attribute("toda.operation.risk", definition.risk)
+        return self._execute_handler(
+            run=run,
+            call=call,
+            definition=definition,
+            registered=registered,
+            record=record,
+            runtime=runtime,
+            envelope=envelope,
+            trace_span=trace_span,
+        )
 
     def _execute_handler(
         self,
@@ -2869,7 +3171,6 @@ class ToolExecutor:
                     "risk": definition.risk,
                 },
                 principal_id=envelope["principal_id"],
-                trace_id=run["trace_id"],
             )
             trace_span.output({"status": "completed", "output": output})
             return ToolResult(
@@ -2892,8 +3193,9 @@ class ToolExecutor:
                 output={"child_task_ids": exc.child_task_ids},
             )
         except Exception as exc:
+            safe_error = redact(str(exc)).text
             record["status"] = "failed"
-            record["error"] = str(exc)
+            record["error"] = safe_error
             record["updated_at"] = utcnow().isoformat()
             self.store.upsert_harness_tool_call(record)
             self.audit.record(
@@ -2903,17 +3205,16 @@ class ToolExecutor:
                     "task_id": run["id"],
                     "tool_call_id": call.id,
                     "tool_name": call.name,
-                    "error": str(exc),
+                    "error": safe_error,
                 },
                 principal_id=envelope["principal_id"],
-                trace_id=run["trace_id"],
             )
-            trace_span.error({"type": type(exc).__name__, "message": str(exc)})
+            trace_span.error({"type": type(exc).__name__, "message": safe_error})
             return ToolResult(
                 call_id=call.id,
                 tool_name=call.name,
                 status="failed",
-                error=str(exc),
+                error=safe_error,
             )
 
     def resolve_approval(
@@ -2927,10 +3228,10 @@ class ToolExecutor:
         approval = self.store.get_harness_record("approvals", approval_id)
         if not approval:
             raise KeyError(f"approval not found: {approval_id}")
-        self.store.trace.record(
-            "approval.decision.received", component="approval", phase="started",
+        self.store.telemetry.record(
+            "approval.resolve", component="approval", phase="started",
             input={"approval_id": approval_id, "approved": approved, "decided_by": decided_by},
-            trace_id=approval.get("trace_id"), task_id=approval.get("task_id"),
+            task_id=approval.get("task_id"),
         )
         if approval["status"] != "pending":
             raise ValueError("approval has already been resolved")
@@ -2974,10 +3275,10 @@ class ToolExecutor:
             )
 
         if not approved:
-            self.store.trace.record(
-                "approval.decision", component="approval", phase="completed",
+            self.store.telemetry.record(
+                "approval.resolve", component="approval", phase="completed",
                 output={"status": approval["status"], "decided_by": decided_by},
-                trace_id=approval.get("trace_id"), task_id=approval.get("task_id"),
+                task_id=approval.get("task_id"),
             )
             return approval, ToolResult(
                 call_id=approval["tool_call_id"],
@@ -3019,10 +3320,10 @@ class ToolExecutor:
                     approval_id=approval_id,
                 )
         result = self.execute(run=task, call=call, approved=True)
-        self.store.trace.record(
-            "approval.decision", component="approval", phase="completed",
+        self.store.telemetry.record(
+            "approval.resolve", component="approval", phase="completed",
             output={"status": approval["status"], "tool_status": result.status},
-            trace_id=task.get("trace_id"), task_id=task.get("id"),
+            task_id=task.get("id"),
         )
         return approval, result
 
@@ -3164,10 +3465,11 @@ class ToolExecutor:
             "preview": {
                 "action": definition.name,
                 "description": definition.description,
-                "arguments": call_record["arguments"],
+                "arguments": self._redact_output(call_record["arguments"]),
                 "destination": run["envelope"]["destination"],
             },
             "expires_at": (now + timedelta(hours=24)).isoformat(),
+            "telemetry_carrier": inject_carrier(),
             "created_at": now.isoformat(),
             "updated_at": now.isoformat(),
         }
@@ -3182,7 +3484,15 @@ class ToolExecutor:
                 "preview": approval["preview"],
             },
             principal_id=run["envelope"]["principal_id"],
-            trace_id=run["trace_id"],
+        )
+        self.store.telemetry.record(
+            "approval.request",
+            component="approval",
+            phase="completed",
+            output={"approval_id": approval["id"], "tool_name": definition.name},
+            task_id=run["id"],
+            approval_id=approval["id"],
+            approval_state="pending",
         )
         return approval
 
@@ -3317,7 +3627,7 @@ class ToolExecutor:
                 bounded["artifact_id"] = artifact["id"]
                 bounded["how_to_get_more"] = (
                     f"Full result stored as artifact {artifact['id']}; use "
-                    "brain_list_artifacts to retrieve it if needed."
+                    "artifact_list to retrieve it if needed."
                 )
             except Exception:
                 # Losing the artifact must never fail the tool call itself —
@@ -3343,6 +3653,7 @@ class ToolExecutor:
         if isinstance(value, list):
             return [ToolExecutor._redact_output(item, extra_keys) for item in value]
         if isinstance(value, str):
+            value = redact(value).text
             return re.sub(
                 r"(?i)(?:sk|xoxb|xapp|fc)-[A-Za-z0-9._-]{12,}|Bearer\s+[A-Za-z0-9._-]+",
                 "[REDACTED]",

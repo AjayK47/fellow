@@ -191,7 +191,8 @@ class RetrievalService:
         include_superseded: bool = False,
         as_of: str | None = None,
     ) -> dict[str, Any]:
-        self.store.trace.record(
+        started = monotonic()
+        self.store.telemetry.record(
             "retrieval.search", component="retrieval", phase="started",
             input={"query": query, "limit": limit, "entity_ids": entity_ids},
             organization_id=organization_id,
@@ -315,11 +316,26 @@ class RetrievalService:
             "allowed_scope_ids": decision.allowed_scope_ids,
             "count": len(results),
         }
-        self.store.trace.record(
+        self.store.telemetry.record(
             "retrieval.search", component="retrieval", phase="completed",
             output={"count": result["count"], "permission_decision_id": decision.id},
             organization_id=organization_id,
         )
+        metrics = self.store.telemetry.metrics
+        if metrics is not None:
+            try:
+                metrics.histogram(
+                    "toda_retrieval_duration_ms",
+                    (monotonic() - started) * 1000,
+                    labels={"source": "memory"},
+                )
+                metrics.counter(
+                    "toda_retrieval_results_total",
+                    result["count"],
+                    labels={"source": "memory"},
+                )
+            except Exception:
+                pass
         return result
 
     def search_evidence(
@@ -528,7 +544,7 @@ class RetrievalService:
         limit: int = 10,
     ) -> dict[str, Any]:
         """One orchestration entry point over memory/episode/evidence search
-        (memory ingestion/retrieval plan §8) so `brain_search` and
+        (memory ingestion/retrieval plan §8) so `memory_search` and
         ContextService.prepare_context call the same permission-safe
         primitives instead of each hand-rolling a subset. `kind` narrows to
         one result type; omitted, all three run and come back labeled."""

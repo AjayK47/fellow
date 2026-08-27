@@ -291,7 +291,7 @@ def test_conditional_policy_default_deny_and_forbid_precedence(brain):
         organization_id="org_acme",
         policy_key="linear-writes",
         effect="permit",
-        actions=["COMPOSIO_EXECUTE"],
+        actions=["integration_execute"],
         conditions={"destination.type": "dm"},
         approval_required=True,
         created_by="person_ajay",
@@ -299,12 +299,12 @@ def test_conditional_policy_default_deny_and_forbid_precedence(brain):
     )
     allowed = brain.policy.evaluate(
         organization_id="org_acme",
-        action="COMPOSIO_EXECUTE",
+        action="integration_execute",
         context={"destination": {"type": "dm"}},
     )
     denied_by_default = brain.policy.evaluate(
         organization_id="org_acme",
-        action="COMPOSIO_EXECUTE",
+        action="integration_execute",
         context={"destination": {"type": "slack_channel"}},
     )
     assert allowed["decision"] == "allow"
@@ -315,14 +315,14 @@ def test_conditional_policy_default_deny_and_forbid_precedence(brain):
         organization_id="org_acme",
         policy_key="incident-freeze",
         effect="forbid",
-        actions=["COMPOSIO_EXECUTE"],
+        actions=["integration_execute"],
         conditions={"action.arguments.status": "closed"},
         created_by="person_ajay",
         status="active",
     )
     forbidden = brain.policy.evaluate(
         organization_id="org_acme",
-        action="COMPOSIO_EXECUTE",
+        action="integration_execute",
         context={
             "destination": {"type": "dm"},
             "action": {"arguments": {"status": "closed"}},
@@ -371,7 +371,7 @@ def test_approved_tool_is_not_executed_when_precondition_changes(brain):
         organization_id="org_acme",
         policy_key="linear-safe-update",
         effect="permit",
-        actions=["COMPOSIO_EXECUTE"],
+        actions=["integration_execute"],
         approval_required=True,
         precondition={
             "action_slug": "LINEAR_GET_ISSUE",
@@ -406,7 +406,7 @@ def test_approved_tool_is_not_executed_when_precondition_changes(brain):
         run=run,
         call=ModelToolCall(
             id="call-precondition",
-            name="COMPOSIO_EXECUTE",
+            name="integration_execute",
             arguments={
                 "tool_slug": "LINEAR_UPDATE_ISSUE",
                 "arguments": {"issue_id": "LIN-1", "status": "closed"},
@@ -540,7 +540,7 @@ def test_policy_changes_are_pending_until_explicit_activation(api_client):
             "organization_id": "org_acme",
             "policy_key": "company-writes",
             "effect": "permit",
-            "actions": ["COMPOSIO_EXECUTE"],
+            "actions": ["integration_execute"],
             "conditions": {"destination.type": "dm"},
             "approval_required": True,
             "created_by": "person_ajay",

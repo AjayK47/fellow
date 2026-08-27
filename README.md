@@ -42,6 +42,7 @@ git clone REPOSITORY_URL toda
 cd toda
 uv sync --extra dev
 cp config.example.json config.json   # set organization.owner_email
+chmod 600 config.json                # config may contain provider/Slack credentials
 uv run toda init                     # prints the owner password once
 uv run toda gateway
 ```
@@ -197,7 +198,7 @@ opaque, server-side, expiring, and revocable.
 
 Toda binds to localhost by default. For a team deployment, expose the port only
 through the organization's VPN or a TLS reverse proxy, set a persistent
-`TODA_DASHBOARD_SESSION_SECRET`, and set `TODA_DASHBOARD_COOKIE_SECURE=true`
+`dashboard.session_secret` and `dashboard.cookie_secure: true` in `config.json`
 when the browser reaches Toda over HTTPS. Do not expose the raw HTTP port to the
 public internet.
 
@@ -384,6 +385,7 @@ Install and create the local configuration:
 ```bash
 uv sync --extra dev
 cp config.example.json config.json
+chmod 600 config.json
 ```
 
 Edit `config.json` — at minimum set `organization.owner_email` — then create
@@ -451,6 +453,22 @@ Open:
 - Graph explorer: <http://127.0.0.1:8080/explorer>
 - OpenAPI documentation: <http://127.0.0.1:8080/docs>
 - Runtime readiness: <http://127.0.0.1:8080/v1/harness/status>
+
+Optional local observability is available without making the external stack a
+runtime dependency:
+
+```bash
+docker compose -f compose.observability.yaml up -d
+```
+
+Set `observability.otlp_endpoint` to
+`http://127.0.0.1:4318/v1/traces` in `config.json` and restart Toda. The
+Collector forwards traces to Tempo and metrics to Prometheus; all exposed
+ports bind to loopback only. The Toda run view continues to use its local
+SQLite exporter when the stack is stopped.
+
+- Tempo query API: <http://127.0.0.1:3200>
+- Prometheus: <http://127.0.0.1:9090>
 
 Toda is one process: the three worker lanes (agent, knowledge,
 infrastructure) run inside the gateway and cannot be split out or turned

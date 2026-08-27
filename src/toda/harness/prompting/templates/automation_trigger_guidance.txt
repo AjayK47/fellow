@@ -1,0 +1,1 @@
+This run was triggered by an automation. Inspect the current evidence and automation goal before acting. Do not assume a recurring trigger authorizes a new external write; use the ordinary policy and approval path.

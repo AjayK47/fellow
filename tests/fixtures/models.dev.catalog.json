@@ -1,0 +1,50 @@
+{
+  "models": {
+    "openai/gpt-4o": {
+      "id": "openai/gpt-4o",
+      "modalities": {"input": ["text", "image"], "output": ["text"]},
+      "limit": {"context": 128000, "output": 16384},
+      "tool_call": true
+    }
+  },
+  "providers": {
+    "openai": {
+      "id": "openai",
+      "name": "OpenAI",
+      "api": "https://api.openai.com/v1",
+      "doc": "https://platform.openai.com/docs",
+      "env": ["OPENAI_API_KEY"],
+      "npm": "@ai-sdk/openai",
+      "models": {
+        "gpt-4o": {
+          "id": "gpt-4o",
+          "name": "GPT-4o",
+          "tool_call": true,
+          "structured_output": true,
+          "modalities": {"input": ["text", "image"], "output": ["text"]},
+          "limit": {"context": 128000, "output": 16384},
+          "cost": {"input": 0.0025, "output": 10.0, "cache_read": 0.00125},
+          "unknown_upstream_field": {"ignored": true}
+        }
+      }
+    },
+    "anthropic": {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "api": "https://api.anthropic.com/v1",
+      "doc": "https://docs.anthropic.com",
+      "env": ["ANTHROPIC_API_KEY"],
+      "npm": "@ai-sdk/anthropic",
+      "models": {
+        "claude-sonnet-4-6": {
+          "id": "claude-sonnet-4-6",
+          "name": "Claude Sonnet 4.6",
+          "tool_call": true,
+          "reasoning": true,
+          "modalities": {"input": ["text", "image"], "output": ["text"]},
+          "limit": {"context": 200000, "output": 64000}
+        }
+      }
+    }
+  }
+}

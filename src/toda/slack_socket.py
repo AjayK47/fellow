@@ -101,7 +101,7 @@ async def run_socket_mode(
 ) -> None:
     """Run Slack Socket Mode as a transport of the owning Toda daemon."""
     if not settings.slack.app_token:
-        raise RuntimeError("TODA_SLACK_APP_TOKEN is required")
+        raise RuntimeError("slack.app_token in config.json is required")
     await _ensure_installation(brain)
 
     stop_event = stop_event or threading.Event()

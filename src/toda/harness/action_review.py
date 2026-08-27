@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from toda.harness.prompt_library import load
+from toda.harness.prompting.catalog import load
 
 REVIEW_SYSTEM_PROMPT = load("action_review")
 

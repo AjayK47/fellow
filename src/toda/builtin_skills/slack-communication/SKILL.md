@@ -70,7 +70,7 @@ two-column layout without needing a Markdown table:
 ]}
 ```
 
-Use `request_human_input` with its `choices` array (2-10 short options) when
+Use `ask_user` with its `choices` array (2-10 short options) when
 the next step is genuinely a pick from a known set -- Slack renders that as
 buttons or a menu instead of asking the user to type a free-text reply.
 Reserve it for a real blocker, not a way to avoid making a reasonable

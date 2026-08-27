@@ -13,15 +13,15 @@ platform_key: builtin.hermes.fastmcp
 activation: {mode: optional}
 required_capabilities: {all_of: [workspace.read, workspace.write]}
 warnings:
-  - Drafting server code with workspace_write does not install packages, start a process, or prove the server runs -- only a Pi child Task can actually execute Python here, and it may not be enabled.
-  - Keep credentials and auth material out of workspace files entirely; workspace_write and workspace_patch already refuse writes containing obvious secret patterns, but design the server so it reads secrets from its own runtime environment rather than a checked-in file.
+  - Drafting server code with write_file does not install packages, start a process, or prove the server runs -- only a Pi child Task can actually execute Python here, and it may not be enabled.
+  - Keep credentials and auth material out of workspace files entirely; write_file and edit_file already refuse writes containing obvious secret patterns, but design the server so it reads secrets from its own runtime environment rather than a checked-in file.
 steps:
   - order: 1
     name: Contract
     description: Decide the tool surface -- names, typed schemas, auth model, side effects -- before writing a line of implementation.
   - order: 2
     name: Implement
-    description: Draft narrow, typed, verb-named tools with workspace_write; keep the first slice small.
+    description: Draft narrow, typed, verb-named tools with write_file; keep the first slice small.
   - order: 3
     name: Validate
     description: Get the draft actually run and smoke-tested via a Pi child Task; do not claim it works without that.
@@ -36,13 +36,13 @@ own tool surface has no shell and no package installer.
 
 ## What Toda can and cannot do here
 
-- `workspace_read` / `workspace_write` / `workspace_patch` let you draft,
+- `read_file` / `write_file` / `edit_file` let you draft,
   read back, and edit the server's Python source, its dependency manifest,
   and its documentation, all inside the org's shared workspace folder.
 - Nothing in Toda's own tool surface can run `pip install`, start the
   server process, or execute a client call against it. `run_code`'s sandbox
   only calls back into a fixed set of read-only company-data lookups
-  (`brain_search` and similar) -- it cannot import the module you just wrote
+  (`memory_search` and similar) -- it cannot import the module you just wrote
   or reach the workspace filesystem at all.
 - Actually running the server -- installing `fastmcp`, importing the module,
   listing its tools, calling one for real -- requires a Pi child Task:
@@ -98,11 +98,11 @@ Add `@mcp.prompt` only for a genuinely reusable prompt template tied to a
 known workflow. Most servers need neither at first -- tools alone are
 usually the right starting shape.
 
-### 2. Implement -- draft with workspace_write
+### 2. Implement -- draft with write_file
 
 Write the server module, its dependency manifest (`pyproject.toml` or
 `requirements.txt`), and a short README describing required environment
-variables, using `workspace_write`. Keep each tool's docstring written as the
+variables, using `write_file`. Keep each tool's docstring written as the
 user-facing description a calling agent will see -- that description is part
 of the contract, not internal commentary.
 
@@ -121,7 +121,7 @@ Design rules, independent of whether you can run it yet:
 ### 3. Validate -- this step requires a Pi child Task
 
 Design review alone (re-reading the schemas, docstrings, and validation
-logic with `workspace_read`) catches contract problems but does not prove
+logic with `read_file`) catches contract problems but does not prove
 the server runs. To actually validate it:
 
 - Delegate a task that installs `fastmcp` and the server's other
@@ -156,7 +156,7 @@ enabling that capability or a human running it locally.
   several narrow ones.
 - **Auth material anywhere near a workspace file.** Design the server to
   read credentials from its own process environment; don't draft a config
-  file containing one, even for local testing -- `workspace_write` will
+  file containing one, even for local testing -- `write_file` will
   reject writes containing common token/key patterns, but the design intent
   matters independent of the scanner.
 - **Skipping the resources-vs-tools-vs-prompts distinction.** Turning every

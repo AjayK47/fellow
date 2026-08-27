@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
+import time
 from collections import deque
 from typing import Any, Protocol
 
 import httpx
+from opentelemetry.trace import SpanKind
 
 from toda.config import Settings, settings as _loaded_settings
 from toda.domain.models import new_id
@@ -41,6 +44,341 @@ class ModelClient(Protocol):
     ) -> ModelResponse: ...
 
     def context_length(self) -> int: ...
+
+
+def _numeric(usage: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+    return None
+
+
+def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize provider vocabularies to the application usage contract."""
+    raw = dict(usage or {})
+    input_tokens = _numeric(raw, "input_tokens", "prompt_tokens")
+    output_tokens = _numeric(raw, "output_tokens", "completion_tokens")
+    total_tokens = _numeric(raw, "total_tokens")
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    input_details = raw.get("input_tokens_details") or raw.get("prompt_tokens_details") or {}
+    output_details = raw.get("output_tokens_details") or raw.get("completion_tokens_details") or {}
+    cached_input_tokens = _numeric(
+        raw,
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+    )
+    if cached_input_tokens is None and isinstance(input_details, dict):
+        cached_input_tokens = _numeric(input_details, "cached_tokens", "cache_read_input_tokens")
+    reasoning_tokens = _numeric(raw, "reasoning_tokens")
+    if reasoning_tokens is None and isinstance(output_details, dict):
+        reasoning_tokens = _numeric(output_details, "reasoning_tokens")
+    cost_usd = raw.get("cost_usd")
+    if isinstance(cost_usd, (int, float)):
+        cost_usd = float(cost_usd)
+    else:
+        cost_usd = None
+    cost_state = str(raw.get("cost_state") or ("actual" if cost_usd is not None else "unavailable"))
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "cost_usd": cost_usd,
+        "cost_state": cost_state,
+    }
+
+
+class InstrumentedModelClient:
+    """Exactly-once telemetry decorator for every model transport.
+
+    Providers and deterministic test clients implement the same small
+    protocol, so instrumentation belongs at this boundary instead of being
+    repeated in every agent/service caller. Only request shape, hashes,
+    usage and cost state enter telemetry; raw prompts, tool arguments and
+    provider responses remain in the returned application object.
+    """
+
+    def __init__(
+        self,
+        client: ModelClient,
+        *,
+        telemetry: Any,
+        role: str,
+        catalog: Any | None = None,
+    ) -> None:
+        self.client = client
+        self.telemetry = telemetry
+        self.role = role
+        self.catalog = catalog
+        self.model = getattr(client, "model", "unknown")
+        self.provider_id = str(
+            getattr(client, "provider_id", None)
+            or getattr(client, "provider_name", None)
+            or type(client).__name__.removesuffix("ModelClient").lower()
+        )
+        self.provider_model_id = f"{self.provider_id}/{self.model}"
+
+    @staticmethod
+    def _hash(value: Any) -> str:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _chars(value: Any) -> int:
+        return len(json.dumps(value, default=str, ensure_ascii=False))
+
+    @staticmethod
+    def _usage(response: ModelResponse) -> dict[str, Any]:
+        return normalize_usage(response.usage)
+
+    def _cost(
+        self,
+        response: ModelResponse,
+        usage: dict[str, Any],
+        raw_usage: dict[str, Any],
+    ) -> tuple[str, float | None, str]:
+        raw = response.raw if isinstance(response.raw, dict) else {}
+        provider_cost = raw.get("cost")
+        if provider_cost is None:
+            provider_cost = raw_usage.get("cost")
+        if provider_cost is None and isinstance(raw.get("usage"), dict):
+            provider_cost = raw["usage"].get("cost")
+        if isinstance(provider_cost, (int, float)):
+            return "actual", float(provider_cost), "provider"
+        if self.catalog is not None:
+            try:
+                estimate = self.catalog.estimate_cost(
+                    provider_id=self.provider_id, model_id=self.model, usage=usage
+                )
+                if isinstance(estimate, dict):
+                    value = estimate.get("usd")
+                    source = str(estimate.get("source") or "catalog")
+                else:
+                    value, source = estimate, "catalog"
+                if isinstance(value, (int, float)):
+                    return "estimated", float(value), source
+            except Exception:
+                log.debug("model.catalog_cost_failed", exc_info=True)
+        return "unavailable", None, "unavailable"
+
+    def generate(self, **kwargs: Any) -> ModelResponse:
+        messages = kwargs.get("messages") or []
+        tools = kwargs.get("tools") or []
+        response_schema = kwargs.get("response_schema")
+        started = time.perf_counter()
+        attrs = {
+            "gen_ai.system": self.provider_id,
+            "gen_ai.request.model": self.model,
+            "gen_ai.request.max_tokens": int(kwargs.get("max_tokens") or 0),
+            "gen_ai.request.temperature": float(kwargs.get("temperature") or 0.0),
+            "toda.model.role": self.role,
+            "toda.provider.id": self.provider_id,
+            "toda.provider_model.id": self.provider_model_id,
+            "toda.message.count": len(messages),
+            "toda.tool.count": len(tools),
+            "toda.input.chars": self._chars(messages),
+            "toda.input.sha256": self._hash(messages),
+            "toda.toolset.sha256": self._hash(tools),
+        }
+        if response_schema is not None:
+            attrs["toda.response_schema.sha256"] = self._hash(response_schema)
+        with self.telemetry.span(
+            "model.generate",
+            component="model",
+            kind=SpanKind.CLIENT,
+            attributes=attrs,
+        ) as span:
+            try:
+                response = self.client.generate(**kwargs)
+                raw_usage = dict(response.usage or {})
+                usage = self._usage(response)
+                cost_state, cost_usd, cost_source = self._cost(
+                    response, usage, raw_usage
+                )
+                usage["cost_usd"] = cost_usd
+                usage["cost_state"] = cost_state
+                response.usage = usage
+                # Keep the provider's native vocabulary available for
+                # inspection without allowing it back into application
+                # budgeting.  Provider transports already put their raw
+                # response in ``raw``; deterministic clients often do not.
+                raw_response = dict(response.raw or {})
+                raw_response.setdefault("usage", raw_usage)
+                response.raw = raw_response
+                span.set_attribute("toda.model.finish_reason", response.finish_reason)
+                span.set_attribute("toda.model.output.chars", len(response.content or ""))
+                span.set_attribute("toda.model.tool_calls", len(response.tool_calls or []))
+                span.set_attribute("toda.cost.state", cost_state)
+                span.set_attribute(
+                    "toda.cost.source",
+                    "provider" if cost_state == "actual" else
+                    "estimated" if cost_state == "estimated" else "unavailable",
+                )
+                if cost_state == "estimated":
+                    span.set_attribute("toda.cost.catalog_source", cost_source)
+                span.set_attribute("toda.cost.currency", "USD")
+                if cost_usd is not None:
+                    span.set_attribute("toda.cost.usd", cost_usd)
+                    span.set_attribute("toda.cost.amount", cost_usd)
+                if self.catalog is not None:
+                    try:
+                        catalog_status = self.catalog.status()
+                        if catalog_status.get("content_hash"):
+                            span.set_attribute(
+                                "toda.catalog.version", str(catalog_status["content_hash"])
+                            )
+                        if catalog_status.get("fetched_at"):
+                            span.set_attribute(
+                                "toda.catalog.fetched_at", str(catalog_status["fetched_at"])
+                            )
+                    except Exception:
+                        log.debug("model.catalog_metadata_failed", exc_info=True)
+                for key in (
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "cached_input_tokens",
+                    "reasoning_tokens",
+                ):
+                    value = usage.get(key)
+                    if value is not None:
+                        span.set_attribute(f"gen_ai.usage.{key}", value)
+                if self.telemetry.metrics is not None:
+                    labels = {
+                        "provider": self.provider_id,
+                        "model": self.model,
+                        "role": self.role,
+                        "outcome": "success",
+                    }
+                    self.telemetry.metrics.counter(
+                        "toda_model_requests_total", labels=labels
+                    )
+                    self.telemetry.metrics.histogram(
+                        "toda_model_request_duration_ms",
+                        (time.perf_counter() - started) * 1000,
+                        labels={key: labels[key] for key in ("provider", "model", "role")},
+                    )
+                    for token_key, value in usage.items():
+                        if token_key in {
+                            "input_tokens",
+                            "output_tokens",
+                            "total_tokens",
+                            "cached_input_tokens",
+                            "reasoning_tokens",
+                        } and value is not None:
+                            self.telemetry.metrics.counter(
+                                "toda_model_tokens_total",
+                                value,
+                                labels={
+                                    "provider": self.provider_id,
+                                    "model": self.model,
+                                    "role": self.role,
+                                    "source": token_key,
+                                },
+                            )
+                    cached_tokens = usage.get("cached_input_tokens")
+                    input_tokens = usage.get("input_tokens")
+                    if cached_tokens is not None:
+                        self.telemetry.metrics.counter(
+                            "toda_model_cache_input_tokens_total",
+                            cached_tokens,
+                            labels={
+                                "provider": self.provider_id,
+                                "model": self.model,
+                                "role": self.role,
+                            },
+                        )
+                    if cached_tokens is not None and input_tokens:
+                        self.telemetry.metrics.gauge(
+                            "toda_model_cache_hit_ratio",
+                            min(1.0, max(0.0, float(cached_tokens) / float(input_tokens))),
+                            labels={
+                                "provider": self.provider_id,
+                                "model": self.model,
+                                "role": self.role,
+                            },
+                        )
+                    if cost_usd is not None:
+                        self.telemetry.metrics.counter(
+                            "toda_model_cost_usd_total",
+                            cost_usd,
+                            labels={
+                                "provider": self.provider_id,
+                                "model": self.model,
+                                "role": self.role,
+                                "source": "actual" if cost_state == "actual" else "estimated",
+                            },
+                        )
+                span.output({
+                    "model": response.model or self.model,
+                    "finish_reason": response.finish_reason,
+                    "tool_calls": len(response.tool_calls or []),
+                    "usage": {
+                        key: value
+                        for key, value in usage.items()
+                        if key != "cost_usd"
+                    },
+                    "cost_state": cost_state,
+                })
+                return response
+            except Exception as exc:
+                if self.telemetry.metrics is not None:
+                    try:
+                        self.telemetry.metrics.counter(
+                            "toda_model_requests_total",
+                            labels={
+                                "provider": self.provider_id,
+                                "model": self.model,
+                                "role": self.role,
+                                "outcome": "error",
+                            },
+                        )
+                        error_text = str(exc).lower()
+                        if isinstance(exc, (TimeoutError, httpx.TimeoutException)) or "timeout" in error_text or "timed out" in error_text:
+                            self.telemetry.metrics.counter(
+                                "toda_model_timeouts_total",
+                                labels={"provider": self.provider_id, "model": self.model, "role": self.role},
+                            )
+                        if any(marker in error_text for marker in ("rate limit", "429", "temporarily unavailable", "503")):
+                            self.telemetry.metrics.counter(
+                                "toda_model_retries_total",
+                                labels={"provider": self.provider_id, "model": self.model, "role": self.role},
+                            )
+                    except Exception:
+                        log.debug("model.metric_record_failed", exc_info=True)
+                span.error(exc)
+                raise
+
+    def context_length(self) -> int:
+        return self.client.context_length()
+
+
+def instrument_model(
+    client: ModelClient,
+    *,
+    telemetry: Any,
+    role: str,
+    catalog: Any | None = None,
+) -> ModelClient:
+    if isinstance(client, InstrumentedModelClient):
+        if client.role == role:
+            return client
+        # Re-label the same transport for an auxiliary logical role without
+        # wrapping the wrapper. The next call still creates exactly one
+        # model.generate span, but a ConversationAgent call is distinguishable
+        # from the main Task loop.
+        return InstrumentedModelClient(
+            client.client,
+            telemetry=telemetry,
+            role=role,
+            catalog=catalog or client.catalog,
+        )
+    return InstrumentedModelClient(
+        client, telemetry=telemetry, role=role, catalog=catalog
+    )
 
 
 class OpenAICompatibleModelClient:
@@ -303,7 +641,8 @@ class OpenAICompatibleModelClient:
         if response.finish_reason != "length":
             return False
         reasoning_tokens = (
-            (response.usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+            response.usage.get("reasoning_tokens")
+            or (response.usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
             or 0
         )
         return bool(reasoning_tokens)
@@ -760,7 +1099,9 @@ class AnthropicModelClient:
         response_schema: dict[str, Any] | None = None,
         temperature: float = 0.1,
         max_tokens: int = 1500,
+        reasoning: bool | None = None,
     ) -> ModelResponse:
+        del reasoning
         system_parts: list[str] = []
         anthropic_messages: list[dict[str, Any]] = []
         for message in repair_tool_call_pairing(messages):
@@ -1058,15 +1399,15 @@ def _build_resolved_model(
     base_url = resolved.profile.endpoint(resolved.connection)
     headers = {**dict(resolved.profile.headers), **resolved.connection.headers}
     if resolved.profile.api_mode == "anthropic_messages":
-        return AnthropicModelClient(
+        client: ModelClient = AnthropicModelClient(
             api_key=api_key,
             model=resolved.assignment.model,
             base_url=base_url,
             timeout_seconds=config.models.timeout_seconds,
             headers=headers,
         )
-    if resolved.profile.api_mode == "concentrate_responses":
-        return ConcentrateResponsesModelClient(
+    elif resolved.profile.api_mode == "concentrate_responses":
+        client = ConcentrateResponsesModelClient(
             api_key=api_key,
             model=resolved.assignment.model,
             base_url=base_url,
@@ -1075,15 +1416,21 @@ def _build_resolved_model(
             headers=headers,
             provider_name=resolved.profile.name,
         )
-    return OpenAICompatibleModelClient(
-        api_key=api_key,
-        model=resolved.assignment.model,
-        base_url=base_url,
-        timeout_seconds=config.models.timeout_seconds,
-        reasoning_effort=reasoning_effort,
-        headers=headers,
-        provider_name=resolved.profile.display_name,
-    )
+    else:
+        client = OpenAICompatibleModelClient(
+            api_key=api_key,
+            model=resolved.assignment.model,
+            base_url=base_url,
+            timeout_seconds=config.models.timeout_seconds,
+            reasoning_effort=reasoning_effort,
+            headers=headers,
+            provider_name=resolved.profile.display_name,
+        )
+    # Runtime transport names and metadata provider IDs are distinct
+    # concepts. Keep a stable registry ID on every client for telemetry.
+    client.provider_id = resolved.connection.provider
+    client.provider_model_id = f"{resolved.connection.provider}/{resolved.assignment.model}"
+    return client
 
 
 def build_vision_model(config: Settings, main_model: ModelClient) -> ModelClient | None:

@@ -6,8 +6,9 @@ from datetime import timedelta
 from typing import Any
 
 from toda.domain.models import new_id, utcnow
-from toda.observability import current_trace_id
 from toda.storage.db import BrainStore
+from toda.telemetry.context import inject_carrier
+from opentelemetry.trace import SpanKind
 
 # Session and child Task execution can drive CompanyAgent._loop() to completion -- potentially
 # several iterations, each with a model round-trip plus tool calls -- and can
@@ -98,6 +99,7 @@ class JobQueue:
         idempotency_key: str,
         available_at: str | None = None,
         max_attempts: int | None = None,
+        link_carrier: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         ceiling = _MAX_PENDING_PER_KIND.get(kind)
         if ceiling is not None:
@@ -108,15 +110,6 @@ class JobQueue:
                     "shedding rather than deepening the backlog"
                 )
         now = utcnow().isoformat()
-        # Stamp the trace in force onto the payload, so the job carries it
-        # across the queue to whichever thread picks it up. Done here rather
-        # than at the ~30 call sites because "remember to pass trace_id" is
-        # a rule that gets followed for a while and then does not: the
-        # previous attempt read `payload.get("trace_id")` on the way out
-        # while nothing ever put one in, so the lookup was always None.
-        ambient_trace_id = current_trace_id()
-        if ambient_trace_id and "trace_id" not in payload:
-            payload = {**payload, "trace_id": ambient_trace_id}
         job = {
             "id": new_id("hjob"),
             "organization_id": organization_id,
@@ -137,14 +130,89 @@ class JobQueue:
         lease_override = _LONG_RUNNING_LEASE_OVERRIDES.get(kind)
         if lease_override:
             job["lease_seconds"] = lease_override
-        created = self.store.enqueue_harness_job(job)
-        self.store.trace.record(
-            "job.enqueued", component="queue", phase="completed", input=payload,
-            output={"id": created["id"], "kind": kind, "available_at": created["available_at"]},
-            trace_id=payload.get("trace_id"), job_id=created["id"],
+        with self.store.telemetry.span(
+            "queue.publish",
+            component="queue",
+            kind=SpanKind.PRODUCER,
             organization_id=organization_id,
-        )
+            job_id=job["id"],
+            job_kind=kind,
+            input={"kind": kind, "available_at": job["available_at"]},
+        ) as span:
+            # The carrier is transport metadata. It intentionally stays out
+            # of the business payload so handlers cannot accidentally depend
+            # on tracing state.
+            job["telemetry"] = {} if link_carrier else inject_carrier()
+            job["telemetry_correlation"] = {
+                "organization_id": organization_id,
+                "job_id": job["id"],
+                "job_kind": kind,
+                **{
+                    key: payload[key]
+                    for key in ("task_id", "root_task_id", "session_id", "approval_id")
+                    if isinstance(payload.get(key), (str, int))
+                },
+            }
+            if link_carrier:
+                # Long waits/resumptions are a new trace segment. Keep the
+                # prior context as a link rather than making a human wait part
+                # of the original synchronous trace.
+                job["telemetry_links"] = [link_carrier]
+            created = self.store.enqueue_harness_job(job)
+            span.output({"job_id": created["id"], "kind": kind})
+            metrics = self.store.telemetry.metrics
+            if metrics is not None:
+                try:
+                    metrics.counter(
+                        "toda_queue_jobs_total",
+                        labels={"operation": kind, "outcome": "published"},
+                    )
+                except Exception:
+                    pass
         return created
+
+    def observe_metrics(self) -> None:
+        """Publish current queue state using only bounded kind labels."""
+        metrics = getattr(self.store.telemetry, "metrics", None)
+        if metrics is None:
+            return
+        organizations = self.store.list_organizations()
+        counts: dict[str, int] = {}
+        oldest: dict[str, float] = {}
+        expired = 0
+        for organization in organizations:
+            organization_id = str(organization["id"])
+            for kind, count in self.store.harness_job_counts(organization_id).items():
+                counts[kind] = counts.get(kind, 0) + int(count)
+            for kind, age in self.store.harness_job_queue_age_seconds(organization_id).items():
+                oldest[kind] = max(oldest.get(kind, 0.0), float(age))
+            expired += self.store.count_expired_harness_jobs(organization_id)
+        for kind, count in counts.items():
+            try:
+                metrics.gauge(
+                    "toda_queue_depth",
+                    count,
+                    labels={"kind": kind, "lane": "all"},
+                )
+                metrics.gauge(
+                    "toda_queue_oldest_ready_job_age_seconds",
+                    oldest.get(kind, 0.0),
+                    labels={"kind": kind, "lane": "all"},
+                )
+            except Exception:
+                pass
+        try:
+            metrics.gauge("toda_queue_expired_leases_total", expired, labels={"lane": "all"})
+            metrics.gauge(
+                "toda_queue_dead_letters_total",
+                sum(
+                    int(self.store.harness_job_counts(str(org["id"])).get("dead_letter", 0))
+                    for org in organizations
+                ),
+                labels={"lane": "all"},
+            )
+        except Exception:
+            pass
 
     def lease(
         self,
@@ -173,10 +241,6 @@ class JobQueue:
             result=result or {},
             lease_owner=worker_id,
         )
-        self.store.trace.record(
-            "job.completed", component="queue", phase="completed", output=result or {},
-            trace_id=(result or {}).get("trace_id"), job_id=job_id,
-        )
         return finished
 
     def fail(
@@ -200,11 +264,6 @@ class JobQueue:
                 error=error,
                 lease_owner=job.get("lease_owner"),
             )
-            self.store.trace.record(
-                "job.dead_lettered", component="queue", phase="failed", error=error,
-                trace_id=(job.get("payload") or {}).get("trace_id"), job_id=job["id"],
-                attempt_number=attempts,
-            )
             return finished
         delay = (
             retry_in_seconds
@@ -218,11 +277,5 @@ class JobQueue:
             error=error,
             retry_at=retry_at,
             lease_owner=job.get("lease_owner"),
-        )
-        self.store.trace.record(
-            "job.retry.scheduled", component="queue", phase="event", error=error,
-            output={"retry_at": retry_at, "delay_seconds": delay},
-            trace_id=(job.get("payload") or {}).get("trace_id"), job_id=job["id"],
-            attempt_number=attempts,
         )
         return finished

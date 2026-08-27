@@ -26,14 +26,14 @@ Toda has no dedicated Google Meet bot and does not join a call live --
 there is no real-time capture here. Every interaction with a Meet meeting
 (finding the event, reading its attendee list, locating a generated
 transcript or recording) is a Composio action against the organization's
-connected Google account, run through `COMPOSIO_EXECUTE`, on artifacts
+connected Google account, run through `integration_execute`, on artifacts
 Google itself already produced after the meeting ended.
 
 ## Finding the right action
 
 There's no curated shortcut for Meet specifically -- discover every time:
 
-1. `COMPOSIO_SEARCH_TOOLS` with a plain-English `use_case`, e.g. "list
+1. `integration_search` with a plain-English `use_case`, e.g. "list
    upcoming Google Calendar events with a Meet link", "get attendees for a
    Google Calendar event", "find the transcript document for a Google Meet
    meeting", "search recent files in Google Drive", "get a Google Doc's
@@ -43,9 +43,9 @@ There's no curated shortcut for Meet specifically -- discover every time:
    transcript" endpoint -- so the actual retrieval is usually a Calendar
    lookup (to resolve the meeting and its time window) followed by a Drive
    search scoped to that time window and meeting title.
-2. `COMPOSIO_GET_TOOL_SCHEMAS` on whatever slugs come back, since the exact
+2. `integration_describe` on whatever slugs come back, since the exact
    field names for meeting ID, event ID, and Drive file ID vary by action.
-3. `COMPOSIO_EXECUTE` with `{tool_slug, arguments}`, passing
+3. `integration_execute` with `{tool_slug, arguments}`, passing
    `connected_account_id` explicitly if more than one Google account is
    connected for this organization.
 
@@ -88,7 +88,7 @@ compensation, personnel matters, unreleased plans, or other restricted
 topics. State the source explicitly when delivering (which meeting, when,
 who was invited) so the recipient can judge the summary's scope themselves.
 Posting the summary anywhere, or sharing the Drive transcript/recording
-more broadly, is a write action through `COMPOSIO_EXECUTE` like any other --
+more broadly, is a write action through `integration_execute` like any other --
 confirm the destination and content before calling it, and remember that an
 externally-facing or otherwise gated destination still pauses for the same
 human approval any other write to that surface would need.
@@ -109,4 +109,4 @@ human approval any other write to that surface would need.
   boundary and isn't otherwise available, treat the invite list as the
   best available proxy and say so.
 - **Multiple connected Google accounts** need an explicit
-  `connected_account_id` on `COMPOSIO_EXECUTE`, same as any other connector.
+  `connected_account_id` on `integration_execute`, same as any other connector.

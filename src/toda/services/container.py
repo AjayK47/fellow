@@ -6,13 +6,13 @@ from pathlib import Path
 from typing import Any
 import json
 
-from toda.config import Settings, settings as _module_settings
+from toda.config import Settings, settings as _module_settings, StorageConfig
 from toda.domain.models import new_id
 from toda.services.audit import AuditService
 from toda.services.authorization import AuthorizationService
 from toda.services.context import ContextService
 from toda.services.events import EventService
-from toda.services.embeddings import build_embedding_provider
+from toda.services.embeddings import build_embedding_provider, instrument_embedding
 from toda.services.graph import GraphService
 from toda.services.ingestion import IngestionService
 from toda.services.indexing import IndexingService
@@ -40,7 +40,7 @@ from toda.harness.history_compaction import HistoryCompactor
 from toda.harness.evaluation import HarnessEvaluationService
 from toda.harness.jobs import JobQueue
 from toda.harness.memory_capture import HarnessMemoryCapture
-from toda.harness.model_client import build_model_clients, build_vision_model
+from toda.harness.model_client import build_model_clients, build_vision_model, instrument_model
 from toda.harness.media_providers import (
     build_image_provider,
     build_speech_provider,
@@ -60,12 +60,15 @@ from toda.harness.worker import HarnessWorker
 from toda.harness.child_tasks import ChildTaskService
 from toda.harness.child_task_executor import ChildTaskExecutor
 from toda.harness.pi_task_executor import PiTaskExecutor
+from toda.harness.agent_runner import AgentRunner
 from toda.harness.session_manager import SessionManagerScheduler
 from toda.harness.conversation import ConversationAgent
 from toda.harness.skill_curator import SkillCurator
 from toda.harness.recovery import RecoveryHeartbeat
 from toda.harness.sessions import SessionService
 from toda.harness.task_run_store import TaskRunStore
+from toda.services.models_catalog import ModelsCatalogService
+from toda.services.run_inspection import RunInspectionService
 
 
 class TodaApp:
@@ -87,15 +90,33 @@ class TodaApp:
         """
         runtime_settings = settings or _module_settings
         path = Path(db_path) if db_path else runtime_settings.storage.db_path
+        if db_path is not None and settings is None:
+            # A caller supplying an isolated database is asking for an
+            # isolated app container as well.  Keeping the process config's
+            # workspace roots here makes private task worktrees escape into
+            # the operator's real data directory (and fails in sandboxes).
+            # Explicit Settings remain authoritative for deployments that
+            # intentionally pair a custom database with fixed roots.
+            isolated_storage = runtime_settings.storage.model_copy(
+                update={
+                    "data_dir": path.parent,
+                    "workspace_root": path.parent / "workspaces",
+                    "agent_workspace_root": path.parent / "agent-workspaces",
+                }
+            )
+            runtime_settings = runtime_settings.model_copy(
+                update={"storage": StorageConfig(**isolated_storage.model_dump())}
+            )
+        self.settings = runtime_settings
         path.parent.mkdir(parents=True, exist_ok=True)
         self.store = BrainStore(path)
-        self.store.trace.enabled = runtime_settings.observability.enabled
-        self.store.trace.max_payload_bytes = runtime_settings.observability.max_payload_bytes
-        self.store.trace.capture_payloads = runtime_settings.observability.capture_payloads
+        self.store.configure_telemetry(runtime_settings.observability)
         self.audit = AuditService(self.store)
         self.graph = GraphService(self.store)
         self.authz = AuthorizationService(self.store, self.audit)
-        self.embeddings = build_embedding_provider(runtime_settings)
+        self.embeddings = instrument_embedding(
+            build_embedding_provider(runtime_settings), telemetry=self.store.telemetry
+        )
         self.indexing = IndexingService(self.store, self.embeddings)
         self.memory = MemoryService(self.store, self.graph, self.audit, indexing=self.indexing)
         self.reality = RealityEngine(
@@ -127,7 +148,10 @@ class TodaApp:
         # and rebuilding would silently discard every configured value.
         self.skill_packages = SkillPackageCatalog()
         self.workspaces = WorkspaceService(
-            self.store, self.audit, runtime_settings.storage.workspaces
+            self.store,
+            self.audit,
+            runtime_settings.storage.workspaces,
+            agent_root=runtime_settings.storage.agent_workspaces,
         )
         self.skills = SkillsService(
             self.store,
@@ -141,13 +165,53 @@ class TodaApp:
 
         # Managed company-wide harness. These are deliberately composed from
         # small first-party primitives rather than an agent framework.
+        self.models_catalog = ModelsCatalogService(
+            cache_path=runtime_settings.storage.data_dir / "models-catalog.json",
+            url=runtime_settings.models.catalog_url,
+            refresh_interval_seconds=runtime_settings.models.catalog_refresh_interval_seconds,
+            timeout_seconds=runtime_settings.models.catalog_timeout_seconds,
+            enabled=runtime_settings.models.catalog_enabled,
+        )
+        if runtime_settings.models.catalog_enabled:
+            self.models_catalog.refresh_in_background(
+                force=bool(self.models_catalog.status().get("fallback"))
+            )
+        self.run_inspection = RunInspectionService(
+            store=self.store,
+            settings=runtime_settings,
+            catalog=self.models_catalog,
+        )
+        self.store.run_inspection = self.run_inspection
+        # The provider profiles retain transport/setup facts; the picker and
+        # inference eligibility use this pinned provider-model catalog.
+        from toda.providers import providers
+        providers.set_catalog(self.models_catalog)
         (
             self.main_model,
             self.attention_model,
             self.extraction_model,
             self.tool_output_summary_model,
         ) = build_model_clients(runtime_settings)
+        self.main_model = instrument_model(
+            self.main_model, telemetry=self.store.telemetry, role="main", catalog=self.models_catalog
+        )
+        self.attention_model = instrument_model(
+            self.attention_model, telemetry=self.store.telemetry, role="attention", catalog=self.models_catalog
+        )
+        self.extraction_model = instrument_model(
+            self.extraction_model, telemetry=self.store.telemetry, role="extraction", catalog=self.models_catalog
+        )
+        self.tool_output_summary_model = instrument_model(
+            self.tool_output_summary_model,
+            telemetry=self.store.telemetry,
+            role="tool_summary",
+            catalog=self.models_catalog,
+        )
         self.vision_model = build_vision_model(runtime_settings, self.main_model)
+        if self.vision_model is not None:
+            self.vision_model = instrument_model(
+                self.vision_model, telemetry=self.store.telemetry, role="vision", catalog=self.models_catalog
+            )
         self.harness_jobs = JobQueue(
             self.store, lease_seconds=runtime_settings.worker.lease_seconds
         )
@@ -160,7 +224,7 @@ class TodaApp:
             webhook_tolerance_seconds=(
                 runtime_settings.composio.webhook_tolerance_seconds
             ),
-            trace=self.store.trace,
+            telemetry=self.store.telemetry,
         )
         self.web_tools = build_web_tools(runtime_settings)
         self.document_tools = DocumentTools(self.artifacts)
@@ -183,6 +247,14 @@ class TodaApp:
             cdp_enabled=runtime_settings.tools.browser_cdp_enabled,
         )
         self.visual_tools = VisualTools(self.artifacts)
+        code_runner = AgentRunner(
+            execution_user=runtime_settings.agent.pi_execution_user,
+            execution_home=runtime_settings.agent.pi_home,
+            cpu_seconds=runtime_settings.agent.pi_cpu_seconds,
+            max_processes=runtime_settings.agent.pi_max_processes,
+            max_file_bytes=runtime_settings.agent.pi_max_file_bytes,
+            memory_bytes=runtime_settings.agent.pi_memory_bytes,
+        )
         self.sessions = SessionService(
             store=self.store, audit=self.audit, queue=self.harness_jobs
         )
@@ -212,6 +284,8 @@ class TodaApp:
             run_code_enabled=runtime_settings.tools.run_code_enabled,
             run_code_timeout_seconds=runtime_settings.tools.run_code_timeout_seconds,
             run_code_max_tool_calls=runtime_settings.tools.run_code_max_tool_calls,
+            run_code_runner=code_runner,
+            run_code_isolation_required=runtime_settings.agent.pi_isolation_required,
             workspace_root=runtime_settings.storage.workspaces,
             workspace_service=self.workspaces,
             document_tools=self.document_tools,
@@ -265,10 +339,15 @@ class TodaApp:
                 workspaces=self.workspaces,
                 max_iterations=runtime_settings.agent.max_iterations,
                 max_tool_calls=runtime_settings.agent.max_tool_calls,
+                max_model_calls=runtime_settings.agent.max_model_calls,
+                max_cost_usd=runtime_settings.agent.max_cost_usd,
+                max_duration_seconds=runtime_settings.agent.max_duration_seconds,
                 context_token_budget=runtime_settings.agent.context_token_budget,
                 max_total_tokens=runtime_settings.agent.max_total_tokens,
                 completion_max_tokens=runtime_settings.agent.completion_max_tokens,
                 embeddings=self.embeddings,
+                run_inspection=self.run_inspection,
+                readiness_target=self,
             )
 
         self.company_agent = _task_agent_factory(
@@ -278,6 +357,10 @@ class TodaApp:
                 lease_seconds=runtime_settings.worker.lease_seconds,
             )
         )
+        # Repair terminal runs created before automatic lifecycle
+        # reconciliation was installed. This is bounded by the organization
+        # query and is safe to repeat because completeness is an upsert.
+        self.run_inspection.reconcile_terminal_tasks(runtime_settings.organization.id)
 
         self.conversation_agent = ConversationAgent(
             store=self.store,
@@ -286,6 +369,7 @@ class TodaApp:
             context_service=self.context,
             task_agent_factory=_task_agent_factory,
             delivery_enqueue=self.harness_jobs.enqueue,
+            readiness_target=self,
         )
         self.session_manager = SessionManagerScheduler(
             store=self.store,
@@ -306,6 +390,10 @@ class TodaApp:
             max_depth=runtime_settings.agent.child_max_depth,
             max_iterations=runtime_settings.agent.child_max_iterations,
             max_tool_calls=runtime_settings.agent.child_max_tool_calls,
+            max_model_calls=runtime_settings.agent.max_model_calls,
+            max_cost_usd=runtime_settings.agent.max_cost_usd,
+            max_duration_seconds=runtime_settings.agent.max_duration_seconds,
+            max_total_tokens=runtime_settings.agent.max_total_tokens,
         )
         self.tool_registry.register(
             self.child_tasks.tool_definition(), self.child_tasks.execute
@@ -328,6 +416,13 @@ class TodaApp:
             provider=runtime_settings.agent.pi_provider,
             model=runtime_settings.agent.pi_model,
             credential_env=runtime_settings.agent.pi_credential_env,
+            execution_user=runtime_settings.agent.pi_execution_user,
+            isolation_required=runtime_settings.agent.pi_isolation_required,
+            execution_home=runtime_settings.agent.pi_home,
+            cpu_seconds=runtime_settings.agent.pi_cpu_seconds,
+            max_processes=runtime_settings.agent.pi_max_processes,
+            max_file_bytes=runtime_settings.agent.pi_max_file_bytes,
+            memory_bytes=runtime_settings.agent.pi_memory_bytes,
             credential=getattr(
                 runtime_settings.models.providers.get(
                     runtime_settings.agent.pi_credential_connection
@@ -346,6 +441,7 @@ class TodaApp:
             queue=self.harness_jobs,
             sessions=self.sessions,
             agent_factory=_task_agent_factory,
+            workspaces=self.workspaces,
             # Only wire Pi when the actual `pi` CLI is expected to be present.
             # worker_type="pi" children fail closed with a clear error
             # otherwise (ChildTaskExecutor.run), never silently no-op.
@@ -434,6 +530,7 @@ class TodaApp:
             task_agent_factory=_task_agent_factory,
             session_manager=self.session_manager,
             sessions=self.sessions,
+            run_inspection=self.run_inspection,
         )
         self.harness_worker.register("task.run_child", self.child_task_executor.run)
         self.harness_worker.register("task.pi_poll", self.child_task_executor.poll_pi)
@@ -442,7 +539,11 @@ class TodaApp:
             lambda payload: self.skill_curator.review(payload["task_id"]),
         )
         self.recovery_heartbeat = RecoveryHeartbeat(
-            store=self.store, sessions=self.sessions, queue=self.harness_jobs
+            store=self.store,
+            sessions=self.sessions,
+            queue=self.harness_jobs,
+            workspaces=self.workspaces,
+            workspace_retention_hours=runtime_settings.agent.pi_workspace_retention_hours,
         )
         self.harness_worker.register(
             "system.recover",

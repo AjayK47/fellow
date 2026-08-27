@@ -8,6 +8,7 @@ executor.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from toda.domain.models import new_id, utcnow
@@ -128,6 +129,10 @@ class TaskRunStore:
         parent_run_id: str | None = None,
         max_iterations: int = 50,
         max_tool_calls: int = 100,
+        max_model_calls: int = 100,
+        max_cost_usd: float | None = 10.0,
+        max_duration_seconds: int = 3_600,
+        max_total_tokens: int = 100_000,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = utcnow().isoformat()
@@ -174,9 +179,18 @@ class TaskRunStore:
             "prompt": goal,
             "goal": goal,
             "envelope": envelope.model_dump(mode="json"),
-            "trace_id": envelope.trace_id,
+            "correlation_id": envelope.correlation_id,
             "max_iterations": max_iterations,
             "max_tool_calls": max_tool_calls,
+            "max_model_calls": max_model_calls,
+            "max_cost_usd": max_cost_usd,
+            "max_duration_seconds": max_duration_seconds,
+            "max_total_tokens": max_total_tokens,
+            "deadline_at": (
+                datetime.fromisoformat(now) + timedelta(seconds=max_duration_seconds)
+            ).isoformat()
+            if max_duration_seconds > 0
+            else None,
             "iteration_count": 0,
             "tool_call_count": 0,
             "final_answer": None,

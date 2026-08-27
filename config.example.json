@@ -11,6 +11,12 @@
     "name": "Acme",
     "owner_email": "you@example.com"
   },
+  "storage": {
+    "data_dir": "~/.local/share/toda",
+    "db_name": "brain.db",
+    "workspace_root": "~/.local/share/toda/workspaces",
+    "agent_workspace_root": "~/.local/share/toda-agent-workspaces"
+  },
   "models": {
     "providers": {
       "concentrate": {
@@ -44,6 +50,10 @@
     },
     "embedding_dimensions": 96,
     "timeout_seconds": 600.0,
+    "catalog_enabled": true,
+    "catalog_url": "https://models.dev/catalog.json",
+    "catalog_refresh_interval_seconds": 86400,
+    "catalog_timeout_seconds": 5.0,
     "main_reasoning_effort": "medium",
     "main_supports_vision": false
   },
@@ -95,5 +105,37 @@
     "tts_voice": "default",
     "tts_format": "mp3",
     "max_bytes": 26214400
+  },
+  "agent": {
+    "require_real_world_readiness": true,
+    "max_duration_seconds": 3600,
+    "max_model_calls": 100,
+    "max_cost_usd": 10.0,
+    "pi_coding_enabled": false,
+    "pi_provider": null,
+    "pi_model": null,
+    "pi_credential_env": "OPENROUTER_API_KEY",
+    "pi_credential_connection": "openrouter",
+    "pi_execution_user": null,
+    "pi_isolation_required": true,
+    "pi_home": null,
+    "pi_cpu_seconds": 3600,
+    "pi_max_processes": 256,
+    "pi_max_file_bytes": 50000000,
+    "pi_memory_bytes": null,
+    "pi_workspace_retention_hours": 24
+  },
+  "observability": {
+    "enabled": true,
+    "service_name": "toda",
+    "environment": "development",
+    "otlp_endpoint": null,
+    "otlp_headers": {},
+    "export_timeout_seconds": 10.0,
+    "capture_payloads": false,
+    "max_payload_bytes": 100000,
+    "retention_days": 7,
+    "sample_ratio": 1.0,
+    "console_export": false
   }
 }

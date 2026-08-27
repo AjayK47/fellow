@@ -1,0 +1,13 @@
+{
+  "content_hash": "d54180307950578818524f2bcd9cc0bfe9317704c87561115073ee1fa26c0303",
+  "etag": "W/\"c74b585bc2e7c4bbf312eef236c9c280\"",
+  "last_modified": null,
+  "model_count": 7348,
+  "normalized_projection_hash": "90a7b5eeff65138c01b61c25bf920f777efddcd77cfcfc6998dbb42d2bccf07a",
+  "parser_version": "2",
+  "provider_count": 203,
+  "provider_model_count": 7348,
+  "raw_content_hash": "d54180307950578818524f2bcd9cc0bfe9317704c87561115073ee1fa26c0303",
+  "retrieved_at": "2026-08-27T06:22:59.307014+00:00",
+  "upstream_url": "https://models.dev/catalog.json"
+}

@@ -22,7 +22,7 @@ class ComposioClient:
         toolkit_versions: str = "latest",
         webhook_secret: str | None = None,
         webhook_tolerance_seconds: int = 300,
-        trace: Any | None = None,
+        telemetry: Any | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -30,7 +30,7 @@ class ComposioClient:
         self.toolkit_versions = toolkit_versions
         self.webhook_secret = webhook_secret
         self.webhook_tolerance_seconds = webhook_tolerance_seconds
-        self.trace = trace
+        self.telemetry = telemetry
 
     def reconfigure(self, *, api_key: str, webhook_secret: str | None = None) -> None:
         """Apply a newly saved credential to the live client.
@@ -71,8 +71,8 @@ class ComposioClient:
         if not self.api_key:
             raise RuntimeError("Composio API key is not configured")
         url = f"{self.v3_base_url if v3 else self.base_url}/{path.lstrip('/')}"
-        if self.trace:
-            self.trace.record("connector.request", component="composio", phase="started", input={"method": method, "url": url, "params": params, "body": body})
+        if self.telemetry:
+            self.telemetry.record("connector.request", component="composio", phase="started", input={"method": method, "url": url, "params": params, "body": body})
         try:
             response = httpx.request(
                 method, url, params=params,
@@ -81,12 +81,21 @@ class ComposioClient:
             )
             response.raise_for_status()
             result = {"successful": True} if response.status_code == 204 or not response.content else response.json()
-            if self.trace:
-                self.trace.record("connector.request", component="composio", phase="completed", output={"status_code": response.status_code, "response": result})
+            if self.telemetry:
+                self.telemetry.record("connector.request", component="composio", phase="completed", output={"status_code": response.status_code, "response": result})
             return result
         except Exception as exc:
-            if self.trace:
-                self.trace.record("connector.request", component="composio", phase="failed", error={"type": type(exc).__name__, "message": str(exc)})
+            metrics = self.telemetry.metrics if self.telemetry else None
+            if metrics is not None:
+                try:
+                    metrics.counter(
+                        "toda_connector_failures_total",
+                        labels={"source": "composio", "outcome": type(exc).__name__},
+                    )
+                except Exception:
+                    pass
+            if self.telemetry:
+                self.telemetry.record("connector.request", component="composio", phase="failed", error={"type": type(exc).__name__, "message": str(exc)})
             raise
 
     def execute(
@@ -100,7 +109,7 @@ class ComposioClient:
         account_id = connected_account_id or self.connected_account_id
         if not self.api_key or not account_id:
             raise RuntimeError(
-                "Composio is not configured; set TODA_COMPOSIO_API_KEY "
+                "Composio is not configured; set composio.api_key in config.json "
                 "and connect an organization account"
             )
         # Composio's v3 execute API rejects a connected_account_id without
@@ -135,20 +144,20 @@ class ComposioClient:
         user_id: str,
         connected_accounts: dict[str, list[str]] | None = None,
     ) -> dict[str, Any]:
-        """Open a discovery-only Tool Router session: COMPOSIO_SEARCH_TOOLS
-        and COMPOSIO_GET_TOOL_SCHEMAS only. Execute, workbench, and
+        """Open a discovery-only Tool Router session: integration_discover
+        and integration_schema only. Execute, workbench, and
         connection-management are explicitly disabled here — confirmed
         against the live API that execute defaults ON otherwise (it appears
         in tool_router_tools even when never requested). Actual write
         execution stays exclusively on this codebase's own approval-gated
-        COMPOSIO_EXECUTE tool; this session can never reach it, by
+        integration_execute tool; this session can never reach it, by
         construction, not just by choosing not to call it.
 
         connected_accounts must be passed explicitly (toolkit slug -> list
         of connected_account_id) — confirmed against the live API that a
         session otherwise has no visibility into a user's existing
         connections at all, even when user_id matches exactly. Without
-        this, COMPOSIO_SEARCH_TOOLS reports every toolkit as unconnected
+        this, integration_discover reports every toolkit as unconnected
         regardless of real connector_accounts state.
         """
         body: dict[str, Any] = {

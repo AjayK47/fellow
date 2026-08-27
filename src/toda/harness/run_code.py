@@ -1,11 +1,11 @@
 """H-07 (rescoped): a scoped `run_code` tool modeled on Hermes's
 `execute_code` — not a full sandbox/computer.
 
-The LLM writes Python; it runs in a locked-down child process with a
-stripped environment. The *only* capability the script has is calling back
-into a small, fixed allow-list of Toda's own existing **read** tools over a
-local Unix domain socket — no ability to open its own network connections,
-no filesystem access beyond its own temp directory, no shell/terminal tool.
+The LLM writes Python; it runs in a child process with a stripped environment.
+The intended capability is calling back into a small, fixed allow-list of
+Toda's own existing **read** tools over a local Unix domain socket. This is
+not an OS sandbox: without a configured low-privilege/container backend the
+process can still inspect anything readable by the Toda service account.
 Hard limits: a timeout, a max tool-call count, and a bounded stdout capture.
 
 Cautionary lesson taken from Hermes's own bug tracker
@@ -24,13 +24,16 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shlex
 import shutil
 import socket
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 # Env var name-based scrubbing (distinct from services/redaction.py, which
@@ -49,7 +52,6 @@ _SAFE_ENV_PREFIXES = (
     "TEMP",
     "SHELL",
     "LOGNAME",
-    "PYTHONPATH",
 )
 _SECRET_ENV_SUBSTRINGS = (
     "KEY",
@@ -71,12 +73,12 @@ _SECRET_ENV_SUBSTRINGS = (
 # risk="read" (some depend on optional services like `reality`/`artifacts`),
 # so run_code never advertises a callback that doesn't exist or isn't safe.
 RUN_CODE_CANDIDATE_TOOLS = (
-    "brain_search",
-    "brain_query_facts",
-    "brain_list_cases",
-    "brain_judgment_guidance",
-    "brain_find_skills",
-    "brain_list_artifacts",
+    "memory_search",
+    "memory_query_facts",
+    "case_list",
+    "judgment_guidance",
+    "procedure_find",
+    "artifact_list",
 )
 
 _DEFAULT_TIMEOUT_SECONDS = 60
@@ -100,7 +102,7 @@ def generate_stub_module(allowed_tools: list[str]) -> str:
 
     Each allowed tool becomes a plain `**kwargs` function so this doesn't
     need to introspect every tool's JSON schema into a Python signature —
-    the child just calls `brain_search(query="...")` and the kwargs are
+    the child just calls `memory_search(query="...")` and the kwargs are
     forwarded as-is to the real tool's argument validation on the parent
     side, which rejects anything malformed exactly like a normal tool call.
     """
@@ -166,12 +168,10 @@ class RunCodeSandbox:
     host, and read the Toda database file directly. This was verified, not
     assumed.
 
-    Consequently `tools.run_code_enabled` defaults to False, the tool
-    description tells the model plainly that it is running on the host, and
-    SECURITY.md documents the real blast radius. Approval is not
-    containment: an action reviewer deciding a script "looks fine" is a
-    judgment about intent, not a limit on capability. Enabling this is a
-    decision to trust the model with the host account.
+    Consequently `tools.run_code_enabled` defaults to False. Hosted
+    deployments pass an AgentRunner so the child runs as the dedicated agent
+    account; development-only callers may omit it, in which case the real
+    host-account blast radius remains explicit in the tool description.
     """
 
     def __init__(
@@ -181,11 +181,13 @@ class RunCodeSandbox:
         allowed_tools: tuple[str, ...],
         timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
         max_tool_calls: int = _DEFAULT_MAX_TOOL_CALLS,
+        runner: Any | None = None,
     ) -> None:
         self.registry = registry
         self.allowed_tools = frozenset(allowed_tools)
         self.timeout_seconds = timeout_seconds
         self.max_tool_calls = max_tool_calls
+        self.runner = runner
 
     def run(self, code: str, *, runtime: dict[str, Any]) -> dict[str, Any]:
         if not code or not code.strip():
@@ -226,27 +228,52 @@ class RunCodeSandbox:
             status = "success"
             stdout_text = ""
             exit_code = -1
+            output_path = os.path.join(tmpdir, "stdout.log")
+            output_handle = open(output_path, "wb")
             try:
-                proc = subprocess.Popen(
-                    [sys.executable, "script.py"],
-                    cwd=tmpdir,
-                    env=child_env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
+                if self.runner is not None:
+                    proc = self.runner.start(
+                        shell_command=shlex.join([sys.executable, "script.py"]),
+                        cwd=Path(tmpdir),
+                        env=child_env,
+                        stdout=output_handle,
+                        stderr=subprocess.STDOUT,
+                    )
+                else:
+                    proc = subprocess.Popen(
+                        [sys.executable, "script.py"],
+                        cwd=tmpdir,
+                        env=child_env,
+                        stdout=output_handle,
+                        stderr=subprocess.STDOUT,
+                    )
                 try:
-                    stdout_text, _ = proc.communicate(timeout=self.timeout_seconds)
+                    proc.wait(timeout=self.timeout_seconds)
                     exit_code = proc.returncode
                     if exit_code != 0:
                         status = "error"
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                    stdout_text, _ = proc.communicate()
+                    # AgentRunner starts a new session so a timed-out script
+                    # cannot leave grandchildren running after the temporary
+                    # directory is removed.  Plain development callers still
+                    # get the ordinary Popen kill fallback.
+                    if self.runner is not None:
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except (OSError, ProcessLookupError):
+                            proc.kill()
+                    else:
+                        proc.kill()
+                    proc.wait()
                     status = "timeout"
             except Exception as exc:
                 status = "error"
                 stdout_text = f"{stdout_text}\n{exc}" if stdout_text else str(exc)
+            finally:
+                output_handle.close()
+
+            if not stdout_text:
+                stdout_text = self._read_output_tail(output_path)
 
             duration = round(time.monotonic() - start, 2)
             result: dict[str, Any] = {
@@ -270,6 +297,18 @@ class RunCodeSandbox:
                 pass
             server_thread.join(timeout=2)
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @staticmethod
+    def _read_output_tail(path: str) -> str:
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - _MAX_OUTPUT_CHARS * 4))
+                value = handle.read(_MAX_OUTPUT_CHARS * 4).decode("utf-8", errors="replace")
+            return value[-_MAX_OUTPUT_CHARS:]
+        except OSError:
+            return ""
 
     def _serve(
         self,

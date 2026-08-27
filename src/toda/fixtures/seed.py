@@ -222,8 +222,8 @@ def seed_starter_skills(brain: TodaApp, organization_id: str = ORG) -> list[dict
     Adapted from patterns in the hermes-agent reference harness
     (systematic-debugging, github-pr-workflow/github-issues, and the
     1-3-1 decision-communication rule), rewritten for Toda's actual
-    tool surface: no shell/terminal/git, permission-scoped brain_* and
-    composio_* tools, and human approval gating every write.
+    tool surface: no shell/terminal/git; permission-scoped memory, workspace,
+    and integration tools; and approval gating for external or destructive writes.
     """
     specs = [
         {
@@ -237,9 +237,9 @@ def seed_starter_skills(brain: TodaApp, organization_id: str = ORG) -> list[dict
                     "order": 1,
                     "name": "Gather evidence",
                     "description": (
-                        "brain_search the exact symptom and affected entity; brain_query_facts "
+                        "memory_search the exact symptom and affected entity; memory_query_facts "
                         "for what was true and what was known at the relevant time; "
-                        "brain_list_cases for related cross-source activity. Read messages and "
+                        "case_list for related cross-source activity. Read messages and "
                         "facts rather than assuming the reported symptom is complete or accurate."
                     ),
                 },
@@ -264,7 +264,7 @@ def seed_starter_skills(brain: TodaApp, organization_id: str = ORG) -> list[dict
                     "order": 4,
                     "name": "Test the top hypothesis with a read-only check",
                     "description": (
-                        "Use brain_query_facts, brain_list_cases, or a composio read tool to "
+                        "Use memory_query_facts, case_list, or a composio read tool to "
                         "confirm or rule out the leading hypothesis before proposing a fix. "
                         "If it's ruled out, re-rank and test the next one instead of guessing."
                     ),
@@ -298,8 +298,8 @@ def seed_starter_skills(brain: TodaApp, organization_id: str = ORG) -> list[dict
                     "order": 1,
                     "name": "Discover the connected tool",
                     "description": (
-                        "composio_list_integrations to confirm the account is connected; "
-                        "composio_search for the exact action (e.g. search issues); never "
+                        "integration_list to confirm the account is connected; "
+                        "integration_search for the exact action (e.g. search issues); never "
                         "invent an action slug."
                     ),
                 },
@@ -315,7 +315,7 @@ def seed_starter_skills(brain: TodaApp, organization_id: str = ORG) -> list[dict
                     "order": 3,
                     "name": "Describe the write action's schema",
                     "description": (
-                        "composio_describe the exact create/update/comment action before "
+                        "integration_describe the exact create/update/comment action before "
                         "calling it, so required fields and enums are correct on the first try."
                     ),
                 },
@@ -332,8 +332,8 @@ def seed_starter_skills(brain: TodaApp, organization_id: str = ORG) -> list[dict
                 },
             ],
             "warnings": [
-                "Never call COMPOSIO_EXECUTE with a guessed action slug — always "
-                "COMPOSIO_SEARCH_TOOLS/composio_search or composio_describe first.",
+                "Never call integration_execute with a guessed action slug — always "
+                "integration_discover/integration_search or integration_describe first.",
                 "If more than one connected account could own this action, ask which account "
                 "rather than guessing.",
             ],
@@ -355,7 +355,7 @@ def seed_starter_skills(brain: TodaApp, organization_id: str = ORG) -> list[dict
                     "name": "Present up to three distinct options",
                     "description": (
                         "Each option is a genuinely different approach, evidenced by what was "
-                        "found via brain_search/brain_query_facts/brain_list_cases, with a "
+                        "found via memory_search/memory_query_facts/case_list, with a "
                         "concrete tradeoff for each — not minor variations of the same idea."
                     ),
                 },

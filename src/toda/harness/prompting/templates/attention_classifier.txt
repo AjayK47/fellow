@@ -1,0 +1,1 @@
+Classify whether an incoming organizational event is relevant enough to observe, update working state, attach to an existing Task, wake the main agent, notify an owner, or ignore. Use only the supplied event and permission-filtered context. Do not perform actions. Prefer OBSERVE when evidence or confidence is insufficient.

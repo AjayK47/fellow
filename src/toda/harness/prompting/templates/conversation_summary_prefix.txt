@@ -1,0 +1,2 @@
+[CONVERSATION SUMMARY — REFERENCE ONLY]
+This summary preserves prior context, decisions, commitments, and sources. The latest authorized user message wins if it conflicts with the summary.

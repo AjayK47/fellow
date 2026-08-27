@@ -1,8 +1,7 @@
 """Cache-friendly prompt construction with explicit trust boundaries.
 
-Prompt *text* lives in prompts.md (see prompt_library); this module owns only
-the assembly -- message order, trust-boundary framing, and which optional
-blocks apply to a given run.
+Prompt prose lives in ``harness/prompting/templates``; this module owns only
+assembly: message order, trust-boundary framing, and optional run blocks.
 """
 
 from __future__ import annotations
@@ -13,10 +12,10 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from toda.harness.prompt_library import load, render
+from toda.harness.prompting.catalog import load, render
 
 
-STABLE_SYSTEM_PROMPT = load("stable_system")
+CORE_SYSTEM_PROMPT = load("core")
 STEER_GUIDANCE = load("steer_guidance")
 AUTOMATION_TRIGGER_GUIDANCE = load("automation_trigger_guidance")
 
@@ -121,7 +120,7 @@ def build_agent_messages(
             ),
         }
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": STABLE_SYSTEM_PROMPT},
+        {"role": "system", "content": CORE_SYSTEM_PROMPT},
         {
             "role": "system",
             "content": "<trusted_invocation>\n"
@@ -367,36 +366,36 @@ _TRUSTED_TOOL_NAMES = frozenset(
         # Toda's own memory and evidence, already permission-filtered. The
         # content originally came from company sources, but it has been
         # through ingestion, redaction and scope authorization to get here.
-        "brain_search",
-        "brain_read_source",
-        "brain_query_facts",
-        "brain_list_cases",
-        "brain_update_case",
-        "brain_judgment_guidance",
-        "brain_resolve_owner",
-        "brain_find_skills",
-        "brain_list_artifacts",
-        "brain_read_artifact",
-        "brain_create_artifact",
+        "memory_search",
+        "memory_read_source",
+        "memory_query_facts",
+        "case_list",
+        "case_update",
+        "judgment_guidance",
+        "owner_resolve",
+        "procedure_find",
+        "artifact_list",
+        "artifact_read",
+        "artifact_create",
         # Toda's own control surfaces: plans, scratchpads, Tasks, skills,
         # workspace, schedule, arithmetic. Output here is Toda's own state.
         "calculate",
-        "delegate_tasks",
-        "manage_child_task",
+        "task_delegate",
+        "task_manage",
         "plan_create",
         "plan_get",
         "plan_update",
-        "request_batch_approval",
-        "request_human_input",
+        "request_approval",
+        "ask_user",
         "scratchpad_read",
         "scratchpad_update",
         "session_search",
         "skill_validate",
-        "skill_view",
-        "skills_list",
+        "skill_read",
+        "skill_list",
         "skill_propose_create",
         "skill_propose_update",
-        "start_parallel_task",
+        "task_delegate_parallel",
         # Outbound Slack tools return an acknowledgement of what Toda itself
         # just sent (ok / ts / channel), never anyone else's content.
         "slack_react",
@@ -407,13 +406,16 @@ _TRUSTED_TOOL_NAMES = frozenset(
         "task_continue",
         "task_get",
         "task_search",
-        "wait_for_children",
-        "workspace_diff",
-        "workspace_list",
-        "workspace_patch",
-        "workspace_read",
-        "workspace_search",
-        "workspace_write",
+        "task_wait",
+        "file_diff",
+        "workspace_publish",
+        "list_files",
+        "edit_file",
+        "move_file",
+        "delete_file",
+        "read_file",
+        "search_files",
+        "write_file",
     }
 )
 

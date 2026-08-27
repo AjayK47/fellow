@@ -15,6 +15,10 @@ adapted from or inspired by other open-source projects:
 - The SVG procedure identifies its upstream inspiration and is distributed
   under MIT.
 
+The optional models.dev metadata source and catalog data are MIT licensed.
+Toda uses it only for inference-model metadata, capabilities, limits, and
+pricing; provider authentication and runtime transport remain Toda code.
+
 No repository under the private `harnesses/` reference directory is part of
 the Toda Community distribution or container build context.
 

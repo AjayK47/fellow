@@ -5,11 +5,18 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Callable
 
 from toda.domain.models import ContextPackage, utcnow
-from toda.harness.model_client import _DEFAULT_CONTEXT_LENGTH, ModelClient
+from toda.harness.model_client import (
+    _DEFAULT_CONTEXT_LENGTH,
+    ModelClient,
+    instrument_model,
+    normalize_usage,
+)
 from toda.harness.context_budget import request_budget
 from toda.harness.models import (
     AgentOutcome,
@@ -21,11 +28,13 @@ from toda.harness.models import (
     TriggerKind,
 )
 from toda.harness.message_sanitization import neutralize_schema_refs
-from toda.harness.prompts import build_agent_messages, frame_untrusted_tool_result
+from toda.harness.prompts import CORE_SYSTEM_PROMPT, build_agent_messages, frame_untrusted_tool_result
+from toda.harness.versioning import run_configuration_versions
 from toda.harness.task_run_store import TaskRunStore
 from toda.harness.tools import ToolExecutor
-from toda.observability import trace_context
 from toda.services.scope_resolution import resolve_scope
+from toda.services.redaction import redact
+from toda.services.readiness import enforce_real_world_readiness
 
 log = logging.getLogger("toda.runtime")
 
@@ -128,14 +137,24 @@ class CompanyAgent:
         workspaces: Any | None = None,
         max_iterations: int = 50,
         max_tool_calls: int = 100,
+        max_model_calls: int = 100,
+        max_cost_usd: float | None = 10.0,
+        max_duration_seconds: int = 3_600,
         context_token_budget: int = 12_000,
         max_total_tokens: int = 100_000,
         completion_max_tokens: int = 40_000,
         embeddings: Any | None = None,
+        run_inspection: Any | None = None,
+        readiness_target: Any | None = None,
     ) -> None:
         self.runs = runs
         self.context_service = context_service
-        self.model = model
+        runtime_telemetry = getattr(runs.store, "telemetry", None)
+        self.model = (
+            instrument_model(model, telemetry=runtime_telemetry, role="main")
+            if runtime_telemetry is not None
+            else model
+        )
         self.tools = tools
         self.skills = skills
         self.skill_validator = skill_validator
@@ -146,10 +165,15 @@ class CompanyAgent:
         self.workspaces = workspaces
         self.max_iterations = max_iterations
         self.max_tool_calls = max_tool_calls
+        self.max_model_calls = max_model_calls
+        self.max_cost_usd = max_cost_usd
+        self.max_duration_seconds = max_duration_seconds
         self.context_token_budget = context_token_budget
         self.max_total_tokens = max_total_tokens
         self.completion_max_tokens = completion_max_tokens
         self.embeddings = embeddings
+        self.run_inspection = run_inspection
+        self.readiness_target = readiness_target
 
     def create_invocation(
         self,
@@ -162,6 +186,12 @@ class CompanyAgent:
         parent_run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if self.readiness_target is not None:
+            enforce_real_world_readiness(
+                self.readiness_target,
+                principal_id=envelope.principal_id,
+                trigger_kind=str(trigger_kind),
+            )
         session = self.runs.get_or_create_session(
             organization_id=envelope.organization_id,
             conversation_key=envelope.conversation_id,
@@ -191,6 +221,10 @@ class CompanyAgent:
             parent_run_id=parent_run_id,
             max_iterations=self.max_iterations,
             max_tool_calls=self.max_tool_calls,
+            max_model_calls=self.max_model_calls,
+            max_cost_usd=self.max_cost_usd,
+            max_duration_seconds=self.max_duration_seconds,
+            max_total_tokens=self.max_total_tokens,
             metadata=metadata,
         )
         if self.workspaces:
@@ -231,7 +265,6 @@ class CompanyAgent:
                     "attributes": {
                         "state": run["state"],
                         "trigger_kind": run["trigger_kind"],
-                        "trace_id": run["trace_id"],
                     },
                 }
             )
@@ -263,22 +296,39 @@ class CompanyAgent:
                 task_id=run_id,
                 state=AgentRunState.COMPLETED,
                 answer=run.get("final_answer"),
-                trace_id=run["trace_id"],
+                correlation_id=run.get("correlation_id"),
+            )
+        # Claim fresh/retried Tasks before preparing their private workspace so
+        # a preparation failure can be durably recorded through the normal
+        # lease-aware failure path instead of bubbling out of the queue worker
+        # with the Task still stuck in ``queued``.
+        if run["state"] == AgentRunState.FAILED.value:
+            run = self.runs.transition(run_id, AgentRunState.QUEUED)
+        if run["state"] == AgentRunState.QUEUED.value:
+            run = self.runs.transition(run_id, AgentRunState.RUNNING)
+        try:
+            run = self._ensure_private_workspace(run)
+        except Exception as exc:
+            failed = self.runs.fail(run_id, str(exc))
+            self.audit.record(
+                failed["organization_id"],
+                "task.failed",
+                {"task_id": run_id, "error": str(exc)},
+                principal_id=failed["envelope"]["principal_id"],
+            )
+            return AgentOutcome(
+                task_id=run_id,
+                state=AgentRunState.FAILED,
+                error=str(exc),
+                correlation_id=failed.get("correlation_id"),
             )
         if run["state"] == AgentRunState.WAITING.value:
             return AgentOutcome(
                 task_id=run_id,
                 state=AgentRunState(run["state"]),
                 approval_id=run.get("pending_approval_id"),
-                trace_id=run["trace_id"],
+                correlation_id=run.get("correlation_id"),
             )
-        if run["state"] == AgentRunState.FAILED.value:
-            run = self.runs.transition(run_id, AgentRunState.QUEUED)
-        self.runs.store.trace.record(
-            "task.execute", component="agent_runtime", phase="started",
-            input={"goal": run.get("goal"), "worker_type": run.get("worker_type")},
-            trace_id=run.get("trace_id"), task_id=run_id, session_id=run.get("session_id"),
-        )
         log.info(
             "Task starting: task_id=%s goal=%r trigger=%s principal=%s",
             run_id,
@@ -291,6 +341,81 @@ class CompanyAgent:
         )
         return self._run_loop_protected(run)
 
+    def _ensure_private_workspace(self, run: dict[str, Any]) -> dict[str, Any]:
+        """Give every model-driven root Task its own workspace copy.
+
+        Conversation turns do not expose filesystem tools.  Once a request is
+        promoted to a durable root Task, however, it must not edit the shared
+        organization workspace directly or race another Task.  Child workers
+        prepare their own roots in ``ChildTaskExecutor``; this covers the root
+        Session Manager lane.
+        """
+        if not self.workspaces or run.get("parent_task_id"):
+            return run
+        metadata = dict(run.get("metadata") or {})
+        if metadata.get("workspace_path"):
+            workspace_path = Path(str(metadata["workspace_path"]))
+            if workspace_path.is_dir() and not workspace_path.is_symlink():
+                # task_root() rejects symlink aliases and verifies the
+                # expected <agent-root>/<organization>/<task> location.
+                expected = self.workspaces.task_root(run["organization_id"], run)
+                if workspace_path.resolve() == expected:
+                    return run
+            # A retention sweep may have removed an old private copy while a
+            # queued root Task was waiting.  Drop stale location/baseline
+            # metadata so the next preparation makes a fresh copy instead of
+            # silently running against an empty directory.
+            metadata.pop("workspace_path", None)
+            metadata.pop("workspace_mode", None)
+            metadata.pop("workspace_base_snapshot", None)
+            run["metadata"] = metadata
+        # Session Manager roots are created by TaskRunStore rather than
+        # CompanyAgent.create_invocation, so they do not pass through the
+        # normal durable-workspace provisioning hook. Provision the same
+        # organization/default or Slack-team workspace here before creating
+        # the isolated task copy. The workspace boundary remains explicit and
+        # tenant-scoped; this only closes the composition seam between the two
+        # supported root-task entry points.
+        durable = self.workspaces.get_for_task(run["organization_id"], run)
+        if durable is None:
+            envelope = run.get("envelope") or {}
+            destination = envelope.get("destination") or {}
+            principal_id = str(envelope.get("principal_id") or run.get("owner_id") or "")
+            if not principal_id:
+                raise ValueError("task envelope has no workspace owner")
+            scope = resolve_scope(
+                store=self.runs.store,
+                organization_id=run["organization_id"],
+                principal_id=principal_id,
+                destination=destination,
+            )
+            self.workspaces.get_or_create(
+                organization_id=run["organization_id"],
+                owner_id=principal_id,
+                scope_id=scope.write_scope_id,
+                slack_workspace_id=((metadata.get("slack") or {}).get("workspace_id")),
+            )
+        workspace_path, workspace_mode = self.workspaces.prepare_task_workspace(
+            run["organization_id"],
+            run,
+            base_revision=str(metadata.get("base_revision") or "HEAD"),
+            isolated=True,
+        )
+        # prepare_task_workspace records the baseline in the task metadata;
+        # refresh our local copy before adding the resolved location so the
+        # subsequent update cannot overwrite that snapshot.
+        metadata = dict(run.get("metadata") or {})
+        metadata.update(
+            {
+                "workspace_path": str(workspace_path),
+                "workspace_mode": workspace_mode,
+            }
+        )
+        run["metadata"] = metadata
+        run["updated_at"] = utcnow().isoformat()
+        self.runs.update(run)
+        return run
+
     def _run_loop_protected(self, run: dict[str, Any]) -> AgentOutcome:
         """Every entrypoint that re-enters _loop() (initial run, resume
         after approval, resume with a human reply) must go through this,
@@ -302,26 +427,69 @@ class CompanyAgent:
         and resume_with_human_message did not, which is exactly how a run
         could hang forever right after a human approved its next step.
         """
-        run_id = run["id"]
-        # One binding for the whole Task, so every model call, tool call and
-        # child dispatch underneath lands on this trace and nests under this
-        # span -- TraceSpan takes its parent from whatever span is in force,
-        # so the tree builds itself from here down.
-        with trace_context(
-            trace_id=run.get("trace_id"),
-            task_id=run_id,
-            session_id=run.get("session_id"),
-            organization_id=run.get("organization_id"),
-        ):
-            return self._run_loop_traced(run)
+        outcome = self._run_loop_traced(run)
+        if self.run_inspection is not None:
+            try:
+                self.run_inspection.reconcile_task(run["id"])
+            except Exception:
+                # Inspection is an observability projection and must never
+                # turn a completed or waiting Task into an execution error.
+                log.exception("run_inspection.reconcile_failed", extra={"task_id": run["id"]})
+        return outcome
 
     def _run_loop_traced(self, run: dict[str, Any]) -> AgentOutcome:
         run_id = run["id"]
+        started = time.perf_counter()
+        metrics = self.runs.store.telemetry.metrics
+        metadata = dict(run.get("metadata") or {})
+        versions = metadata.get("versions")
+        if not isinstance(versions, dict):
+            catalog = getattr(getattr(self.model, "catalog", None), "status", lambda: {})()
+            versions = run_configuration_versions(
+                prompts={"version": "prompt-assets-v1", "core": CORE_SYSTEM_PROMPT},
+                tools=getattr(self.tools, "model_schemas", lambda: [])(),
+                skills=metadata.get("active_skills") or metadata.get("skill_refs") or [],
+                policy={
+                    "purpose": (run.get("envelope") or {}).get("purpose"),
+                    "allowed_scope_ids": (run.get("envelope") or {}).get("allowed_scope_ids"),
+                },
+                models={"provider": getattr(self.model, "provider_id", ""), "model": getattr(self.model, "model", "")},
+                catalog=catalog,
+                build="0.1.0",
+            )
+            metadata["versions"] = versions
+            run["metadata"] = metadata
+            self.runs.update(run)
+        version_attributes = {
+            "toda.prompt.version": "prompt-assets-v1",
+            "toda.prompt.hash": versions.get("prompt_hash"),
+            "toda.toolset.hash": versions.get("toolset_hash"),
+            "toda.skillset.hash": versions.get("skillset_hash"),
+            "toda.policy.hash": versions.get("policy_hash"),
+            "toda.catalog.version": versions.get("catalog_hash"),
+        }
+        catalog_status = getattr(getattr(self.model, "catalog", None), "status", lambda: {})()
+        if catalog_status.get("fetched_at"):
+            version_attributes["toda.catalog.fetched_at"] = catalog_status["fetched_at"]
+        if metrics is not None:
+            try:
+                metrics.up_down_counter(
+                    "toda_agent_active", 1, labels={"operation": "agent.invoke"}
+                )
+            except Exception:
+                pass
         try:
-            with self.runs.store.trace.span(
-                "task.execute",
+            with self.runs.store.telemetry.span(
+                "agent.invoke",
                 component="agent_runtime",
+                organization_id=run.get("organization_id"),
                 task_id=run_id,
+                root_task_id=run.get("root_task_id") or run_id,
+                session_id=run.get("session_id"),
+                attributes={
+                    key: value for key, value in version_attributes.items()
+                    if value not in (None, "")
+                },
                 input={
                     "goal": str(run.get("goal") or "")[:2_000],
                     "worker_type": (run.get("metadata") or {}).get("worker_type"),
@@ -338,15 +506,43 @@ class CompanyAgent:
                         "answer": (outcome.answer or "")[:2_000] or None,
                     }
                 )
+                if metrics is not None:
+                    try:
+                        metrics.up_down_counter(
+                            "toda_agent_active", -1, labels={"operation": "agent.invoke"}
+                        )
+                        outcome_name = getattr(outcome.state, "value", str(outcome.state))
+                        metrics.counter(
+                            "toda_agent_runs_total", labels={"outcome": outcome_name}
+                        )
+                        metrics.histogram(
+                            "toda_agent_elapsed_duration_ms",
+                            (time.perf_counter() - started) * 1000,
+                            labels={"operation": "agent.invoke"},
+                        )
+                    except Exception:
+                        pass
                 return outcome
         except Exception as exc:
+            if metrics is not None:
+                try:
+                    metrics.up_down_counter(
+                        "toda_agent_active", -1, labels={"operation": "agent.invoke"}
+                    )
+                    metrics.counter("toda_agent_runs_total", labels={"outcome": "failed"})
+                    metrics.histogram(
+                        "toda_agent_elapsed_duration_ms",
+                        (time.perf_counter() - started) * 1000,
+                        labels={"operation": "agent.invoke"},
+                    )
+                except Exception:
+                    pass
             failed = self.runs.fail(run_id, str(exc))
             self.audit.record(
                 failed["organization_id"],
                 "task.failed",
                 {"task_id": run_id, "error": str(exc)},
                 principal_id=failed["envelope"]["principal_id"],
-                trace_id=failed["trace_id"],
             )
             # Whether this failure is worth telling a human about depends on
             # whether the queue is about to retry it (transient errors like
@@ -359,7 +555,7 @@ class CompanyAgent:
                 task_id=run_id,
                 state=AgentRunState.FAILED,
                 error=str(exc),
-                trace_id=failed["trace_id"],
+                correlation_id=failed.get("correlation_id"),
             )
 
     def _loop(self, run: dict[str, Any]) -> AgentOutcome:
@@ -372,12 +568,13 @@ class CompanyAgent:
         cached_context: dict[str, Any] | None = None
         context_dirty = True
         while int(run.get("iteration_count", 0)) < int(run["max_iterations"]):
+            compacted = False
             persisted = self.runs.get(run["id"])
             if persisted and persisted["state"] == AgentRunState.CANCELLED.value:
                 return AgentOutcome(
                     task_id=run["id"],
                     state=AgentRunState.CANCELLED,
-                    trace_id=run["trace_id"],
+                    correlation_id=run.get("correlation_id"),
                 )
             if persisted:
                 run = persisted
@@ -398,7 +595,7 @@ class CompanyAgent:
                     return AgentOutcome(
                         task_id=run["id"],
                         state=AgentRunState.CANCELLED,
-                        trace_id=cancelled["trace_id"],
+                        correlation_id=cancelled.get("correlation_id"),
                     )
                 if signal.get("kind") == "reauthorize":
                     run["waiting_for"] = {"type": "user", "reason": "current_actor_changed"}
@@ -411,7 +608,7 @@ class CompanyAgent:
                     return AgentOutcome(
                         task_id=run["id"],
                         state=AgentRunState.WAITING,
-                        trace_id=paused["trace_id"],
+                        correlation_id=paused.get("correlation_id"),
                     )
                 # SessionService already persisted ordinary steering in the
                 # Session transcript and therefore sends an empty signal.
@@ -428,8 +625,16 @@ class CompanyAgent:
                     )
             if int(run.get("tool_call_count", 0)) >= int(run["max_tool_calls"]):
                 raise RuntimeError("tool_call_limit")
-            if int((run.get("usage") or {}).get("total_tokens", 0)) >= int(
-                run.get("max_total_tokens") or self.max_total_tokens
+            if int((run.get("usage") or {}).get("model_calls", 0)) >= int(
+                run.get("max_model_calls") or self.max_iterations
+            ):
+                raise RuntimeError("model_call_limit")
+            known_total_tokens = (run.get("usage") or {}).get("total_tokens")
+            if (
+                known_total_tokens is not None
+                and int(known_total_tokens) >= int(
+                    run.get("max_total_tokens") or self.max_total_tokens
+                )
             ):
                 raise RuntimeError("model_token_budget")
             if run.get("deadline_at") and utcnow().isoformat() >= run["deadline_at"]:
@@ -454,7 +659,7 @@ class CompanyAgent:
             prior_budget = (run.get("metadata") or {}).get("request_budget") or {}
             prior_estimate = float(prior_budget.get("estimated_input_tokens") or 0)
             measured_prompt = float(
-                (run.get("metadata") or {}).get("last_prompt_tokens") or 0
+                (run.get("metadata") or {}).get("last_input_tokens") or 0
             )
             # Provider prompt usage includes wrappers that local preflight
             # cannot see. Carry forward only an upward calibration, capped so
@@ -483,6 +688,7 @@ class CompanyAgent:
                 provisional_budget.effective_input_window * threshold_percent
             )
             if len(full_history) > 30 and _estimate_tokens(full_history) > threshold_tokens:
+                compacted = True
                 session = self.runs.store.get_session(run["session_id"])
                 split = _tool_safe_head(full_history, 30)
                 older = full_history[:split]
@@ -554,7 +760,7 @@ class CompanyAgent:
                         permission_decision_id=run["envelope"]["permission_decision_id"],
                         summary=(
                             "Child worker: context retrieval is skipped by "
-                            "design. Use brain_search/brain_query_facts directly "
+                            "design. Use memory_search/memory_query_facts directly "
                             "if you genuinely need to look something up."
                         ),
                     ).model_dump(mode="json")
@@ -627,6 +833,28 @@ class CompanyAgent:
                     model=model_name,
                     calibration_factor=calibration_factor,
                 )
+            metrics = self.runs.store.telemetry.metrics
+            if metrics is not None:
+                try:
+                    metrics.gauge(
+                        "toda_context_utilization_ratio",
+                        min(
+                            1.0,
+                            max(
+                                0.0,
+                                float(final_budget.estimated_input_tokens)
+                                / max(1, float(final_budget.context_window)),
+                            ),
+                        ),
+                        labels={"role": "agent"},
+                    )
+                    if compacted:
+                        metrics.counter(
+                            "toda_context_compactions_total",
+                            labels={"role": "agent"},
+                        )
+                except Exception:
+                    pass
             if not final_budget.fits:
                 # Keep the newest conversation evidence and the active prompt;
                 # the incremental summary carries the aged-out middle.
@@ -716,58 +944,55 @@ class CompanyAgent:
                 self.runs.update(run)
                 response = ModelResponse(**promoted_response)
             else:
-                # A span rather than two records: this is the single slowest
-                # step in most traces, so its duration is the number worth
-                # having, and a provider error has to land as `failed`
-                # instead of leaving a `started` with nothing after it.
-                with self.runs.store.trace.span(
-                    "model.generate",
-                    component="model_client",
-                    task_id=run.get("id"),
-                    iteration=run.get("iteration_count"),
-                    input={
-                        "model": getattr(self.model, "model", ""),
-                        "message_count": len(messages),
-                        "tool_count": len(schemas),
-                        "messages": messages,
-                    },
-                ) as span:
-                    response = self.model.generate(
-                        messages=messages,
-                        tools=schemas,
-                        temperature=0.1,
-                        max_tokens=self.completion_max_tokens,
-                    )
-                    span.output(
-                        {
-                            "content": response.content,
-                            "tool_calls": [
-                                call.model_dump(mode="json")
-                                for call in response.tool_calls
-                            ],
-                            "usage": response.usage,
-                            "finish_reason": response.finish_reason,
-                        }
-                    )
+                response = self.model.generate(
+                    messages=messages,
+                    tools=schemas,
+                    temperature=0.1,
+                    max_tokens=self.completion_max_tokens,
+                )
             if response.tool_calls:
                 response.tool_calls = self._deduplicate_tool_calls(
                     run["id"], response.tool_calls
                 )
+            response_usage = normalize_usage(response.usage)
+            response.usage = response_usage
             usage = dict(run.get("usage") or {})
-            response_usage = response.usage or {}
             for key in (
-                "prompt_tokens",
-                "completion_tokens",
+                "input_tokens",
+                "output_tokens",
                 "total_tokens",
-                "cost",
+                "cached_input_tokens",
+                "reasoning_tokens",
             ):
-                try:
-                    usage[key] = float(usage.get(key, 0)) + float(
-                        response_usage.get(key, 0)
-                    )
-                except (TypeError, ValueError):
-                    continue
-            usage["model_calls"] = int(usage.get("model_calls", 0)) + 1
+                value = response_usage.get(key)
+                if value is not None:
+                    # A missing measurement stays unavailable for the
+                    # cumulative report.  Use the separate arithmetic value
+                    # only when every contributing call supplied this field.
+                    if key in usage and usage[key] is None:
+                        usage[key] = None
+                    else:
+                        usage[key] = int(usage.get(key) or 0) + int(value)
+                elif key not in usage:
+                    usage[key] = None
+            prior_cost = usage.get("cost_usd")
+            current_cost = response_usage.get("cost_usd")
+            if isinstance(prior_cost, (int, float)) and isinstance(current_cost, (int, float)):
+                usage["cost_usd"] = float(prior_cost) + float(current_cost)
+            elif isinstance(current_cost, (int, float)) and usage.get("cost_state") not in {"unavailable", "unknown"}:
+                usage["cost_usd"] = float(current_cost)
+            else:
+                usage["cost_usd"] = None
+            prior_state = usage.get("cost_state")
+            current_state = response_usage.get("cost_state") or "unavailable"
+            usage["cost_state"] = (
+                "unavailable"
+                if "unavailable" in {prior_state, current_state}
+                else "actual"
+                if "actual" in {prior_state, current_state}
+                else "estimated"
+            )
+            usage["model_calls"] = int(usage.get("model_calls") or 0) + 1
             run["usage"] = usage
             # Preserve the provider's real prompt measurement alongside the
             # cumulative usage. This is the calibration signal for later
@@ -780,44 +1005,58 @@ class CompanyAgent:
             # question -- and one nobody could answer, because the field was
             # parsed away. Accumulated here so a Task's own usage shows the
             # hit rate instead of an assumption.
-            cached = int(
-                (response_usage.get("prompt_tokens_details") or {}).get(
-                    "cached_tokens"
-                )
-                or 0
-            )
-            usage["cached_prompt_tokens"] = int(
-                usage.get("cached_prompt_tokens", 0)
-            ) + cached
+            cached = response_usage.get("cached_input_tokens")
+            if cached is None:
+                cached = 0
             run["usage"] = usage
-            run_metadata["last_cached_prompt_tokens"] = cached
-            run_metadata["last_prompt_tokens"] = response_usage.get("prompt_tokens")
-            run_metadata["last_completion_tokens"] = response_usage.get(
-                "completion_tokens"
-            )
+            run_metadata["last_cached_input_tokens"] = cached
+            run_metadata["last_input_tokens"] = response_usage.get("input_tokens")
+            run_metadata["last_output_tokens"] = response_usage.get("output_tokens")
             run_metadata["last_total_tokens"] = response_usage.get("total_tokens")
             run["metadata"] = run_metadata
             self.runs.update(run)
+
+            # Persist the completed model call before evaluating post-call
+            # limits.  A call that crosses a ceiling must remain visible in
+            # the Task record and in the next completeness reconciliation.
+            token_limit = run.get("max_total_tokens")
+            if (
+                token_limit is not None
+                and usage.get("total_tokens") is not None
+                and int(usage["total_tokens"]) > int(token_limit)
+            ):
+                raise RuntimeError("model_token_budget")
+            cost_limit = run.get("max_cost_usd")
+            if (
+                cost_limit is not None
+                and usage.get("cost_state") != "unavailable"
+                and usage.get("cost_usd") is not None
+                and float(usage["cost_usd"]) > float(cost_limit)
+            ):
+                raise RuntimeError("monetary_cost_limit")
+            if run.get("deadline_at") and utcnow().isoformat() >= run["deadline_at"]:
+                raise RuntimeError("worker_deadline_exceeded")
+            if int(run.get("tool_call_count", 0)) + len(response.tool_calls) > int(
+                run["max_tool_calls"]
+            ):
+                raise RuntimeError("tool_call_limit")
             answer: str | None = None
             skill_validation: dict[str, Any] | None = None
-            assistant_content = response.content
+            safe_response_content = redact(response.content).text
+            assistant_content = safe_response_content
             if not response.tool_calls:
-                draft = response.content.strip()
+                draft = safe_response_content.strip()
                 if not draft:
                     # "neither answer nor tool call" alone hides the usual
                     # cause: a reasoning model that spent every output token
                     # thinking and stopped before writing anything.
                     if response.finish_reason == "length":
-                        reasoning_tokens = (
-                            (response.usage.get("completion_tokens_details") or {})
-                            .get("reasoning_tokens")
-                            or 0
-                        )
+                        reasoning_tokens = response.usage.get("reasoning_tokens")
                         raise RuntimeError(
                             f"{response.model} used its entire {self.completion_max_tokens}-token "
                             f"output budget without answering "
                             f"({reasoning_tokens} of it on reasoning). Lower "
-                            f"TODA_MAIN_MODEL_REASONING_EFFORT or choose a different model."
+                            f"models.main_reasoning_effort in config.json or choose a different model."
                         )
                     # Everything needed to tell the causes apart, because the
                     # turn is only persisted below -- raising bare here threw
@@ -826,7 +1065,7 @@ class CompanyAgent:
                     # model from its own reasoning, re-sending, and disabling
                     # reasoning outright, so this is a model that will not
                     # answer rather than a one-off empty turn.
-                    details = (response.usage.get("completion_tokens_details") or {})
+                    reasoning_tokens = response.usage.get("reasoning_tokens")
                     # Persist the turn BEFORE raising. A failed turn used to
                     # be recorded nowhere at all -- the append below is only
                     # reached on success -- so the one request that explains
@@ -856,7 +1095,7 @@ class CompanyAgent:
                         response={
                             "finish_reason": response.finish_reason,
                             "usage": response.usage,
-                            "content_chars": len(response.content),
+                            "content_chars": len(safe_response_content),
                             "reasoning_chars": len(response.reasoning),
                             "unusable": True,
                         },
@@ -865,8 +1104,8 @@ class CompanyAgent:
                         f"{response.model} returned neither answer nor tool call "
                         f"after recovery "
                         f"(finish_reason={response.finish_reason!r}, "
-                        f"completion_tokens={response.usage.get('completion_tokens')}, "
-                        f"reasoning_tokens={details.get('reasoning_tokens') or 0}, "
+                        f"output_tokens={response.usage.get('output_tokens')}, "
+                        f"reasoning_tokens={reasoning_tokens or 0}, "
                         f"reasoning_chars={len(response.reasoning)}, "
                         f"messages={len(messages)}). "
                         f"The failing request's shape is recorded on this Task's "
@@ -879,6 +1118,14 @@ class CompanyAgent:
                 )
                 answer = str(skill_validation["response"]).strip()
                 assistant_content = answer
+            persisted_tool_calls = [
+                call.model_dump(mode="json") for call in response.tool_calls
+            ]
+            # Tool arguments are model output too; redact their persisted copy
+            # while keeping the in-memory arguments intact for this execution.
+            persisted_tool_calls = json.loads(
+                redact(json.dumps(persisted_tool_calls)).text
+            )
             self.runs.append_turn(
                 run,
                 request={
@@ -898,8 +1145,8 @@ class CompanyAgent:
                 },
                 response={
                     "content": assistant_content,
-                    "draft_content": response.content
-                    if assistant_content != response.content
+                    "draft_content": safe_response_content
+                    if assistant_content != safe_response_content
                     else None,
                     "skill_validation": {
                         key: value
@@ -908,9 +1155,7 @@ class CompanyAgent:
                     }
                     if skill_validation
                     else None,
-                    "tool_calls": [
-                        call.model_dump(mode="json") for call in response.tool_calls
-                    ],
+                    "tool_calls": persisted_tool_calls,
                     "finish_reason": response.finish_reason,
                     "model": response.model,
                     "usage": response.usage,
@@ -928,7 +1173,7 @@ class CompanyAgent:
                         "type": "function",
                         "function": {
                             "name": call.name,
-                            "arguments": json.dumps(call.arguments),
+                            "arguments": redact(json.dumps(call.arguments)).text,
                         },
                     }
                     for call in response.tool_calls
@@ -944,10 +1189,10 @@ class CompanyAgent:
                     len(answer),
                 )
                 completed = self.runs.complete(run["id"], answer)
-                self.runs.store.trace.record(
+                self.runs.store.telemetry.record(
                     "task.execute", component="agent_runtime", phase="completed",
                     output={"answer": answer, "iterations": run.get("iteration_count"), "usage": run.get("usage")},
-                    trace_id=completed.get("trace_id"), task_id=completed.get("id"),
+                    task_id=completed.get("id"),
                 )
                 if not completed.get("parent_task_id"):
                     children = self.runs.store.list_tasks(
@@ -990,7 +1235,6 @@ class CompanyAgent:
                             "attributes": {
                                 "state": completed["state"],
                                 "trigger_kind": completed["trigger_kind"],
-                                "trace_id": completed["trace_id"],
                                 "final_answer": answer[:500],
                             },
                         }
@@ -1024,13 +1268,13 @@ class CompanyAgent:
                         "tool_calls": completed["tool_call_count"],
                     },
                     principal_id=run["envelope"]["principal_id"],
-                    trace_id=run["trace_id"],
+                    correlation_id=run.get("correlation_id"),
                 )
                 return AgentOutcome(
                     task_id=run["id"],
                     state=AgentRunState.COMPLETED,
                     answer=answer,
-                    trace_id=run["trace_id"],
+                    correlation_id=run.get("correlation_id"),
                 )
 
             # H-08: independent read-only calls run concurrently; anything
@@ -1049,9 +1293,9 @@ class CompanyAgent:
                 # through the serialized other_calls path below, not the
                 # concurrent read path, which never checks status.
                 if call.name in {
-                    "request_human_input",
-                    "delegate_tasks",
-                    "wait_for_children",
+                    "ask_user",
+                    "task_delegate",
+                    "task_wait",
                     "plan_create",
                     "plan_update",
                     "scratchpad_update",
@@ -1111,14 +1355,14 @@ class CompanyAgent:
                 )
                 definition = allowed_by_name.get(call.name)
                 if (
-                    call.name != "request_human_input"
+                    call.name != "ask_user"
                     and definition is not None
                     and definition.risk != "read"
                 ):
                     context_dirty = True
                 result = self.tools.execute(run=run, call=call)
                 if (
-                    call.name == "request_human_input"
+                    call.name == "ask_user"
                     and result.status == "completed"
                 ):
                     question = str(result.output.get("question") or "")
@@ -1171,7 +1415,7 @@ class CompanyAgent:
                         task_id=run["id"],
                         state=AgentRunState.WAITING,
                         answer=result.output.get("question"),
-                        trace_id=run["trace_id"],
+                        correlation_id=run.get("correlation_id"),
                     )
                 if result.status == "waiting_for_approval":
                     run["pending_approval_id"] = result.approval_id
@@ -1191,10 +1435,10 @@ class CompanyAgent:
                         task_id=run["id"],
                         state=AgentRunState.WAITING,
                         approval_id=result.approval_id,
-                        trace_id=run["trace_id"],
+                        correlation_id=run.get("correlation_id"),
                     )
                 if result.status == "waiting_for_children":
-                    # delegate_tasks already created and enqueued the child
+                    # task_delegate already created and enqueued the child
                     # Tasks (child_tasks.py) -- pause here without blocking a
                     # thread on them. resume_for_children() is what wakes
                     # this Task back up, called by the Session Manager
@@ -1221,7 +1465,7 @@ class CompanyAgent:
                     return AgentOutcome(
                         task_id=run["id"],
                         state=AgentRunState.WAITING,
-                        trace_id=run["trace_id"],
+                        correlation_id=run.get("correlation_id"),
                     )
                 self._append_tool_result(run, result)
                 self._track_checkpoint(run, call, definition)
@@ -1298,7 +1542,7 @@ class CompanyAgent:
         transition notified the Session, but also safe to call speculatively
         (e.g. a checkpoint tick): each child's CURRENT state/result is
         reported, and _loop() is free to decide "still waiting" is the right
-        outcome and pause again on the same or a fresh delegate_tasks call.
+        outcome and pause again on the same or a fresh task_delegate call.
         """
         run = self.runs.get(run_id)
         if not run:
@@ -1343,7 +1587,7 @@ class CompanyAgent:
                 }
             )
         tool_call_id = run.get("pending_tool_call_id")
-        tool_name = run.get("pending_tool_name") or "delegate_tasks"
+        tool_name = run.get("pending_tool_name") or "task_delegate"
         unfinished = [
             child["id"]
             for child in children
@@ -1441,8 +1685,8 @@ class CompanyAgent:
     def _toolkit_label(self, definition: Any, call: ModelToolCall) -> str | None:
         if definition and definition.toolkits:
             return definition.toolkits[0]
-        if call.name == "COMPOSIO_EXECUTE":
-            # COMPOSIO_EXECUTE covers every toolkit dynamically via
+        if call.name == "integration_execute":
+            # integration_execute covers every toolkit dynamically via
             # tool_slug, which Composio conventionally
             # names "{TOOLKIT}_{ACTION}" -- good enough for a friendly
             # progress label without an extra composio.describe() round trip.
@@ -1486,7 +1730,7 @@ class CompanyAgent:
     def _enqueue_post_run_jobs(self, run: dict[str, Any]) -> None:
         # Children are private specialist evidence. Only a synthesized root
         # conclusion is captured as durable memory or delivered to Slack.
-        if run.get("parent_task_id"):
+        if run.get("parent_task_id") or (run.get("metadata") or {}).get("suppress_post_run_jobs"):
             return
         kinds = ["memory.capture_task", "delivery.send"]
         if int(run.get("tool_call_count") or 0) > 0 or self.runs.store.list_tasks(
@@ -1622,7 +1866,6 @@ class CompanyAgent:
             "agent.skills.resolved",
             {"task_id": run["id"], "skills": metadata["skill_refs"]},
             principal_id=run["envelope"]["principal_id"],
-            trace_id=run["trace_id"],
         )
         return active
 
@@ -1677,7 +1920,6 @@ class CompanyAgent:
                     "corrected": validation["response"] != response,
                 },
                 principal_id=run["envelope"]["principal_id"],
-                trace_id=run["trace_id"],
             )
         return validation
 

@@ -26,6 +26,7 @@ from toda.runtime_owner import DatabaseOwner
 from toda.services.bootstrap import initialize, is_initialized
 from toda.services.container import TodaApp, get_app, reset_app
 from toda.observability import configure_json_logging
+from toda.telemetry.bootstrap import instrument_fastapi, instrument_httpx_once
 
 log = logging.getLogger("toda")
 
@@ -119,8 +120,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             db = os.environ.get("TODA_DB")
             brain = reset_app(Path(db) if db else settings.storage.db_path)
         app.state.brain = brain
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=settings.observability.retention_days)).isoformat()
-        brain.store.purge_trace_events(before=cutoff, limit=100_000)
+        instrument_fastapi(app, brain.store.telemetry)
+        instrument_httpx_once(brain.store.telemetry)
+        runtime_settings = brain.settings
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(days=runtime_settings.observability.retention_days)
+        ).isoformat()
+        deleted = brain.store.purge_otel_spans(before=cutoff, limit=100_000)
+        brain._last_retention_result = {
+            "last_success_at": datetime.now(timezone.utc).isoformat(),
+            "deleted": deleted,
+        }
         brain.indexing.backfill()
         # Independent lanes keep long agent work and ingestion from
         # delaying infrastructure jobs, while all lanes remain inside
@@ -131,7 +142,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             while True:
                 if tick_automations and (
                     time.monotonic() - last_dispatcher_tick
-                    >= settings.worker.dispatcher_tick_interval_seconds
+                    >= runtime_settings.worker.dispatcher_tick_interval_seconds
                 ):
                     await asyncio.to_thread(brain.automations.tick)
                     last_dispatcher_tick = time.monotonic()
@@ -153,7 +164,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     brain.harness_worker.pump, kinds=kinds
                 )
                 if result["leased"] == 0:
-                    await asyncio.sleep(settings.worker.poll_interval_seconds)
+                    await asyncio.sleep(runtime_settings.worker.poll_interval_seconds)
                 else:
                     await asyncio.sleep(0)
 
@@ -277,9 +288,9 @@ def serve(target_app: FastAPI | str | None = None) -> None:
 def _register_composio_webhook(brain: TodaApp) -> None:
     """Point Composio's one-per-project webhook subscription at this gateway.
 
-    Requires TODA_PUBLIC_URL (an ngrok/cloudflared tunnel to this process)
-    so Composio's cloud can reach the local /v1/composio/webhooks endpoint.
-    Also captures the signing secret Composio returns so no manual .env
+    Requires server.public_url in config.json (an ngrok/cloudflared tunnel to
+    this process) so Composio's cloud can reach the local
+    /v1/composio/webhooks endpoint. Also captures the signing secret Composio returns so no manual
     copy step is needed.
     """
     if not (brain.composio.configured and settings.server.public_url):
@@ -440,11 +451,15 @@ def reset_cli(args: argparse.Namespace) -> None:
     architecture that no longer exists).
     """
     db_path = settings.storage.db_path.resolve()
-    workspace_root = settings.storage.workspaces.resolve()
+    workspace_root_raw = settings.storage.workspaces.expanduser()
+    agent_workspace_root_raw = settings.storage.agent_workspaces.expanduser()
+    workspace_root = workspace_root_raw.resolve()
+    agent_workspace_root = agent_workspace_root_raw.resolve()
     if not args.yes:
         print(
             f"This permanently deletes all Toda data in {db_path} "
-            f"and all task workspaces in {workspace_root}. "
+            f"and all durable/agent workspaces in {workspace_root} and "
+            f"{agent_workspace_root}. "
             "Pass --yes to continue."
         )
         raise SystemExit(2)
@@ -474,23 +489,38 @@ def reset_cli(args: argparse.Namespace) -> None:
     # home directory) turning a reset into an unrecoverable wipe: only ever
     # delete a directory that actually looks like Toda's own workspace
     # tree, and only its contents.
-    if workspace_root.exists() and workspace_root.is_dir():
-        if workspace_root.parent == settings.storage.data_dir.resolve() or workspace_root.name in {
-            "workspaces",
-            ".toda-workspaces",
-        }:
+    for candidate, label, allowed_names in (
+        (workspace_root, "durable workspace", {"workspaces", ".toda-workspaces"}),
+        (agent_workspace_root, "agent workspace", {"agent-workspaces", ".toda-tasks"}),
+    ):
+        raw_candidate = workspace_root_raw if label == "durable workspace" else agent_workspace_root_raw
+        if raw_candidate.is_symlink():
+            print(f"Skipped {label} cleanup: configured path is a symlink.")
+            continue
+        if not candidate.exists() or not candidate.is_dir():
+            continue
+        default_agent_root = (
+            settings.storage.data_dir.resolve().parent
+            / f"{settings.storage.data_dir.resolve().name}-agent-workspaces"
+        )
+        if (
+            candidate.parent == settings.storage.data_dir.resolve()
+            or candidate == default_agent_root
+            or candidate.name in allowed_names
+        ):
             workspace_count = 0
-            for child in workspace_root.iterdir():
-                shutil.rmtree(child, ignore_errors=True) if child.is_dir() else child.unlink(
-                    missing_ok=True
-                )
+            for child in candidate.iterdir():
+                if child.is_symlink():
+                    child.unlink(missing_ok=True)
+                elif child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
                 workspace_count += 1
-            print(
-                f"Removed {workspace_count} workspace entr(ies) under {workspace_root}."
-            )
+            print(f"Removed {workspace_count} {label} entr(ies) under {candidate}.")
         else:
             print(
-                f"Skipped workspace cleanup: {workspace_root} does not look like "
+                f"Skipped {label} cleanup: {candidate} does not look like "
                 "a Toda workspace directory. Remove it manually if intended."
             )
 

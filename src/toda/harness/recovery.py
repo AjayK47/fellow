@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+import time
 
 # How many times the sweep will try to rescue one undelivered answer before
 # leaving it for a human. Bounded because the sweep runs every 30s forever:
@@ -13,13 +14,26 @@ _MAX_DELIVERY_RECOVERIES = 3
 
 
 class RecoveryHeartbeat:
-    def __init__(self, *, store: Any, sessions: Any, queue: Any) -> None:
+    def __init__(
+        self,
+        *,
+        store: Any,
+        sessions: Any,
+        queue: Any,
+        workspaces: Any | None = None,
+        workspace_retention_hours: int = 24,
+    ) -> None:
         self.store = store
         self.sessions = sessions
         self.queue = queue
+        self.workspaces = workspaces
+        self.workspace_retention_hours = max(1, int(workspace_retention_hours))
+        self._last_tick_monotonic: float | None = None
+        self._last_tick_result: dict[str, Any] | None = None
 
     def tick(self, organization_id: str) -> dict[str, Any]:
-        self.store.trace.record(
+        self._last_tick_monotonic = time.monotonic()
+        self.store.telemetry.record(
             "recovery.heartbeat", component="recovery", phase="started",
             input={"organization_id": organization_id}, organization_id=organization_id,
         )
@@ -27,6 +41,7 @@ class RecoveryHeartbeat:
         recovered: list[str] = []
         woken: list[str] = []
         deliveries: list[str] = []
+        cleaned_workspaces: list[str] = []
         for task in self.store.list_expired_running_tasks(
             organization_id, now=now, limit=100
         ):
@@ -77,17 +92,38 @@ class RecoveryHeartbeat:
                 idempotency_key=f"delivery.recover:{task['id']}:{attempt + 1}",
             )
             deliveries.append(task["id"])
+        if self.workspaces is not None:
+            active_task_ids = set(self.store.list_active_task_ids(organization_id))
+            cleaned_workspaces = self.workspaces.cleanup_expired_tasks(
+                organization_id,
+                older_than_hours=self.workspace_retention_hours,
+                active_task_ids=active_task_ids,
+            )
         result = {
             "organization_id": organization_id,
             "requeued_task_ids": recovered,
             "woken_parent_task_ids": woken,
             "queued_delivery_task_ids": deliveries,
+            "cleaned_workspace_paths": cleaned_workspaces,
         }
-        self.store.trace.record(
+        self.store.telemetry.record(
             "recovery.heartbeat", component="recovery", phase="completed",
             output=result, organization_id=organization_id,
         )
+        self._last_tick_result = result
         return result
+
+    def health(self, *, max_age_seconds: float = 90.0) -> dict[str, Any]:
+        age = (
+            None
+            if self._last_tick_monotonic is None
+            else max(0.0, time.monotonic() - self._last_tick_monotonic)
+        )
+        return {
+            "ok": age is not None and age <= max_age_seconds,
+            "last_tick_age_seconds": age,
+            "last_result": self._last_tick_result,
+        }
 
     def _delivery_recovery_attempts(self, organization_id: str, task_id: str) -> int:
         return self.store.count_jobs_with_key_prefix(

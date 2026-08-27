@@ -13,6 +13,8 @@ permission expectations still hold against the authorization code.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from evals import cases, corpus as corpus_mod, report as report_mod, spec, suites
@@ -131,3 +133,81 @@ def test_a_judge_that_fails_reports_a_leak_rather_than_a_pass():
     )
     assert verdict.judge_error
     assert [v.claim for v in verdict.leaked] == ["a secret"]
+
+
+def test_scenario_comparison_and_candidate_contract():
+    from evals.comparison import summarize_trials
+    from evals.runner import _candidate_label
+
+    comparison = summarize_trials([
+        {
+            "candidate": "candidate-leaky",
+            "scenario": "question.simple",
+            "scenario_version": 1,
+            "outcome": "completed",
+            "privacy": {"violation": True},
+            "completeness": {"status": "complete"},
+        }
+    ])
+    assert comparison["comparison_is_valid"] is False
+    assert comparison["fatal_trials"] > 0
+    assert _candidate_label("primary=openrouter-prod:openai/gpt-5") == (
+        "primary", "openrouter-prod", "openai/gpt-5"
+    )
+    with pytest.raises(SystemExit, match="label=connection:model"):
+        _candidate_label("deterministic")
+
+
+def test_write_scenarios_require_explicit_operator_confirmation(tmp_path: Path):
+    import argparse
+
+    from evals.runner import scenarios_run
+    from evals.scenarios import SCENARIOS
+
+    args = argparse.Namespace(
+        samples=1,
+        mode="write",
+        confirm_operator=False,
+        candidate=["deterministic"],
+        scenario=[SCENARIOS[0].id],
+        category=None,
+        output_dir=tmp_path,
+        human_scores=None,
+    )
+    with pytest.raises(SystemExit, match="requires --confirm-operator"):
+        scenarios_run(args)
+
+
+def test_queue_fault_fixtures_create_and_verify_real_lease_conditions(eval_brain):
+    from evals.faults import install
+    from toda.domain.models import utcnow
+
+    brain, _built = eval_brain
+    now = utcnow().isoformat()
+    brain.store.create_session(
+        {
+            "id": "eval-contention-session",
+            "organization_id": spec.ORG_ID,
+            "conversation_key": "eval:contention",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    brain.store.bump_session_revision("eval-contention-session")
+    task = {
+        "id": "eval-fault-task",
+        "organization_id": spec.ORG_ID,
+        "session_id": "eval-contention-session",
+    }
+
+    contention = install(brain, "queue_contention")
+    contention.before_execute(task)
+    assert contention.verify()[0] is True
+
+    restart = install(brain, "worker_restart")
+    restart.before_execute(task)
+    assert restart.verify()[0] is True
+    jobs = brain.store.list_harness_jobs_for_task(spec.ORG_ID, task["id"])
+    assert [(job["kind"], job["status"]) for job in jobs] == [
+        ("eval.worker_restart", "completed")
+    ]

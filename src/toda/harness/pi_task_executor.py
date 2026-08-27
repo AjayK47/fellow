@@ -1,7 +1,7 @@
-"""PiTaskExecutor: Phase 5's durable, non-blocking Pi Task runtime.
+"""PiTaskExecutor: durable, non-blocking Pi Task runtime.
 
 Runs Pi as a durable, detached worker_type=pi child Task created via
-delegate_tasks. Per plan §10.1, Pi is a Task *runtime*, not a
+task_delegate. Per plan §10.1, Pi is a Task *runtime*, not a
 synchronous tool handler:
 
 - `pi` is spawned once, detached (its own process group), with output
@@ -39,8 +39,9 @@ from toda.domain.models import new_id, utcnow
 from toda.config import settings
 from toda.harness.hazard import hazard_reason
 from toda.harness.models import AgentRunState
-from toda.harness.run_code import scrub_child_env
+from toda.harness.agent_runner import AgentRunner
 from toda.services.scope_resolution import resolve_scope
+from toda.services.redaction import redact
 
 _MAX_OUTPUT_CHARS = 20_000
 _EXIT_MARKER = "__PI_EXIT__"
@@ -92,10 +93,10 @@ def check_hardline_floor(prompt: str, command: list[str], workspace_root: Path) 
 def prescan_pi_launch(prompt: str, command: list[str]) -> str | None:
     """A deterministic observation about this launch, for the reviewer.
 
-    Not a block. Pi is a full-trust coding subprocess by design and the
-    whole point is that it gets on with the work; refusing outright on a
-    pattern match would make it useless for exactly the debugging tasks it
-    exists for. This only gives the reviewer something concrete to weigh.
+    Not a block. Pi is an agent-account coding subprocess and the whole point
+    is that it gets on with the work; refusing outright on a pattern match
+    would make it useless for exactly the debugging tasks it exists for. This
+    only gives the reviewer something concrete to weigh.
 
     Uses Toda's data dir, NOT the workspace: the workspace is precisely
     where Pi is supposed to be writing, so scanning against it would flag
@@ -204,6 +205,13 @@ class PiTaskExecutor:
         model: str,
         credential_env: str | None = None,
         credential: str | None = None,
+        execution_user: str | None = None,
+        isolation_required: bool = True,
+        execution_home: Path | None = None,
+        cpu_seconds: int | None = None,
+        max_processes: int | None = None,
+        max_file_bytes: int | None = None,
+        memory_bytes: int | None = None,
         command_builder: CommandBuilder | None = None,
         checkpoint_interval_seconds: int = 3600,
         stale_heartbeat_seconds: int = 1800,
@@ -212,10 +220,10 @@ class PiTaskExecutor:
         lease_seconds: int = 1800,
     ) -> None:
         self.store = store
-        # Pi is the one execution path with no gate at all -- a full-trust
-        # subprocess with network access. Routing its launch through the
-        # same reviewer every other risky action already uses gives it a
-        # judgment step without putting a human in the loop for ordinary
+        # Pi is the execution path with network access. It runs under the
+        # configured low-privilege agent account and a scrubbed environment;
+        # routing launch through the same reviewer as other risky actions
+        # still gives it a judgment step without a human pause for routine
         # coding work.
         self.action_reviewer = action_reviewer
         self.sessions = sessions
@@ -224,6 +232,17 @@ class PiTaskExecutor:
         self.audit = audit
         self.credential_env = credential_env
         self.credential = credential
+        self.execution_user = execution_user
+        self.isolation_required = bool(isolation_required)
+        self.execution_home = execution_home
+        self.runner = AgentRunner(
+            execution_user=execution_user,
+            execution_home=execution_home,
+            cpu_seconds=cpu_seconds,
+            max_processes=max_processes,
+            max_file_bytes=max_file_bytes,
+            memory_bytes=memory_bytes,
+        )
         self.command_builder = command_builder or pi_command_builder(
             provider=provider, model=model
         )
@@ -245,12 +264,53 @@ class PiTaskExecutor:
         if not self.store.claim_task(task_id, owner=owner, lease_seconds=self.lease_seconds):
             current = self.store.get_task(task_id) or task
             return {"task_id": task_id, "started": False, "state": current["state"], "reason": "already claimed"}
+        if self.isolation_required and not self.execution_user:
+            self._fail(
+                task,
+                owner=owner,
+                error=(
+                    "Pi coding is disabled for this deployment: configure a "
+                    "dedicated pi_execution_user and agent workspace root "
+                    "before launching an agent process."
+                ),
+            )
+            return {
+                "task_id": task_id,
+                "started": False,
+                "state": AgentRunState.FAILED.value,
+                "reason": "dedicated execution user required",
+            }
         organization_id = task["organization_id"]
         workspace = self.workspaces.get_for_task(organization_id, task) if self.workspaces else None
         if not workspace:
             self._fail(task, owner=owner, error="no persistent workspace resolved for this task")
             return {"task_id": task_id, "started": False, "state": AgentRunState.FAILED.value, "reason": "no workspace"}
-        workspace_root = Path(workspace["path"]).resolve()
+        try:
+            durable_workspace_root = self.workspaces.resolve_durable_path(workspace)
+        except (AttributeError, ValueError) as exc:
+            self._fail(task, owner=owner, error=f"invalid durable workspace: {exc}")
+            return {
+                "task_id": task_id,
+                "started": False,
+                "state": AgentRunState.FAILED.value,
+                "reason": "invalid durable workspace",
+            }
+        base_revision = str((task.get("metadata") or {}).get("base_revision") or "HEAD")
+        try:
+            workspace_root, workspace_mode = self.workspaces.prepare_task_workspace(
+                organization_id,
+                task,
+                base_revision=base_revision,
+                isolated=bool(self.execution_user),
+            )
+        except Exception as exc:
+            self._fail(task, owner=owner, error=f"could not prepare task workspace: {exc}")
+            return {
+                "task_id": task_id,
+                "started": False,
+                "state": AgentRunState.FAILED.value,
+                "reason": "workspace preparation failed",
+            }
         prompt = task.get("prompt") or task.get("goal") or ""
         command = self.command_builder(prompt)
 
@@ -265,10 +325,13 @@ class PiTaskExecutor:
             verdict = self.action_reviewer.review(
                 tool_name="pi_coding_worker",
                 description=(
-                    "Launch a full-trust Pi coding subprocess with network "
-                    "access in this Task's workspace."
+                    "Launch a Pi coding subprocess with network access in an "
+                    "isolated, agent-owned Task workspace."
                 ),
-                arguments={"prompt": prompt, "command": command},
+                arguments={
+                    "prompt": redact(prompt).text,
+                    "command": [redact(str(item)).text for item in command],
+                },
                 hazard=flagged,
             )
             if verdict == "deny":
@@ -282,10 +345,19 @@ class PiTaskExecutor:
                         "state": AgentRunState.FAILED.value, "reason": denial}
 
         pi_dir = workspace_root / ".pi"
+        if pi_dir.is_symlink():
+            self._fail(task, owner=owner, error="Pi metadata directory cannot be a symlink")
+            return {"task_id": task_id, "started": False, "state": AgentRunState.FAILED.value, "reason": "unsafe Pi metadata directory"}
         pi_dir.mkdir(parents=True, exist_ok=True)
+        if pi_dir.resolve() != pi_dir:
+            self._fail(task, owner=owner, error="Pi metadata directory escaped its workspace")
+            return {"task_id": task_id, "started": False, "state": AgentRunState.FAILED.value, "reason": "unsafe Pi metadata directory"}
         attempt_number = len(self.store.list_task_attempts(task_id)) + 1
         attempt_id = new_id("attempt")
         log_path = pi_dir / f"{task_id}-{attempt_number}.log"
+        if log_path.is_symlink():
+            self._fail(task, owner=owner, error="Pi log path cannot be a symlink")
+            return {"task_id": task_id, "started": False, "state": AgentRunState.FAILED.value, "reason": "unsafe Pi log path"}
 
         shell_command = (
             f"{shlex.join(command)} > {shlex.quote(str(log_path))} 2>&1; "
@@ -295,18 +367,27 @@ class PiTaskExecutor:
         # is right for run_code but leaves Pi with no way to reach a model.
         # Re-add exactly the one credential it needs, by name, rather than
         # widening the scrub for everything.
-        child_env = scrub_child_env(dict(os.environ))
-        if self.credential_env and self.credential:
-            child_env[self.credential_env] = self.credential
-        proc = subprocess.Popen(
-            ["/bin/sh", "-c", shell_command],
-            cwd=str(workspace_root),
-            env=child_env,
-            # Detached and unattended: an inherited stdin would let Pi block
-            # forever waiting on a terminal nobody is sitting at.
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
+        child_env = self.runner.environment(
+            dict(os.environ),
+            credential_env=self.credential_env,
+            credential=self.credential,
+            working_directory=workspace_root,
         )
+        try:
+            proc = self.runner.start(
+                shell_command=shell_command,
+                cwd=workspace_root,
+                env=child_env,
+                isolate_parent=True,
+            )
+        except (OSError, PermissionError, RuntimeError, subprocess.SubprocessError) as exc:
+            self._fail(task, owner=owner, error=f"could not start Pi runner: {exc}")
+            return {
+                "task_id": task_id,
+                "started": False,
+                "state": AgentRunState.FAILED.value,
+                "reason": "runner unavailable",
+            }
         now = utcnow().isoformat()
         attempt = {
             "id": attempt_id,
@@ -318,6 +399,9 @@ class PiTaskExecutor:
             "pid": proc.pid,
             "command": command,
             "workspace_path": str(workspace_root),
+            "durable_workspace_path": str(durable_workspace_root),
+            "workspace_mode": workspace_mode,
+            "base_revision": base_revision,
             "log_path": str(log_path),
             "started_at": now,
             "last_heartbeat_at": now,
@@ -333,6 +417,15 @@ class PiTaskExecutor:
         self.store.create_task_attempt(attempt)
         task["state"] = AgentRunState.RUNNING.value
         task["active_attempt_id"] = attempt_id
+        task_metadata = dict(task.get("metadata") or {})
+        task_metadata.update(
+            {
+                "pi_workspace_path": str(workspace_root),
+                "pi_workspace_mode": workspace_mode,
+                "pi_base_revision": base_revision,
+            }
+        )
+        task["metadata"] = task_metadata
         task["updated_at"] = now
         if not self.store.update_task_owned(task, owner=owner):
             try:
@@ -345,7 +438,6 @@ class PiTaskExecutor:
             "task.pi.started",
             {"task_id": task_id, "attempt_id": attempt_id, "pid": proc.pid},
             principal_id=task["envelope"]["principal_id"],
-            trace_id=task.get("trace_id"),
         )
         enqueue_poll(task_id, available_at=None)
         return {
@@ -437,7 +529,6 @@ class PiTaskExecutor:
                     "output_tail": self._tail_log(attempt["log_path"])[-2000:],
                 },
                 principal_id=task["envelope"]["principal_id"],
-                trace_id=task.get("trace_id"),
             )
             if task.get("session_id"):
                 # Liveness is not progress (§10.3.1) -- the Manager decides
@@ -474,11 +565,17 @@ class PiTaskExecutor:
             "task.pi.cancel_requested",
             {"task_id": task_id, "attempt_id": attempt["id"], "reason": reason},
             principal_id=task["envelope"]["principal_id"],
-            trace_id=task.get("trace_id"),
         )
         return {"task_id": task_id, "cancelled": True}
 
     # ---- internals ----
+
+    def _redact_text(self, value: str) -> str:
+        """Redact known credential formats and this Pi provider key itself."""
+        result = redact(value).text
+        if self.credential and len(self.credential) >= 8:
+            result = result.replace(self.credential, "[REDACTED:provider_credential]")
+        return result
 
     def _active_attempt(self, task: dict[str, Any]) -> dict[str, Any] | None:
         attempt_id = task.get("active_attempt_id")
@@ -492,9 +589,9 @@ class PiTaskExecutor:
     @staticmethod
     def _read_exit_marker(log_path: str) -> tuple[int, str] | None:
         path = Path(log_path)
-        if not path.exists():
+        if not path.exists() or path.is_symlink() or not path.is_file():
             return None
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = PiTaskExecutor._tail_log(log_path, max_chars=_MAX_OUTPUT_CHARS + 4096)
         marker_prefix = f"{_EXIT_MARKER}:"
         idx = text.rfind(marker_prefix)
         if idx == -1:
@@ -510,11 +607,19 @@ class PiTaskExecutor:
         return exit_code, output
 
     @staticmethod
-    def _tail_log(log_path: str) -> str:
+    def _tail_log(log_path: str, *, max_chars: int = _MAX_OUTPUT_CHARS) -> str:
         path = Path(log_path)
-        if not path.exists():
+        if not path.exists() or path.is_symlink() or not path.is_file():
             return ""
-        return path.read_text(encoding="utf-8", errors="replace")[-_MAX_OUTPUT_CHARS:]
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - max_chars * 4))
+                value = handle.read(max_chars * 4).decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+        return value[-max_chars:]
 
     def _finalize(
         self,
@@ -535,6 +640,17 @@ class PiTaskExecutor:
         ):
             raise RuntimeError(f"pi task lease lost while finalizing {task['id']}")
         terminal_event = parse_terminal_event(output) if output else None
+        # Pi receives one provider credential by design, so its raw stream is
+        # untrusted data.  Never copy a credential-shaped value into the
+        # answer, artifact, audit payload, or parent-worker transcript.
+        safe_output = self._redact_text(output or "")
+        safe_terminal_event = dict(terminal_event or {}) if terminal_event else None
+        if safe_terminal_event and safe_terminal_event.get("text"):
+            safe_terminal_event["text"] = self._redact_text(str(safe_terminal_event["text"]))
+        workspace_changes = _workspace_changes(
+            Path(str(attempt.get("workspace_path") or "")),
+            str(attempt.get("workspace_mode") or ""),
+        )
         # A cancelled attempt reaches here via the same "process no longer
         # alive, no exit marker" path as a genuine crash (SIGTERM usually
         # kills the whole /bin/sh -c chain before it reaches the trailing
@@ -554,7 +670,7 @@ class PiTaskExecutor:
         else:
             status = "failed"
 
-        # manage_child_task(action="revise") on a pi child cancels the
+        # task_manage(action="revise") on a pi child cancels the
         # current attempt and marks this on the Task rather than trying to
         # race a live redirect (plan §10.5: pi has no documented interactive
         # protocol) -- once that cancellation is confirmed here, immediately
@@ -567,8 +683,8 @@ class PiTaskExecutor:
                 {
                     "status": "cancelled",
                     "exit_code": exit_code,
-                    "output_tail": output[-_MAX_OUTPUT_CHARS:],
-                    "terminal_event": terminal_event,
+                    "output_tail": safe_output[-_MAX_OUTPUT_CHARS:],
+                    "terminal_event": safe_terminal_event,
                     "forced_reason": "revised -- restarting with new prompt",
                     "updated_at": now,
                 }
@@ -595,7 +711,6 @@ class PiTaskExecutor:
                 "task.pi.revision_restart",
                 {"task_id": task["id"], "attempt_id": attempt["id"]},
                 principal_id=task["envelope"]["principal_id"],
-                trace_id=task.get("trace_id"),
             )
             return self.start(task["id"], owner=owner, enqueue_poll=enqueue_poll)
 
@@ -604,8 +719,8 @@ class PiTaskExecutor:
             {
                 "status": status,
                 "exit_code": exit_code,
-                "output_tail": output[-_MAX_OUTPUT_CHARS:],
-                "terminal_event": terminal_event,
+                "output_tail": safe_output[-_MAX_OUTPUT_CHARS:],
+                "terminal_event": safe_terminal_event,
                 "forced_reason": forced_reason,
                 "updated_at": now,
             }
@@ -618,8 +733,8 @@ class PiTaskExecutor:
         # the last 4000 characters are the middle of one repeated message
         # object, not anything a reader can use.
         answer = (
-            (terminal_event or {}).get("text")
-            or output[-4000:]
+            (safe_terminal_event or {}).get("text")
+            or safe_output[-4000:]
             or (forced_reason or "")
         )
         artifact = None
@@ -637,13 +752,19 @@ class PiTaskExecutor:
                 content={
                     "status": status,
                     "exit_code": exit_code,
-                    "terminal_event": terminal_event,
-                    "output": output[-_MAX_OUTPUT_CHARS:],
+                    "terminal_event": safe_terminal_event,
+                    "output": safe_output[-_MAX_OUTPUT_CHARS:],
+                    "workspace": workspace_changes,
                 },
                 scope_id=scope_id,
                 task_id=task["id"],
                 created_by=principal_id,
-                metadata={"attempt_id": attempt["id"], "task_id": task["id"]},
+                metadata={
+                    "attempt_id": attempt["id"],
+                    "task_id": task["id"],
+                    "workspace_mode": attempt.get("workspace_mode"),
+                    "workspace_path": attempt.get("workspace_path"),
+                },
             )
         task.pop("active_attempt_id", None)
         if status == "succeeded":
@@ -673,9 +794,9 @@ class PiTaskExecutor:
                 "attempt_id": attempt["id"],
                 "status": status,
                 "artifact_id": (artifact or {}).get("id"),
+                "workspace": workspace_changes,
             },
             principal_id=principal_id,
-            trace_id=task.get("trace_id"),
         )
         parent = (
             self.store.get_task(task["parent_task_id"])
@@ -750,7 +871,6 @@ class PiTaskExecutor:
             "task.pi.blocked",
             {"task_id": task["id"], "reason": violation},
             principal_id=task["envelope"]["principal_id"],
-            trace_id=task.get("trace_id"),
         )
 
 
@@ -760,3 +880,38 @@ def _parse(value: str) -> datetime:
 
 def _future(base: datetime, seconds: int) -> str:
     return (base + timedelta(seconds=seconds)).isoformat()
+
+
+def _workspace_changes(root: Path, mode: str) -> dict[str, Any]:
+    """Capture bounded evidence of what Pi left in its private workspace."""
+    if not root or not root.exists():
+        return {"mode": mode, "path": str(root), "status": "missing"}
+    if mode == "git_worktree":
+        status = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        diff = subprocess.run(
+            ["git", "diff", "--stat"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        return {
+            "mode": mode,
+            "path": str(root),
+            "status": status.stdout[-20_000:],
+            "diff_stat": diff.stdout[-20_000:],
+        }
+    files = [
+        str(item.relative_to(root))
+        for item in sorted(root.rglob("*"))
+        if not item.is_symlink() and item.is_file() and ".pi" not in item.parts
+    ]
+    return {"mode": mode, "path": str(root), "files": files[:500], "truncated": len(files) > 500}

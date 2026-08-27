@@ -56,18 +56,26 @@ class AttentionPipeline:
         conversation = self._update_conversation_state(event)
         matched_roles = self._match_roles(event)
         compact = self._build_context(event, conversation, matched_roles)
-        response = self.model.generate(
-            messages=[
-                {"role": "system", "content": ATTENTION_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": json.dumps(compact, sort_keys=True),
-                },
-            ],
-            response_schema=ATTENTION_SCHEMA,
-            temperature=0.0,
-            max_tokens=700,
-        )
+        with self.store.telemetry.span(
+            "attention.classify",
+            component="attention",
+            organization_id=event.organization_id,
+            event_id=event.id,
+            input={"matched_roles": matched_roles},
+        ) as span:
+            response = self.model.generate(
+                messages=[
+                    {"role": "system", "content": ATTENTION_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(compact, sort_keys=True),
+                    },
+                ],
+                response_schema=ATTENTION_SCHEMA,
+                temperature=0.0,
+                max_tokens=700,
+            )
+            span.output({"finish_reason": response.finish_reason})
         try:
             evaluation = AttentionEvaluation(**json.loads(response.content))
         except (json.JSONDecodeError, TypeError, ValueError) as exc:

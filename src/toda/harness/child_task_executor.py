@@ -1,4 +1,4 @@
-"""ChildTaskExecutor: the job-queue-side counterpart to delegate_tasks.
+"""ChildTaskExecutor: the job-queue-side counterpart to task_delegate.
 
 Each child Task created by ChildTaskService is enqueued as a "task.run_child"
 job. A worker_type="general" child runs the ordinary CompanyAgent reasoning
@@ -16,6 +16,7 @@ waiting parent via CompanyAgent.resume_for_children().
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from toda.domain.models import new_id
@@ -37,6 +38,7 @@ class ChildTaskExecutor:
         queue: Any,
         sessions: Any,
         agent_factory: Any,
+        workspaces: Any | None = None,
         pi_executor: Any = None,
         lease_seconds: int = 1800,
     ) -> None:
@@ -44,6 +46,7 @@ class ChildTaskExecutor:
         self.queue = queue
         self.sessions = sessions
         self.agent_factory = agent_factory
+        self.workspaces = workspaces
         self.pi_executor = pi_executor
         self.lease_seconds = lease_seconds
 
@@ -52,21 +55,57 @@ class ChildTaskExecutor:
         task = self.store.get_task(task_id)
         if not task:
             raise KeyError(f"child task not found: {task_id}")
-        self.store.trace.record(
+        self.store.telemetry.record(
             "child_task.execute", component="child_tasks", phase="started",
             input={"task_id": task_id, "worker_type": task.get("worker_type")},
-            trace_id=task.get("trace_id"), task_id=task_id,
+            task_id=task_id,
         )
         if task.get("worker_type") == "pi":
             if not self.pi_executor:
-                raise RuntimeError("no PiTaskExecutor configured for worker_type=pi")
+                # Existing queued Pi children can outlive a configuration
+                # change that disables the runtime. Resolve them as a
+                # terminal failure so their parent is woken instead of
+                # retrying/dead-lettering an unfulfillable job forever.
+                executor_id = new_id("exec")
+                runs = TaskRunStore(
+                    self.store, owner=executor_id, lease_seconds=self.lease_seconds
+                )
+                if self.store.claim_task(
+                    task_id, owner=executor_id, lease_seconds=self.lease_seconds
+                ):
+                    failed = runs.fail(
+                        task_id,
+                        "Pi coding workers are unavailable in this deployment",
+                    )
+                    parent = (
+                        self.store.get_task(task.get("parent_task_id"))
+                        if task.get("parent_task_id")
+                        else None
+                    )
+                    if parent and parent.get("state") not in _TERMINAL_STATES:
+                        self.store.bump_task_revision(task_id)
+                        self.store.bump_task_revision(parent["id"])
+                        self.sessions.notify(task["session_id"], reason="child_task.failed")
+                    result = {
+                        "task_id": task_id,
+                        "state": failed["state"],
+                        "error": failed.get("error"),
+                    }
+                else:
+                    current = self.store.get_task(task_id) or task
+                    result = {"task_id": task_id, "state": current.get("state")}
+                self.store.telemetry.record(
+                    "child_task.execute", component="child_tasks", phase="completed",
+                    output=result, task_id=task_id,
+                )
+                return result
             executor_id = new_id("exec")
             result = self.pi_executor.start(
                 task_id, owner=executor_id, enqueue_poll=self._enqueue_poll
             )
-            self.store.trace.record(
+            self.store.telemetry.record(
                 "child_task.execute", component="child_tasks", phase="completed",
-                output=result, trace_id=task.get("trace_id"), task_id=task_id,
+                output=result, task_id=task_id,
             )
             return result
         executor_id = new_id("exec")
@@ -74,6 +113,89 @@ class ChildTaskExecutor:
             self.store, owner=executor_id, lease_seconds=self.lease_seconds
         )
         task = runs.get(task_id)
+        if task["state"] not in {
+            AgentRunState.QUEUED.value,
+            AgentRunState.WAITING.value,
+        }:
+            result = {"task_id": task_id, "state": task["state"]}
+            self.store.telemetry.record(
+                "child_task.execute", component="child_tasks", phase="skipped",
+                output=result, task_id=task_id,
+            )
+            return result
+        if self.workspaces is not None:
+            try:
+                workspace_path, workspace_mode = self.workspaces.prepare_task_workspace(
+                    task["organization_id"],
+                    task,
+                    base_revision=str((task.get("metadata") or {}).get("base_revision") or "HEAD"),
+                    isolated=True,
+                )
+            except Exception as exc:
+                # A worker must never silently fall back to the durable
+                # organization workspace when its private root cannot be
+                # prepared. The normal runtime failure path records the
+                # message and wakes the parent.
+                # Preparation happens before CompanyAgent claims a queued
+                # child (and before a waiting child is re-claimed for
+                # resume). Claim it here so TaskRunStore.fail() can renew
+                # and release a real lease instead of attempting a terminal
+                # release against an unclaimed row.
+                if not self.store.claim_task(
+                    task_id, owner=executor_id, lease_seconds=self.lease_seconds
+                ):
+                    current = self.store.get_task(task_id) or task
+                    result = {
+                        "task_id": task_id,
+                        "state": current.get("state"),
+                        "error": "workspace preparation could not claim the child Task",
+                    }
+                    self.store.telemetry.record(
+                        "child_task.execute", component="child_tasks", phase="completed",
+                        output=result, task_id=task_id,
+                    )
+                    return result
+                failed = runs.fail(task_id, f"could not prepare agent workspace: {exc}")
+                result = {
+                    "task_id": task_id,
+                    "state": failed["state"],
+                    "error": failed.get("error"),
+                }
+                parent = self.store.get_task(task.get("parent_task_id")) if task.get("parent_task_id") else None
+                if parent and parent.get("state") not in _TERMINAL_STATES:
+                    self.store.bump_task_revision(task_id)
+                    self.store.bump_task_revision(parent["id"])
+                    self.sessions.notify(task["session_id"], reason="child_task.failed")
+                self.store.telemetry.record(
+                    "child_task.execute", component="child_tasks", phase="completed",
+                    output=result, task_id=task_id,
+                )
+                return result
+            metadata = dict(task.get("metadata") or {})
+            had_workspace_path = bool(metadata.get("workspace_path"))
+            metadata.update(
+                {
+                    "workspace_path": str(workspace_path),
+                    "workspace_mode": workspace_mode,
+                }
+            )
+            task["metadata"] = metadata
+            task["updated_at"] = datetime.now(timezone.utc).isoformat()
+            if task["state"] == AgentRunState.QUEUED.value:
+                if not self.store.update_unclaimed_task(task):
+                    current = self.store.get_task(task_id) or task
+                    result = {"task_id": task_id, "state": current["state"]}
+                    self.store.telemetry.record(
+                        "child_task.execute", component="child_tasks", phase="skipped",
+                        output=result, task_id=task_id,
+                    )
+                    return result
+            else:
+                # A waiting child already has a prepared workspace in normal
+                # operation; retain the metadata only when this is a legacy
+                # row missing it, then let resume_for_children claim it.
+                if not had_workspace_path:
+                    self.store.update_task(task)
         agent = self.agent_factory(runs)
         if task["state"] == AgentRunState.QUEUED.value:
             outcome = agent.execute_task(task_id)
@@ -85,9 +207,9 @@ class ChildTaskExecutor:
             # (e.g. waiting_for_approval -- Phase 7 links that resume path
             # directly). Nothing to do this tick.
             result = {"task_id": task_id, "state": task["state"]}
-            self.store.trace.record(
+            self.store.telemetry.record(
                 "child_task.execute", component="child_tasks", phase="skipped",
-                output=result, trace_id=task.get("trace_id"), task_id=task_id,
+                output=result, task_id=task_id,
             )
             return result
         if outcome.state == AgentRunState.WAITING and outcome.approval_id:
@@ -115,9 +237,9 @@ class ChildTaskExecutor:
                 session_id, reason=f"child_task.{outcome.state.value}"
             )
         result = outcome.model_dump(mode="json")
-        self.store.trace.record(
+        self.store.telemetry.record(
             "child_task.execute", component="child_tasks", phase="completed",
-            output=result, trace_id=task.get("trace_id"), task_id=task_id,
+            output=result, task_id=task_id,
         )
         return result
 

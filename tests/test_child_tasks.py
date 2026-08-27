@@ -39,6 +39,7 @@ def _provision_workspace(brain) -> None:
         owner_id="person_ajay",
         scope_id="scope_org_public",
     )
+    brain.pi_task_executor.isolation_required = False
 
 
 def _fake_pi_command(prompt: str) -> list[str]:
@@ -88,7 +89,7 @@ def test_root_task_delegates_three_children_and_synthesizes_result(brain):
                 tool_calls=[
                     ModelToolCall(
                         id="call_delegate",
-                        name="delegate_tasks",
+                        name="task_delegate",
                         arguments={
                             "tasks": [
                                 {
@@ -215,13 +216,14 @@ def test_root_task_delegates_three_children_and_synthesizes_result(brain):
 
 
 def _dispatch_delegation(brain, *, conversation_key: str, tasks: list[dict]):
+    _provision_workspace(brain)
     brain.company_agent.model = ScriptedModelClient(
         [
             ModelResponse(
                 tool_calls=[
                     ModelToolCall(
                         id="call_delegate_focused",
-                        name="delegate_tasks",
+                        name="task_delegate",
                         arguments={"tasks": tasks},
                     )
                 ],
@@ -294,10 +296,10 @@ def test_general_child_is_temporary_specialist_with_task_local_handoff_and_tools
     }
     assert {"child_test_read", "child_test_write", "session_search"} <= allowed
     assert not {
-        "delegate_tasks",
-        "manage_child_task",
-        "start_parallel_task",
-        "wait_for_children",
+        "task_delegate",
+        "task_manage",
+        "task_delegate_parallel",
+        "task_wait",
     } & allowed
     with pytest.raises(PermissionError, match="cannot delegate further"):
         brain.child_tasks.execute(
@@ -331,7 +333,7 @@ def test_partial_child_completion_can_wait_then_continue_sequentially(brain):
                 tool_calls=[
                     ModelToolCall(
                         id="call_wait_remaining",
-                        name="wait_for_children",
+                        name="task_wait",
                         arguments={},
                     )
                 ],
@@ -380,7 +382,7 @@ def test_adding_children_after_partial_result_preserves_running_siblings(brain):
                 tool_calls=[
                     ModelToolCall(
                         id="call_delegate_followup",
-                        name="delegate_tasks",
+                        name="task_delegate",
                         arguments={
                             "tasks": [
                                 {

@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from toda.harness.prompt_library import load
+from toda.harness.prompting.catalog import load
 from toda.domain.models import (
     EXTRACTABLE_EDGE_TYPES,
     CanonicalClaim,
@@ -412,7 +412,7 @@ class ModelMemoryExtractor:
             self.memory.indexing.index_memories(committed)
         self.audit.record(
             source["organization_id"],
-            "memory.model_extracted",
+            "memory.capture",
             {
                 "source_id": source["id"],
                 "memory_ids": [item["id"] for item in committed],

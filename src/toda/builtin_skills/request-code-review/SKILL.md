@@ -38,15 +38,15 @@ quickly, without re-deriving it themselves.
 
 There is no standalone git tool. Getting an actual diff, running the test
 suite, running a linter, and committing the result all require
-`delegate_tasks` -- a Pi child Task with real shell and network
+`task_delegate` -- a Pi child Task with real shell and network
 access scoped to the shared workspace, available only when Phase D is
-enabled. Everything else here (`workspace_read`, `workspace_search`,
-`workspace_diff`) is read-only inspection of files already sitting in the
+enabled. Everything else here (`read_file`, `search_files`,
+`file_diff`) is read-only inspection of files already sitting in the
 workspace.
 
 If a Pi child Task is not available for this task: you can still
 describe the intended change and its risk in prose, and read the affected
-files with `workspace_read`, but you cannot produce a real diff, cannot run
+files with `read_file`, but you cannot produce a real diff, cannot run
 tests, and cannot commit. Say that explicitly rather than presenting a
 description as verified evidence.
 
@@ -55,7 +55,7 @@ description as verified evidence.
 Delegate a task that reports the real diff: what files changed, and the
 line-level change in each. If the workspace isn't a git repository, or the
 change is really "compare this draft against what was there before,"
-`workspace_diff` between two files already saved in the workspace is the
+`file_diff` between two files already saved in the workspace is the
 lighter-weight option.
 
 If the diff is large, work through it file by file rather than trying to
@@ -63,7 +63,7 @@ hold the whole thing in context at once.
 
 ## Step 2 -- Risk pass
 
-Read the changed files (`workspace_read`) and identify:
+Read the changed files (`read_file`) and identify:
 
 - What behavior actually changed, in plain terms a reviewer can verify
   against their own understanding of the system.
@@ -73,7 +73,7 @@ Read the changed files (`workspace_read`) and identify:
   diff looks.
 - Any migration or schema change and whether it's backward compatible.
 
-A lightweight pattern scan over the changed files with `workspace_search` is
+A lightweight pattern scan over the changed files with `search_files` is
 worth running for things like: credentials or tokens hardcoded instead of
 read from the environment, string-built database queries instead of
 parameterized ones, code that builds a shell command from unsanitized input,
@@ -109,7 +109,7 @@ Before handing this to a reviewer, confirm:
 ## Step 5 -- Independent review
 
 A reviewer with no context on how the change was built catches things the
-implementer's own context blinds them to. Use `delegate_tasks` to spin up a
+implementer's own context blinds them to. Use `task_delegate` to spin up a
 child Task with a narrowly scoped prompt and only the diff plus the
 Step 2/3 findings -- not the implementer's reasoning, not the rest of this
 conversation:

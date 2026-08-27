@@ -24,7 +24,7 @@ steps:
     description: Follow the one execution path that matters for the task, file by file, from entry point to effect.
   - order: 3
     name: Quantify
-    description: Get size and language signal from what workspace_list and workspace_search actually return, or delegate for a real tool if precision matters.
+    description: Get size and language signal from what list_files and search_files actually return, or delegate for a real tool if precision matters.
   - order: 4
     name: Report
     description: State findings with file:line citations, and say plainly what remains unknown.
@@ -52,19 +52,19 @@ not a private per-run scratch space, and not the org's actual production
 repository unless something has explicitly checked that repository out into
 the workspace first:
 
-- `workspace_list` -- list files under a path, optionally recursive (capped at
+- `list_files` -- list files under a path, optionally recursive (capped at
   500 entries per call). Use this first, always. If the folder already has
   content from a previous task, that content is real and visible to you --
   read it before assuming you are starting from nothing.
-- `workspace_read` -- read one UTF-8 text file, up to `max_chars` (default
+- `read_file` -- read one UTF-8 text file, up to `max_chars` (default
   50,000, cap 200,000). Large generated files or binaries will not decode
   cleanly; skip them.
-- `workspace_search` -- case-insensitive substring search across files under a
+- `search_files` -- case-insensitive substring search across files under a
   path, optionally filtered by extension, returning up to 200
   `{path, line, text}` matches. This is your grep. It is line-oriented and
   literal-substring, not regex -- search for the exact token you expect
   (a function name, an error string, an import) rather than a pattern.
-- `workspace_diff` -- unified diff between two files already in the workspace.
+- `file_diff` -- unified diff between two files already in the workspace.
   Useful for comparing two versions of a config or a before/after pair someone
   else left there; not a git tool.
 
@@ -77,17 +77,17 @@ running the real coding CLI agent with network access, scoped to this same
 workspace folder. It is only available when Phase D is enabled for this
 deployment; if it is not, say so rather than fabricating a metric.
 
-For a repository large enough that no one pass can hold it, use `delegate_tasks`
+For a repository large enough that no one pass can hold it, use `task_delegate`
 to fan out 2-3 independent child Tasks (for example: "map the API layer" and
 "map the persistence layer" as separate prompts), each with its own
-`workspace_read`/`workspace_search` grant and a tight token budget, then
+`read_file`/`search_files` grant and a tight token budget, then
 synthesize their reports yourself.
 
 ## Procedure
 
 ### 1. Inventory
 
-- `workspace_list` with `recursive: true` at the repository root (or a
+- `list_files` with `recursive: true` at the repository root (or a
   reasonable subpath if the tree is huge and the task is scoped).
 - Read the manifest that tells you what kind of project this is:
   `pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`, or equivalent.
@@ -105,11 +105,11 @@ factory, a server bootstrap) before moving on.
 ### 2. Trace
 
 Pick the one execution path the task actually needs -- not the whole
-codebase. Follow it with `workspace_read` and `workspace_search`:
+codebase. Follow it with `read_file` and `search_files`:
 
 - Start at the entry point and read forward.
-- When you hit a call into another module, `workspace_search` for where that
-  symbol is defined, then `workspace_read` that file.
+- When you hit a call into another module, `search_files` for where that
+  symbol is defined, then `read_file` that file.
 - Keep a running note of the chain (`entry -> module A -> module B -> effect`)
   so you can present it, not just remember it.
 - Stop tracing once you reach the boundary the task cares about (a database
@@ -121,7 +121,7 @@ no unexplained jump.
 
 ### 3. Quantify (only if the task needs a number)
 
-`workspace_list` and `workspace_search` give you rough signal for free: file
+`list_files` and `search_files` give you rough signal for free: file
 counts per directory, how many files match a given extension, how many hits a
 symbol gets. That is usually enough to answer "how big is this" or "how
 common is this pattern" at the precision a Slack conversation needs.
@@ -151,7 +151,7 @@ State:
   context budget before you reach the part that matters. Scope to the task's
   execution path first; widen only if the answer demands it.
 - **Forgetting the workspace is shared.** Files, notes, or partial clones left
-  by an earlier task in this org are still there. `workspace_list` before
+  by an earlier task in this org are still there. `list_files` before
   assuming a clean slate, and don't silently overwrite something another task
   may still need.
 - **Presenting a guess as a measurement.** If you did not run a real counting
@@ -162,7 +162,7 @@ State:
 
 ## Verification checklist
 
-- [ ] `workspace_list` was run before any claim about the tree's shape
+- [ ] `list_files` was run before any claim about the tree's shape
 - [ ] Every behavioral claim cites a `path` and, where relevant, a line
 - [ ] The traced path is stated end to end, not just its endpoints
 - [ ] Any quantitative claim is either backed by tool output or explicitly

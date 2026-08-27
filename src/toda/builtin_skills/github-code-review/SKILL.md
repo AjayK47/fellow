@@ -18,7 +18,7 @@ Toda has no local checkout and no `git diff` to run — every piece of context f
 
 ## Finding the right action
 
-For every GitHub operation, describe the use case to `COMPOSIO_SEARCH_TOOLS`, inspect the returned schema with `COMPOSIO_GET_TOOL_SCHEMAS`, and call `COMPOSIO_EXECUTE`. Do not pin an action slug or expect a GitHub-specific tool alias:
+For every GitHub operation, describe the use case to `integration_search`, inspect the returned schema with `integration_describe`, and call `integration_execute`. Do not pin an action slug or expect a GitHub-specific tool alias:
 
 - "get the list of files changed in a GitHub pull request" (with additions/deletions per file)
 - "get the diff for a GitHub pull request"
@@ -80,5 +80,5 @@ Structure findings by severity, and keep questions visibly separate from defects
 - **Everything you post is public-ish and permanent.** Inline comments, review verdicts, and summary comments are visible to everyone with repo access and cannot be un-posted the way a private note can be discarded. Draft the full review content in your own reasoning before calling the posting action.
 - **Approval gate.** Reading PR metadata, diffs, and CI status is read-only and executes immediately. Posting a review, inline comments, or a summary comment are writes; they are fully audited and typically execute directly (they are not on the forced-approval destructive/financial/external-comms list), which puts the responsibility on you to only fire the posting call once you're confident in the content — there is no "undo" step afterward.
 - **Match the commit SHA.** If the PR has been updated since you last fetched it (new commits pushed mid-review), re-fetch the head SHA before posting inline comments — stale SHAs cause the comment to fail or attach to the wrong diff view.
-- **Don't conflate local review guidance with this connector.** Nothing here runs `git diff` or reads a local checkout — if a human is instead asking you to review code you already have open in the run's workspace (not a GitHub PR), that's local inspection via `workspace_read`/`workspace_diff`, not this skill's connector path.
-- **Multiple connected GitHub accounts** on the same organization require passing `connected_account_id` explicitly to `COMPOSIO_EXECUTE`.
+- **Don't conflate local review guidance with this connector.** Nothing here runs `git diff` or reads a local checkout — if a human is instead asking you to review code you already have open in the run's workspace (not a GitHub PR), that's local inspection via `read_file`/`file_diff`, not this skill's connector path.
+- **Multiple connected GitHub accounts** on the same organization require passing `connected_account_id` explicitly to `integration_execute`.

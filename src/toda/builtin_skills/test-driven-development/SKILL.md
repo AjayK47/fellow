@@ -13,12 +13,12 @@ platform_key: builtin.hermes.tdd
 activation: {mode: optional}
 required_capabilities: {all_of: [workspace.read, workspace.write]}
 warnings:
-  - Toda cannot execute a test itself -- workspace_write only edits files. Watching a test actually fail and then actually pass requires a Pi child Task; without one, this skill can draft the RED/GREEN/REFACTOR cycle but cannot prove any step happened.
+  - Toda cannot execute a test itself -- write_file only edits files. Watching a test actually fail and then actually pass requires a Pi child Task; without one, this skill can draft the RED/GREEN/REFACTOR cycle but cannot prove any step happened.
   - Never report a test as passing or failing without a real execution behind the claim.
 steps:
   - order: 1
     name: Red
-    description: Write one focused failing test with workspace_write, then get it actually run and confirm it fails for the right reason.
+    description: Write one focused failing test with write_file, then get it actually run and confirm it fails for the right reason.
   - order: 2
     name: Green
     description: Write the smallest implementation that makes that one test pass, then get it actually run and confirm it does.
@@ -39,20 +39,20 @@ thing.**
 
 ## Toda's execution reality
 
-`workspace_write` and `workspace_patch` let you author and edit test files
+`write_file` and `edit_file` let you author and edit test files
 and implementation files directly in the org's shared workspace. Neither one
 runs anything. Toda has no built-in test runner wired up yet -- the
 `code_test` tool exists in the schema but currently always reports that its
 runtime isn't configured, so it cannot be relied on to execute anything.
 
 The only way to get a real pass/fail signal in this harness is
-`delegate_tasks`: a Pi child Task that can install
+`task_delegate`: a Pi child Task that can install
 dependencies and run the project's real test command inside the shared
 workspace. It is an optional, explicitly-enabled capability (Phase D) and may
 not be present in every deployment.
 
 If it is not available for this run: draft the test and the implementation
-with `workspace_write`, describe the RED/GREEN cycle you intend, and say
+with `write_file`, describe the RED/GREEN cycle you intend, and say
 plainly that no execution has actually happened rather than asserting the
 test failed or passed. A described-but-unrun cycle is a plan, not TDD.
 
@@ -77,7 +77,7 @@ describes the behavior (not the implementation). If the test's name needs
 Prefer real code over mocks. A test built entirely from mocked collaborators
 verifies that the mocks were called, not that the behavior works.
 
-Then get it run for real, via `delegate_tasks` ("run this one specific
+Then get it run for real, via `task_delegate` ("run this one specific
 test and report the exact output"), and confirm:
 
 - It fails -- and fails because the behavior is missing, not because of a
@@ -95,7 +95,7 @@ Write the least code that makes the one new test pass. Cheating is
 acceptable here on purpose -- hardcoded return values, obvious duplication,
 skipped edge cases. Refactor comes next; don't reach for it early.
 
-Get it run for real via `delegate_tasks`: the one new test, then the
+Get it run for real via `task_delegate`: the one new test, then the
 full relevant suite, to confirm both the new behavior and no regression.
 Only trust a "tests pass" claim that came from an actual run reported back
 to you.
@@ -103,7 +103,7 @@ to you.
 ### REFACTOR -- clean up with tests staying green
 
 Once green, remove duplication, improve names, extract helpers -- without
-adding new behavior. Re-run the suite via `delegate_tasks` after each
+adding new behavior. Re-run the suite via `task_delegate` after each
 structural change. If a change breaks a test, undo it and take a smaller
 step rather than debugging the refactor and the behavior at the same time.
 
@@ -129,7 +129,7 @@ what the interface actually needs to look like. Take one vertical slice
 - **Reporting a pass or fail you didn't observe.** The single most important
   rule in this environment specifically: Toda's own tools cannot execute
   anything, so any claim about test results must trace back to a real
-  `delegate_tasks` execution.
+  `task_delegate` execution.
 - **Writing implementation before the test exists.** If it happens, delete
   the implementation and start the cycle over -- don't keep it "as
   reference" while writing the test around it.
@@ -145,7 +145,7 @@ what the interface actually needs to look like. Take one vertical slice
 
 - [ ] Every new function/behavior has a test that was written before its
       implementation
-- [ ] Each test's failure was actually observed (via `delegate_tasks`)
+- [ ] Each test's failure was actually observed (via `task_delegate`)
       before the implementation was written
 - [ ] Each test's pass was actually observed after the implementation
 - [ ] The full relevant suite was re-run and confirmed clean after each

@@ -78,7 +78,6 @@ class HarnessMemoryCapture:
             entity_ids=list(task.get("metadata", {}).get("entity_ids") or []),
             metadata={
                 "task_id": task_id,
-                "trace_id": task["trace_id"],
                 "trigger_kind": task["trigger_kind"],
                 "conversation_id": envelope["conversation_id"],
             },
@@ -97,14 +96,13 @@ class HarnessMemoryCapture:
                 )
         self.audit.record(
             task["organization_id"],
-            "memory.task_captured",
+            "memory.capture",
             {
                 "task_id": task_id,
                 "source_id": result["source"]["id"],
                 "memory_count": len(memories),
             },
             principal_id=envelope["principal_id"],
-            trace_id=task["trace_id"],
         )
         return {
             "task_id": task_id,
@@ -261,7 +259,7 @@ class HarnessMemoryCapture:
 
         self.audit.record(
             organization_id,
-            "memory.episode_consolidated",
+            "memory.capture",
             {
                 "episode_id": episode["id"],
                 "group_key": group_key,

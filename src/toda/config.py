@@ -1,8 +1,9 @@
 """Runtime configuration.
 
-Toda reads exactly one file: ``config.json``. There is no ``.env``, no
-environment-variable layer, and nothing writes this file at runtime — an
-operator edits it and restarts the gateway. The previous split (a
+Toda reads exactly one file: ``config.json``. There is no ``.env`` and no
+environment-variable layer. An administrator may update validated model
+assignments through the dashboard; the gateway writes the same file atomically
+and requires a restart. The previous split (a
 hand-edited ``.env`` plus a setup wizard writing back into that same file)
 kept two sources of truth that drifted: roughly half the keys in a typical
 ``.env`` were no longer ``Settings`` fields at all and were silently
@@ -25,11 +26,13 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from toda.providers import ModelAssignment, ProviderConnection, ToolConnection
 
@@ -93,14 +96,24 @@ class StorageConfig(_Section):
     data_dir: Path = Field(default_factory=_default_data_dir)
     db_name: str = "brain.db"
     workspace_root: Path | None = None
+    # Durable organization files and disposable agent worktrees are separate
+    # roots.  Operators can place the latter on an agent-owned volume while
+    # keeping the database, connector state, and control-plane files in
+    # ``data_dir``.
+    agent_workspace_root: Path | None = None
 
     @property
     def db_path(self) -> Path:
-        return self.data_dir / self.db_name
+        return self.data_dir.expanduser() / self.db_name
 
     @property
     def workspaces(self) -> Path:
-        return self.workspace_root or (self.data_dir / "workspaces")
+        return (self.workspace_root or (self.data_dir / "workspaces")).expanduser()
+
+    @property
+    def agent_workspaces(self) -> Path:
+        default = self.data_dir.expanduser().parent / f"{self.data_dir.expanduser().name}-agent-workspaces"
+        return (self.agent_workspace_root or default).expanduser()
 
 
 class OrganizationConfig(_Section):
@@ -115,6 +128,18 @@ class OrganizationConfig(_Section):
     owner_email: str | None = None
 
 
+class ModelPolicyConfig(_Section):
+    """Organization policy governing model selection, pricing ceilings, and rankings."""
+
+    allow_models: list[str] = Field(default_factory=list)
+    deny_models: list[str] = Field(default_factory=list)
+    min_context: int | None = None
+    max_input_price_per_1m: float | None = None
+    max_output_price_per_1m: float | None = None
+    allow_unknown_price: bool = False
+    preference_order: list[str] = Field(default_factory=list)
+
+
 class ModelsConfig(_Section):
     """Credentials belong to named provider connections; model roles
     reference a connection plus a model id, so a key is stored once no
@@ -127,8 +152,13 @@ class ModelsConfig(_Section):
 
     providers: dict[str, ProviderConnection] = Field(default_factory=dict)
     assignments: dict[str, ModelAssignment] = Field(default_factory=dict)
+    policy: ModelPolicyConfig = Field(default_factory=ModelPolicyConfig)
     embedding_dimensions: int = 96
     timeout_seconds: float = 600.0
+    catalog_enabled: bool = True
+    catalog_url: str = "https://models.dev/catalog.json"
+    catalog_refresh_interval_seconds: int = 86_400
+    catalog_timeout_seconds: float = 5.0
     # Enables the underlying model's native extended-thinking tokens via the
     # unified `reasoning` request field. Applied only to the main agent
     # model, not the small auxiliary classifiers, where deeper reasoning
@@ -196,11 +226,18 @@ class MediaConfig(_Section):
 
 
 class AgentConfig(_Section):
+    # Development/tests may run with deterministic offline clients. A
+    # supervised pilot must opt in to this gate so a new Slack/API/dashboard
+    # Task cannot start until behavioral readiness is real-world ready.
+    require_real_world_readiness: bool = False
     # Root Session Manager Tasks coordinate the conversation and synthesize
     # worker results — generous enough for a long multi-stage request
     # without making the Manager loop unbounded.
     max_iterations: int = 50
     max_tool_calls: int = 100
+    max_model_calls: int = 100
+    max_cost_usd: float | None = 10.0
+    max_duration_seconds: int = 3_600
     context_token_budget: int = 200_000
     max_total_tokens: int = 2_000_000
     # Output budget for a single completion, distinct from the input-side
@@ -218,24 +255,48 @@ class AgentConfig(_Section):
     # reasoning iteration extends it.
     session_manager_lease_seconds: int = 3600
     task_execution_lease_seconds: int = 3600
-    # Full-trust `pi` coding child-worker subprocess. Unlike run_code this
-    # has real network access and no approval gate, so it defaults off.
+    # `pi` coding child-worker subprocess. It has network access and no human
+    # approval pause for routine work, so it defaults off and is isolated by a
+    # dedicated Unix account when enabled.
     pi_coding_enabled: bool = False
-    # Pinned here rather than left to Pi's own defaults, which come from the
-    # operator's ~/.pi/agent/settings.json -- otherwise changing the model in
-    # the Pi TUI silently changes what Toda's coding workers run on.
-    pi_provider: str = "openrouter"
-    pi_model: str = "z-ai/glm-5.2"
+    # When Pi is enabled, provider and model must be explicitly configured
+    # by the operator. There is no hidden default model ID.
+    pi_provider: str | None = None
+    pi_model: str | None = None
     # Pi discovers its credential from an environment variable, so the key is
     # injected into the child's env rather than passed as `--api-key`, which
     # would expose it in argv to every process on the host. The value is read
     # from models.providers[pi_credential_connection].api_key.
     pi_credential_env: str = "OPENROUTER_API_KEY"
     pi_credential_connection: str = "reasoning"
+    # Optional low-privilege Unix account for Pi. When configured, the Toda
+    # service must have permission to launch this account (normally via a
+    # dedicated runner/service policy); otherwise startup of a Pi task fails
+    # closed instead of silently running as the control-plane user.
+    pi_execution_user: str | None = None
+    # Temporary directories and environment scrubbing are not an OS boundary
+    # when Pi shares the control-plane Unix account. Keep this true in hosted
+    # deployments so Pi fails closed until a dedicated account is configured.
+    pi_isolation_required: bool = True
+    # Agent-owned home directory. Pi never receives Toda's control-plane home.
+    pi_home: Path | None = None
+    pi_cpu_seconds: int | None = 3_600
+    pi_max_processes: int = 256
+    pi_max_file_bytes: int = 50_000_000
+    pi_memory_bytes: int | None = None
+    # Completed task copies remain available for review for this long; the
+    # recovery heartbeat removes only unreferenced, inactive copies after it.
+    pi_workspace_retention_hours: int = 24
     pi_checkpoint_interval_seconds: int = 3600
     pi_stale_heartbeat_seconds: int = 1800
     pi_poll_interval_seconds: int = 10
     pi_cancel_grace_seconds: int = 20
+
+    @model_validator(mode="after")
+    def _validate_pi_config(self) -> AgentConfig:
+        if self.pi_coding_enabled and (not self.pi_provider or not self.pi_model):
+            raise ValueError("pi_coding_enabled requires explicit pi_provider and pi_model configuration")
+        return self
 
 
 class WorkerConfig(_Section):
@@ -270,18 +331,19 @@ class DashboardConfig(_Section):
 
 
 class ObservabilityConfig(_Section):
-    """Execution tracing. Every field here is read by something.
-
-    `level` and `otel_endpoint` used to sit alongside these and were read
-    nowhere -- the second in particular promised OpenTelemetry export that
-    did not exist. A setting that does nothing is worse than a missing one,
-    because it is believed.
-    """
+    """OpenTelemetry execution telemetry and local trace retention."""
 
     enabled: bool = True
-    capture_payloads: bool = True
+    service_name: str = "toda"
+    environment: str = "development"
+    otlp_endpoint: str | None = None
+    otlp_headers: dict[str, str] = Field(default_factory=dict)
+    export_timeout_seconds: float = 10.0
+    capture_payloads: bool = False
     max_payload_bytes: int = 100_000
     retention_days: int = 7
+    sample_ratio: float = 1.0
+    console_export: bool = False
 
 
 class Settings(_Section):
@@ -315,6 +377,15 @@ def load_settings(path: Path | None = None) -> Settings:
     target = path or config_path()
     if not target.is_file():
         return Settings()
+    if os.name != "nt":
+        try:
+            mode = stat.S_IMODE(target.stat().st_mode)
+        except OSError as exc:
+            raise ConfigError(f"cannot inspect permissions for {target}: {exc}") from exc
+        if mode & 0o077:
+            raise ConfigError(
+                f"{target} must be owner-readable only (chmod 600); it may contain credentials"
+            )
     try:
         raw: Any = json.loads(target.read_text())
     except json.JSONDecodeError as exc:
@@ -325,6 +396,27 @@ def load_settings(path: Path | None = None) -> Settings:
         return Settings.model_validate(raw)
     except ValidationError as exc:
         raise ConfigError(f"{target} is invalid:\n{exc}") from exc
+
+
+def save_settings(value: Settings, path: Path | None = None) -> Path:
+    """Atomically persist validated settings with credential-safe permissions."""
+    target = (path or config_path()).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value.model_dump(mode="json"), handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return target
 
 
 settings = load_settings()

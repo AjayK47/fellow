@@ -15,7 +15,9 @@ Committed: `spec.py` (the fictional organization), `cases.py` (labeled
 expectations), the scorers, the judge, the runner.
 
 Not committed: `evals/data/` (the generated corpus and its SQLite database)
-and `evals/results/` (every run's scores).
+and `evals/results/` (every run's scores). The supervised pilot scenario pack
+is committed in `evals/scenarios.py`; trial summaries are linked to the same
+Task run-summary API used by the operator console.
 
 This works because **the spec pins the facts and the model only writes the
 prose around them**. A case names `mem:acme.renewal.security_review`, never a
@@ -32,23 +34,40 @@ uv run toda-eval build
 # Everything, three samples per model-dependent case.
 uv run toda-eval run
 
-# Just the free, exact suite.
-uv run toda-eval run --offline --suites permissions
-
 # Record what "current" means, so later runs can be compared to it.
 uv run toda-eval run --set-baseline
 ```
 
-`--offline` pins deterministic providers by passing `Settings` into
-`TodaApp`, not through the environment. That distinction matters: the
-embedding provider resolves from config and is called on every ingest, so an
-"offline" mode that only silenced the generator would still make real
-billable calls — which is exactly what `benchmarks/organization_1000.py` did
-for as long as it set `TODA_*` variables nothing reads.
+Both corpus generation and model-dependent suites require configured provider
+assignments. There is no offline benchmark mode: a synthetic model can prove
+plumbing, but it cannot tell us whether the production harness is useful.
 
-On an offline corpus only the permission suite is meaningful. Retrieval
-scores measured against the deterministic hash embedder tell you the
-plumbing works and nothing about ranking, and the runner says so.
+## Supervised pilot comparisons
+
+Run the same scenario version three times per candidate and save each
+`/v1/tasks/{task_id}/run-summary` response with `candidate`, `scenario`, and
+`scenario_version` fields. Aggregate the trial files with:
+
+```bash
+uv run toda-eval compare --input pilot-a.json pilot-b.json --strict
+```
+
+The comparison reports success rate, latency p50/p95, tokens, known cost, and
+run IDs. Privacy violations and incomplete traces are fatal to the comparison
+even when the answer score is high.
+
+To execute the versioned scenario pack directly against configured providers:
+
+```bash
+uv run toda-eval scenarios \
+  --candidate primary=openrouter:openai/gpt-5-mini \
+  --samples 3 --mode shadow --human-scores human-scores.json
+```
+
+Human-score files contain `scores` entries with `candidate`, `scenario`,
+one-based `sample`, a `score` from 0 to 1, and an optional `comment`. Judge and
+human evaluations are persisted on the Task; privacy and authorization gates
+remain fatal regardless of quality score.
 
 ## Reading a result
 
@@ -84,9 +103,8 @@ Add a `Beat` to `spec.py` if the world needs a new fact, then a case in
 asserts that every case resolves to real rows, so a case naming a beat the
 corpus never produced fails loudly instead of scoring a silent zero.
 
-## What this does not cover yet
-
-Tool-call trajectories, skill activation, memory extraction quality, entity
-resolution, and injection resistance beyond what `tests/test_red_team.py`
-already asserts. The four suites here were chosen because they are the ones
-whose absence was actually costing something.
+The scenario pack also exercises tool-call trajectories, connector failures,
+provider failure/retry behavior, cancellation, idempotent delivery, prompt
+injection, and workspace-boundary canaries. These runs invoke configured
+providers and can cost money; external writes remain suppressed unless the
+operator selects write mode and supplies `--confirm-operator`.

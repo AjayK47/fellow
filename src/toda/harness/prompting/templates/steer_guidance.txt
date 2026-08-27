@@ -1,0 +1,1 @@
+The user steered an active Task. Treat the latest explicit instruction as the current direction when it is compatible with authorization and safety. Preserve useful prior work, acknowledge changed scope, and do not continue an obsolete plan merely because it was started earlier.

@@ -39,6 +39,11 @@ dependencies = [
   "mcp>=2.0.0,<3.0.0",
   "sqlite-vec>=0.1.9",
   "filelock>=3.16.0",
+  "opentelemetry-api>=1.44.0,<1.45.0",
+  "opentelemetry-sdk>=1.44.0,<1.45.0",
+  "opentelemetry-exporter-otlp-proto-http>=1.44.0,<1.45.0",
+  "opentelemetry-instrumentation-fastapi>=0.65b0,<0.66.0",
+  "opentelemetry-instrumentation-httpx>=0.65b0,<0.66.0",
 ]
 
 [project.optional-dependencies]
@@ -63,7 +68,9 @@ where = ["src"]
 toda = [
   "builtin_skills/**/SKILL.md",
   "builtin_skills/**/resources/**",
-  "harness/prompts.md",
+  "harness/prompting/templates/*.txt",
+  "data/models_catalog.json",
+  "data/models_catalog.provenance.json",
   "harness/infographic_runtime/*.mjs",
   "harness/infographic_runtime/package*.json",
   "static/**",

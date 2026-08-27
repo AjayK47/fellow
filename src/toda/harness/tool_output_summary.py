@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from toda.harness.prompt_library import load
+from toda.harness.prompting.catalog import load
 
 TOOL_OUTPUT_SUMMARY_SYSTEM_PROMPT = load("tool_output_summary")
 

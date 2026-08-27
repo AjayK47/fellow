@@ -230,11 +230,11 @@ def test_agent_catalog_is_scoped_to_organization_connections(
         "task_id": "task_test",
     }
     listing = brain.tool_registry.get(
-        "composio_list_integrations"
+        "integration_list"
     ).handler({}, runtime)
     assert [item["toolkit"] for item in listing["integrations"]] == ["github"]
 
-    result = brain.tool_registry.get("composio_search").handler(
+    result = brain.tool_registry.get("integration_search").handler(
         {"query": "commits and email"}, runtime
     )
     assert [tool["slug"] for tool in result["tools"]] == [
@@ -243,7 +243,7 @@ def test_agent_catalog_is_scoped_to_organization_connections(
     assert calls[0]["toolkit"] == "github"
 
     other_tenant = {**runtime, "organization_id": "org_not_connected"}
-    isolated = brain.tool_registry.get("composio_search").handler(
+    isolated = brain.tool_registry.get("integration_search").handler(
         {"query": "commits"}, other_tenant
     )
     assert isolated["tools"] == []

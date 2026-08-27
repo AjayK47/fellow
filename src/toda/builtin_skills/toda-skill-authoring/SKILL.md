@@ -47,7 +47,7 @@ format of the file you are reading right now. It is source, not runtime
 state: shipping a new one, or editing an existing one, means committing a
 file to the codebase (or, for a `marketplace`-kind package, to whatever
 additional package root a deployment has configured) so it gets picked up
-the next time the catalog loads. `workspace_write` lets you draft this
+the next time the catalog loads. `write_file` lets you draft this
 file's content for a human to review and commit; it does not, by itself,
 register the skill anywhere a running agent will see it. The rest of this
 skill covers this format.
@@ -87,7 +87,7 @@ Key fields:
   unless every conversation genuinely needs it in scope.
 - **`required_capabilities`** -- `all_of` and/or `any_of` lists of
   capability ids (the same ids tool definitions declare, like
-  `workspace.read` or `task.delegate_tasks`). A skill missing an
+  `workspace.read` or `task.task_delegate`). A skill missing an
   `all_of` capability, or with no member of `any_of` present, is reported as
   needing setup rather than silently offered with instructions the agent
   can't actually follow.
@@ -173,7 +173,7 @@ Before writing frontmatter:
 
 ### 2. Package
 
-Write the frontmatter and body to a draft file with `workspace_write`,
+Write the frontmatter and body to a draft file with `write_file`,
 matching the schema above exactly -- no extra keys, correct `kind`, `name`
 matching the regex. Structure the body so an agent unfamiliar with the
 subject can follow it: what the skill is for, when to use it and when not
@@ -182,7 +182,7 @@ pitfalls, and a closing verification checklist.
 
 ### 3. Validate
 
-At minimum, self-check by reading the draft back with `workspace_read` and
+At minimum, self-check by reading the draft back with `read_file` and
 walking it against: does it start with the opening fence at byte zero, does
 the frontmatter parse as a mapping with only allowed keys, does `name` match
 the pattern, is `kind` one of the three valid values, and -- reading your
@@ -190,7 +190,7 @@ own body slowly -- does any sentence resemble one of the five scanner
 categories above closely enough that it would likely match, even if the
 intent was educational rather than malicious.
 
-If `delegate_tasks` is available, get a real signal from a Pi child Task instead of just a
+If `task_delegate` is available, get a real signal from a Pi child Task instead of just a
 self-check: delegate a task that loads the draft file through the actual
 catalog loader and reports whether it parses and whether the scanner flags
 anything, before proposing the file be committed. A self-review is a good
@@ -199,7 +199,7 @@ survive the real loader.
 
 Once the draft passes, hand it off for a human to add to the source tree
 (or to whatever marketplace root a deployment uses) -- this skill's own
-`workspace_write` step never registers it anywhere on its own.
+`write_file` step never registers it anywhere on its own.
 
 ## Pitfalls
 
@@ -214,7 +214,7 @@ Once the draft passes, hand it off for a human to add to the source tree
 - **Listing a capability the instructions don't use, or omitting one they
   do.** Both produce a skill that's either gated when it shouldn't be, or
   offered when the agent can't actually follow it.
-- **Assuming `workspace_write` registers the skill.** It only drafts the
+- **Assuming `write_file` registers the skill.** It only drafts the
   file; getting it into the running catalog is a separate, human-reviewed
   step.
 - **Treating `marketplace` kind as a way around the scanner.** It changes
@@ -231,7 +231,7 @@ Once the draft passes, hand it off for a human to add to the source tree
 - [ ] No sentence in the body quotes a dangerous command or a secret
       pattern verbatim
 - [ ] The draft was read back and checked against the schema before handoff
-- [ ] If `delegate_tasks` was available, the draft was actually run
+- [ ] If `task_delegate` was available, the draft was actually run
       through the loader rather than only self-reviewed
 - [ ] The handoff states plainly that a human still needs to commit or
       approve the package

@@ -68,7 +68,7 @@ class SessionManagerScheduler:
             # Contention is the normal case on a follow-up, not a failure --
             # recorded so a trace shows the wait rather than an unexplained
             # gap before the answer.
-            self.store.trace.record(
+            self.store.telemetry.record(
                 "session.dispatch.contended",
                 component="session",
                 phase="completed",
@@ -81,7 +81,7 @@ class SessionManagerScheduler:
                 session_id, owner=executor_id, lease_seconds=self.lease_seconds
             ):
                 raise RuntimeError("session manager lease lost before execution")
-            with self.store.trace.span(
+            with self.store.telemetry.span(
                 "session.dispatch",
                 component="session",
                 session_id=session_id,
@@ -190,6 +190,10 @@ class SessionManagerScheduler:
                 trigger_event_id=trigger_event_id,
                 max_iterations=agent.max_iterations,
                 max_tool_calls=agent.max_tool_calls,
+                max_model_calls=getattr(agent, "max_model_calls", agent.max_iterations),
+                max_cost_usd=getattr(agent, "max_cost_usd", 10.0),
+                max_duration_seconds=getattr(agent, "max_duration_seconds", 3_600),
+                max_total_tokens=getattr(agent, "max_total_tokens", 100_000),
                 metadata=self._root_task_metadata(session),
             )
             self._acknowledge(agent, root_task)
@@ -234,6 +238,10 @@ class SessionManagerScheduler:
                 session_id=session_id, envelope=envelope, goal=latest_user_text,
                 trigger_kind=trigger_kind, trigger_event_id=trigger_event_id,
                 max_iterations=agent.max_iterations, max_tool_calls=agent.max_tool_calls,
+                max_model_calls=getattr(agent, "max_model_calls", agent.max_iterations),
+                max_cost_usd=getattr(agent, "max_cost_usd", 10.0),
+                max_duration_seconds=getattr(agent, "max_duration_seconds", 3_600),
+                max_total_tokens=getattr(agent, "max_total_tokens", 100_000),
                 metadata=self._root_task_metadata(session),
             )
             self._acknowledge(agent, root_task)
@@ -245,7 +253,7 @@ class SessionManagerScheduler:
             return AgentOutcome(
                 task_id=root_task["id"],
                 state=AgentRunState(root_task["state"]),
-                trace_id=root_task.get("trace_id", ""),
+                correlation_id=root_task.get("correlation_id"),
             )
 
         # A transient failure (rate limit, timeout, ...) must not be marked

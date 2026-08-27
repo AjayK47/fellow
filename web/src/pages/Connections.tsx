@@ -6,6 +6,139 @@ import { PageHeader, Section, Card, Empty, Pill, Modal } from "../components";
 
 type ConnectorAccount = Record<string, unknown>;
 
+type ModelSettings = {
+  connections: { name: string; provider: string }[];
+  assignments: Record<string, { connection: string; model: string }>;
+  roles: string[];
+};
+
+type SelectableModel = {
+  id: string;
+  name: string;
+  source: string;
+  recommended: boolean;
+  eligibility_reason?: { code?: string; display?: string };
+  ranking_reason?: { code?: string; display?: string };
+};
+
+function ModelAssignments({ tick, onSaved }: { tick: number; onSaved: () => void }) {
+  const { data, error, loading } = useAsync<ModelSettings>(
+    () => api.get("/v1/model-settings"),
+    [tick]
+  );
+  const [role, setRole] = useState("main");
+  const [connection, setConnection] = useState("");
+  const [model, setModel] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!data) return;
+    const assigned = data.assignments[role];
+    const nextConnection = assigned?.connection || data.connections[0]?.name || "";
+    setConnection(nextConnection);
+    setModel(assigned?.model || "");
+  }, [data, role]);
+
+  const { data: catalog, loading: catalogLoading, error: catalogError } = useAsync<{
+    models: SelectableModel[];
+    total: number;
+    catalog: {
+      stale?: boolean;
+      fallback?: boolean;
+      fetched_at?: string;
+      last_refresh_result?: string;
+      retry_after_seconds?: number;
+    };
+  }>(
+    () =>
+      connection
+        ? api.get("/v1/models", { connection_name: connection, role, limit: 200 })
+        : Promise.resolve({ models: [], total: 0, catalog: {} }),
+    [connection, role, tick]
+  );
+
+  useEffect(() => {
+    if (!catalog?.models.length) return;
+    if (!catalog.models.some((item) => item.id === model)) {
+      setModel(catalog.models[0].id);
+    }
+  }, [catalog, model]);
+
+  async function save() {
+    if (!connection || !model) return;
+    setSaving(true);
+    setNotice(null);
+    try {
+      const result = await api.put<{ restart_required: boolean }>(
+        "/v1/model-settings/assignment",
+        { role, connection_name: connection, model }
+      );
+      setNotice(result.restart_required ? "Saved. Restart Toda to load this model." : "Saved.");
+      onSaved();
+    } catch (e) {
+      setNotice(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const selected = catalog?.models.find((item) => item.id === model);
+  return (
+    <Card title="Models" meta={data ? `${Object.keys(data.assignments).length} assigned roles` : undefined}>
+      {loading && <Empty>loading model settings…</Empty>}
+      {error && <Empty>error: {error}</Empty>}
+      {data && data.connections.length === 0 && (
+        <Empty>Add a named provider connection to config.json before assigning models.</Empty>
+      )}
+      {data && data.connections.length > 0 && (
+        <div className="grid gap-4 p-5 lg:grid-cols-[160px_220px_minmax(260px,1fr)_auto] lg:items-end">
+          <label className="grid gap-1.5 text-[12px] font-medium text-ink">
+            Role
+            <select className="select" value={role} onChange={(e) => setRole(e.target.value)}>
+              {data.roles.map((item) => <option key={item} value={item}>{item}</option>)}
+            </select>
+          </label>
+          <label className="grid gap-1.5 text-[12px] font-medium text-ink">
+            Connection
+            <select className="select" value={connection} onChange={(e) => setConnection(e.target.value)}>
+              {data.connections.map((item) => (
+                <option key={item.name} value={item.name}>{item.name} · {item.provider}</option>
+              ))}
+            </select>
+          </label>
+          <label className="grid gap-1.5 text-[12px] font-medium text-ink">
+            Eligible model
+            <select className="select" value={model} onChange={(e) => setModel(e.target.value)} disabled={catalogLoading}>
+              {(catalog?.models || []).map((item) => (
+                <option key={item.id} value={item.id}>{item.name}{item.recommended ? " · recommended" : ""}</option>
+              ))}
+            </select>
+          </label>
+          <button className="btn" disabled={saving || !model} onClick={save}>
+            {saving ? "Saving…" : "Save assignment"}
+          </button>
+          <div className="lg:col-span-4 flex flex-wrap items-center gap-2 text-[11px] text-muted">
+            {catalogError && <span className="text-bad">{catalogError}</span>}
+            {selected && <Pill tone="good">{selected.source}</Pill>}
+            {selected?.eligibility_reason?.display && <span>{selected.eligibility_reason.display}</span>}
+            {selected?.ranking_reason?.display && <span>· {selected.ranking_reason.display}</span>}
+            {catalog && (
+              <span>
+                · models.dev {catalog.catalog.stale || catalog.catalog.fallback ? "needs refresh" : "current"}
+                {catalog.catalog.retry_after_seconds
+                  ? ` · retry in ${Math.ceil(catalog.catalog.retry_after_seconds)}s`
+                  : ""}
+              </span>
+            )}
+            {notice && <span className={notice.startsWith("Saved") ? "text-good" : "text-bad"}>{notice}</span>}
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 const CURATED_INTEGRATIONS: { toolkit: string; label: string; blurb: string; bubble: string }[] = [
   { toolkit: "github", label: "GitHub", blurb: "Issues, pull requests, commits, and reviews.", bubble: "bg-ink text-white" },
   { toolkit: "linear", label: "Linear", blurb: "Issues, projects, and cycles.", bubble: "bg-[#5E6AD2] text-white" },
@@ -560,6 +693,10 @@ export default function Connections() {
           ) : null
         }
       />
+
+      <Section>
+        <ModelAssignments tick={tick} onSaved={() => setTick((value) => value + 1)} />
+      </Section>
 
       {!composioReady && (
         <Section>

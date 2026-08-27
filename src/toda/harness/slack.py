@@ -17,12 +17,11 @@ import httpx
 from toda.config import Settings
 from toda.domain.models import new_id, utcnow
 from toda.harness.models import EventActor, EventScope, NormalizedEvent
-from toda.observability import trace_context
 from toda.storage.db import BrainStore
 
 log = logging.getLogger("toda.slack")
 
-# Backstop for the prompt-level rule in prompts.py (STABLE_SYSTEM_PROMPT):
+# Backstop for the prompt-level rule in prompts.py (CORE_SYSTEM_PROMPT):
 # a live test showed the model still emitting :droplet: on a water-reminder
 # automation despite that instruction being in its system prompt at the
 # time -- prompt adherence alone isn't reliable enough for a hard rule, so
@@ -447,24 +446,22 @@ class SlackGateway:
         }
         if not self.store.upsert_received_event(received):
             return {"accepted": False, "duplicate": True, "event_id": event.id}
-        # Where a trace is born. Everything Toda does in response to this
-        # message -- routing, attention, the agent turn, every tool call,
-        # the reply -- hangs off this one id, because enqueue() stamps the
-        # ambient trace onto each job it creates from here on.
-        with trace_context(
-            trace_id=event.trace_id,
+        with self.store.telemetry.span(
+            "channel.receive",
+            component="slack",
             organization_id=event.organization_id,
             channel_id=event.scope.channel_id,
             principal_id=event.actor.id,
             event_id=event.id,
-        ):
+            input={"type": event.type, "source": event.source},
+        ) as receive_span:
             job = self.queue.enqueue(
                 organization_id=event.organization_id,
                 kind="event.route",
                 payload={"event": event.model_dump(mode="json")},
                 idempotency_key=f"event.route:{event.dedupe_key}",
             )
-            self.store.trace.record(
+            self.store.telemetry.record(
                 "slack.event.accepted",
                 component="slack",
                 phase="completed",
@@ -475,6 +472,7 @@ class SlackGateway:
                 },
                 output={"job_id": job["id"]},
             )
+            receive_span.output({"accepted": True, "job_id": job["id"]})
             self.audit.record(
                 event.organization_id,
                 "slack.event.accepted",
@@ -491,7 +489,7 @@ class SlackGateway:
             "accepted": True,
             "event_id": event.id,
             "job_id": job["id"],
-            "trace_id": event.trace_id,
+            "event_correlation_id": event.event_correlation_id,
         }
 
     def accept_interaction(
@@ -568,13 +566,14 @@ class SlackGateway:
                 "decided_by": decided_by,
             },
             idempotency_key=f"approval.slack:{approval_id}:{action['action_id']}",
+            link_carrier=approval.get("telemetry_carrier"),
         )
         return {"accepted": True, "job_id": job["id"]}
 
     def _resolve_choice_interaction(
         self, payload: dict[str, Any], action: dict[str, Any]
     ) -> dict[str, Any]:
-        """Resolve a request_human_input(choices=...) button/select click.
+        """Resolve a ask_user(choices=...) button/select click.
 
         The interactive element's value only ever carries `task_id::index` —
         Slack caps option/button values at 75 chars, far shorter than a
@@ -672,7 +671,7 @@ class SlackGateway:
         # addressed ones never consulted it.
         #
         # Arbitration between unrelated concurrent requests belongs to the
-        # Session Manager, which has start_parallel_task for exactly that.
+        # Session Manager, which has task_delegate_parallel for exactly that.
         context_key = f"slack:{workspace_id}:{channel_id}"
         conversation_key = context_key
         existing_session = self.store.find_session_by_conversation(
@@ -803,7 +802,9 @@ class SlackGateway:
         message_identity = client_message_id or f"{channel_id}:{ts}:{source_user_id}"
         event = NormalizedEvent(
             id=event_id,
-            trace_id=str(payload.get("trace_id") or new_id("trace")),
+            event_correlation_id=str(
+                payload.get("event_correlation_id") or new_id("event_correlation")
+            ),
             organization_id=organization_id,
             source="slack",
             type=event_type,
@@ -859,9 +860,9 @@ class SlackGateway:
             bot_mentioned=bot_mentioned,
             raw_event=payload,
         )
-        self.store.trace.record(
+        self.store.telemetry.record(
             "slack.event.normalized", component="slack_gateway", phase="completed",
-            input=payload, output=event.model_dump(mode="json"), trace_id=event.trace_id,
+            input=payload, output=event.model_dump(mode="json"),
             event_id=event.id,
         )
         return event

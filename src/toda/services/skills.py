@@ -333,7 +333,7 @@ class SkillsService:
         ]
         # Optional Skill bodies stay out of the base prompt. The compact
         # catalog is always present and the model loads a relevant body with
-        # skill_view. Only mandatory operating constraints are preloaded.
+        # skill_read. Only mandatory operating constraints are preloaded.
         return [
             self._active_skill(skill, reason="destination_mandatory")
             for skill in mandatory
@@ -353,7 +353,7 @@ class SkillsService:
         Hermes's build_skills_system_prompt(): show the *entire* compatible
         skill catalog as a lightweight index and let the model itself
         decide what's relevant and pull in the full content via
-        skill_view/skills_list, rather than a server-side keyword scorer
+        skill_read/skill_list, rather than a server-side keyword scorer
         silently deciding what the model never even gets to see. A keyword
         matcher can't tell "PDF and Document Handling" is the right skill
         for a report request that never uses the word "PDF" and misspells
@@ -361,7 +361,7 @@ class SkillsService:
         unused now (kept for signature compatibility) since nothing here
         pre-filters by relevance anymore; resolve_for_task's small
         mandatory+optional auto-load selection still uses search() as a
-        genuine optimization (skip a manual skill_view round-trip for the
+        genuine optimization (skip a manual skill_read round-trip for the
         common case), it just isn't the only way a skill can be found."""
         self.ensure_platform_skills(organization_id)
         allowed = set(allowed_scope_ids)

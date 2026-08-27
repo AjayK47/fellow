@@ -30,7 +30,7 @@ steps:
 ---
 There is no `blogwatcher-cli` binary or persistent daemon here -- this skill
 is a pattern built from `web_fetch` (to read the blog or its feed) and the
-shared team workspace (`workspace_read`/`workspace_write`) to remember what
+shared team workspace (`read_file`/`write_file`) to remember what
 was already seen. It's designed to run either ad hoc or, more usefully, as a
 recurring `automation_create` goal.
 
@@ -41,7 +41,7 @@ predictable workspace path, e.g. `watchers/blog-<slug>.json` containing the
 most recent post title, URL, and publication date. Before generating any
 digest:
 
-1. `workspace_read` the baseline file for this blog. If it doesn't exist yet,
+1. `read_file` the baseline file for this blog. If it doesn't exist yet,
    this is the *first* check -- record the current posts as the baseline and
    say so; do not report them as new.
 2. `web_fetch` the blog's homepage or its RSS/Atom feed URL if you know it
@@ -50,7 +50,7 @@ digest:
    once).
 3. Compare the fetched posts against the baseline by URL (most reliable) or
    title + date if the URL isn't stable.
-4. `workspace_write` the updated baseline with the newest post(s) before
+4. `write_file` the updated baseline with the newest post(s) before
    reporting anything -- so a delivery failure doesn't cause the same post to
    be re-reported next run.
 
@@ -66,7 +66,7 @@ inconclusive rather than guessing.
 
 Keep it compact: title, one-line summary, and the source URL per new post --
 this is a Slack message, not a document artifact, unless the user explicitly
-wants a running archive (in which case use `brain_create_artifact` to persist
+wants a running archive (in which case use `artifact_create` to persist
 a durable digest log). If this check was triggered by a schedule
 (`trigger_kind` is `automation`) and nothing changed, say so briefly or
 produce no output at all rather than manufacturing an update -- the

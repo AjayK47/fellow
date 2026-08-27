@@ -41,6 +41,18 @@ type Dashboard = {
   attention: Json[];
   interventions: Json[];
   jobs: { counts: Record<string, number>; dead_letters: Json[] };
+  readiness: {
+    mode: string;
+    checks: { name: string; status: string; message: string; remediation: string }[];
+  };
+  catalog: {
+    model_count?: number;
+    provider_count?: number;
+    stale?: boolean;
+    fallback?: boolean;
+    last_refresh_result?: string;
+    fetched_at?: string;
+  };
 };
 
 type AuditEvents = { events: Json[]; count: number };
@@ -169,6 +181,49 @@ export default function Overview() {
               Connect an integration
             </Link>
           </div>
+        </Section>
+      )}
+
+      {data && (
+        <Section>
+          <Card
+            title="Harness readiness"
+            meta={data.readiness.mode.replace(/_/g, " ")}
+          >
+            <div className="grid gap-4 p-5 lg:grid-cols-[220px_220px_1fr]">
+              <div>
+                <div className="text-[11px] font-medium uppercase tracking-wide text-muted">Runtime</div>
+                <div className="mt-2 flex items-center gap-2">
+                  <Pill tone={data.readiness.mode === "real_world_ready" ? "good" : "bad"}>
+                    {data.readiness.mode.replace(/_/g, " ")}
+                  </Pill>
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] font-medium uppercase tracking-wide text-muted">models.dev</div>
+                <div className="mt-2 text-[13px] font-semibold text-ink">
+                  {data.catalog.model_count ?? 0} models · {data.catalog.provider_count ?? 0} providers
+                </div>
+                <div className="mt-1 text-[11px] text-muted">
+                  {data.catalog.stale || data.catalog.fallback ? "refresh required" : data.catalog.last_refresh_result || "current"}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] font-medium uppercase tracking-wide text-muted">Needs attention</div>
+                <div className="mt-2 grid gap-2">
+                  {data.readiness.checks.filter((item) => item.status !== "pass").slice(0, 3).map((item) => (
+                    <div key={item.name} className="flex items-start justify-between gap-4 text-[12px]">
+                      <span><span className="font-medium text-ink">{item.name.replace(/_/g, " ")}</span> · {item.message}</span>
+                      <span className="flex-none text-muted">{item.remediation}</span>
+                    </div>
+                  ))}
+                  {data.readiness.checks.every((item) => item.status === "pass") && (
+                    <div className="text-[12px] text-good">Every readiness check is passing.</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </Card>
         </Section>
       )}
 

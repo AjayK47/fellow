@@ -11,7 +11,7 @@ latest-message-wins rule — not Hermes's own production-scale machinery
 which has no equivalent concept in Toda and would be needless complexity
 here.
 
-The system prompt's "head" (STABLE_SYSTEM_PROMPT, the trusted invocation
+The system prompt's "head" (CORE_SYSTEM_PROMPT, the trusted invocation
 block, and the permission-filtered company context) never passes through
 this at all — `build_agent_messages()` rebuilds it fresh every iteration
 outside the compacted `history` list, so it's structurally protected without
@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from toda.harness.prompt_library import load
+from toda.harness.prompting.catalog import load
 from toda.services.redaction import redact
 
 # Adapted from Hermes's own "[CONTEXT COMPACTION — REFERENCE ONLY]" prefix

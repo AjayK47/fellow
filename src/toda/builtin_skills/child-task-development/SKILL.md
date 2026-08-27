@@ -12,7 +12,7 @@ platform_key: builtin.toda.child_task_development
 activation: {mode: optional}
 required_capabilities: {}
 warnings:
-  - A child Task cannot call delegate_tasks again; keep each prompt completable by one worker.
+  - A child Task cannot call task_delegate again; keep each prompt completable by one worker.
   - Write-capable child Tasks still pass through the normal approval and precondition checks.
   - Sibling Tasks should have genuinely different prompts so their work is complementary.
 steps:
@@ -26,7 +26,7 @@ steps:
     name: Synthesize
     description: Read each child result and decide how it changes the parent Task's answer.
 ---
-Use `delegate_tasks` when a substantial part of the request can be completed
+Use `task_delegate` when a substantial part of the request can be completed
 independently. The tool accepts one to three items, each with exactly:
 
 - `worker_type`: `general` for research, analysis, or bounded actions; `pi` for

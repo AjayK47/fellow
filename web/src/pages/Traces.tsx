@@ -8,7 +8,7 @@ type TraceRow = {
   trace_id: string;
   started_at: string;
   ended_at: string;
-  event_count: number;
+  span_count: number;
   failures: number;
   root_operation: string | null;
   duration_ms: number | null;
@@ -17,15 +17,15 @@ type TraceRow = {
 type Span = {
   span_id: string;
   parent_span_id: string | null;
-  operation: string;
-  component: string;
-  phase: string;
-  started_at: string;
+  name: string;
+  kind: string;
+  status_code: string;
+  status_description: string | null;
+  scope_name: string | null;
   duration_ms: number | null;
-  context: Record<string, unknown>;
-  input: unknown;
-  output: unknown;
-  error: unknown;
+  attributes: Record<string, unknown>;
+  events: unknown[];
+  links: unknown[];
   children: Span[];
 };
 
@@ -51,6 +51,12 @@ function widestSpan(spans: Span[]): number {
   );
 }
 
+function hasSpanData(span: Span, field: "attributes" | "events" | "links"): boolean {
+  return field === "attributes"
+    ? Object.keys(span.attributes).length > 0
+    : span[field].length > 0;
+}
+
 const COMPONENT_TONE: Record<string, string> = {
   slack: "bg-[#4A9D7E]",
   router: "bg-[#7C6BB8]",
@@ -72,10 +78,10 @@ function SpanRow({
 }) {
   const [open, setOpen] = useState(depth < 2);
   const [showPayload, setShowPayload] = useState(false);
-  const failed = span.phase === "failed";
+  const failed = span.status_code === "ERROR";
   const hasChildren = span.children.length > 0;
   const pct = widest > 0 ? Math.max(1, ((span.duration_ms ?? 0) / widest) * 100) : 0;
-  const tone = COMPONENT_TONE[span.component] ?? "bg-[#8A8A8A]";
+  const tone = COMPONENT_TONE[span.scope_name ?? ""] ?? "bg-[#8A8A8A]";
 
   return (
     <>
@@ -100,13 +106,13 @@ function SpanRow({
         <button
           className="flex-none cursor-pointer border-none bg-transparent p-0 font-mono text-[12px] text-ink hover:underline"
           onClick={() => setShowPayload((v) => !v)}
-          title="Show what went in and what came back"
+          title="Show span metadata"
         >
-          {span.operation}
+          {span.name}
         </button>
 
         <span className="flex-none font-mono text-[10px] uppercase tracking-wide text-muted">
-          {span.component}
+          {span.scope_name ?? span.kind}
         </span>
 
         <div className="mx-2 h-[6px] min-w-[40px] flex-1 rounded-full bg-line/50">
@@ -126,16 +132,16 @@ function SpanRow({
           className="border-b border-line/60 bg-paper py-2 pr-3 text-[11px]"
           style={{ paddingLeft: `${28 + depth * 16}px` }}
         >
-          {span.error != null && (
+          {span.status_description && (
             <div className="mb-2">
               <div className="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-bad">error</div>
               <pre className="m-0 overflow-x-auto whitespace-pre-wrap break-words text-[11px] text-bad">
-                {JSON.stringify(span.error, null, 2)}
+                {span.status_description}
               </pre>
             </div>
           )}
-          {(["input", "output"] as const).map((field) =>
-            span[field] == null ? null : (
+          {(["attributes", "events", "links"] as const).map((field) =>
+            !hasSpanData(span, field) ? null : (
               <div key={field} className="mb-2 last:mb-0">
                 <div className="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-muted">
                   {field}
@@ -145,20 +151,6 @@ function SpanRow({
                 </pre>
               </div>
             ),
-          )}
-          {Object.keys(span.context).length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1">
-              {Object.entries(span.context)
-                .filter(([key]) => key !== "trace_id" && key !== "span_id")
-                .map(([key, value]) => (
-                  <span
-                    key={key}
-                    className="rounded bg-line/40 px-1.5 py-0.5 font-mono text-[10px] text-muted"
-                  >
-                    {key}={fmt(value, 40)}
-                  </span>
-                ))}
-            </div>
           )}
         </div>
       )}
@@ -246,7 +238,7 @@ export default function Traces() {
                   </Pill>
                 )}
                 <span className="flex-none text-[11px] text-muted">
-                  {trace.event_count} steps
+                  {trace.span_count} spans
                 </span>
                 <span className="flex-none text-[11px] text-muted">
                   {reltime(trace.started_at)}

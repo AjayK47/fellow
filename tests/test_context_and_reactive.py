@@ -111,6 +111,6 @@ def test_context_emits_audit(brain):
         destination={"type": "internal_agent_session", "id": "s", "is_private": True},
         token_budget=2000,
     )
-    events = brain.audit.list_events("org_acme", event_type="context.prepared")
+    events = brain.audit.list_events("org_acme", event_type="context.build")
     assert events
     assert events[-1]["payload"]["permission_decision_id"]

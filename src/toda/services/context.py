@@ -49,8 +49,8 @@ class ContextService:
         agent_id: str | None = None,
         conversation: dict[str, Any] | None = None,
     ) -> ContextPackage:
-        self.store.trace.record(
-            "context.prepare", component="context", phase="started",
+        self.store.telemetry.record(
+            "context.build", component="context", phase="started",
             input={"task": task, "token_budget": token_budget, "agent_id": agent_id},
             organization_id=organization_id,
         )
@@ -350,7 +350,7 @@ class ContextService:
 
         self.audit.record(
             organization_id=organization_id,
-            event_type="context.prepared",
+            event_type="context.build",
             principal_id=acting_principal_id,
             payload={
                 "request_id": package.request_id,
@@ -365,8 +365,8 @@ class ContextService:
                 "summary": package.summary,
             },
         )
-        self.store.trace.record(
-            "context.prepare", component="context", phase="completed",
+        self.store.telemetry.record(
+            "context.build", component="context", phase="completed",
             output={"request_id": package.request_id, "permission_decision_id": decision_id,
                     "token_estimate": used, "source_count": len(package.sources)},
             organization_id=organization_id,

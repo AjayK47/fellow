@@ -226,7 +226,7 @@ class AutomationService:
         organization_id: str | None = None,
         automation_id: str | None = None,
     ) -> dict[str, Any]:
-        self.store.trace.record(
+        self.store.telemetry.record(
             "automation.tick", component="automations", phase="started",
             input={"organization_id": organization_id, "automation_id": automation_id},
             organization_id=organization_id,
@@ -377,7 +377,7 @@ class AutomationService:
             "activations": activations,
             "skipped": skipped,
         }
-        self.store.trace.record(
+        self.store.telemetry.record(
             "automation.tick", component="automations", phase="completed",
             output=result, organization_id=organization_id,
         )

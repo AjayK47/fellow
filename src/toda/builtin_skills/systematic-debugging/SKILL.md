@@ -45,19 +45,19 @@ gap with a guess.
 
 ## Toda's evidence-gathering tools
 
-- `workspace_read` / `workspace_search` -- read the failing code, the error
-  path, and anything nearby. `workspace_search` is a literal substring
+- `read_file` / `search_files` -- read the failing code, the error
+  path, and anything nearby. `search_files` is a literal substring
   search (not regex): search for the exact error string, function name, or
   variable to find where it's referenced.
-- `workspace_diff` -- compare two versions of a file already in the
+- `file_diff` -- compare two versions of a file already in the
   workspace, useful when someone has left a before/after pair to inspect.
-- `delegate_tasks` -- for a bug that spans multiple independent components
+- `task_delegate` -- for a bug that spans multiple independent components
   (a request path through several services, or several candidate causes
   worth investigating in parallel), fan out 2-3 child Tasks with distinct
   investigation prompts and synthesize their findings yourself. This
   does not replace forming your own ranked hypotheses -- it's for covering
   more ground faster, not for skipping the analysis.
-- `delegate_tasks` -- the way to hand execution to a Pi child Task:
+- `task_delegate` -- the way to hand execution to a Pi child Task:
   a failing test, reproduce a crash, add temporary diagnostic output and
   observe it, or check out and run a specific prior commit. It's a
   full-trust subprocess with real network and package-install access,
@@ -82,7 +82,7 @@ Before forming any theory:
 2. **Build the tightest reproduction you can.** Can this symptom be
    triggered on demand? A failing test at the right seam is the strongest
    form; a scripted repro against fixture input is the next best. If
-   `delegate_tasks` is available, use it to hand that execution to a Pi child Task
+   `task_delegate` is available, use it to hand that execution to a Pi child Task
    reproduction and confirm it goes red on this bug specifically -- not
    just "something failed," but this exact symptom. If the bug is
    intermittent, the immediate goal is raising the reproduction rate high
@@ -95,7 +95,7 @@ Before forming any theory:
    what leaves it, whether config actually propagated the way it was
    supposed to.
 5. **Trace bad data to its source.** When a bad value shows up deep in a
-   call stack, keep tracing upstream (via `workspace_search` for callers)
+   call stack, keep tracing upstream (via `search_files` for callers)
    until you find where it originates. Fix at the source, not where the
    symptom happened to surface.
 
@@ -112,7 +112,7 @@ one sentence with the evidence behind it.
   it stop failing. What's left is the minimal case, and it often becomes
   the regression test later.
 - **Find a working comparison.** Is there similar code elsewhere in the same
-  codebase that works? `workspace_search` for the pattern and read it fully
+  codebase that works? `search_files` for the pattern and read it fully
   — every line, not a skim — before comparing.
 - **List every difference**, however small it looks. Don't pre-filter "that
   can't matter" before checking.

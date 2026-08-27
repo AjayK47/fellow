@@ -32,8 +32,11 @@ def _runtime_for(task: dict) -> dict:
         "principal_id": envelope["principal_id"],
         "destination": envelope["destination"],
         "purpose": envelope["purpose"],
+        "envelope": envelope,
+        "id": task["id"],
         "task_id": task["id"],
         "task_metadata": task.get("metadata") or {},
+        "metadata": task.get("metadata") or {},
     }
 
 
@@ -57,11 +60,21 @@ def test_two_tasks_in_the_same_slack_workspace_share_one_workspace_folder(brain)
     assert workspace_a["id"] == workspace_b["id"]
     assert workspace_a["path"] == workspace_b["path"]
 
-    write_handler = brain.tool_registry.get("workspace_write").handler
-    read_handler = brain.tool_registry.get("workspace_read").handler
+    path_a, _ = brain.workspaces.prepare_task_workspace("org_acme", task_a)
+    task_a["metadata"]["workspace_path"] = str(path_a)
+    brain.store.update_task(task_a)
+    task_a = brain.store.get_task(task_a["id"])
+    write_handler = brain.tool_registry.get("write_file").handler
     write_handler({"path": "notes.txt", "content": "hello from a"}, _runtime_for(task_a))
+    brain.workspaces.publish_task_workspace("org_acme", task_a)
+
+    path_b, _ = brain.workspaces.prepare_task_workspace("org_acme", task_b)
+    task_b["metadata"]["workspace_path"] = str(path_b)
+    brain.store.update_task(task_b)
+    task_b = brain.store.get_task(task_b["id"])
+    read_handler = brain.tool_registry.get("read_file").handler
     result = read_handler({"path": "notes.txt"}, _runtime_for(task_b))
-    assert result["content"] == "hello from a"
+    assert "hello from a" in result["content"]
 
 
 def test_two_different_slack_workspaces_get_separate_folders(brain):
@@ -94,8 +107,13 @@ def test_task_with_no_slack_destination_falls_back_to_org_default_without_crashi
     assert workspace is not None
     assert workspace["slack_workspace_id"] is None
 
-    write_handler = brain.tool_registry.get("workspace_write").handler
+    path, _ = brain.workspaces.prepare_task_workspace("org_acme", task)
+    task["metadata"]["workspace_path"] = str(path)
+    brain.store.update_task(task)
+    task = brain.store.get_task(task["id"])
+    write_handler = brain.tool_registry.get("write_file").handler
     write_handler({"path": "notes.txt", "content": "no slack here"}, _runtime_for(task))
+    brain.workspaces.publish_task_workspace("org_acme", task)
 
     other_task = brain.company_agent.create_invocation(
         envelope=_envelope(brain, conversation="api:internal:task-2"),

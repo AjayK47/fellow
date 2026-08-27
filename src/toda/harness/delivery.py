@@ -115,7 +115,6 @@ class DeliveryOwner:
     session_id: str | None = None
     message_id: str | None = None
     principal_id: str | None = None
-    trace_id: str | None = None
 
     @classmethod
     def for_task(cls, task: dict[str, Any]) -> "DeliveryOwner":
@@ -124,7 +123,6 @@ class DeliveryOwner:
             task_id=task["id"],
             session_id=task.get("session_id"),
             principal_id=(task.get("envelope") or {}).get("principal_id"),
-            trace_id=task.get("trace_id"),
         )
 
     @classmethod
@@ -274,10 +272,10 @@ class DeliveryService:
         task = self.store.get_task(task_id)
         if not task:
             raise KeyError(task_id)
-        self.store.trace.record(
-            "delivery.task", component="delivery", phase="started",
+        self.store.telemetry.record(
+            "delivery.send", component="delivery", phase="started",
             input={"task_id": task_id, "state": task.get("state")},
-            trace_id=task.get("trace_id"), task_id=task_id,
+            task_id=task_id,
         )
         if task["state"] != "completed" or not task.get("final_answer"):
             return {
@@ -388,9 +386,9 @@ class DeliveryService:
                 conversation["updated_at"] = intervention["created_at"]
                 self.store.upsert_conversation_state(conversation)
         result = {"task_id": task_id, "delivered": True, "delivery": delivery}
-        self.store.trace.record(
-            "delivery.task", component="delivery", phase="completed", output=result,
-            trace_id=task.get("trace_id"), task_id=task_id,
+        self.store.telemetry.record(
+            "delivery.send", component="delivery", phase="completed", output=result,
+            task_id=task_id,
         )
         return result
 
@@ -994,6 +992,5 @@ class DeliveryService:
                 "status": status,
             },
             principal_id=owner.principal_id,
-            trace_id=owner.trace_id,
         )
         return delivery

@@ -43,49 +43,51 @@ class ProviderProfile:
     api_mode: ApiMode = "chat_completions"
     models_path: str = "/models"
     api_key_required: bool = True
-    # Curated picker lists as (model_id, note) pairs, kept in the order they
-    # should appear. A raw provider catalog is hundreds of entries and makes an
-    # unusable dropdown, so the picker shows the curated list intersected with
-    # whatever the live catalog confirms is actually available (the approach
-    # Hermes' model picker uses).
-    chat_catalog: tuple[tuple[str, str], ...] = ()
-    embedding_catalog: tuple[tuple[str, str], ...] = ()
-    # Models known to accept image input, for providers whose catalog does not
-    # publish modalities. OpenRouter does publish them, so it needs none here.
-    vision_models: tuple[str, ...] = ()
-    image_catalog: tuple[tuple[str, str], ...] = ()
-    transcription_catalog: tuple[tuple[str, str], ...] = ()
-    tts_catalog: tuple[tuple[str, str], ...] = ()
-    recommended_image_model: str = ""
-    recommended_transcription_model: str = ""
-    recommended_tts_model: str = ""
-    # Roles this provider can actually serve beyond chat. Anthropic, xAI and
-    # Groq have no image / speech / transcription APIs at all, so offering them
-    # for those roles would only produce a runtime failure later.
+    embedding_supported: bool = True
     media_roles: tuple[str, ...] = ()
     headers: tuple[tuple[str, str], ...] = ()
-    # Setup-facing metadata. The onboarding picker reads these instead of
-    # keeping its own parallel copy of provider facts (ported from Hermes'
-    # ProviderProfile, which drives every one of its pickers the same way).
     description: str = ""
     signup_url: str = ""
-    # The model the picker pre-selects. Deliberately NOT catalog entry [0]:
-    # aggregators order their catalogs flagship-first, so defaulting to the
-    # head of the list silently selects the most expensive model available.
-    recommended_model: str = ""
-    # Embeddings are a separate API surface, not a model role every provider
-    # serves. Anthropic has no embeddings endpoint at all.
-    supports_embeddings: bool = True
-    embedding_models: tuple[str, ...] = ()
-    recommended_embedding_model: str = ""
 
     def endpoint(self, connection: ProviderConnection) -> str:
         return (connection.base_url or self.base_url).rstrip("/")
 
 
+# Canonical role and capability contracts — import these in routes.py
+# instead of duplicating the sets.
+VALID_ROLES: frozenset[str] = frozenset({
+    "main", "attention", "extraction", "summary", "review",
+    "vision", "embedding", "image", "transcription", "tts",
+})
+VALID_CAPABILITIES: frozenset[str] = frozenset({
+    "chat", "embedding", "image", "transcription", "tts",
+})
+
+
+def capability_for(*, role: str, capability: str) -> str:
+    """Return the runtime transport required by a picker request."""
+    if role in {"embedding", "image", "transcription", "tts"}:
+        return role
+    return capability
+
+
 class ProviderRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, catalog: Any | None = None) -> None:
         self._profiles: dict[str, ProviderProfile] = {}
+        self._catalog = catalog
+
+    def set_catalog(self, catalog: Any | None) -> None:
+        """Attach the process' pinned models.dev metadata service."""
+        self._catalog = catalog
+
+    def _get_catalog(self) -> Any:
+        if self._catalog is not None:
+            return self._catalog
+        try:
+            from toda.services.models_catalog import models_catalog
+            return models_catalog
+        except Exception:
+            return None
 
     def register(self, profile: ProviderProfile) -> None:
         self._profiles[profile.name] = profile
@@ -93,11 +95,11 @@ class ProviderRegistry:
     def get(self, name: str) -> ProviderProfile:
         try:
             return self._profiles[name]
-        except KeyError as exc:
-            raise ValueError(f"Unknown model provider: {name}") from exc
+        except KeyError:
+            raise KeyError(f"Unknown provider '{name}'") from None
 
-    def list(self) -> tuple[ProviderProfile, ...]:
-        return tuple(sorted(self._profiles.values(), key=lambda item: item.display_name))
+    def list(self) -> list[ProviderProfile]:
+        return list(self._profiles.values())
 
     def models(
         self,
@@ -105,63 +107,264 @@ class ProviderRegistry:
         *,
         capability: str = "chat",
         timeout: float = 20.0,
+        explicit_model: str | None = None,
+        role: str = "main",
+        policy: Any = None,
+        allow_models: list[str] | None = None,
+        deny_models: list[str] | None = None,
+        min_context: int | None = None,
+        max_input_price_per_1m: float | None = None,
+        max_output_price_per_1m: float | None = None,
+        allow_unknown_price: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return the picker list for *connection* and *capability*.
+        """Return the picker list for *connection* and *capability* using models.dev."""
+        if role not in VALID_ROLES:
+            raise ValueError(f"Invalid role '{role}'. Must be one of: {', '.join(sorted(VALID_ROLES))}")
+        if capability not in VALID_CAPABILITIES:
+            raise ValueError(f"Invalid capability '{capability}'. Must be one of: {', '.join(sorted(VALID_CAPABILITIES))}")
 
-        The curated catalog on the profile is the source of order and content.
-        It is intersected with the provider's live catalog so models that were
-        retired upstream disappear without a Toda release, and chat models that
-        do not advertise tool calling are dropped -- the agent loop cannot drive
-        them and they would fail at the first tool call.
-        """
+        preference_order: list[str] | None = None
+        if policy is not None:
+            allow_models = allow_models if allow_models is not None else getattr(policy, "allow_models", None)
+            deny_models = deny_models if deny_models is not None else getattr(policy, "deny_models", None)
+            min_context = min_context if min_context is not None else getattr(policy, "min_context", None)
+            max_input_price_per_1m = max_input_price_per_1m if max_input_price_per_1m is not None else getattr(policy, "max_input_price_per_1m", None)
+            max_output_price_per_1m = max_output_price_per_1m if max_output_price_per_1m is not None else getattr(policy, "max_output_price_per_1m", None)
+            allow_unknown_price = allow_unknown_price or getattr(policy, "allow_unknown_price", False)
+            preference_order = getattr(policy, "preference_order", None)
+
         profile = self.get(connection.provider)
-        # "chat" keeps the unprefixed field names it has always used; every
-        # other capability follows <capability>_catalog / recommended_<x>_model,
-        # so adding a role is two fields on the profile and nothing here.
-        if capability == "chat":
-            curated, preferred = profile.chat_catalog, profile.recommended_model
-        else:
-            curated = getattr(profile, f"{capability}_catalog", ())
-            preferred = getattr(profile, f"recommended_{capability}_model", "")
-        def entry(model_id: str, note: str, item: dict[str, Any] | None) -> dict[str, Any]:
-            return {
-                "id": model_id,
-                "note": note,
-                "free": _is_free((item or {}).get("pricing")),
-                "recommended": model_id == preferred,
-                "vision": _accepts_images(model_id, item, profile),
-            }
+        transport_capability = capability_for(role=role, capability=capability)
+        if transport_capability == "embedding" and (
+            not profile.embedding_supported or profile.api_mode != "chat_completions"
+        ):
+            return []
+        if transport_capability in {"image", "transcription", "tts"} and (
+            transport_capability not in profile.media_roles
+        ):
+            return []
+        catalog = self._get_catalog()
+        candidates: list[dict[str, Any]] = []
+        if catalog is not None:
+            try:
+                candidates = catalog.models(connection.provider)
+            except Exception:
+                candidates = []
 
-        # Only chat models are intersected with the live catalog: /models lists
-        # chat models only, so an embedding, image, speech or transcription
-        # model that works perfectly well (OpenRouter serves /embeddings but
-        # never lists them) would be filtered out of its own picker.
-        if capability != "chat":
-            return [entry(model_id, note, None) for model_id, note in curated]
+        all_catalog_model_ids = {str(m.get("model_id") or "") for m in candidates if m.get("model_id")}
 
-        live = self._live_catalog(connection, profile, timeout)
-
-        if live is None:
-            # No reachable catalog (no key yet, or a provider without a REST
-            # listing). The curated list is still the right answer.
-            return [entry(model_id, note, None) for model_id, note in curated]
-
-        result = [
-            entry(model_id, note, live[model_id])
-            for model_id, note in curated
-            if model_id in live
-            and (capability != "chat" or _supports_tools(live[model_id]))
+        # Filter out deprecated / retired lifecycle states
+        active = [
+            m for m in candidates
+            if str(m.get("lifecycle") or "").lower() not in {"deprecated", "retired", "shutdown", "discontinued"}
         ]
-        if result:
-            return result
-        # Curated and live disagree entirely -- a private mirror, a renamed
-        # deployment, or a self-hosted endpoint. Show the live catalog rather
-        # than an empty dropdown.
-        return [
-            entry(model_id, "", item)
-            for model_id, item in live.items()
-            if _matches_capability(model_id, item, capability)
-        ][:200]
+
+        # Role and capability filtering - exact directional evidence required
+        eligible: list[dict[str, Any]] = []
+
+        for item in active:
+            caps = set(item.get("capabilities") or [])
+            in_mods = set(item.get("input_modalities") or [])
+            out_mods = set(item.get("output_modalities") or [])
+
+            # Modality and capability evidence without assuming missing fields
+            if capability == "embedding" or role == "embedding":
+                if "embedding" in caps:
+                    eligible.append(item)
+            elif capability == "image" or role == "image":
+                if "image" in out_mods or "image_generation" in caps:
+                    eligible.append(item)
+            elif capability == "transcription" or role == "transcription":
+                if "audio" in in_mods and "text" in out_mods:
+                    eligible.append(item)
+            elif capability == "tts" or role == "tts":
+                if "text" in in_mods and "audio" in out_mods:
+                    eligible.append(item)
+            elif role == "vision":
+                if "image" in in_mods and "text" in out_mods:
+                    eligible.append(item)
+            elif role == "main":
+                if "tool_calling" in caps and "text" in out_mods:
+                    if min_context is not None and (item.get("context_length") or 0) < min_context:
+                        continue
+                    eligible.append(item)
+            elif role in {"attention", "extraction", "summary", "review"}:
+                if "text" in out_mods:
+                    eligible.append(item)
+
+        # Policy allow / deny / budget filtering
+        denied_set = set(deny_models or [])
+        allowed_set = set(allow_models) if allow_models is not None else None
+
+        filtered_active: list[dict[str, Any]] = []
+        for item in eligible:
+            mid = str(item.get("model_id") or "")
+            qmid = f"{connection.provider}/{mid}"
+            if mid in denied_set or qmid in denied_set:
+                continue
+            if allowed_set is not None and mid not in allowed_set and qmid not in allowed_set:
+                continue
+            if max_input_price_per_1m is not None:
+                cost = item.get("input_usd_per_1m")
+                if cost is None:
+                    if not allow_unknown_price:
+                        continue
+                elif cost > max_input_price_per_1m:
+                    continue
+            if max_output_price_per_1m is not None:
+                cost = item.get("output_usd_per_1m")
+                if cost is None:
+                    if not allow_unknown_price:
+                        continue
+                elif cost > max_output_price_per_1m:
+                    continue
+            filtered_active.append(item)
+
+        # Provider /models is authoritative for chat-style model transports.
+        # Media registries use separate endpoints and are filtered by the
+        # explicit transport contract above.
+        live = (
+            self._live_catalog(connection, profile, timeout=min(timeout, 5.0))
+            if transport_capability == "chat"
+            else None
+        )
+        live_ids = set(live.keys()) if live is not None else None
+
+        results: list[dict[str, Any]] = []
+
+        for item in filtered_active:
+            model_id = str(item.get("model_id") or "")
+            if not model_id:
+                continue
+
+            if live_ids is not None:
+                # Live list is reachable, model must be present in live list
+                if model_id not in live_ids and f"{connection.provider}/{model_id}" not in live_ids:
+                    continue
+                live_item = live.get(model_id) or live.get(f"{connection.provider}/{model_id}") or {}
+                if role == "main" and not _supports_tools(live_item):
+                    continue
+                source = "models.dev+provider_live"
+                entry_meta = {**item, "live": live_item}
+            else:
+                source = "models.dev"
+                entry_meta = item
+
+            results.append(
+                {
+                    "id": model_id,
+                    "name": item.get("name") or model_id,
+                    "note": "models.dev",
+                    "free": (item.get("input_usd_per_1m") == 0 and item.get("output_usd_per_1m") == 0),
+                    "recommended": False,
+                    "vision": "vision" in (item.get("capabilities") or []) or "image" in (item.get("input_modalities") or []),
+                    "source": source,
+                    "metadata": entry_meta,
+                    "eligibility": "catalog_eligible",
+                    "eligibility_reason": {
+                        "code": "catalog_and_policy_eligible",
+                        "display": "Meets transport, modality, lifecycle, and organization policy requirements",
+                    },
+                    "ranking_reason": "",
+                    "fact_sources": {
+                        "capabilities": "models.dev",
+                        "limits": "models.dev",
+                        "pricing": "models.dev",
+                        "lifecycle": "models.dev",
+                    },
+                }
+            )
+
+        # Preserve explicit custom model ONLY when absent from upstream models.dev
+        if explicit_model:
+            explicit_id = str(explicit_model)
+            if explicit_id not in all_catalog_model_ids:
+                live_item = (live or {}).get(explicit_id)
+                results.append(
+                    {
+                        "id": explicit_id,
+                        "name": explicit_id,
+                        "note": "explicit custom model; metadata unknown",
+                        "free": False,
+                        "recommended": False,
+                        "vision": False,
+                        "source": "custom",
+                        "metadata": {"model_id": explicit_id, "metadata_unknown": True, "live": live_item},
+                        "eligibility": "explicit_custom_unknown",
+                        "eligibility_reason": {
+                            "code": "explicit_model_absent_upstream",
+                            "display": "Explicit custom model is absent from models.dev",
+                        },
+                        "ranking_reason": {
+                            "code": "custom_unverified",
+                            "display": "Custom model without upstream verification",
+                        },
+                        "fact_sources": {
+                            "capabilities": "unknown",
+                            "limits": "unknown",
+                            "pricing": "unknown",
+                            "lifecycle": "unknown",
+                        },
+                    }
+                )
+
+        # Deterministic ranking & recommendation flag
+        results = self._rank_models(
+            results,
+            role=role,
+            allow_models=allow_models,
+            preference_order=preference_order,
+        )
+        return results
+
+    def _rank_models(
+        self,
+        models: list[dict[str, Any]],
+        *,
+        role: str,
+        allow_models: list[str] | None = None,
+        preference_order: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        pref_indices = {name: idx for idx, name in enumerate(preference_order or [])}
+        allow_indices = {name: idx for idx, name in enumerate(allow_models or [])}
+
+        def _sort_key(item: dict[str, Any]) -> tuple:
+            meta = item.get("metadata") or {}
+            is_custom = 1 if item.get("eligibility") == "explicit_custom_unknown" else 0
+            pref_order = pref_indices.get(item["id"], pref_indices.get(meta.get("model_id", ""), 999))
+            allow_order = allow_indices.get(item["id"], allow_indices.get(meta.get("model_id", ""), 999))
+            # Sort only by organization preference and allow-list order.
+            # No global quality ranking — Toda must not invent universal preferences.
+            return (is_custom, pref_order, allow_order, item["id"])
+
+        sorted_models = sorted(models, key=_sort_key)
+        for rank, item in enumerate(sorted_models, start=1):
+            meta = item.get("metadata") or {}
+            model_id = item["id"]
+
+            if item.get("eligibility") == "explicit_custom_unknown":
+                item["recommended"] = False
+                item["ranking_reason"] = {
+                    "code": "custom_unverified",
+                    "display": "Custom model without upstream verification",
+                }
+            else:
+                # Determine the reason code for this ranking position
+                if model_id in pref_indices or meta.get("model_id", "") in pref_indices:
+                    code = "org_preference"
+                elif model_id in allow_indices or meta.get("model_id", "") in allow_indices:
+                    code = "allow_list"
+                else:
+                    code = "alphabetical"
+
+                item["ranking_reason"] = {
+                    "code": code,
+                    "rank": rank,
+                    "display": f"Rank {rank}: {code}",
+                }
+                item["recommended"] = (rank == 1)
+
+        return sorted_models
 
     def _live_catalog(
         self, connection: ProviderConnection, profile: ProviderProfile, timeout: float
@@ -197,23 +400,36 @@ class ProviderRegistry:
         capability: str = "chat",
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Make one real call so setup can prove a key and model actually work.
-
-        Assignments that merely look right are the failure this closes: a typo'd
-        key or a model the account cannot reach otherwise stays invisible until
-        the first live request, long after setup said everything was fine.
-        """
+        """Make one real call so setup can prove a key and model actually work."""
         profile = self.get(connection.provider)
         if profile.api_key_required and not connection.api_key:
             return {"ok": False, "error": f"{profile.display_name} requires an API key"}
         if not model.strip():
             return {"ok": False, "error": "Choose a model first"}
         if timeout is None:
-            # An embedding model that has gone cold can take far longer to
-            # answer its first request than a chat completion does, so it gets
-            # real headroom rather than a short budget that would fail a
-            # working configuration.
             timeout = 90.0 if capability == "embedding" else 25.0
+        if capability in {"image", "transcription", "tts"}:
+            if capability not in profile.media_roles:
+                return {
+                    "ok": False,
+                    "error": f"{profile.display_name} has no {capability} transport",
+                }
+            live = self._live_catalog(connection, profile, timeout=min(timeout, 10.0))
+            if live is None:
+                return {
+                    "ok": False,
+                    "error": f"{profile.display_name} model availability probe failed",
+                }
+            if model not in live and f"{connection.provider}/{model}" not in live:
+                return {
+                    "ok": False,
+                    "error": f"{profile.display_name} does not advertise {model}",
+                }
+            return {
+                "ok": True,
+                "detail": f"{model} is advertised for the {capability} transport",
+                "probe": "authenticated_model_catalog",
+            }
         base = profile.endpoint(connection)
         headers = {**dict(profile.headers), **connection.headers}
         if connection.api_key:
@@ -241,9 +457,6 @@ class ProviderRegistry:
                 url,
                 headers=headers,
                 json=payload,
-                # A provider that accepts the request but never routes it would
-                # otherwise leave setup spinning on "Testing…" forever, so the
-                # read budget is bounded and reported as its own outcome.
                 timeout=httpx.Timeout(timeout, connect=10.0),
             )
         except httpx.TimeoutException:
@@ -276,14 +489,6 @@ class ProviderRegistry:
 
 
 def _provider_error(response: httpx.Response, label: str, model: str) -> str:
-    """Turn a provider error into a sentence that says what to do next.
-
-    Provider wording is often meaningless out of context -- OpenRouter answers
-    a bad key with "User not found.", which reads like the model or the account
-    is missing rather than the credential being wrong. The status code is the
-    reliable signal, so it leads; the provider's own text is appended only when
-    it adds something.
-    """
     detail = ""
     try:
         body = response.json()
@@ -314,54 +519,11 @@ def _provider_error(response: httpx.Response, label: str, model: str) -> str:
     return f"{label} returned HTTP {code}."
 
 
-def _is_free(pricing: Any) -> bool:
-    """True when both prompt and completion pricing are explicitly zero."""
-    if not isinstance(pricing, dict):
-        return False
-    try:
-        return (
-            float(pricing.get("prompt", "0")) == 0
-            and float(pricing.get("completion", "0")) == 0
-        )
-    except (TypeError, ValueError):
-        return False
-
-
-def _accepts_images(
-    model_id: str, item: dict[str, Any] | None, profile: ProviderProfile
-) -> bool:
-    """Whether this model can read images, so no separate vision model is needed.
-
-    Most current text models are already multimodal, and OpenRouter publishes it
-    per model as ``architecture.input_modalities``. Providers that publish
-    nothing fall back to the profile's curated list, so the answer is never a
-    guess made from the model's name.
-    """
-    architecture = (item or {}).get("architecture")
-    if isinstance(architecture, dict):
-        modalities = architecture.get("input_modalities")
-        if isinstance(modalities, list):
-            return "image" in modalities
-    return model_id in profile.vision_models
-
-
 def _supports_tools(item: dict[str, Any]) -> bool:
-    """True unless the model explicitly advertises no tool-calling support.
-
-    Permissive when the field is absent: several OpenAI-compatible gateways
-    never populate it, and treating that as "no" would empty the picker.
-    """
     parameters = item.get("supported_parameters")
     if not isinstance(parameters, list):
         return True
     return "tools" in parameters
-
-
-def _matches_capability(model_id: str, item: dict[str, Any], capability: str) -> bool:
-    looks_like_embedding = "embed" in model_id.lower()
-    if capability == "embedding":
-        return looks_like_embedding
-    return not looks_like_embedding and _supports_tools(item)
 
 
 providers = ProviderRegistry()
@@ -372,40 +534,7 @@ for _profile in (
         description="One key for models from every major lab.",
         signup_url="https://openrouter.ai/keys",
         base_url="https://openrouter.ai/api/v1",
-        chat_catalog=(
-            ("anthropic/claude-sonnet-4.6", ""),
-            ("anthropic/claude-opus-4.6", "most capable, highest cost"),
-            ("anthropic/claude-haiku-4.5", "fastest, lowest cost"),
-            ("openai/gpt-5.4", ""),
-            ("openai/gpt-5.4-mini", "lower cost"),
-            ("openai/gpt-5-mini", "lower cost"),
-            ("google/gemini-3.1-pro-preview", ""),
-            ("google/gemini-3.6-flash", "fast"),
-            ("x-ai/grok-4.5", ""),
-            ("deepseek/deepseek-v4-pro", ""),
-            ("deepseek/deepseek-chat", "low cost"),
-            ("qwen/qwen3-max", ""),
-            ("moonshotai/kimi-k2", ""),
-            ("z-ai/glm-4.6", ""),
-            ("mistralai/mistral-large", ""),
-            ("meta-llama/llama-4-maverick", ""),
-        ),
-        recommended_model="anthropic/claude-sonnet-4.6",
-        media_roles=("image",),
-        image_catalog=(
-            ("google/gemini-2.5-flash-image", ""),
-            ("openai/gpt-image-1", ""),
-        ),
-        recommended_image_model="google/gemini-2.5-flash-image",
-        # Embedding models are absent from OpenRouter's /models listing, which
-        # covers chat models only -- they are served all the same. Never infer
-        # embedding support from that catalog.
-        embedding_catalog=(
-            ("qwen/qwen3-embedding-8b", ""),
-            ("openai/text-embedding-3-large", "highest quality"),
-            ("openai/text-embedding-3-small", "lower cost"),
-        ),
-        recommended_embedding_model="qwen/qwen3-embedding-8b",
+        media_roles=("image", "transcription", "tts"),
     ),
     ProviderProfile(
         name="openai",
@@ -413,49 +542,16 @@ for _profile in (
         description="GPT models and embeddings, direct.",
         signup_url="https://platform.openai.com/api-keys",
         base_url="https://api.openai.com/v1",
-        chat_catalog=(
-            ("gpt-5.4", ""),
-            ("gpt-5.4-mini", "lower cost"),
-            ("gpt-5-mini", "lower cost"),
-            ("gpt-4.1", ""),
-            ("gpt-4o", ""),
-            ("gpt-4o-mini", "lower cost"),
-        ),
-        recommended_model="gpt-5.4",
-        vision_models=("gpt-5.4", "gpt-5.4-mini", "gpt-5-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini"),
         media_roles=("image", "transcription", "tts"),
-        image_catalog=(("gpt-image-1", ""), ("dall-e-3", "")),
-        recommended_image_model="gpt-image-1",
-        transcription_catalog=(
-            ("gpt-4o-transcribe", ""),
-            ("gpt-4o-mini-transcribe", "lower cost"),
-            ("whisper-1", ""),
-        ),
-        recommended_transcription_model="gpt-4o-transcribe",
-        tts_catalog=(("gpt-4o-mini-tts", ""), ("tts-1", ""), ("tts-1-hd", "higher quality"))
-        ,
-        recommended_tts_model="gpt-4o-mini-tts",
-        embedding_catalog=(
-            ("text-embedding-3-large", "highest quality"),
-            ("text-embedding-3-small", "lower cost"),
-        ),
-        recommended_embedding_model="text-embedding-3-large",
     ),
     ProviderProfile(
         name="concentrate",
         display_name="Concentrate",
-        description=(
-            "Unified Responses API across providers. Chat only -- no "
-            "embeddings endpoint, so an embedding role must point elsewhere."
-        ),
+        description="Unified Responses API across providers.",
         signup_url="https://concentrate.ai",
         base_url="https://api.concentrate.ai/v1",
         api_mode="concentrate_responses",
-        chat_catalog=(
-            ("auto", "let Concentrate route the request"),
-        ),
-        recommended_model="auto",
-        supports_embeddings=False,
+        embedding_supported=False,
     ),
     ProviderProfile(
         name="anthropic",
@@ -464,19 +560,8 @@ for _profile in (
         signup_url="https://console.anthropic.com/settings/keys",
         base_url="https://api.anthropic.com/v1",
         api_mode="anthropic_messages",
-        chat_catalog=(
-            ("claude-sonnet-4-6", ""),
-            ("claude-opus-4-6", "most capable, highest cost"),
-            ("claude-haiku-4-5-20251001", "fastest, lowest cost"),
-            ("claude-sonnet-4-5-20250929", ""),
-        ),
-        recommended_model="claude-sonnet-4-6",
-        vision_models=(
-            "claude-sonnet-4-6", "claude-opus-4-6",
-            "claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250929",
-        ),
+        embedding_supported=False,
         headers=(("anthropic-version", "2023-06-01"),),
-        supports_embeddings=False,
     ),
     ProviderProfile(
         name="xai",
@@ -484,12 +569,7 @@ for _profile in (
         description="Grok models, direct.",
         signup_url="https://console.x.ai",
         base_url="https://api.x.ai/v1",
-        chat_catalog=(
-            ("grok-4-fast", "fast, lower cost"),
-            ("grok-4", ""),
-        ),
-        recommended_model="grok-4-fast",
-        supports_embeddings=False,
+        embedding_supported=False,
     ),
     ProviderProfile(
         name="groq",
@@ -497,13 +577,7 @@ for _profile in (
         description="Open models at very high throughput.",
         signup_url="https://console.groq.com/keys",
         base_url="https://api.groq.com/openai/v1",
-        chat_catalog=(
-            ("openai/gpt-oss-120b", ""),
-            ("openai/gpt-oss-20b", "lower cost"),
-            ("moonshotai/kimi-k2-instruct", ""),
-        ),
-        recommended_model="openai/gpt-oss-120b",
-        supports_embeddings=False,
+        embedding_supported=False,
     ),
     ProviderProfile(
         name="deepinfra",
@@ -511,17 +585,6 @@ for _profile in (
         description="Open models and embeddings, pay per token.",
         signup_url="https://deepinfra.com/dash/api_keys",
         base_url="https://api.deepinfra.com/v1/openai",
-        chat_catalog=(
-            ("deepseek-ai/DeepSeek-V3", ""),
-            ("meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8", ""),
-            ("Qwen/Qwen3-235B-A22B", ""),
-        ),
-        recommended_model="deepseek-ai/DeepSeek-V3",
-        embedding_catalog=(
-            ("BAAI/bge-m3", ""),
-            ("Qwen/Qwen3-Embedding-8B", ""),
-        ),
-        recommended_embedding_model="BAAI/bge-m3",
     ),
     ProviderProfile(
         name="custom",

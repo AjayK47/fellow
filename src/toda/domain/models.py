@@ -396,6 +396,7 @@ class AuditEvent(BaseModel):
     principal_id: str | None = None
     application_id: str | None = None
     trace_id: str | None = None
+    correlation_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utcnow)
 

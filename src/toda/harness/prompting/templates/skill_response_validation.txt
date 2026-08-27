@@ -1,0 +1,1 @@
+Validate whether the proposed skill response follows the supplied skill contract, preserves authorization boundaries, and answers the requested outcome. Report concrete violations only. Do not execute any proposed action.

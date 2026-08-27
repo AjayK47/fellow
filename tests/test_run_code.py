@@ -227,6 +227,7 @@ def test_run_code_end_to_end_calls_back_into_a_real_read_tool(
         artifacts=brain.artifacts,
         web_tools=brain.web_tools,
         run_code_enabled=True,
+        run_code_isolation_required=False,
         run_code_timeout_seconds=10,
         run_code_max_tool_calls=5,
     )
@@ -240,7 +241,7 @@ def test_run_code_end_to_end_calls_back_into_a_real_read_tool(
     }
     script = (
         "import toda_tools\n"
-        "result = toda_tools.brain_search(query='Acme export')\n"
+        "result = toda_tools.memory_search(query='Acme export')\n"
         "print(result.get('count'))\n"
     )
     output = run_code.handler({"code": script}, runtime)

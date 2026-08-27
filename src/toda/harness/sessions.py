@@ -349,7 +349,7 @@ class SessionService:
         # An ordinary steering message only injects into the root's own
         # live loop if it's genuinely mid-iteration right now; children are
         # never touched mechanically here -- revising/cancelling a specific
-        # child is the Manager's own judgment call (manage_child_task),
+        # child is the Manager's own judgment call (task_manage),
         # made once it wakes and reads this message in the transcript.
         if root["state"] == "running":
             self.store.push_task_signal(

@@ -83,7 +83,7 @@ def test_a_conversation_turn_can_see_what_is_connected(brain):
     at all, so it could not find out and guessed."""
     from toda.harness.conversation import _CONVERSATION_READ_TOOLS
 
-    assert "composio_list_integrations" in _CONVERSATION_READ_TOOLS
+    assert "integration_list" in _CONVERSATION_READ_TOOLS
 
 
 def test_doing_connector_work_still_requires_a_task(brain):
@@ -94,13 +94,13 @@ def test_doing_connector_work_still_requires_a_task(brain):
     from toda.harness.conversation import _CONVERSATION_READ_TOOLS
 
     for name in (
-        "COMPOSIO_SEARCH_TOOLS",
-        "COMPOSIO_GET_TOOL_SCHEMAS",
-        "COMPOSIO_EXECUTE",
-        "delegate_tasks",
+        "integration_search",
+        "integration_describe",
+        "integration_execute",
+        "task_delegate",
         "plan_create",
-        "workspace_read",
-        "pdf_extract",
+        "read_file",
+        "pdf_create",
     ):
         assert name not in _CONVERSATION_READ_TOOLS, name
 
@@ -144,7 +144,7 @@ def test_an_unfinished_turn_becomes_a_task_instead_of_raising(brain):
                 content="",
                 tool_calls=[
                     ModelToolCall(
-                        id=new_id("call"), name="brain_search", arguments={"query": "x"}
+                        id=new_id("call"), name="memory_search", arguments={"query": "x"}
                     )
                 ],
             )

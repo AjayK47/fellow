@@ -51,7 +51,7 @@ class IngestionService:
         event-routing control path calls directly so a slow embedding
         provider can never delay wake (memory ingestion/retrieval plan §2
         Phase A)."""
-        self.store.trace.record(
+        self.store.telemetry.record(
             "knowledge.ingestion.persist", component="ingestion", phase="started",
             input={"source_system": source_system, "source_type": source_type,
                    "external_id": external_id, "content": content, "scope_id": scope_id},
@@ -106,7 +106,7 @@ class IngestionService:
             principal_id=author_entity_id,
             payload={"source_id": data["id"], "content_hash": content_hash},
         )
-        self.store.trace.record(
+        self.store.telemetry.record(
             "knowledge.ingestion.persist", component="ingestion", phase="completed",
             output={"source_id": data["id"], "content_hash": content_hash, "version": version},
             organization_id=organization_id,
@@ -125,10 +125,10 @@ class IngestionService:
         extract memories + update the reality graph only when `learn` is
         set. Runs in the knowledge lane (harness/worker.py), never inline
         on the wake path."""
-        self.store.trace.record(
+        self.store.telemetry.record(
             "knowledge.ingestion.process", component="ingestion", phase="started",
             input={"source_id": source.get("id"), "learn": learn, "processing_mode": processing_mode},
-            trace_id=source.get("trace_id"), organization_id=source.get("organization_id"),
+            organization_id=source.get("organization_id"),
         )
         chunks = self.indexing.index_source(source)
 
@@ -159,10 +159,10 @@ class IngestionService:
             "memories": memories,
             "reality": reality_result,
         }
-        self.store.trace.record(
+        self.store.telemetry.record(
             "knowledge.ingestion.process", component="ingestion", phase="completed",
             output={"source_id": source.get("id"), "chunk_count": len(chunks), "memory_count": len(memories)},
-            trace_id=source.get("trace_id"), organization_id=source.get("organization_id"),
+            organization_id=source.get("organization_id"),
         )
         return result
 

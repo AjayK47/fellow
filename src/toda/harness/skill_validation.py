@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from toda.harness.prompt_library import load
+from toda.harness.prompting.catalog import load
 
 
 SKILL_VALIDATION_SCHEMA: dict[str, Any] = {

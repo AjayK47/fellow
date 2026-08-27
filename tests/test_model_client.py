@@ -415,3 +415,40 @@ def test_the_deterministic_model_implements_the_whole_protocol():
         reasoning=False,
     )
     assert response.content
+
+
+def test_anthropic_usage_derives_total_and_preserves_cost():
+    from toda.harness.model_client import normalize_usage
+
+    raw_anthropic = {
+        "input_tokens": 1200,
+        "output_tokens": 300,
+        "cache_read_input_tokens": 800,
+        "cost_usd": 0.0095,
+        "cost_state": "actual",
+    }
+    normalized = normalize_usage(raw_anthropic)
+    assert normalized["input_tokens"] == 1200
+    assert normalized["output_tokens"] == 300
+    assert normalized["total_tokens"] == 1500
+    assert normalized["cached_input_tokens"] == 800
+    assert normalized["cost_usd"] == 0.0095
+    assert normalized["cost_state"] == "actual"
+
+
+def test_usage_normalization_vocabularies():
+    from toda.harness.model_client import normalize_usage
+
+    # Chat Completions vocabulary
+    raw_openai = {
+        "prompt_tokens": 500,
+        "completion_tokens": 150,
+        "total_tokens": 650,
+        "completion_tokens_details": {"reasoning_tokens": 50},
+    }
+    normalized = normalize_usage(raw_openai)
+    assert normalized["input_tokens"] == 500
+    assert normalized["output_tokens"] == 150
+    assert normalized["total_tokens"] == 650
+    assert normalized["reasoning_tokens"] == 50
+    assert normalized["cost_state"] == "unavailable"

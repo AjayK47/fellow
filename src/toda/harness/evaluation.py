@@ -25,6 +25,9 @@ class HarnessEvaluationService:
         task_id: str | None = None,
         attention_evaluation_id: str | None = None,
         comment: str | None = None,
+        score: float | None = None,
+        evaluator: str | None = None,
+        rubric_version: str | None = None,
     ) -> dict[str, Any]:
         allowed = {
             "helpful",
@@ -35,6 +38,8 @@ class HarnessEvaluationService:
             "missed_critical_event",
             "action_correct",
             "action_incorrect",
+            "judge_evaluation",
+            "human_evaluation",
         }
         if feedback_type not in allowed:
             raise ValueError(f"unsupported feedback type: {feedback_type}")
@@ -46,6 +51,9 @@ class HarnessEvaluationService:
             "feedback_type": feedback_type,
             "principal_id": principal_id,
             "comment": comment,
+            "score": max(0.0, min(1.0, float(score))) if score is not None else None,
+            "evaluator": evaluator,
+            "rubric_version": rubric_version,
             "created_at": utcnow().isoformat(),
         }
         with self.store.cursor() as cur:
@@ -70,6 +78,27 @@ class HarnessEvaluationService:
             item,
             principal_id=principal_id,
         )
+        metrics = getattr(getattr(self.store, "telemetry", None), "metrics", None)
+        if metrics is not None:
+            # Keep evaluator labels bounded and make qualitative feedback
+            # queryable as a stable score without treating missing feedback
+            # as a zero.  Positive/negative is intentionally coarse; the
+            # detailed feedback type remains in the durable evaluation row.
+            metric_score = (
+                item["score"]
+                if item["score"] is not None
+                else 1.0
+                if feedback_type in {"helpful", "acknowledged", "action_correct"}
+                else 0.0
+            )
+            try:
+                metrics.gauge(
+                    "toda_feedback_score",
+                    metric_score,
+                    labels={"outcome": "positive" if metric_score >= 0.5 else "negative"},
+                )
+            except Exception:
+                pass
         if self.reality:
             self.reality.record_judgment(
                 organization_id=organization_id,
@@ -139,7 +168,7 @@ class HarnessEvaluationService:
                     completed / terminal if terminal else None
                 ),
                 "total_model_tokens": sum(
-                    int((task.get("usage") or {}).get("total_tokens", 0))
+                    int((task.get("usage") or {}).get("total_tokens") or 0)
                     for task in tasks
                 ),
             },

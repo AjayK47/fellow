@@ -322,7 +322,7 @@ class MCPClientService:
         server = self._owned(server_id, organization_id)
         if not server.get("enabled") or server.get("status") != "ready":
             raise RuntimeError("MCP server is not ready")
-        self.store.trace.record(
+        self.store.telemetry.record(
             "mcp.tool.call", component="mcp", phase="started",
             input={"server_id": server_id, "remote_name": remote_name, "arguments": arguments},
             organization_id=organization_id,
@@ -330,7 +330,7 @@ class MCPClientService:
         try:
             result = self._run_async(self._call(server, remote_name, arguments))
         except Exception as exc:
-            self.store.trace.record(
+            self.store.telemetry.record(
                 "mcp.tool.call", component="mcp", phase="failed",
                 error={"type": type(exc).__name__, "message": str(exc)}, organization_id=organization_id,
             )
@@ -340,7 +340,7 @@ class MCPClientService:
             "remote_tool": remote_name,
             "result": _jsonable(result),
         }
-        self.store.trace.record(
+        self.store.telemetry.record(
             "mcp.tool.call", component="mcp", phase="completed", output=output,
             organization_id=organization_id,
         )
@@ -458,6 +458,12 @@ class MCPClientService:
         server["last_tested_at"] = now
         server["updated_at"] = now
         self._upsert(server)
+        self.store.record_connector_health(
+            server["organization_id"],
+            f"mcp:{server['id']}",
+            status="ok",
+            detail={"tool_count": len(tools)},
+        )
         if server.get("enabled"):
             self._register_server_tools(server)
         self.audit.record(
@@ -473,6 +479,12 @@ class MCPClientService:
         server["last_tested_at"] = utcnow().isoformat()
         server["updated_at"] = server["last_tested_at"]
         self._upsert(server)
+        self.store.record_connector_health(
+            server["organization_id"],
+            f"mcp:{server['id']}",
+            status="error",
+            detail={"error_type": type(exc).__name__},
+        )
         self._unregister_server_tools(server["id"])
 
     def _register_server_tools(self, server: dict[str, Any]) -> None:

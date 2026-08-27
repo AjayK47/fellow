@@ -59,7 +59,7 @@ a file that has to be found and re-read. Keep it that way: call
 
 - The goal has more than one real, orderable step, or has dependencies
   between steps.
-- The work will be delegated to `delegate_tasks`
+- The work will be delegated to `task_delegate`
   child Tasks) or checked in on later, and needs to be legible to something
   other than your own immediate reasoning.
 
@@ -88,7 +88,7 @@ order. For each step, before calling `plan_create`:
   the three most likely causes with supporting evidence" rather than
   "investigate the issue."
 - Set `dependencies` to the ids of steps that must complete first. Steps with
-  no dependency on each other can run in parallel later (via `delegate_tasks`)
+  no dependency on each other can run in parallel later (via `task_delegate`)
   if that's worth the overhead.
 - Leave status as `pending` for anything not yet started.
 
@@ -113,7 +113,7 @@ Work through steps respecting their dependencies. As you go:
 
 ## Delegation
 
-For independent steps with no shared dependency, `delegate_tasks` can run up to
+For independent steps with no shared dependency, `task_delegate` can run up to
 three child Tasks in parallel, each
 with its own prompt, tool grant, and token/time budget. This is a good
 fit once a step is genuinely self-contained -- give the child Task the

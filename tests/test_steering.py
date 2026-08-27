@@ -104,6 +104,7 @@ def _provision_workspace(brain) -> None:
         owner_id="person_ajay",
         scope_id="scope_org_public",
     )
+    brain.pi_task_executor.isolation_required = False
 
 
 def _pid_alive(pid: int) -> bool:

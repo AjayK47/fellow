@@ -59,7 +59,7 @@ class InvocationEnvelope(BaseModel):
     permission_decision_id: str
     allowed_scope_ids: list[str] = Field(default_factory=list)
     delegated_by: str | None = None
-    trace_id: str = Field(default_factory=lambda: new_id("trace"))
+    correlation_id: str = Field(default_factory=lambda: new_id("correlation"))
 
 
 class EventActor(BaseModel):
@@ -78,7 +78,7 @@ class EventScope(BaseModel):
 
 class NormalizedEvent(BaseModel):
     id: str = Field(default_factory=lambda: new_id("evt"))
-    trace_id: str = Field(default_factory=lambda: new_id("trace"))
+    event_correlation_id: str = Field(default_factory=lambda: new_id("event_correlation"))
     organization_id: str
     source: str
     type: str
@@ -207,4 +207,4 @@ class AgentOutcome(BaseModel):
     answer: str | None = None
     approval_id: str | None = None
     error: str | None = None
-    trace_id: str
+    correlation_id: str | None = None

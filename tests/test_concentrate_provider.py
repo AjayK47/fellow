@@ -185,11 +185,15 @@ def test_the_provider_resolves_through_the_registry():
 def test_embeddings_refuse_a_non_chat_provider():
     """Concentrate has no embeddings endpoint, so an embedding role must
     point elsewhere -- OpenRouter keeps serving them."""
-    from toda.providers import providers
+    from toda.providers import ProviderConnection, providers
 
     profile = providers.get("concentrate")
     assert profile.api_mode == "concentrate_responses"
-    assert profile.supports_embeddings is False
+    embedding_models = providers.models(
+        ProviderConnection(provider="concentrate", api_key="k"),
+        capability="embedding",
+    )
+    assert embedding_models == []
 
 
 def test_a_trailing_model_turn_gets_a_synthetic_user_turn(monkeypatch):

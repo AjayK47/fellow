@@ -24,7 +24,7 @@ from toda.harness.media_providers import (
     SpeechProvider,
     TranscriptionProvider,
 )
-from toda.harness.prompt_library import load
+from toda.harness.prompting.catalog import load
 from toda.services.scope_resolution import resolve_scope
 
 

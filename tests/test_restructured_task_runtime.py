@@ -25,7 +25,7 @@ def test_delegation_uses_one_waiting_state_with_child_reason(brain):
             ModelResponse(
                 tool_calls=[
                     ModelToolCall(
-                        name="delegate_tasks",
+                        name="task_delegate",
                         arguments={
                             "tasks": [
                                 {"worker_type": "general", "prompt": "Inspect system A"},

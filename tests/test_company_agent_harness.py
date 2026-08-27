@@ -100,12 +100,12 @@ def test_request_batch_approval_pauses_once_then_pre_approves_declared_actions(b
 
     batch_call = ModelToolCall(
         id="call_batch",
-        name="request_batch_approval",
+        name="request_approval",
         arguments={
-            "summary": "Set up a recurring check and run some code for it.",
+            "summary": "Set up a recurring check and delete a file.",
             "actions": [
                 {"tool_name": "skill_propose_create", "description": "Draft the recurring check skill"},
-                {"tool_name": "run_code", "description": "Compute the summary"},
+                {"tool_name": "delete_file", "description": "Delete temporary file"},
             ],
         },
     )
@@ -138,9 +138,9 @@ def test_request_batch_approval_pauses_once_then_pre_approves_declared_actions(b
     second_result = brain.tool_executor.execute(run=run, call=second_proposal_call)
     assert second_result.status == "waiting_for_approval"
 
-    run_code_call = ModelToolCall(id="call_run_code", name="run_code", arguments={"code": "print(1)"})
-    run_code_result = brain.tool_executor.execute(run=run, call=run_code_call)
-    assert run_code_result.status != "waiting_for_approval"
+    delete_file_call = ModelToolCall(id="call_delete_file", name="delete_file", arguments={"path": "test.txt"})
+    delete_file_result = brain.tool_executor.execute(run=run, call=delete_file_call)
+    assert delete_file_result.status != "waiting_for_approval"
 
 
 def test_batch_approval_does_not_pre_approve_undeclared_tools(brain):
@@ -153,10 +153,10 @@ def test_batch_approval_does_not_pre_approve_undeclared_tools(brain):
     run = brain.store.get_task(run["id"])
     batch_call = ModelToolCall(
         id="call_batch_narrow",
-        name="request_batch_approval",
+        name="request_approval",
         arguments={
-            "summary": "Just run some code.",
-            "actions": [{"tool_name": "run_code", "description": "Compute something"}],
+            "summary": "Just delete a file.",
+            "actions": [{"tool_name": "delete_file", "description": "Delete temporary file"}],
         },
     )
     batch_result = brain.tool_executor.execute(run=run, call=batch_call)
@@ -188,7 +188,7 @@ def test_write_tool_pauses_and_resumes_from_approval(brain):
                 tool_calls=[
                     ModelToolCall(
                         id="call_delete_repo",
-                        name="COMPOSIO_EXECUTE",
+                        name="integration_execute",
                         arguments={
                             "tool_slug": "GITHUB_DELETE_A_REPOSITORY",
                             "arguments": {"owner": "acme", "repo": "exports"},
@@ -215,7 +215,7 @@ def test_write_tool_pauses_and_resumes_from_approval(brain):
     assert outcome.state.value == "waiting"
     approval = brain.store.get_harness_record("approvals", outcome.approval_id)
     assert approval["status"] == "pending"
-    assert approval["tool_name"] == "COMPOSIO_EXECUTE"
+    assert approval["tool_name"] == "integration_execute"
 
     resumed = brain.company_agent.resume_after_approval(
         approval_id=approval["id"],
@@ -251,7 +251,7 @@ def test_auto_approve_writes_flag_still_creates_an_approved_record(
                 tool_calls=[
                     ModelToolCall(
                         id="call_delete_repo_auto",
-                        name="COMPOSIO_EXECUTE",
+                        name="integration_execute",
                         arguments={
                             "tool_slug": "GITHUB_DELETE_A_REPOSITORY",
                             "arguments": {"owner": "acme", "repo": "exports"},
@@ -395,7 +395,7 @@ def test_resume_after_approval_failure_does_not_leave_a_zombie_run(brain):
                     tool_calls=[
                         ModelToolCall(
                             id="call_zombie",
-                            name="COMPOSIO_EXECUTE",
+                            name="integration_execute",
                             arguments={
                                 "tool_slug": "GITHUB_DELETE_A_REPOSITORY",
                                 "arguments": {"owner": "acme", "repo": "zombie"},
@@ -585,14 +585,14 @@ def test_parallel_read_tool_calls_execute_concurrently(brain):
         trigger_kind="reactive",
         initial_message="run two slow reads",
     )
-    started = time.monotonic()
     outcome = brain.company_agent.execute_task(run["id"])
-    elapsed = time.monotonic() - started
 
     assert outcome.state.value == "completed"
-    # Serial execution would take >=0.6s; concurrent execution should finish
-    # in roughly one call's duration plus overhead.
-    assert elapsed < 0.55, f"expected concurrent execution, took {elapsed:.2f}s"
+    timestamps = dict(call_log)
+    # Prove overlap directly instead of timing the whole agent iteration,
+    # whose SQLite/telemetry overhead varies under the full test suite.
+    assert timestamps["start:a"] < timestamps["end:b"]
+    assert timestamps["start:b"] < timestamps["end:a"]
     labels_started = {name.split(":")[1] for name, _ in call_log if name.startswith("start")}
     assert labels_started == {"a", "b"}
 
@@ -651,6 +651,11 @@ def test_context_is_recomputed_after_a_write_tool_call(brain, monkeypatch):
     see on its very next turn -- the cache must invalidate in that case,
     not just blindly reuse the first snapshot for the whole run."""
     monkeypatch.setattr(brain.action_reviewer, "review", lambda **_kwargs: "approve")
+    brain.workspaces.get_or_create(
+        organization_id="org_acme",
+        owner_id="person_ajay",
+        scope_id="scope_org_public",
+    )
     calls = _spy_on_prepare_context(brain)
     brain.company_agent.model = ScriptedModelClient(
         [
@@ -659,7 +664,7 @@ def test_context_is_recomputed_after_a_write_tool_call(brain, monkeypatch):
                 tool_calls=[
                     ModelToolCall(
                         id="call_write",
-                        name="workspace_write",
+                        name="write_file",
                         arguments={"path": "notes.txt", "content": "hello"},
                     )
                 ],
@@ -689,11 +694,11 @@ def test_read_and_write_calls_in_one_iteration_still_pause_correctly(brain):
                 content="",
                 tool_calls=[
                     ModelToolCall(
-                        id="call_read", name="brain_search", arguments={"query": "Acme export"}
+                        id="call_read", name="memory_search", arguments={"query": "Acme export"}
                     ),
                     ModelToolCall(
                         id="call_write",
-                        name="COMPOSIO_EXECUTE",
+                        name="integration_execute",
                         arguments={
                             "tool_slug": "GITHUB_DELETE_A_REPOSITORY",
                             "arguments": {"owner": "acme", "repo": "exports"},
@@ -729,10 +734,10 @@ def test_duplicate_tool_calls_in_one_turn_execute_only_once(brain):
                 content="",
                 tool_calls=[
                     ModelToolCall(
-                        id="call_a", name="brain_search", arguments={"query": "Acme export"}
+                        id="call_a", name="memory_search", arguments={"query": "Acme export"}
                     ),
                     ModelToolCall(
-                        id="call_b", name="brain_search", arguments={"query": "Acme export"}
+                        id="call_b", name="memory_search", arguments={"query": "Acme export"}
                     ),
                 ],
                 finish_reason="tool_calls",
@@ -833,7 +838,7 @@ def _pending_approval(brain, *, conversation: str) -> str:
                 tool_calls=[
                     ModelToolCall(
                         id="call_delete_repo",
-                        name="COMPOSIO_EXECUTE",
+                        name="integration_execute",
                         arguments={
                             "tool_slug": "GITHUB_DELETE_A_REPOSITORY",
                             "arguments": {"owner": "acme", "repo": "exports"},
@@ -948,7 +953,7 @@ def _pending_question_with_choices(brain, *, conversation: str) -> tuple[str, li
                 tool_calls=[
                     ModelToolCall(
                         id="call_ask",
-                        name="request_human_input",
+                        name="ask_user",
                         arguments={
                             "question": "How should we handle the export failure?",
                             "reason": "Multiple valid remediation paths.",
@@ -1063,7 +1068,7 @@ def test_choice_button_click_resumes_session_manager_task(brain):
                 tool_calls=[
                     ModelToolCall(
                         id="call_task_ask",
-                        name="request_human_input",
+                        name="ask_user",
                         arguments={
                             "question": "How should we handle the export failure?",
                             "reason": "Multiple valid remediation paths.",
@@ -1174,21 +1179,21 @@ def test_status_checkpoint_tracking_and_live_update_message(brain):
     )
     linear_call = ModelToolCall(
         id="c1",
-        name="COMPOSIO_EXECUTE",
+        name="integration_execute",
         arguments={"tool_slug": "LINEAR_CREATE_ISSUE", "arguments": {}},
     )
     linear_definition = ToolDefinition(
-        name="COMPOSIO_EXECUTE",
+        name="integration_execute",
         description="d",
         input_schema={"type": "object"},
     )
     github_call = ModelToolCall(
         id="c2",
-        name="COMPOSIO_EXECUTE",
+        name="integration_execute",
         arguments={"tool_slug": "GITHUB_CREATE_ISSUE", "arguments": {}},
     )
     github_definition = ToolDefinition(
-        name="COMPOSIO_EXECUTE",
+        name="integration_execute",
         description="d",
         input_schema={"type": "object"},
     )
@@ -1223,11 +1228,11 @@ def test_status_checkpoint_tracking_and_live_update_message(brain):
     # A third checkpoint must EDIT that same message, not post a new one.
     slack_call = ModelToolCall(
         id="c3",
-        name="COMPOSIO_EXECUTE",
+        name="integration_execute",
         arguments={"tool_slug": "SLACK_SEND_MESSAGE"},
     )
     slack_definition = ToolDefinition(
-        name="COMPOSIO_EXECUTE", description="d", input_schema={"type": "object"}
+        name="integration_execute", description="d", input_schema={"type": "object"}
     )
     brain.company_agent._track_checkpoint(
         brain.store.get_task(run["id"]), slack_call, slack_definition
@@ -2013,7 +2018,7 @@ def test_api_invoke_exposes_complete_trace(api_client):
     assert trace["messages"]
     assert trace["turns"]
     assert trace["checkpoints"]
-    assert trace["task"]["trace_id"]
+    assert trace["task"]["correlation_id"]
     evaluation = api_client.get(
         "/v1/harness/evaluation", params={"organization_id": "org_acme"}
     )
@@ -2028,7 +2033,7 @@ def test_agent_can_wait_for_human_and_resume(brain):
                 tool_calls=[
                     ModelToolCall(
                         id="call_human",
-                        name="request_human_input",
+                        name="ask_user",
                         arguments={
                             "question": "Which Linear team should own this?",
                             "reason": "The request did not identify a team.",

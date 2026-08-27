@@ -1,7 +1,7 @@
 """ChildTaskService: durable child-worker delegation for the Task tree.
 
 Where synchronous delegation would block waiting for every child to finish
-before returning, delegate_tasks creates child Tasks, enqueues each one for
+before returning, task_delegate creates child Tasks, enqueues each one for
 independent execution by a worker (ChildTaskExecutor, dispatched off the
 durable job queue), and immediately pauses the calling Task at
 waiting with `waiting_for.type=child_task` -- releasing its execution lease so no Python thread
@@ -19,11 +19,13 @@ current Task and creates durable child Tasks.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from toda.domain.models import new_id, utcnow
 from toda.harness.models import AgentRunState, ToolDefinition, TriggerKind
+from toda.harness.workspace_filesystem import WorkspaceFilesystem
 
 _SUPPORTED_WORKER_TYPES = {"general", "pi"}
 
@@ -60,6 +62,10 @@ class ChildTaskService:
         max_depth: int = 2,
         max_iterations: int = 200,
         max_tool_calls: int = 500,
+        max_model_calls: int = 100,
+        max_cost_usd: float | None = 10.0,
+        max_duration_seconds: int = 3_600,
+        max_total_tokens: int = 100_000,
     ) -> None:
         self.store = store
         self.queue = queue
@@ -74,11 +80,15 @@ class ChildTaskService:
         self.max_depth = max(1, max_depth)
         self.max_iterations = max(1, max_iterations)
         self.max_tool_calls = max(1, max_tool_calls)
+        self.max_model_calls = max(1, max_model_calls)
+        self.max_cost_usd = max_cost_usd
+        self.max_duration_seconds = max(1, max_duration_seconds)
+        self.max_total_tokens = max(1, max_total_tokens)
 
     @staticmethod
     def tool_definition() -> ToolDefinition:
         return ToolDefinition(
-            name="delegate_tasks",
+            name="task_delegate",
             description=(
                 "Create one to three child Tasks for substantial or specialized "
                 "work: worker_type='general' for investigation/analysis/action, "
@@ -92,7 +102,8 @@ class ChildTaskService:
                 "finishes, fails, or otherwise needs attention, and you "
                 "decide whether to wait for the rest, revise or retry a "
                 "child, create additional children, synthesize the "
-                "available results, ask the user, or finish."
+                "available results, publish a reviewed child workspace with "
+                "workspace_publish, ask the user, or finish."
             ),
             input_schema={
                 "type": "object",
@@ -153,6 +164,15 @@ class ChildTaskService:
                                     "required": ["name", "instructions"],
                                     "additionalProperties": False,
                                 },
+                                "tool_profile": {
+                                    "type": "string",
+                                    "enum": ["read_only_specialist"],
+                                    "description": (
+                                        "Optional restrictive profile for research/review "
+                                        "children. Omit it when the child must author files "
+                                        "or perform approved actions."
+                                    ),
+                                },
                             },
                             "required": ["worker_type", "prompt"],
                             "additionalProperties": False,
@@ -182,6 +202,15 @@ class ChildTaskService:
         for spec in tasks:
             if spec["worker_type"] not in _SUPPORTED_WORKER_TYPES:
                 raise ValueError(f"unsupported worker_type: {spec['worker_type']!r}")
+        if any(spec["worker_type"] == "pi" for spec in tasks) and not self.pi_executor:
+            # Fail at the delegation boundary, before persisting/enqueuing a
+            # child that the queue worker cannot execute. Otherwise the
+            # parent would pause on a child that only retries/dead-letters
+            # and never produces a terminal result to wake it.
+            raise RuntimeError(
+                "Pi coding workers are unavailable; enable agent.pi_coding_enabled "
+                "and configure the isolated runner first"
+            )
         root_task_id = parent.get("root_task_id") or parent["id"]
         existing_child_ids = list(parent.get("pending_child_task_ids") or [])
         unfinished_existing_ids = [
@@ -191,6 +220,11 @@ class ChildTaskService:
             not in _TERMINAL_TASK_STATES
         ]
         now = utcnow().isoformat()
+        deadline_at = (
+            (utcnow() + timedelta(seconds=self.max_duration_seconds)).isoformat()
+            if self.max_duration_seconds > 0
+            else None
+        )
         base_child_metadata: dict[str, Any] = {
             "worker_depth": depth + 1,
             "suppress_delivery": True,
@@ -239,13 +273,18 @@ class ChildTaskService:
                 "prompt": spec["prompt"],
                 "goal": spec["prompt"],
                 "envelope": parent["envelope"],
-                "trace_id": parent.get("trace_id"),
+                "correlation_id": parent.get("correlation_id") or (parent.get("envelope") or {}).get("correlation_id"),
                 # General specialists may own a long sequential workflow, so
                 # their configurable envelope is intentionally much larger
                 # than the Session Manager's coordination envelope. Pi Tasks
                 # use heartbeat/checkpoint lifecycle controls instead.
                 "max_iterations": self.max_iterations,
                 "max_tool_calls": self.max_tool_calls,
+                "max_model_calls": self.max_model_calls,
+                "max_cost_usd": self.max_cost_usd,
+                "max_duration_seconds": self.max_duration_seconds,
+                "max_total_tokens": self.max_total_tokens,
+                "deadline_at": deadline_at,
                 "iteration_count": 0,
                 "tool_call_count": 0,
                 "final_answer": None,
@@ -270,6 +309,11 @@ class ChildTaskService:
                     # normal principal, destination, policy, risk, and approval
                     # checks still apply to every actual call.
                     "worker_has_write_tools": spec["worker_type"] == "general",
+                    **(
+                        {"tool_profile": spec["tool_profile"]}
+                        if spec.get("tool_profile")
+                        else {}
+                    ),
                 },
                 "created_at": now,
                 "updated_at": now,
@@ -304,6 +348,17 @@ class ChildTaskService:
                 payload={"task_id": child["id"]},
                 idempotency_key=f"task.run_child:{child['id']}",
             )
+        self.store.telemetry.record(
+            "child_task.create",
+            component="child_tasks",
+            phase="completed",
+            output={
+                "count": len(created),
+                "child_task_ids": [child["id"] for child in created],
+            },
+            task_id=parent["id"],
+            root_task_id=root_task_id,
+        )
         self.audit.record(
             parent["organization_id"],
             "task.children.delegated",
@@ -313,7 +368,6 @@ class ChildTaskService:
                 "child_task_ids": [child["id"] for child in created],
             },
             principal_id=parent["envelope"]["principal_id"],
-            trace_id=parent.get("trace_id"),
         )
         # A Manager may add more parallel work after a partial child result.
         # Preserve the still-running prior set instead of orphaning it when
@@ -381,10 +435,18 @@ class ChildTaskService:
                     scope = self.store.get_scope(scope_id) if scope_id else None
                     if scope_id not in allowed_scopes and not bool((scope or {}).get("is_public")):
                         raise PermissionError("workspace attachment is outside allowed scopes")
-                    root = Path(workspace["path"]).resolve()
-                    if Path(ref).is_absolute():
-                        raise ValueError("workspace attachment must be a relative path")
-                    candidate = (root / ref).resolve()
+                    root = self.workspaces.resolve_durable_path(workspace)
+                    relative = Path(ref)
+                    if relative.is_absolute() or ".." in relative.parts:
+                        raise ValueError("workspace attachment escapes the workspace root")
+                    if WorkspaceFilesystem._sensitive_relative(ref):
+                        raise PermissionError("workspace attachment is sensitive")
+                    current = root
+                    for part in relative.parts:
+                        current = current / part
+                        if current.is_symlink():
+                            raise ValueError("workspace attachment cannot traverse symlinks")
+                    candidate = (root / relative).resolve()
                     if candidate == root or root not in candidate.parents:
                         raise ValueError("workspace attachment escapes the workspace root")
                     if not candidate.is_file():
@@ -399,7 +461,6 @@ class ChildTaskService:
                 "task.attachment_handoff.rejected",
                 {"parent_task_id": parent["id"], "reason": str(exc)},
                 principal_id=(parent.get("envelope") or {}).get("principal_id"),
-                trace_id=parent.get("trace_id"),
             )
             raise
         return validated
@@ -407,7 +468,7 @@ class ChildTaskService:
     @staticmethod
     def tool_definition_wait() -> ToolDefinition:
         return ToolDefinition(
-            name="wait_for_children",
+            name="task_wait",
             description=(
                 "Pause this parent Task again while its existing unfinished "
                 "children continue. Use after a child checkpoint or partial "
@@ -441,7 +502,7 @@ class ChildTaskService:
     @staticmethod
     def tool_definition_start_root() -> ToolDefinition:
         return ToolDefinition(
-            name="start_parallel_task",
+            name="task_delegate_parallel",
             description=(
                 "Create a separate root Task in this same Session when a new "
                 "user request is genuinely unrelated to the root Task you are "
@@ -487,9 +548,17 @@ class ChildTaskService:
             "prompt": arguments["prompt"],
             "goal": arguments["prompt"],
             "envelope": current["envelope"],
-            "trace_id": current.get("trace_id"),
             "max_iterations": current.get("max_iterations", 100),
             "max_tool_calls": current.get("max_tool_calls", 150),
+            "max_model_calls": current.get("max_model_calls", self.max_model_calls),
+            "max_cost_usd": current.get("max_cost_usd", self.max_cost_usd),
+            "max_duration_seconds": current.get("max_duration_seconds", self.max_duration_seconds),
+            "max_total_tokens": current.get("max_total_tokens", self.max_total_tokens),
+            "deadline_at": (
+                (utcnow() + timedelta(seconds=int(current.get("max_duration_seconds", self.max_duration_seconds)))).isoformat()
+                if int(current.get("max_duration_seconds", self.max_duration_seconds)) > 0
+                else None
+            ),
             "iteration_count": 0,
             "tool_call_count": 0,
             "final_answer": None,
@@ -524,15 +593,15 @@ class ChildTaskService:
         )
         return {"task_id": task_id, "state": "queued", "prompt": arguments["prompt"]}
 
-    # ---- manage_child_task: revise or cancel an existing child (plan §9.2) ----
+    # ---- task_manage: revise or cancel an existing child (plan §9.2) ----
 
     @staticmethod
     def tool_definition_manage() -> ToolDefinition:
         return ToolDefinition(
-            name="manage_child_task",
+            name="task_manage",
             description=(
                 "Cancel or revise one of this Task's own child Tasks "
-                "(created via delegate_tasks). Cancelling stops it -- "
+                "(created via task_delegate). Cancelling stops it -- "
                 "gracefully for a pi child (SIGTERM, then SIGKILL after a "
                 "grace period if needed), immediately for a general child "
                 "-- and preserves any workspace changes a pi child already "

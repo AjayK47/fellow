@@ -31,6 +31,9 @@ node_modules/
 
 # Toda runtime state and local operator material
 data/
+!src/toda/data/
+!src/toda/data/models_catalog.json
+!src/toda/data/models_catalog.provenance.json
 *.db
 *.db-shm
 *.db-wal
@@ -69,6 +72,8 @@ archive/
 *_STATUS.md
 *_NOTES.md
 *_ADOPTION.md
+*_IMPLEMENTATION.md
+*_REMEDIATION.md
 *_UNDERSTANDING.md
 *_ARCHITECTURE.md
 *_architecture.md

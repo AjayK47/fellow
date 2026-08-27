@@ -12,6 +12,7 @@ from toda.config import ConfigError, load_settings
 def _write(tmp_path, payload: dict) -> "object":
     path = tmp_path / "config.json"
     path.write_text(json.dumps(payload))
+    path.chmod(0o600)
     return path
 
 

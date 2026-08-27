@@ -95,7 +95,7 @@ def test_authoring_and_replying_do_not_pause_for_approval(brain):
     """Producing the document that was asked for is the deliverable, not a
     consequential action. Approvals lose meaning when they fire on the
     obvious."""
-    for name in ("pdf_create", "docx_create", "brain_create_artifact",
+    for name in ("pdf_create", "docx_create", "artifact_create",
                  "slack_send_artifact", "slack_send_message"):
         registered = brain.tool_registry.get(name)
         assert registered is not None, name

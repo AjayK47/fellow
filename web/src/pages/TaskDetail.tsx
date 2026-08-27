@@ -15,11 +15,21 @@ export default function TaskDetail() {
     () => api.get(`/v1/tasks/${taskId}`, { organization_id: ORG }),
     [taskId, refresh]
   );
+  const { data: inspection, error: inspectionError } = useAsync<Record<string, any>>(
+    () => api.get(`/v1/tasks/${taskId}/run-summary`, { organization_id: ORG }),
+    [taskId, refresh]
+  );
   const task = data?.task || {};
   const children = (data?.children || []) as Record<string, any>[];
   const attempts = (data?.attempts || []) as Record<string, any>[];
   const plan = (data?.plan || null) as Record<string, any> | null;
   const artifacts = (data?.artifacts || []) as Record<string, any>[];
+  const inspectionMetrics = (inspection?.metrics || {}) as Record<string, any>;
+  const inspectionTokens = (inspectionMetrics.tokens || {}) as Record<string, any>;
+  const inspectionCost = (inspectionMetrics.cost || {}) as Record<string, any>;
+  const completeness = (inspection?.completeness || {}) as Record<string, any>;
+  const privacy = (inspection?.privacy || {}) as Record<string, any>;
+  const traceIds = (inspection?.trace_ids || []) as string[];
 
   async function cancel() {
     await api.post(`/v1/tasks/${taskId}:cancel`, undefined);
@@ -61,6 +71,30 @@ export default function TaskDetail() {
           <Section><Card title="Artifacts" meta={String(artifacts.length)}>{artifacts.length === 0 ? <Empty>no Task artifacts</Empty> : <div className="grid gap-1 p-4">{artifacts.map((artifact) => <a key={String(artifact.id)} href={String(artifact.download_url || `/v1/artifacts/${artifact.id}/download?organization_id=${ORG}`)} className="rounded border border-line p-2 text-[12px] hover:bg-paper"><span className="font-medium text-ink">{String(artifact.title || artifact.id)}</span><span className="ml-2 text-muted">{String(artifact.artifact_type || "artifact")}</span></a>)}</div>}</Card></Section>
           <Section><Card title="Attempts" meta={String(attempts.length)}>{attempts.length === 0 ? <Empty>no attempts</Empty> : <div className="grid gap-2 p-4">{attempts.map((attempt) => <div key={String(attempt.id)} className="rounded border border-line p-3 text-[12px]"><div className="flex justify-between"><Pill tone={attempt.status === "completed" ? "good" : attempt.status === "running" ? "orange" : "bad"}>{String(attempt.status)}</Pill><span className="text-muted">attempt {String(attempt.attempt_number)}</span></div><div className="mt-2 text-muted">{fmt(attempt.error || attempt.output_tail, 300)}</div></div>)}</div>}</Card></Section>
           <Section><Card title="Result"><div className="whitespace-pre-wrap px-4 py-4 text-[13px] text-ink">{fmt(task.result || task.final_answer || task.error, 4000)}</div></Card></Section>
+          <Section><Card title="Run inspection" meta={inspectionError ? "unavailable" : String(completeness.status || "pending")}>
+            {inspectionError ? <Empty>inspection unavailable: {inspectionError}</Empty> : !inspection ? <Empty>loading inspection…</Empty> : <>
+              <div className="grid grid-cols-2 border-b border-line sm:grid-cols-4">
+                <Field label="active duration">{fmt(inspectionMetrics.active_duration_ms, 20)} ms</Field>
+                <Field label="wall duration">{fmt(inspectionMetrics.wall_duration_ms, 20)} ms</Field>
+                <Field label="iterations">{fmt(inspectionMetrics.iterations, 20)}</Field>
+                <Field label="model / tool calls">{fmt(inspectionMetrics.model_calls, 12)} / {fmt(inspectionMetrics.tool_calls, 12)}</Field>
+                <Field label="input tokens">{fmt(inspectionTokens.input_tokens, 20)}</Field>
+                <Field label="output tokens">{fmt(inspectionTokens.output_tokens, 20)}</Field>
+                <Field label="total tokens">{fmt(inspectionTokens.total_tokens, 20)}</Field>
+                <Field label="cached / reasoning">{fmt(inspectionTokens.cached_input_tokens, 12)} / {fmt(inspectionTokens.reasoning_tokens, 12)}</Field>
+                <Field label="cost">{inspectionCost.amount == null ? "unavailable" : `${inspectionCost.amount} ${inspectionCost.currency || "USD"}`} ({String(inspectionCost.source || "unavailable")})</Field>
+                <Field label="queue delay">{fmt(inspectionMetrics.queue_delay_ms, 20)} ms</Field>
+                <Field label="completeness"><Pill tone={completeness.status === "complete" ? "good" : completeness.status === "pending" ? "orange" : "bad"}>{String(completeness.status || "unknown")}</Pill></Field>
+                <Field label="privacy"><Pill tone={privacy.payload_capture_enabled ? "orange" : "good"}>{privacy.payload_capture_enabled ? "debug capture enabled" : "payloads off"}</Pill></Field>
+              </div>
+              {completeness.missing?.length > 0 && <div className="border-b border-line px-4 py-3 text-[12px] text-red-700">missing coverage: {completeness.missing.join(", ")}</div>}
+              <div className="grid gap-3 p-4 sm:grid-cols-2">
+                <div><div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted">models</div>{(inspection.models || []).length === 0 ? <div className="text-[12px] text-muted">no model spans</div> : <div className="grid gap-1">{inspection.models.map((model: Record<string, any>, index: number) => <div key={index} className="font-mono text-[11px] text-ink">{fmt(model.role, 14)} · {fmt(model.provider, 20)} / {fmt(model.model, 42)} · {String(model.cost_state || "unavailable")}</div>)}</div>}</div>
+                <div><div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted">linked traces</div>{traceIds.length === 0 ? <div className="text-[12px] text-muted">none recorded</div> : <div className="flex flex-wrap gap-1">{traceIds.map((traceId) => <Link key={traceId} to={`/traces?trace_id=${traceId}`} className="font-mono text-[11px] text-link">{fmt(traceId, 34)}</Link>)}</div>}</div>
+              </div>
+              <div className="border-t border-line px-4 py-3 text-[11px] text-muted">versions: {fmt(inspection.versions, 500)}</div>
+            </>}
+          </Card></Section>
         </>
       )}
     </>

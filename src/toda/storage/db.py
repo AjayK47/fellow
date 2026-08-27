@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -70,41 +71,58 @@ class BrainStore:
         bootstrap = self._new_connection()
         bootstrap.execute("PRAGMA journal_mode=WAL")
         bootstrap.close()
+        self._harden_control_files()
         self._migrate()
-        from toda.observability import TraceRecorder
-        self.trace = TraceRecorder(self)
+        self._harden_control_files()
+        from toda.telemetry.bootstrap import build_telemetry
 
-    def _drop_stale_trace_events(self) -> None:
-        """Recreate trace_events when it predates the organization_id column.
+        self.telemetry = build_telemetry(store=self)
 
-        The rest of the schema is `CREATE TABLE IF NOT EXISTS` and nothing
-        else in this file alters a table, so a database written before that
-        column existed would silently keep the old shape and every insert
-        would fail. Dropping is acceptable here and nowhere else in this
-        file: trace events are telemetry with a seven-day retention, so the
-        worst case is losing at most a week of debugging history, whereas
-        the alternative is a table nothing can write to.
+    def _harden_control_files(self) -> None:
+        """Keep the control database and SQLite sidecars private.
+
+        Agent workers may share the host with Toda, so relying on the process
+        account alone is insufficient.  SQLite creates these files according
+        to the process umask; explicitly narrowing them prevents a default
+        ``0644`` database from exposing organization memory, connector state,
+        or audit payloads to the agent account.
         """
-        with self.cursor() as cur:
-            cur.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name='trace_events'"
-            )
-            if not cur.fetchone():
-                return
-            columns = {row[1] for row in cur.execute("PRAGMA table_info(trace_events)")}
-            if "organization_id" not in columns:
-                cur.execute("DROP TABLE trace_events")
+        if os.name == "nt":
+            return
+        for path in (
+            self.db_path,
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+            Path(f"{self.db_path}-journal"),
+        ):
+            try:
+                if path.exists():
+                    path.chmod(0o600)
+            except OSError as exc:
+                raise RuntimeError(f"could not secure control-plane file {path}: {exc}") from exc
 
     def close(self) -> None:
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is not None:
+            telemetry.shutdown()
         conn = getattr(self._local, "connection", None)
         if conn is not None:
             conn.close()
             del self._local.connection
         self._closed = True
 
+    def configure_telemetry(self, config: Any) -> None:
+        """Replace the default telemetry runtime with application settings."""
+        from toda.telemetry.bootstrap import build_telemetry
+
+        previous = getattr(self, "telemetry", None)
+        if previous is not None:
+            previous.shutdown()
+        self.telemetry = build_telemetry(store=self, config=config)
+
     def _new_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        self._harden_control_files()
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
@@ -138,7 +156,6 @@ class BrainStore:
             cur.close()
 
     def _migrate(self) -> None:
-        self._drop_stale_trace_events()
         with self.cursor() as cur:
             cur.executescript(
                 """
@@ -412,26 +429,50 @@ class BrainStore:
                     UNIQUE (organization_id, idempotency_key)
                 );
 
-                CREATE TABLE IF NOT EXISTS trace_events (
+                CREATE TABLE IF NOT EXISTS otel_spans (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL DEFAULT '',
                     trace_id TEXT NOT NULL,
                     span_id TEXT NOT NULL,
                     parent_span_id TEXT,
-                    component TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    phase TEXT NOT NULL,
-                    context TEXT NOT NULL,
-                    input_json TEXT,
-                    output_json TEXT,
-                    error_json TEXT,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    start_time_ns INTEGER NOT NULL,
+                    end_time_ns INTEGER,
                     duration_ms REAL,
+                    status_code TEXT NOT NULL,
+                    status_description TEXT,
+                    resource_attributes TEXT NOT NULL,
+                    attributes TEXT NOT NULL,
+                    events TEXT NOT NULL,
+                    links TEXT NOT NULL,
+                    scope_name TEXT,
+                    scope_version TEXT,
+                    task_id TEXT,
+                    root_task_id TEXT,
+                    session_id TEXT,
+                    job_id TEXT,
                     created_at TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_trace_events_trace
-                    ON trace_events(trace_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_trace_events_component
-                    ON trace_events(component, operation, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_otel_spans_trace_span
+                    ON otel_spans(trace_id, span_id);
+                CREATE INDEX IF NOT EXISTS idx_otel_spans_org_started
+                    ON otel_spans(organization_id, start_time_ns DESC);
+                CREATE INDEX IF NOT EXISTS idx_otel_spans_task
+                    ON otel_spans(organization_id, task_id, start_time_ns);
+                CREATE INDEX IF NOT EXISTS idx_otel_spans_job
+                    ON otel_spans(organization_id, job_id, start_time_ns);
+                CREATE TABLE IF NOT EXISTS trace_completeness (
+                    task_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    trace_id TEXT,
+                    complete INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_trace_completeness_org
+                    ON trace_completeness(organization_id, updated_at DESC);
 
                 CREATE TABLE IF NOT EXISTS approvals (
                     id TEXT PRIMARY KEY,
@@ -548,6 +589,18 @@ class BrainStore:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS connector_health (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    connector TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    probed_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, connector)
                 );
 
                 CREATE TABLE IF NOT EXISTS tool_policies (
@@ -2175,129 +2228,174 @@ class BrainStore:
                 ),
             )
 
-    def append_trace_event(self, event: dict[str, Any]) -> None:
-        """Append one redacted, immutable execution-trace event.
+    def append_otel_span(self, span: dict[str, Any]) -> None:
+        """Persist one completed OpenTelemetry span.
 
-        `organization_id` is denormalized out of the context blob because
-        every read of this table is tenant-scoped, and filtering a tenant
-        boundary with a LIKE against serialized JSON is not a boundary.
+        The exporter is deliberately the only writer. A failed telemetry
+        write must never fail the operation that produced the span.
         """
-        context = event.get("context") or {}
         with self.cursor() as cur:
             cur.execute(
-                """INSERT INTO trace_events
+                """INSERT OR REPLACE INTO otel_spans
                 (id, organization_id, trace_id, span_id, parent_span_id,
-                 component, operation, phase, context, input_json,
-                 output_json, error_json, duration_ms, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 name, kind, start_time_ns, end_time_ns, duration_ms,
+                 status_code, status_description, resource_attributes,
+                 attributes, events, links, scope_name, scope_version,
+                 task_id, root_task_id, session_id, job_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    event["id"],
-                    str(context.get("organization_id") or ""),
-                    event["trace_id"], event["span_id"],
-                    event.get("parent_span_id"), event["component"],
-                    event["operation"], event["phase"], _ser(context),
-                    _ser(event.get("input")), _ser(event.get("output")),
-                    _ser(event.get("error")), event.get("duration_ms"), event["created_at"],
+                    span["id"], str(span.get("organization_id") or ""),
+                    span["trace_id"], span["span_id"], span.get("parent_span_id"),
+                    span["name"], span.get("kind") or "INTERNAL",
+                    span["start_time_ns"], span.get("end_time_ns"), span.get("duration_ms"),
+                    span.get("status_code") or "UNSET", span.get("status_description"),
+                    _ser(span.get("resource_attributes") or {}),
+                    _ser(span.get("attributes") or {}), _ser(span.get("events") or []),
+                    _ser(span.get("links") or []), span.get("scope_name"),
+                    span.get("scope_version"), span.get("task_id"),
+                    span.get("root_task_id"), span.get("session_id"), span.get("job_id"),
+                    span.get("created_at") or datetime.now(timezone.utc).isoformat(),
                 ),
             )
 
-    def list_traces(
+    def list_otel_traces(
         self, organization_id: str, *, limit: int = 50, errors_only: bool = False
     ) -> list[dict[str, Any]]:
-        """One row per trace, newest first — the index for the trace viewer.
-
-        Rolled up in SQL rather than by loading every event and grouping in
-        Python: a single busy trace is thousands of rows, and the list view
-        needs none of their payloads.
-        """
-        having = "HAVING failures > 0" if errors_only else ""
+        """Return logical trace summaries, newest first."""
+        having = "HAVING SUM(status_code = 'ERROR') > 0" if errors_only else ""
         with self.cursor() as cur:
             cur.execute(
                 f"""SELECT trace_id,
-                           MIN(created_at) AS started_at,
-                           MAX(created_at) AS ended_at,
-                           COUNT(*) AS event_count,
-                           SUM(phase = 'failed') AS failures,
-                           (SELECT operation FROM trace_events inner_events
-                             WHERE inner_events.trace_id = trace_events.trace_id
-                             ORDER BY created_at ASC LIMIT 1) AS root_operation,
-                           MAX(duration_ms) AS max_duration_ms
-                    FROM trace_events
+                           MIN(start_time_ns) AS started_ns,
+                           MAX(end_time_ns) AS ended_ns,
+                           COUNT(*) AS span_count,
+                           SUM(status_code = 'ERROR') AS failures,
+                           (SELECT name FROM otel_spans root
+                             WHERE root.trace_id = otel_spans.trace_id
+                               AND root.parent_span_id IS NULL
+                             ORDER BY start_time_ns ASC LIMIT 1) AS root_operation,
+                           MIN(task_id) AS task_id,
+                           MIN(root_task_id) AS root_task_id,
+                           MIN(session_id) AS session_id
+                    FROM otel_spans
                     WHERE organization_id = ?
                     GROUP BY trace_id
                     {having}
-                    ORDER BY started_at DESC
+                    ORDER BY started_ns DESC
                     LIMIT ?""",
                 (organization_id, limit),
             )
             rows = cur.fetchall()
+        def iso(ns: int | None) -> str | None:
+            if ns is None:
+                return None
+            return datetime.fromtimestamp(ns / 1_000_000_000, tz=timezone.utc).isoformat()
         return [
             {
                 "trace_id": row["trace_id"],
-                "started_at": row["started_at"],
-                "ended_at": row["ended_at"],
-                "event_count": row["event_count"],
+                "started_at": iso(row["started_ns"]),
+                "ended_at": iso(row["ended_ns"]),
+                "span_count": row["span_count"],
                 "failures": int(row["failures"] or 0),
                 "root_operation": row["root_operation"],
-                "duration_ms": row["max_duration_ms"],
+                "duration_ms": (
+                    (row["ended_ns"] - row["started_ns"]) / 1_000_000
+                    if row["ended_ns"] is not None else None
+                ),
+                "task_id": row["task_id"],
+                "root_task_id": row["root_task_id"],
+                "session_id": row["session_id"],
             }
             for row in rows
         ]
 
-    def list_trace_events(
-        self, trace_id: str, *, organization_id: str | None = None,
-        component: str | None = None,
-        operation: str | None = None, errors_only: bool = False, limit: int = 5000,
+    def list_otel_spans(
+        self, trace_id: str | None, *, organization_id: str | None = None,
+        task_id: str | None = None, name: str | None = None,
+        errors_only: bool = False, limit: int = 5000,
     ) -> list[dict[str, Any]]:
-        clauses = ["trace_id = ?"]
-        params: list[Any] = [trace_id]
+        clauses: list[str] = []
+        params: list[Any] = []
+        if trace_id and task_id:
+            clauses.append("(trace_id = ? OR task_id = ?)")
+            params.extend([trace_id, task_id])
+        elif trace_id:
+            clauses.append("trace_id = ?")
+            params.append(trace_id)
+        elif task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        else:
+            return []
         if organization_id:
             clauses.append("organization_id = ?")
             params.append(organization_id)
-        if component:
-            clauses.append("component = ?")
-            params.append(component)
-        if operation:
-            clauses.append("operation = ?")
-            params.append(operation)
+        if name:
+            clauses.append("name = ?")
+            params.append(name)
         if errors_only:
-            clauses.append("phase = 'failed'")
+            clauses.append("status_code = 'ERROR'")
         params.append(limit)
         with self.cursor() as cur:
             cur.execute(
-                f"SELECT * FROM trace_events WHERE {' AND '.join(clauses)} "
-                "ORDER BY created_at ASC LIMIT ?", params
+                f"SELECT * FROM otel_spans WHERE {' AND '.join(clauses)} "
+                "ORDER BY start_time_ns ASC LIMIT ?", params
             )
             rows = cur.fetchall()
         return [
             {
                 "id": row["id"], "trace_id": row["trace_id"], "span_id": row["span_id"],
-                "parent_span_id": row["parent_span_id"], "component": row["component"],
-                "operation": row["operation"], "phase": row["phase"],
-                "context": _de(row["context"]), "input": _de(row["input_json"]),
-                "output": _de(row["output_json"]), "error": _de(row["error_json"]),
-                "duration_ms": row["duration_ms"], "created_at": row["created_at"],
+                "parent_span_id": row["parent_span_id"], "name": row["name"],
+                "operation": row["name"], "kind": row["kind"],
+                "start_time_ns": row["start_time_ns"], "end_time_ns": row["end_time_ns"],
+                "duration_ms": row["duration_ms"], "status_code": row["status_code"],
+                "status_description": row["status_description"],
+                "resource_attributes": _de(row["resource_attributes"]),
+                "attributes": _de(row["attributes"]), "events": _de(row["events"]),
+                "links": _de(row["links"]), "scope_name": row["scope_name"],
+                "scope_version": row["scope_version"], "task_id": row["task_id"],
+                "root_task_id": row["root_task_id"], "session_id": row["session_id"],
+                "job_id": row["job_id"], "created_at": row["created_at"],
             }
             for row in rows
         ]
 
-    def purge_trace_events(self, *, before: str, limit: int = 10_000) -> int:
-        """Drop trace events older than `before`, at most `limit` per call.
-
-        `DELETE ... LIMIT` is an optional SQLite compile-time feature
-        (SQLITE_ENABLE_UPDATE_DELETE_LIMIT) and the build CPython ships does
-        not have it, so that spelling is a hard syntax error rather than a
-        slow query. It ran unguarded at gateway startup, which meant the
-        process could not boot at all. The bound belongs in a subquery.
-        """
+    def purge_otel_spans(self, *, before: str, limit: int = 10_000) -> int:
+        """Drop completed spans older than ``before`` in bounded batches."""
         with self.cursor() as cur:
             cur.execute(
-                "DELETE FROM trace_events WHERE rowid IN ("
-                "  SELECT rowid FROM trace_events WHERE created_at < ? LIMIT ?"
+                "DELETE FROM otel_spans WHERE rowid IN ("
+                "  SELECT rowid FROM otel_spans WHERE created_at < ? LIMIT ?"
                 ")",
                 (before, limit),
             )
             return cur.rowcount
+
+    def save_trace_completeness(
+        self, *, task_id: str, organization_id: str, trace_id: str | None, result: dict[str, Any]
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT INTO trace_completeness
+                (task_id, organization_id, trace_id, complete, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET trace_id=excluded.trace_id,
+                complete=excluded.complete, payload=excluded.payload, updated_at=excluded.updated_at""",
+                (task_id, organization_id, trace_id, int(bool(result.get("complete"))), _ser(result), now, now),
+            )
+
+    def get_trace_completeness(self, task_id: str, *, organization_id: str | None = None) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            if organization_id:
+                cur.execute("SELECT * FROM trace_completeness WHERE task_id = ? AND organization_id = ?", (task_id, organization_id))
+            else:
+                cur.execute("SELECT * FROM trace_completeness WHERE task_id = ?", (task_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        result = _de(row["payload"])
+        return {**result, "task_id": row["task_id"], "trace_id": row["trace_id"], "updated_at": row["updated_at"]}
 
     def list_audit(self, organization_id: str, event_type: str | None = None) -> list[dict[str, Any]]:
         with self.cursor() as cur:
@@ -2696,6 +2794,7 @@ class BrainStore:
         "channel_policies",
         "identity_mappings",
         "connector_accounts",
+        "connector_health",
         "tool_policies",
         "checkpoints",
         "episodes",
@@ -2751,6 +2850,7 @@ class BrainStore:
             "tool_name",
             "trigger_kind",
             "kind",
+            "connector",
         }
         clauses = ["organization_id = ?"]
         params: list[Any] = [organization_id]
@@ -3233,6 +3333,18 @@ class BrainStore:
             )
             return [self._task_row(row) for row in cur.fetchall()]
 
+    def list_active_task_ids(self, organization_id: str, *, limit: int = 100_000) -> list[str]:
+        """Targeted projection for workspace cleanup/recovery heartbeats."""
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT id FROM tasks
+                WHERE organization_id = ?
+                  AND state IN ('queued', 'running', 'waiting')
+                ORDER BY updated_at LIMIT ?""",
+                (organization_id, max(1, int(limit))),
+            )
+            return [str(row["id"]) for row in cur.fetchall()]
+
     def list_parents_waiting_for_children(
         self, organization_id: str, *, limit: int = 100
     ) -> list[dict[str, Any]]:
@@ -3396,7 +3508,17 @@ class BrainStore:
                 WHERE id = ? AND state NOT IN ('completed', 'failed', 'cancelled')""",
                 (now, now, task_id),
             )
-            return cur.rowcount > 0
+            changed = cur.rowcount > 0
+        if changed:
+            inspection = getattr(self, "run_inspection", None)
+            if inspection is not None:
+                try:
+                    inspection.reconcile_task(task_id)
+                except Exception:
+                    # Cancellation is authoritative; a projection failure is
+                    # repaired by startup reconciliation or the next read.
+                    pass
+        return changed
 
     def retry_task(self, task_id: str) -> bool:
         """Requeue a terminal Task for an explicit operator retry."""
@@ -3589,6 +3711,49 @@ class BrainStore:
                     call["updated_at"],
                 ),
             )
+
+    def record_connector_health(
+        self,
+        organization_id: str,
+        connector: str,
+        *,
+        status: str,
+        detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist one bounded, credential-free connector probe result."""
+        now = datetime.now(timezone.utc).isoformat()
+        allowed_detail = {"account_count", "tool_count", "error_type"}
+        safe_detail = {
+            key: value
+            for key, value in (detail or {}).items()
+            if key in allowed_detail and isinstance(value, (str, int, float, bool))
+        }
+        record = {
+            "id": f"connector_health:{organization_id}:{connector}",
+            "organization_id": organization_id,
+            "connector": connector,
+            "status": status,
+            "detail": safe_detail,
+            "probed_at": now,
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT INTO connector_health
+                (id, organization_id, connector, status, payload, probed_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(organization_id, connector) DO UPDATE SET
+                    status=excluded.status,
+                    payload=excluded.payload,
+                    probed_at=excluded.probed_at,
+                    updated_at=excluded.updated_at""",
+                (
+                    record["id"], organization_id, connector, status,
+                    _ser(record), now, now, now,
+                ),
+            )
+        return record
 
     def tool_call_by_idempotency(
         self, organization_id: str, idempotency_key: str
@@ -4143,9 +4308,16 @@ class BrainStore:
         the invoice does the telling.
         """
         since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-        stats = {"window_hours": hours, "agent_turns": 0, "prompt_tokens": 0,
-                 "completion_tokens": 0, "cached_prompt_tokens": 0,
-                 "attention_calls": 0}
+        stats = {
+            "window_hours": hours,
+            "agent_turns": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
+            "attention_calls": 0,
+        }
         with self.cursor() as cur:
             cur.execute(
                 """SELECT payload FROM task_turns
@@ -4155,11 +4327,16 @@ class BrainStore:
             for row in cur.fetchall():
                 usage = ((_de(row["payload"]) or {}).get("response") or {}).get("usage") or {}
                 stats["agent_turns"] += 1
-                stats["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
-                stats["completion_tokens"] += int(usage.get("completion_tokens") or 0)
-                stats["cached_prompt_tokens"] += int(
-                    (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
-                )
+                for key in (
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "cached_input_tokens",
+                    "reasoning_tokens",
+                ):
+                    value = usage.get(key)
+                    if isinstance(value, (int, float)):
+                        stats[key] += int(value)
             cur.execute(
                 """SELECT COUNT(*) AS n FROM attention_evaluations
                 WHERE organization_id = ? AND created_at >= ?""",
@@ -4168,8 +4345,9 @@ class BrainStore:
             row = cur.fetchone()
             stats["attention_calls"] = int(row["n"]) if row else 0
         stats["total_model_calls"] = stats["agent_turns"] + stats["attention_calls"]
-        billed = stats["prompt_tokens"] - stats["cached_prompt_tokens"]
-        stats["uncached_prompt_tokens"] = max(0, billed)
+        stats["uncached_input_tokens"] = max(
+            0, stats["input_tokens"] - stats["cached_input_tokens"]
+        )
         return stats
 
     def count_pending_jobs(self, organization_id: str, kind: str) -> int:
@@ -4209,6 +4387,25 @@ class BrainStore:
             cur.execute("SELECT payload FROM harness_jobs WHERE id = ?", (job_id,))
             row = cur.fetchone()
             return _de(row["payload"]) if row else None
+
+    def list_harness_jobs_for_task(
+        self, organization_id: str, task_id: str, *, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        """Return durable queue records associated with one Task.
+
+        Task IDs live in the explicit job payload/correlation section. Keep
+        this query indexed by organization and bounded; run inspection must
+        not scan the entire queue table for every dashboard request.
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT payload FROM harness_jobs
+                WHERE organization_id = ?
+                  AND json_extract(payload, '$.payload.task_id') = ?
+                ORDER BY created_at LIMIT ?""",
+                (organization_id, task_id, max(1, int(limit))),
+            )
+            return [_de(row["payload"]) for row in cur.fetchall()]
 
     def lease_harness_jobs(
         self,
@@ -4316,6 +4513,19 @@ class BrainStore:
                 (organization_id,),
             )
             return {row["status"]: int(row["count"]) for row in cur.fetchall()}
+
+    def count_expired_harness_jobs(self, organization_id: str, *, now: str | None = None) -> int:
+        """Count leases that need recovery without changing queue state."""
+        current = now or datetime.now(timezone.utc).isoformat()
+        with self.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS count FROM harness_jobs
+                WHERE organization_id = ? AND status = 'leased'
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at < ?""",
+                (organization_id, current),
+            )
+            row = cur.fetchone()
+            return int(row["count"] or 0) if row else 0
 
     def harness_job_queue_age_seconds(self, organization_id: str) -> dict[str, float]:
         """Oldest still-queued job's wait time per kind — the plan §9/§7

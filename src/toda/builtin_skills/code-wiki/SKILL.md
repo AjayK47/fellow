@@ -35,8 +35,8 @@ Produce reference documentation (what the code does and how it's put
 together) for a repository sitting in Toda's shared workspace. This is not
 a shell-driven wiki generator -- there is no `git clone`, no terminal, and no
 diagramming CLI available directly to this skill. Everything here is built
-from `workspace_read` / `workspace_search` / `workspace_list` output, written
-out with `workspace_write`.
+from `read_file` / `search_files` / `list_files` output, written
+out with `write_file`.
 
 This produces reference documentation, not a strategic "why does this
 project exist" narrative. If the request is really for the latter, that's a
@@ -51,7 +51,7 @@ different, shorter piece of writing -- don't force it into this shape.
 
 ## When not to use
 
-- Documenting one file or one function -- just read it with `workspace_read`
+- Documenting one file or one function -- just read it with `read_file`
   and answer directly.
 - The repository is not yet in the shared workspace and getting it there
   requires cloning from a remote URL. Cloning needs real network access,
@@ -65,21 +65,21 @@ different, shorter piece of writing -- don't force it into this shape.
 
 ## Toda tools for this
 
-- `workspace_list` (recursive) -- scan directory structure, cap depth and
+- `list_files` (recursive) -- scan directory structure, cap depth and
   breadth deliberately; a 500-file wall-of-output is not useful signal.
-- `workspace_read` -- read manifests (`pyproject.toml`, `package.json`,
+- `read_file` -- read manifests (`pyproject.toml`, `package.json`,
   `Cargo.toml`, `go.mod`), the README, and the source files for each module
   you commit to documenting. Use `max_chars` to avoid pulling in huge
   generated files.
-- `workspace_search` -- find where a symbol is defined or referenced instead
+- `search_files` -- find where a symbol is defined or referenced instead
   of guessing a file name; also useful for a rough "how many places call
   this" signal when picking which modules matter most.
-- `workspace_write` -- write the generated markdown files. One file per
+- `write_file` -- write the generated markdown files. One file per
   logical page (`README.md`, `architecture.md`, `modules/<name>.md`,
   `diagrams.md`) rather than one giant document; writes are capped at 1 MB
   each and 10 MB total for the whole workspace, and are scanned for obvious
   secret patterns.
-- `delegate_tasks` -- for a repository large enough that documenting 8-10
+- `task_delegate` -- for a repository large enough that documenting 8-10
   modules single-threaded would blow the context budget, split module
   write-ups across 2-3 child Tasks with distinct prompts, then assemble
   the pages yourself so cross-links stay consistent.
@@ -88,12 +88,12 @@ different, shorter piece of writing -- don't force it into this shape.
 
 ### 1. Gather
 
-- `workspace_list` recursively, capped at a sensible depth. Note top-level
+- `list_files` recursively, capped at a sensible depth. Note top-level
   directories and obvious noise (dependency directories, build output,
   generated code) to exclude from the documentation pass.
-- `workspace_read` the manifest and README.
+- `read_file` the manifest and README.
 - Pick 6-10 modules to document in the first pass, prioritized by: how many
-  other places reference them (via `workspace_search` hit count), size, and
+  other places reference them (via `search_files` hit count), size, and
   README mentions. State the module list before writing anything if the
   repository is large -- it gives whoever asked a chance to redirect before
   you spend the budget.
@@ -165,9 +165,9 @@ not add a participant or a call edge because it seems structurally likely.
 - [ ] Module list was stated up front for any repository large enough that
       scope needed confirming
 - [ ] Every documented function/class/module was actually read via
-      `workspace_read`, not inferred from its name
+      `read_file`, not inferred from its name
 - [ ] Every diagram node maps to real code
-- [ ] Output files were written with `workspace_write` to a stated,
+- [ ] Output files were written with `write_file` to a stated,
       deliberate path
 - [ ] Tests, vendored code, and generated files are excluded or clearly
       labeled as such

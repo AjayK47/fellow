@@ -133,7 +133,7 @@ def test_summary_prefix_appears_only_when_a_summary_is_present():
     matches = [m for m in with_summary if SUMMARY_PREFIX in m["content"]]
     assert matches
     assert "shipped v1" in matches[0]["content"]
-    assert "latest message wins" in matches[0]["content"]
+    assert "latest authorized user message wins" in matches[0]["content"]
 
 
 def test_slack_session_context_and_company_memory_are_separate_prompt_blocks():

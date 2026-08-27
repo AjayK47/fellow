@@ -41,8 +41,8 @@ type, or screenshot tool built in. What's directly available depends on how
 the product being tested is reachable:
 
 - **If the product is reachable through a connected integration** (Composio),
-  `composio_search` finds available actions for that connected application
-  and `composio_describe` shows an action's exact schema before calling it.
+  `integration_search` finds available actions for that connected application
+  and `integration_describe` shows an action's exact schema before calling it.
   Calling the action itself uses the specific tool that search surfaces --
   never guess an action's name or arguments. This lets you exercise a real
   user journey against an actual connected product (create a ticket, send a
@@ -134,7 +134,7 @@ tested plus any blocker that limited coverage.
   plainly rather than describing an inferred outcome as if it were
   observed.
 - **Guessing a connector action's name or arguments.** Always
-  `composio_search`/`composio_describe` first; a guessed action slug will
+  `integration_search`/`integration_describe` first; a guessed action slug will
   simply fail, or worse, silently call the wrong thing.
 - **Reporting duplicate symptoms as separate bugs.** Merge them, and note
   every place the same root issue showed up.

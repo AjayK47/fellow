@@ -13,12 +13,12 @@ platform_key: builtin.hermes.jupyter
 activation: {mode: optional}
 required_capabilities: {all_of: [workspace.read, workspace.write]}
 warnings:
-  - Toda has no live Jupyter kernel of its own -- workspace_read/workspace_write only let you author the .ipynb file's JSON; actually executing a cell requires a Pi child Task, and outputs you write yourself without running anything are not real results.
+  - Toda has no live Jupyter kernel of its own -- read_file/write_file only let you author the .ipynb file's JSON; actually executing a cell requires a Pi child Task, and outputs you write yourself without running anything are not real results.
   - Never write cell outputs by hand and present them as if a kernel produced them -- if the notebook wasn't executed, say so.
 steps:
   - order: 1
     name: Author
-    description: Write the notebook's cells (markdown and code) as a structured .ipynb file with workspace_write.
+    description: Write the notebook's cells (markdown and code) as a structured .ipynb file with write_file.
   - order: 2
     name: Execute
     description: Run the notebook's cells for real via a Pi child Task, since Toda has no kernel of its own.
@@ -38,14 +38,14 @@ explicit step.
 
 ## What's actually available
 
-- `workspace_write` / `workspace_read` / `workspace_patch` operate on the
+- `write_file` / `read_file` / `edit_file` operate on the
   `.ipynb` file as a plain UTF-8 text file (notebooks are JSON under the
   hood). You can create cells, edit a cell's source, and read back the
   current structure this way.
 - Nothing in Toda's own tool surface executes a notebook cell.
   `run_code`'s sandbox is a real Python execution environment, but it can
   only call back into a fixed allow-list of read-only company-data lookups
-  (`brain_search` and similar) -- it has no filesystem access to the
+  (`memory_search` and similar) -- it has no filesystem access to the
   workspace and cannot import or run notebook cells, and it is a poor
   substitute for this skill because state does not persist between
   `run_code` invocations the way it does inside one kernel.
@@ -79,7 +79,7 @@ explicit step.
 
 ### 1. Author the notebook structure
 
-Write a valid `.ipynb` (nbformat 4) file with `workspace_write`:
+Write a valid `.ipynb` (nbformat 4) file with `write_file`:
 
 - Markdown cells narrate what the analysis is doing and why, ahead of the
   code that does it.
@@ -93,7 +93,7 @@ Write a valid `.ipynb` (nbformat 4) file with `workspace_write`:
 
 ### 2. Execute for real
 
-Delegate the actual run to `delegate_tasks` with a concrete
+Delegate the actual run to `task_delegate` with a concrete
 description: which notebook file, what environment it needs (packages to
 install), and an instruction to execute it top to bottom and save outputs
 back into the same file. A reasonable delegated task reads like: "install
@@ -107,7 +107,7 @@ authored cell and re-delegate the run, or report the failure and stop.
 
 ### 3. Verify
 
-- Read the executed notebook back with `workspace_read` and confirm
+- Read the executed notebook back with `read_file` and confirm
   `execution_count` increases monotonically across cells and outputs are
   present where expected -- both are direct evidence the run actually
   happened rather than being fabricated.
@@ -137,7 +137,7 @@ authored cell and re-delegate the run, or report the failure and stop.
 ## Verification checklist
 
 - [ ] Every code cell with a filled-in output was actually executed via
-      `delegate_tasks` -- not hand-written
+      `task_delegate` -- not hand-written
 - [ ] `execution_count` is present and monotonically increasing for executed
       cells
 - [ ] Markdown cells explain what each code step is doing and why

@@ -50,7 +50,7 @@ def _start_root_with_plan_and_child(brain, *, artifact_id: str | None = None):
                 tool_calls=[
                     ModelToolCall(
                         id="call_delegate",
-                        name="delegate_tasks",
+                        name="task_delegate",
                         arguments={
                             "tasks": [
                                 {
@@ -218,7 +218,7 @@ def test_artifact_reads_are_bounded_and_lists_are_metadata_only(brain):
     )
     root, _child = _start_root_with_plan_and_child(brain)
 
-    listed = _execute(brain, root, "brain_list_artifacts", {}, "list_artifacts")
+    listed = _execute(brain, root, "artifact_list", {}, "list_artifacts")
     assert listed.status == "completed"
     listed_value = next(item for item in listed.output["artifacts"] if item["id"] == artifact["id"])
     assert "content" not in listed_value
@@ -226,7 +226,7 @@ def test_artifact_reads_are_bounded_and_lists_are_metadata_only(brain):
     read = _execute(
         brain,
         root,
-        "brain_read_artifact",
+        "artifact_read",
         {"artifact_id": artifact["id"], "offset": 10, "max_chars": 25},
         "read_artifact",
     )
@@ -246,7 +246,7 @@ def test_artifact_reads_are_bounded_and_lists_are_metadata_only(brain):
     binary_read = _execute(
         brain,
         root,
-        "brain_read_artifact",
+        "artifact_read",
         {"artifact_id": binary["id"]},
         "read_binary_artifact",
     )
@@ -314,7 +314,7 @@ def test_source_references_are_permission_checked_and_read_in_slices(brain):
     read = _execute(
         brain,
         child,
-        "brain_read_source",
+        "memory_read_source",
         {"source_id": source["id"], "max_chars": 31},
         "read_source",
     )
@@ -417,7 +417,7 @@ def test_missing_app_connection_returns_exact_oauth_link_and_requires_rediscover
     )
     assert requested.status == "completed"
     assert requested.output["redirect_url"] == "https://connect.example/linear"
-    assert "composio_list_integrations again" in requested.output["instruction"]
+    assert "integration_list again" in requested.output["instruction"]
     assert brain.audit.list_events(
         "org_acme", "task.integration_connection.requested"
     )
@@ -425,7 +425,7 @@ def test_missing_app_connection_returns_exact_oauth_link_and_requires_rediscover
     # A returned OAuth link is not proof of connection. Only fresh connector
     # state makes the integration visible.
     before = _execute(
-        brain, root, "composio_list_integrations", {}, "integrations_before"
+        brain, root, "integration_list", {}, "integrations_before"
     )
     assert before.output["integrations"] == []
     brain.store.upsert_connector_account(
@@ -438,7 +438,7 @@ def test_missing_app_connection_returns_exact_oauth_link_and_requires_rediscover
         }
     )
     after = _execute(
-        brain, root, "composio_list_integrations", {}, "integrations_after"
+        brain, root, "integration_list", {}, "integrations_after"
     )
     assert [item["toolkit"] for item in after.output["integrations"]] == ["linear"]
 

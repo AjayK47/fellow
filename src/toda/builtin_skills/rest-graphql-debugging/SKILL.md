@@ -61,9 +61,9 @@ evidence a human has already pasted into the conversation, plus public
 documentation via `web_fetch`. Say which situation you're in before
 diagnosing.
 
-`workspace_write` is useful for saving a reproduction script or a regression
+`write_file` is useful for saving a reproduction script or a regression
 test once the failure is understood, so it can be re-run later via
-`delegate_tasks` rather than re-typed each time.
+`task_delegate` rather than re-typed each time.
 
 ## When to use
 

@@ -11,7 +11,7 @@ import ipaddress
 import json
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -29,6 +29,18 @@ from toda.harness.slack import (
     _slack_identity_key,
 )
 from toda.services.dashboard_auth import DashboardAuthService
+from toda.services.readiness import (
+    ReadinessBlockedError,
+    enforce_real_world_readiness,
+    readiness_report,
+)
+from toda.config import ModelAssignment, save_settings
+from toda.providers import (
+    VALID_CAPABILITIES,
+    VALID_ROLES,
+    capability_for,
+    providers,
+)
 
 router = APIRouter()
 
@@ -288,7 +300,7 @@ class CloudEventRequest(BaseModel):
     organizationid: str
     principalid: str | None = None
     applicationid: str | None = None
-    traceid: str | None = None
+    eventcorrelationid: str | None = None
     scopeid: str | None = None
     purpose: str | None = None
     processing_mode: str = "memory"
@@ -615,6 +627,9 @@ class HarnessFeedbackRequest(BaseModel):
     task_id: str | None = None
     attention_evaluation_id: str | None = None
     comment: str | None = None
+    score: float | None = Field(default=None, ge=0, le=1)
+    evaluator: str | None = None
+    rubric_version: str | None = None
 
 
 class SlackInstallationRequest(BaseModel):
@@ -956,6 +971,30 @@ def invoke_task(body: TaskInvokeRequest, request: Request) -> dict[str, Any]:
     """Wake the one Session Manager responsible for this conversation."""
     brain = _app(request)
     actor = _acting_principal(request)
+    if getattr(brain.settings.agent, "require_real_world_readiness", False):
+        existing_session = brain.store.find_session_by_conversation(
+            body.organization_id, _api_conversation_key(actor, body.conversation_id)
+        )
+        existing_root = (
+            brain.store.find_root_task_for_session(existing_session["id"])
+            if existing_session
+            else None
+        )
+        if existing_root is None or existing_root.get("state") in {"completed", "failed", "cancelled"}:
+            try:
+                enforce_real_world_readiness(
+                    brain, principal_id=actor, trigger_kind=str(body.trigger_kind)
+                )
+            except ReadinessBlockedError as exc:
+                failed = [
+                    {key: item.get(key) for key in ("name", "message", "remediation")}
+                    for item in exc.report.get("checks", [])
+                    if item.get("status") != "pass"
+                ]
+                raise HTTPException(
+                    503,
+                    {"error": "real_world_readiness_required", "failed_checks": failed},
+                ) from exc
     try:
         wake = brain.sessions.wake(
             organization_id=body.organization_id,
@@ -1163,73 +1202,90 @@ def get_task_trace(
     task = _authorized_task(task_id, request, what="task_trace")
     if task["organization_id"] != organization_id:
         raise HTTPException(404, "task not found")
-    events = brain.store.list_trace_events(
-        task.get("trace_id") or "",
-        component=component,
-        operation=operation,
+    spans = brain.store.list_otel_spans(
+        None,
+        task_id=task_id,
+        name=operation or component,
+        organization_id=organization_id,
         errors_only=errors_only,
         limit=min(limit, 10_000),
     )
     return {
-        "trace_id": task.get("trace_id"),
+        "trace_ids": sorted({str(item["trace_id"]) for item in spans if item.get("trace_id")}),
         "task_id": task_id,
-        "events": events,
-        "count": len(events),
+        "spans": spans,
+        "count": len(spans),
     }
 
 
-def _trace_tree(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Fold a flat event stream into the nested spans it describes.
+@router.get("/v1/tasks/{task_id}/run-summary")
+def get_run_summary(task_id: str, request: Request, organization_id: str) -> dict[str, Any]:
+    brain = _app(request)
+    task = _authorized_task(task_id, request, what="run_summary")
+    if task["organization_id"] != organization_id:
+        raise HTTPException(404, "task not found")
+    return brain.run_inspection.summary(task)
 
-    A span appears as two rows sharing a span_id -- `started` when it opened
-    and `completed`/`failed` when it closed, the latter carrying the
-    duration and result. Single `record()` calls appear once and are leaves.
-    Rebuilding the nesting here rather than in the browser keeps the client
-    dumb and means the same shape is available to anything else that asks.
+@router.get("/v1/harness/runs")
+def list_run_summaries(
+    request: Request,
+    organization_id: str,
+    state: str | None = None,
+    task_id: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    tool: str | None = None,
+    approval_id: str | None = None,
+    errors_only: bool = False,
+    since: str | None = None,
+    until: str | None = None,
+    incomplete_only: bool = False,
+    high_cost_usd: float | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    brain = _app(request)
+    def parse_bound(value: str | None, name: str) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(400, f"invalid {name}; expected ISO-8601") from exc
 
-    A span whose parent is missing (trimmed by retention, or still running
-    when the trace was read) is promoted to a root instead of being dropped,
-    because a half-visible trace is still worth reading and a vanished one
-    is not.
-    """
-    spans: dict[str, dict[str, Any]] = {}
+    lower_bound = parse_bound(since, "since")
+    upper_bound = parse_bound(until, "until")
+    runs = brain.run_inspection.list_runs(
+        organization_id,
+        state=state,
+        provider=provider,
+        model=model,
+        tool=tool,
+        approval_id=approval_id,
+        errors_only=errors_only,
+        incomplete_only=incomplete_only,
+        high_cost_usd=high_cost_usd,
+        since=lower_bound,
+        until=upper_bound,
+        limit=limit,
+    )
+    return {"runs": runs, "count": len(runs)}
+
+def _trace_tree(span_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold completed OpenTelemetry spans into a navigable tree."""
+    nodes: dict[str, dict[str, Any]] = {}
     order: list[str] = []
-    for event in events:
-        span_id = event["span_id"]
-        node = spans.get(span_id)
-        if node is None:
-            node = {
-                "span_id": span_id,
-                "parent_span_id": event.get("parent_span_id"),
-                "operation": event["operation"],
-                "component": event["component"],
-                "phase": event["phase"],
-                "started_at": event["created_at"],
-                "duration_ms": event.get("duration_ms"),
-                "context": event.get("context") or {},
-                "input": event.get("input"),
-                "output": event.get("output"),
-                "error": event.get("error"),
-                "children": [],
-            }
-            spans[span_id] = node
-            order.append(span_id)
-            continue
-        # The closing row wins on everything it actually carries.
-        node["phase"] = event["phase"]
-        node["duration_ms"] = event.get("duration_ms", node["duration_ms"])
-        for field in ("output", "error"):
-            if event.get(field) is not None:
-                node[field] = event[field]
-        if event.get("input") is not None and node.get("input") is None:
-            node["input"] = event["input"]
-        if event.get("context"):
-            node["context"] = {**node["context"], **event["context"]}
+    for item in span_rows:
+        node = {**item, "children": []}
+        node.setdefault("operation", node.get("name"))
+        node.setdefault("component", node.get("scope_name"))
+        node.setdefault("phase", "failed" if node.get("status_code") == "ERROR" else "completed")
+        nodes[node["span_id"]] = node
+        order.append(node["span_id"])
 
     roots: list[dict[str, Any]] = []
     for span_id in order:
-        node = spans[span_id]
-        parent = spans.get(node["parent_span_id"] or "")
+        node = nodes[span_id]
+        parent = nodes.get(node.get("parent_span_id") or "")
         if parent is not None and parent is not node:
             parent["children"].append(node)
         else:
@@ -1251,7 +1307,7 @@ def list_traces(
     being a participant in any of them.
     """
     _require_admin(request)
-    traces = _app(request).store.list_traces(
+    traces = _app(request).store.list_otel_traces(
         organization_id, limit=min(limit, 200), errors_only=errors_only
     )
     return {"traces": traces, "count": len(traces)}
@@ -1264,18 +1320,18 @@ def get_trace(
     organization_id: str,
     limit: int = 5000,
 ) -> dict[str, Any]:
-    """One trace as a nested span tree, with its flat events alongside."""
+    """One trace as a nested tree with its flat completed spans alongside."""
     _require_admin(request)
-    events = _app(request).store.list_trace_events(
+    spans = _app(request).store.list_otel_spans(
         trace_id, organization_id=organization_id, limit=min(limit, 10_000)
     )
-    if not events:
+    if not spans:
         raise HTTPException(404, "trace not found")
     return {
         "trace_id": trace_id,
-        "tree": _trace_tree(events),
-        "events": events,
-        "count": len(events),
+        "tree": _trace_tree(spans),
+        "spans": spans,
+        "count": len(spans),
     }
 
 
@@ -1458,6 +1514,7 @@ def decide_approval(
             "edited_arguments": body.edited_arguments,
         },
         idempotency_key=f"approval.resolve:{approval_id}:{body.approved}",
+        link_carrier=approval.get("telemetry_carrier"),
     )
     response: dict[str, Any] = {"approval": approval, "job": job}
     if body.run_now:
@@ -1561,6 +1618,9 @@ def harness_dashboard(
     )
     return {
         "organization_id": organization_id,
+        "readiness": readiness_report(brain),
+        "catalog": brain.models_catalog.status(),
+        "telemetry": brain.store.telemetry.metrics_snapshot(),
         "evaluation": brain.harness_evaluation.metrics(organization_id),
         "sessions": brain.store.list_sessions(organization_id, limit=50),
         "tasks": tasks,
@@ -1589,12 +1649,18 @@ def harness_dashboard(
 @router.get("/v1/harness/status")
 def harness_status(request: Request) -> dict[str, Any]:
     brain = _app(request)
-    from toda.config import settings as config
+    config = brain.settings
 
     capability_ids = brain.tool_executor.available_capabilities_for_organization(
         config.organization.id
     )
     return {
+        "readiness": readiness_report(brain),
+        "telemetry": {
+            "backend": "opentelemetry",
+            "local_exporter": type(brain.store.telemetry.local_exporter).__name__,
+            "metrics": brain.store.telemetry.metrics_snapshot(),
+        },
         "database": {
             "backend": "sqlite",
             "wal": True,
@@ -1660,6 +1726,166 @@ def harness_status(request: Request) -> dict[str, Any]:
             "execution_preconditions": True,
             "durable_artifacts": True,
         },
+    }
+
+
+@router.get("/v1/harness/readiness")
+def harness_readiness(request: Request) -> dict[str, Any]:
+    return readiness_report(_app(request))
+
+
+@router.get("/v1/admin/catalog/models")
+def list_raw_catalog_models(
+    request: Request,
+    provider_id: str | None = None,
+    search: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    _require_admin(request)
+    brain = _app(request)
+    catalog = brain.models_catalog
+
+    all_models = catalog.models(provider_id)
+    if search:
+        s = search.lower().strip()
+        all_models = [
+            m for m in all_models
+            if s in str(m.get("id") or m.get("model_id") or "").lower()
+            or s in str(m.get("name") or "").lower()
+        ]
+
+    total = len(all_models)
+    paged = all_models[offset : offset + limit]
+
+    return {
+        "models": paged,
+        "count": len(paged),
+        "total": total,
+        "catalog": catalog.status(),
+    }
+
+
+@router.post("/v1/admin/catalog/refresh")
+def force_refresh_catalog(request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    brain = _app(request)
+    status = brain.models_catalog.refresh(force=True)
+    return {"catalog": status}
+
+
+@router.get("/v1/models")
+def list_selectable_models(
+    request: Request,
+    connection_name: str,
+    role: str = "main",
+    capability: str = "chat",
+    explicit_model: str | None = None,
+    search: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    brain = _app(request)
+    catalog = brain.models_catalog
+
+    conn = brain.settings.models.providers.get(connection_name)
+    if not conn:
+        raise HTTPException(
+            404,
+            f"Provider connection '{connection_name}' is not configured in organization settings.",
+        )
+
+    if role not in VALID_ROLES:
+        raise HTTPException(400, f"Invalid role '{role}'. Must be one of: {', '.join(sorted(VALID_ROLES))}")
+
+    if capability not in VALID_CAPABILITIES:
+        raise HTTPException(400, f"Invalid capability '{capability}'. Must be one of: {', '.join(sorted(VALID_CAPABILITIES))}")
+
+    all_models = providers.models(
+        conn,
+        capability=capability,
+        role=role,
+        explicit_model=explicit_model,
+        policy=brain.settings.models.policy,
+    )
+
+    if search:
+        s = search.lower().strip()
+        all_models = [
+            m for m in all_models
+            if s in str(m.get("id") or m.get("model_id") or "").lower()
+            or s in str(m.get("name") or "").lower()
+        ]
+
+    total = len(all_models)
+    paged = all_models[offset : offset + limit]
+
+    return {
+        "models": paged,
+        "count": len(paged),
+        "total": total,
+        "connection_name": connection_name,
+        "provider": conn.provider,
+        "catalog": catalog.status(),
+    }
+
+
+class ModelAssignmentUpdate(BaseModel):
+    role: str
+    connection_name: str
+    model: str
+
+
+@router.get("/v1/model-settings")
+def model_settings(request: Request) -> dict[str, Any]:
+    _require_admin(request)
+    brain = _app(request)
+    return {
+        "connections": [
+            {"name": name, "provider": connection.provider}
+            for name, connection in sorted(brain.settings.models.providers.items())
+        ],
+        "assignments": {
+            role: assignment.model_dump()
+            for role, assignment in brain.settings.models.assignments.items()
+        },
+        "roles": sorted(VALID_ROLES),
+    }
+
+
+@router.put("/v1/model-settings/assignment")
+@member_writable
+def update_model_assignment(
+    body: ModelAssignmentUpdate, request: Request
+) -> dict[str, Any]:
+    _require_admin(request)
+    brain = _app(request)
+    if body.role not in VALID_ROLES:
+        raise HTTPException(400, f"invalid model role: {body.role}")
+    connection = brain.settings.models.providers.get(body.connection_name)
+    if connection is None:
+        raise HTTPException(404, "provider connection is not configured")
+    selectable = providers.models(
+        connection,
+        role=body.role,
+        capability=capability_for(role=body.role, capability="chat"),
+        explicit_model=body.model,
+        policy=brain.settings.models.policy,
+    )
+    if body.model not in {str(item.get("id")) for item in selectable}:
+        raise HTTPException(400, "model is not eligible for this role and connection")
+    assignments = dict(brain.settings.models.assignments)
+    assignments[body.role] = ModelAssignment(
+        connection=body.connection_name,
+        model=body.model,
+    )
+    updated_models = brain.settings.models.model_copy(update={"assignments": assignments})
+    updated = brain.settings.model_copy(update={"models": updated_models})
+    save_settings(updated)
+    return {
+        "assignment": assignments[body.role].model_dump(),
+        "role": body.role,
+        "restart_required": True,
     }
 
 
@@ -1979,7 +2205,19 @@ def sync_composio_connections(
     try:
         response = brain.composio.list_connected_accounts(user_id=user_id)
     except Exception as exc:
+        brain.store.record_connector_health(
+            body.organization_id,
+            "composio",
+            status="error",
+            detail={"error_type": type(exc).__name__},
+        )
         raise HTTPException(502, f"Composio connection sync failed: {exc}") from exc
+    brain.store.record_connector_health(
+        body.organization_id,
+        "composio",
+        status="ok",
+        detail={"account_count": len(response.get("items") or [])},
+    )
     saved: list[dict[str, Any]] = []
     # Oldest-first: when Composio reports several accounts for the same
     # toolkit (e.g. repeated reconnects), each active upsert supersedes any
@@ -3248,7 +3486,7 @@ _INLINE_MIME_TYPES = {
 
 # An SVG served inline from the console's own origin is an active document:
 # it may carry <script> and same-origin fetches. chart_create/diagram_render
-# only ever emit renderer output, but `brain_create_artifact` accepts an
+# only ever emit renderer output, but `artifact_create` accepts an
 # arbitrary content dict from the model, so an "image/svg+xml" artifact is not
 # necessarily one of theirs. The header makes the inline response inert rather
 # than trusting where the bytes came from.
@@ -3334,7 +3572,7 @@ def _cloud_event_payload(body: CloudEventRequest) -> dict[str, Any]:
     event["organization_id"] = event.pop("organizationid")
     event["principal_id"] = event.pop("principalid")
     event["application_id"] = event.pop("applicationid")
-    event["trace_id"] = event.pop("traceid")
+    event["event_correlation_id"] = event.pop("eventcorrelationid")
     event["scope_id"] = event.pop("scopeid")
     return event
 

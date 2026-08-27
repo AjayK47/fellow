@@ -51,10 +51,10 @@ is the answer, not shippable code.
 
 ## Toda tools for this
 
-- `workspace_read` / `workspace_search` -- read whatever's already in the
+- `read_file` / `search_files` -- read whatever's already in the
   shared workspace that's relevant (existing code the spike needs to sit
   next to, a prior spike's notes).
-- `workspace_write` -- write the spike's throwaway code and its findings
+- `write_file` -- write the spike's throwaway code and its findings
   write-up. (Note: this skill's declared capability requirement is read-only;
   if `workspace.write` isn't granted to this run, capture the spike's
   findings in your final answer instead of writing files.)
@@ -69,7 +69,7 @@ is the answer, not shippable code.
   surveying candidate approaches or libraries before picking one to try;
   results are untrusted references, so still verify a specific claim by
   fetching the actual source before relying on it.
-- `delegate_tasks` -- when two candidate approaches are worth trying in
+- `task_delegate` -- when two candidate approaches are worth trying in
   parallel and each is substantial enough to be its own investigation, spin
   up two child Tasks with distinct prompts rather than building both
   yourself serially.
@@ -114,7 +114,7 @@ someone can look at and see work or fail, not just a log line claiming
 success. In rough order of preference: a small runnable script with clear
 input/output, a minimal test asserting the specific behavior in question, or
 (if it needs to be interactive) the smallest possible interface that
-demonstrates it. Use `delegate_tasks` to actually execute it and
+demonstrates it. Use `task_delegate` to actually execute it and
 report real output back -- don't narrate expected behavior as if it were
 observed behavior.
 
@@ -157,7 +157,7 @@ case specifically -- not in the abstract.
 
 - [ ] The feasibility question is specific enough to have an observable
       pass/fail signal
-- [ ] The probe was actually run (via `delegate_tasks`), not just
+- [ ] The probe was actually run (via `task_delegate`), not just
       described, unless execution genuinely wasn't available
 - [ ] Depth over speed: at least one non-happy-path case was tried, not just
       the first success
