@@ -11,7 +11,7 @@ RUN pnpm install --frozen-lockfile
 COPY web/ ./
 RUN pnpm run build
 
-FROM ghcr.io/astral-sh/uv:0.6.17 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.10 AS uv
 
 FROM python:3.12-slim AS runtime
 # TODA_CONFIG is the only environment variable Toda reads -- a config file
