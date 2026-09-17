@@ -414,6 +414,9 @@ class SlackGateway:
             return {"accepted": False, "reason": "unsupported_slack_payload"}
         inner = payload.get("event") or {}
         workspace_id = str(payload.get("team_id") or "")
+        # TEMP TRACE (before normalization) — exactly what Slack sent, before
+        # anything in this codebase has touched it.
+        log.info("SLACK RAW <= %s", json.dumps(payload, indent=2, default=str))
         # Handled before _ignore_event, which drops both shapes of this as
         # "not a message". They are not messages -- they are permission
         # changes, and ignoring them is what made membership add-only.
@@ -426,6 +429,13 @@ class SlackGateway:
         if self._ignore_event(inner, workspace_id):
             return {"accepted": False, "reason": "ignored_event"}
         event = self.normalize(payload)
+        # TEMP TRACE (after normalization) — the NormalizedEvent this raw
+        # payload became: organization/scope resolved, DM-vs-channel-vs-
+        # private decided, dedupe_key computed, bot mention stripped.
+        log.info(
+            "SLACK NORMALIZED => %s",
+            json.dumps(event.model_dump(mode="json"), indent=2, default=str),
+        )
         if not event.payload.get("channel_enabled", True):
             return {
                 "accepted": False,

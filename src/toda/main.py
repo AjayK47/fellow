@@ -517,10 +517,35 @@ def reindex_cli(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        log_dir = settings.storage.data_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # Rotating, not one growing file: 10MB per file, 5 backups kept, so a
+        # long-lived gateway (or a chatty TEMP TRACE) can't quietly fill the
+        # disk while you're not looking. That's ~50MB of history retained
+        # across restarts -- "always look back" without an unbounded log.
+        from logging.handlers import RotatingFileHandler
+
+        handlers.append(
+            RotatingFileHandler(
+                log_dir / "gateway.log",
+                maxBytes=10_000_000,
+                backupCount=5,
+                encoding="utf-8",
+            )
+        )
+    except OSError:
+        # A read-only or missing data_dir must not stop the gateway from
+        # starting -- console logging alone is still a functioning fallback.
+        pass
     logging.basicConfig(
         level=settings.server.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=log_format,
+        handlers=handlers,
     )
+    log.info("Logging to console" + (f" and {log_dir / 'gateway.log'}" if len(handlers) > 1 else " only"))
     parser = argparse.ArgumentParser(
         prog="toda",
         description="Toda local control plane and company-agent gateway",
