@@ -660,17 +660,30 @@ class SlackGateway:
         now = _utcnow().isoformat()
         scope_id = f"scope_person_{principal_id}"
         if action.get("action_id") == "toda_preference_yes":
-            self.store.upsert_simple_harness_record(
+            # Merge into the tool's existing policy row: an admin's
+            # execution setting and other people's overrides must survive
+            # one person opting in.
+            existing = self.store.list_harness_records(
                 "tool_policies",
-                {
-                    "id": f"tool_policy:{organization_id}:{tool_name}",
-                    "organization_id": organization_id,
-                    "tool_name": tool_name,
-                    "execution": "inherit",
-                    "principal_overrides": {principal_id: "direct"},
-                    "updated_at": now,
-                },
+                organization_id,
+                where={"tool_name": tool_name},
+                order_by="updated_at",
+                limit=1,
             )
+            record = dict(existing[0]) if existing else {
+                "id": f"tool_policy:{organization_id}:{tool_name}",
+                "organization_id": organization_id,
+                "tool_name": tool_name,
+                "execution": "inherit",
+            }
+            overrides = dict(record.get("principal_overrides") or {})
+            per_channel = overrides.get(principal_id)
+            per_channel = dict(per_channel) if isinstance(per_channel, dict) else {}
+            per_channel[channel] = "direct"
+            overrides[principal_id] = per_channel
+            record["principal_overrides"] = overrides
+            record["updated_at"] = now
+            self.store.upsert_simple_harness_record("tool_policies", record)
             predicate, object_value = "auto_approve", f"{tool_name}@{channel}"
         else:
             predicate, object_value = "declined_auto_approve", f"{tool_name}@{channel}"

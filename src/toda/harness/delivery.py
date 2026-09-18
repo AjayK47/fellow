@@ -220,24 +220,22 @@ class DeliveryService:
         return ((task.get("metadata") or {}).get("slack") or {}).get("thread_ts")
 
     def _conversation_thread(self, session_id: str, message_id: str) -> str | None:
+        """Thread of the user message that triggered this reply.
+
+        That is the last user/event message before the reply, and a
+        top-level trigger means no thread -- an earlier threaded message
+        in the same channel must not pull the reply into its thread.
+        """
         messages = self.store.list_session_messages(session_id, limit=200)
-        target = next((m for m in messages if m.get("id") == message_id), None)
-        if target is None:
-            return None
-        created = str(target.get("created_at") or "")
-        thread = None
+        trigger: dict[str, Any] | None = None
         for item in messages:
             if item.get("id") == message_id:
                 break
             if item.get("role") in {"user", "event"}:
-                ts = (item.get("metadata") or {}).get("thread_ts")
-                if ts:
-                    thread = ts
-                elif created and str(item.get("created_at") or "") > created:
-                    break
-        if thread is None and target is not None:
-            thread = ((target.get("metadata") or {}).get("thread_ts"))
-        return thread
+                trigger = item
+        else:
+            return None
+        return ((trigger or {}).get("metadata") or {}).get("thread_ts") or None
 
     def deliver_conversation(self, session_id: str, message_id: str) -> dict[str, Any]:
         session = self.store.get_session(session_id)
@@ -697,8 +695,10 @@ class DeliveryService:
         envelope = task["envelope"]
         slack = (task.get("metadata") or {}).get("slack") or {}
         preview = approval["preview"]
-        sentence = self._approval_sentence(task, preview)
         is_draft = (preview.get("action") or approval.get("tool_name")) == "post_draft"
+        # A draft card shows the draft itself; only other approvals need the
+        # model-written sentence (one fewer model call before a draft appears).
+        sentence = "" if is_draft else self._approval_sentence(task, preview)
         if is_draft:
             draft_args = approval.get("arguments") or {}
             draft_text = to_slack_mrkdwn(str(draft_args.get("text") or ""))

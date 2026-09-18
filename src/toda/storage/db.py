@@ -2184,7 +2184,7 @@ class BrainStore:
             cur.execute(
                 f"""SELECT payload FROM memories WHERE organization_id = ?
                 AND scope_id IN ({placeholders}) AND status IN ('active', 'confirmed')
-                AND is_latest = 1 ORDER BY observed_at DESC LIMIT ?""",
+                AND is_latest = 1 ORDER BY json_extract(payload, '$.observed_at') DESC LIMIT ?""",
                 [organization_id, *scope_ids, int(limit)],
             )
             return [_de(r["payload"]) for r in cur.fetchall()]

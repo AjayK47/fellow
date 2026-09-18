@@ -3108,7 +3108,10 @@ class ToolExecutor:
                 error="Tool is outside this run's resolved capability envelope.",
             )
         policy = self.effective_policy(
-            run["organization_id"], definition, principal_id=run["envelope"]["principal_id"]
+            run["organization_id"],
+            definition,
+            principal_id=run["envelope"]["principal_id"],
+            channel_id=str((run["envelope"].get("destination") or {}).get("id") or "") or None,
         )
         if policy["access"] != "enabled":
             return ToolResult(
@@ -3548,7 +3551,11 @@ class ToolExecutor:
         return mode if mode in _TOOL_POLICY_MODES else "autonomous"
 
     def effective_policy(
-        self, organization_id: str, definition: ToolDefinition, principal_id: str | None = None
+        self,
+        organization_id: str,
+        definition: ToolDefinition,
+        principal_id: str | None = None,
+        channel_id: str | None = None,
     ) -> dict[str, Any]:
         mode = self.organization_policy_mode(organization_id)
         records = self.store.list_harness_records(
@@ -3569,13 +3576,16 @@ class ToolExecutor:
             else override
         )
         source = "tool_override" if override != "inherit" else mode
-        # Per-person relaxations: a principal override wins, but may only
-        # relax ask/ai_review -> direct for write-risk tools — never for
-        # destructive tools, and never for always-approval tools (except
-        # post_draft, whose approval is the product).
-        if principal_id:
-            principal_override = str(
-                ((record.get("principal_overrides") or {}).get(principal_id) or "")
+        # Per-person relaxations, per channel: {principal: {channel: "direct"}}.
+        # A person agreed to stop being asked in one channel, so the override
+        # applies there only. It may only relax ask/ai_review -> direct for
+        # write-risk tools: never destructive tools, never always-approval
+        # tools (except post_draft, whose approval is the product), and never
+        # an explicit deny.
+        if principal_id and channel_id:
+            per_channel = (record.get("principal_overrides") or {}).get(principal_id) or {}
+            principal_override = (
+                str(per_channel.get(channel_id) or "") if isinstance(per_channel, dict) else ""
             )
             if (
                 principal_override == "direct"

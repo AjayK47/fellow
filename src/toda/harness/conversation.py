@@ -29,6 +29,12 @@ from toda.services.readiness import enforce_real_world_readiness
 log = logging.getLogger("toda.conversation")
 
 
+# Messages sent verbatim, and how many aged-out ones fold into the summary
+# at once.
+_HISTORY_WINDOW = 30
+_COMPACT_BATCH = 10
+
+
 _START_TASK = ToolDefinition(
     name="start_task",
     description=(
@@ -204,38 +210,10 @@ class ConversationAgent:
     ) -> AgentOutcome:
         turn_id = new_id("turn")
         full_history = self.store.list_session_messages(session["id"], limit=200)
-        history = full_history[-30:]
+        history = full_history[-_HISTORY_WINDOW:]
         session_summary = str((session or {}).get("summary") or "")
-        if len(full_history) > 30:
-            older = full_history[:-30]
-            already_through = (session or {}).get("summary_through_message_id")
-            new_messages = older
-            if already_through:
-                for index, message in enumerate(older):
-                    if message.get("id") == already_through:
-                        new_messages = older[index + 1 :]
-                        break
-                else:
-                    if already_through in {m.get("id") for m in history}:
-                        new_messages = []
-            if new_messages:
-                if self.history_compactor is not None:
-                    session_summary = self.history_compactor.compact(
-                        previous_summary=session_summary,
-                        new_messages=new_messages,
-                    )
-                else:
-                    session_summary = (session_summary + "\n" + "\n".join(
-                        f"{m.get('role', '').upper()}: {m.get('content') or ''}" for m in new_messages
-                    ).strip()).strip()[-8000:]
-                updated = dict(session)
-                updated["summary"] = session_summary
-                updated["summary_through_message_id"] = older[-1]["id"]
-                updated["updated_at"] = utcnow().isoformat()
-                self.store.update_session(updated)
-                session = updated
         latest_user = next(
-            (item for item in reversed(history) if item.get("role") in {"user", "event"}),
+            (item for item in reversed(full_history) if item.get("role") in {"user", "event"}),
             None,
         )
         user_text = str((latest_user or {}).get("content") or "")
@@ -258,6 +236,40 @@ class ConversationAgent:
             )
             self._acknowledge(root)
             return task_agent.execute_task(root["id"])
+        # Only the conversation path needs the summary; a Task handoff above
+        # never pays for it. Aged-out messages stay in the prompt until a
+        # batch has built up, then fold in one call -- so a quick reply in a
+        # long conversation isn't one extra model call slower every turn.
+        if len(full_history) > _HISTORY_WINDOW:
+            older = full_history[:-_HISTORY_WINDOW]
+            already_through = (session or {}).get("summary_through_message_id")
+            new_messages = older
+            if already_through:
+                for index, message in enumerate(older):
+                    if message.get("id") == already_through:
+                        new_messages = older[index + 1 :]
+                        break
+                else:
+                    if already_through in {m.get("id") for m in history}:
+                        new_messages = []
+            if len(new_messages) >= _COMPACT_BATCH:
+                if self.history_compactor is not None:
+                    session_summary = self.history_compactor.compact(
+                        previous_summary=session_summary,
+                        new_messages=new_messages,
+                    )
+                else:
+                    session_summary = (session_summary + "\n" + "\n".join(
+                        f"{m.get('role', '').upper()}: {m.get('content') or ''}" for m in new_messages
+                    ).strip()).strip()[-8000:]
+                updated = dict(session)
+                updated["summary"] = session_summary
+                updated["summary_through_message_id"] = older[-1]["id"]
+                updated["updated_at"] = utcnow().isoformat()
+                self.store.update_session(updated)
+                session = updated
+            else:
+                history = [*new_messages, *history]
         context = self.context_service.prepare_context(
             organization_id=session["organization_id"],
             task=user_text,

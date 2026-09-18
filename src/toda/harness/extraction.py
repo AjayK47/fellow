@@ -284,9 +284,16 @@ class ModelMemoryExtractor:
         if self.reality is not None:
             try:
                 source_entity_ids = list(source.get("entity_ids") or [])[:20]
+                # Only facts this source's room may see: a public message
+                # must never be shown (and then restate) private facts.
+                visible = sorted(
+                    self.reality.visible_scope_ids(
+                        source["organization_id"], str(source.get("scope_id") or "")
+                    )
+                )
                 for entity_id in source_entity_ids:
                     for fact in self.reality.current_facts(
-                        source["organization_id"], subject_id=entity_id
+                        source["organization_id"], subject_id=entity_id, scope_ids=visible
                     )[:10]:
                         current_facts.append(
                             {

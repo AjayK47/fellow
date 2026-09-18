@@ -96,7 +96,7 @@ def test_principal_override_skips_approval_for_that_person_only(brain):
             "organization_id": "org_acme",
             "tool_name": "pref_test_write",
             "execution": "ask",
-            "principal_overrides": {"person_ajay": "direct"},
+            "principal_overrides": {"person_ajay": {"C1": "direct"}},
             "updated_at": "2026-09-18T00:00:00+00:00",
         },
     )
@@ -104,9 +104,17 @@ def test_principal_override_skips_approval_for_that_person_only(brain):
         d for d in brain.tool_executor.registry.definitions() if d.name == "pref_test_write"
     )
     assert not runs_without_approval(definition)
-    ajay = brain.tool_executor.effective_policy("org_acme", definition, principal_id="person_ajay")
-    ravi = brain.tool_executor.effective_policy("org_acme", definition, principal_id="person_ravi")
+    ajay = brain.tool_executor.effective_policy(
+        "org_acme", definition, principal_id="person_ajay", channel_id="C1"
+    )
+    ajay_elsewhere = brain.tool_executor.effective_policy(
+        "org_acme", definition, principal_id="person_ajay", channel_id="C2"
+    )
+    ravi = brain.tool_executor.effective_policy(
+        "org_acme", definition, principal_id="person_ravi", channel_id="C1"
+    )
     assert ajay["execution"] == "direct" and ajay["source"] == "principal_override"
+    assert ajay_elsewhere["execution"] == "ask"
     assert ravi["execution"] == "ask"
 
     destructive = next(
@@ -119,12 +127,12 @@ def test_principal_override_skips_approval_for_that_person_only(brain):
             "organization_id": "org_acme",
             "tool_name": "delete_file",
             "execution": "inherit",
-            "principal_overrides": {"person_ajay": "direct"},
+            "principal_overrides": {"person_ajay": {"C1": "direct"}},
             "updated_at": "2026-09-18T00:00:00+00:00",
         },
     )
     assert brain.tool_executor.effective_policy(
-        "org_acme", destructive, principal_id="person_ajay"
+        "org_acme", destructive, principal_id="person_ajay", channel_id="C1"
     )["execution"] != "direct"
 
 
@@ -192,8 +200,12 @@ def test_five_unedited_approvals_asks_once_then_yes_skips(brain):
         d for d in brain.tool_executor.registry.definitions() if d.name == "post_draft"
     )
     assert brain.tool_executor.effective_policy(
-        "org_acme", definition, principal_id="person_ajay"
+        "org_acme", definition, principal_id="person_ajay", channel_id="C9"
     )["execution"] == "direct"
+    # Agreed for C9 only: every other channel still asks.
+    assert brain.tool_executor.effective_policy(
+        "org_acme", definition, principal_id="person_ajay", channel_id="C1"
+    )["execution"] != "direct"
 
 
 def test_no_means_never_ask_again(brain):

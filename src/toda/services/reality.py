@@ -1105,6 +1105,14 @@ class RealityEngine:
         record["updated_at"] = _utcnow().isoformat()
         self.store.upsert_predicate(record)
 
+    def visible_scope_ids(self, organization_id: str, scope_id: str) -> set[str]:
+        """Scopes a source in `scope_id` may read: its own plus public ones."""
+        visible = {scope_id} if scope_id else set()
+        for scope in self.store.list_scopes(organization_id):
+            if scope.get("is_public"):
+                visible.add(scope["id"])
+        return visible
+
     def apply_claim(
         self,
         organization_id: str,
@@ -1159,8 +1167,20 @@ class RealityEngine:
         source_ids = list(memory.get("source_ids") or [])
         confidence = float(memory.get("confidence") or 0.5)
         authority = float(memory.get("authority") or 0.5)
+        # A claim may only see or change facts its source's room can see:
+        # its own scope plus public ones. The target id comes from model
+        # output over untrusted text, so it is checked, never trusted.
+        visible = self.visible_scope_ids(organization_id, str(memory.get("scope_id") or ""))
         target_fact_id = claim.get("target_fact_id")
         target = self._get_payload("reality_facts", str(target_fact_id)) if target_fact_id else None
+        if target is not None and not (
+            target.get("organization_id") == organization_id
+            and target.get("scope_id") in visible
+            and target.get("subject_id") == subject_id
+            and target.get("predicate") == predicate
+        ):
+            log.warning("Ignoring claim target outside the claim's reach: %s", target_fact_id)
+            target = None
 
         if decision == "NOOP":
             if target is not None:
@@ -1172,7 +1192,10 @@ class RealityEngine:
         if decision == "UPDATE":
             if target is None:
                 candidates = self.current_facts(
-                    organization_id, subject_id=subject_id, predicate=predicate
+                    organization_id,
+                    subject_id=subject_id,
+                    predicate=predicate,
+                    scope_ids=sorted(visible),
                 )
                 target = candidates[0] if candidates else None
             if target is None:
@@ -1223,7 +1246,10 @@ class RealityEngine:
 
         if decision == "CONTRADICTS":
             competing = self.current_facts(
-                organization_id, subject_id=subject_id, predicate=predicate
+                organization_id,
+                subject_id=subject_id,
+                predicate=predicate,
+                scope_ids=sorted(visible),
             )
             if target is not None and all(f["id"] != target["id"] for f in competing):
                 competing = [target, *competing]
