@@ -1666,6 +1666,7 @@ class RealityEngine:
         *,
         limit: int = 10,
         query: str | None = None,
+        query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """Rank past corrections by relevance to `query`, not insertion order.
 
@@ -1686,9 +1687,13 @@ class RealityEngine:
             return []
         query_tokens = self._case_tokens(query) if query else set()
         query_vector = (
-            self.embeddings.embed([query])[0]
-            if query and query.strip() and self.embeddings
-            else []
+            query_vector
+            if query_vector
+            else (
+                self.embeddings.embed([query])[0]
+                if query and query.strip() and self.embeddings
+                else []
+            )
         )
         embeddings = (
             self.store.judgment_embeddings([item["id"] for item in applicable])

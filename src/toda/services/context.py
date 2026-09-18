@@ -54,6 +54,11 @@ class ContextService:
             input={"task": task, "token_budget": token_budget, "agent_id": agent_id},
             organization_id=organization_id,
         )
+        query_embedding = (
+            self.retrieval.embeddings.embed([task])[0]
+            if (task or "").strip()
+            else []
+        )
         search = self.retrieval.search(
             organization_id=organization_id,
             query=task,
@@ -62,6 +67,7 @@ class ContextService:
             purpose=purpose,
             entity_ids=entity_ids,
             limit=50,
+            query_embedding=query_embedding,
         )
         decision_id = search["permission_decision_id"]
         results = search["results"]
@@ -72,6 +78,7 @@ class ContextService:
             destination=destination,
             purpose=purpose,
             limit=5,
+            query_embedding=query_embedding,
         )["results"]
 
         current_facts: list[dict[str, Any]] = []
@@ -204,6 +211,7 @@ class ContextService:
             destination=destination,
             purpose=purpose,
             limit=12,
+            query_embedding=query_embedding,
         )
         related_messages = raw_search["results"]
 
@@ -273,7 +281,10 @@ class ContextService:
                         }
                     )
             judgment_guidance = self.retrieval.reality.judgment_guidance(
-                organization_id, acting_principal_id, query=task
+                organization_id,
+                acting_principal_id,
+                query=task,
+                query_vector=query_embedding,
             )
 
         # Budget by priority (spec §8.11)

@@ -594,6 +594,13 @@ for _profile in (
         api_key_required=False,
         media_roles=("image", "transcription", "tts"),
     ),
+    ProviderProfile(
+        name="local",
+        display_name="Local ONNX embeddings",
+        description="On-device embedder (fastembed/ONNX). No API key and no network after the model file is cached.",
+        base_url="",
+        api_key_required=False,
+    ),
 ):
     providers.register(_profile)
 

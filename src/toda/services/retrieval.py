@@ -125,6 +125,20 @@ class RetrievalService:
         self._entity_name_cache: _LookupCache = _LookupCache()
         self._scope_label_cache: _LookupCache = _LookupCache()
 
+    def _query_vector(
+        self,
+        query: str,
+        query_embedding: list[float] | None = None,
+        *,
+        needed: bool = True,
+    ) -> list[float]:
+        """Embed a search query at most once per call stack."""
+        if not needed or not (query or "").strip():
+            return []
+        if query_embedding:
+            return query_embedding
+        return self.embeddings.embed([query])[0]
+
     def _scope_label(self, scope_id: str | None) -> str | None:
         """Human-readable name for the room a claim came from.
 
@@ -190,6 +204,7 @@ class RetrievalService:
         limit: int = 20,
         include_superseded: bool = False,
         as_of: str | None = None,
+        query_embedding: list[float] | None = None,
     ) -> dict[str, Any]:
         started = monotonic()
         self.store.telemetry.record(
@@ -226,7 +241,9 @@ class RetrievalService:
             wanted = set(entity_ids)
             allowed = [m for m in allowed if wanted.intersection(m.get("entity_ids") or [])]
 
-        query_embedding = self.embeddings.embed([query])[0] if query.strip() and allowed else []
+        query_embedding = self._query_vector(
+            query, query_embedding, needed=bool(query.strip() and allowed)
+        )
         # Semantic candidates come from the vec0 ANN index (ordered by cosine
         # distance) rather than a per-row Python cosine loop. A memory that
         # isn't among the nearest `k` simply scores 0 on the semantic term —
@@ -347,6 +364,7 @@ class RetrievalService:
         destination: Destination | dict[str, Any] | None = None,
         purpose: str | None = None,
         limit: int = 10,
+        query_embedding: list[float] | None = None,
     ) -> dict[str, Any]:
         """Search raw embedded source chunks with permission filtering first.
 
@@ -378,7 +396,7 @@ class RetrievalService:
                 "count": min(len(results), limit),
             }
 
-        query_vector = self.embeddings.embed([query])[0]
+        query_vector = self._query_vector(query, query_embedding)
         fts_ranks = self.store.chunk_fts_ranks(query, organization_id, decision.allowed_scope_ids)
         semantic_hits = self._semantic_hits(
             self.store.vec_search_chunks, organization_id, query_vector, k=max(200, limit * 20)
@@ -465,6 +483,7 @@ class RetrievalService:
         destination: Destination | dict[str, Any] | None = None,
         purpose: str | None = None,
         limit: int = 10,
+        query_embedding: list[float] | None = None,
     ) -> dict[str, Any]:
         """Episode summaries are their own result kind (memory ingestion/
         retrieval plan §8) — a coherent narrative over a bounded window of
@@ -479,7 +498,7 @@ class RetrievalService:
             results = [self._episode_result(e, score=0.0) for e in episodes]
             return {"results": results[:limit], "permission_decision_id": decision.id, "count": len(results)}
 
-        query_vector = self.embeddings.embed([query])[0]
+        query_vector = self._query_vector(query, query_embedding)
         fts_ranks = self.store.episode_fts_ranks(query, organization_id, decision.allowed_scope_ids)
         semantic_hits = self._semantic_hits(
             self.store.vec_search_episodes, organization_id, query_vector, k=max(50, limit * 10)

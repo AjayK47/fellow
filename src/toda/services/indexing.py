@@ -62,23 +62,38 @@ class IndexingService:
         return {"indexed_memories": len(pending)}
 
     def backfill(self) -> dict[str, int]:
-        """Index pre-existing records after a schema upgrade without duplicating work."""
+        """Index pre-existing records after a schema upgrade without duplicating work.
+
+        Also re-embeds rows whose stored vector width does not match the
+        current model — otherwise a switch from a remote 8B embedder to a
+        local 384-d model leaves the ANN index empty (reindex skips the
+        old-width JSON columns).
+        """
+        probe = self.embeddings.embed(["\u200b"])[0]
+        width = len(probe)
         indexed_sources = 0
         indexed_memories = 0
         for org in self.store.list_organizations():
             org_id = org["id"]
             for source in self.store.list_sources(org_id, include_revoked=True):
-                if not self.store.has_chunks_for_source(source["id"]):
+                existing = self.store.list_chunks(
+                    org_id, source_ids=[source["id"]], limit=1
+                )
+                stored = (existing[0].get("embedding") if existing else None) or []
+                if not existing or len(stored) != width:
                     self.index_source(source)
                     indexed_sources += 1
+            memories = self.store.list_memories(org_id, latest_only=False)
+            stored_vectors = self.store.memory_embeddings(
+                [memory["id"] for memory in memories]
+            )
             missing_memories = [
                 memory
-                for memory in self.store.list_memories(
-                    org_id, latest_only=False
-                )
-                if not self.store.has_memory_embedding(
+                for memory in memories
+                if (not self.store.has_memory_embedding(
                     memory["id"], memory.get("content") or ""
-                )
+                ))
+                or len(stored_vectors.get(memory["id"]) or []) != width
             ]
             if missing_memories:
                 indexed_memories += self.index_memories(missing_memories)[

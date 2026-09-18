@@ -28,6 +28,11 @@
         "provider": "openrouter",
         "api_key": "<your-openrouter-key>",
         "base_url": null
+      },
+      "local": {
+        "provider": "local",
+        "api_key": null,
+        "base_url": null
       }
     },
     "assignments": {
@@ -44,11 +49,11 @@
         "model": "auto"
       },
       "embedding": {
-        "connection": "openrouter",
-        "model": "qwen/qwen3-embedding-8b"
+        "connection": "local",
+        "model": "BAAI/bge-small-en-v1.5"
       }
     },
-    "embedding_dimensions": 96,
+    "embedding_dimensions": 384,
     "timeout_seconds": 600.0,
     "catalog_enabled": true,
     "catalog_url": "https://models.dev/catalog.json",
