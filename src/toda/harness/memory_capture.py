@@ -2,11 +2,37 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from toda.domain.models import new_id, utcnow
 from toda.services.scope_resolution import resolve_scope
+
+_CITED_ID_PATTERN = re.compile(r"\b(?:src|mem)_[0-9a-f]{16}\b")
+
+
+def _outcome_text(tool_name: str, arguments: dict[str, Any]) -> str:
+    args = arguments or {}
+    if tool_name == "slack_send_message":
+        channel = args.get("channel_id") or args.get("channel") or "the conversation"
+        return f"Posted a message to {channel}"
+    if tool_name in {"artifact_create", "pdf_create", "docx_create", "html_create"}:
+        title = args.get("title") or args.get("name") or args.get("filename") or "a file"
+        return f"Created artifact '{title}'"
+    if tool_name == "slack_send_artifact":
+        title = args.get("title") or args.get("artifact_id") or "an artifact"
+        return f"Shared artifact '{title}'"
+    if tool_name == "integration_execute":
+        slug = str(args.get("tool_slug") or args.get("action") or "").replace("_", " ").lower()
+        return f"Ran connected-app action {slug or tool_name}".strip()
+    if tool_name in {"write_file", "edit_file", "move_file", "delete_file"}:
+        path = args.get("path") or args.get("destination") or "a file"
+        verb = {"write_file": "Wrote", "edit_file": "Edited", "move_file": "Moved", "delete_file": "Deleted"}[tool_name]
+        return f"{verb} file {path}"
+    if tool_name.startswith("automation_"):
+        return f"Updated scheduled automation ({tool_name})"
+    return f"Ran {tool_name}"
 
 # Episode boundaries (memory ingestion/retrieval plan §5 Phase C): a quiet
 # window alone isn't enough for a high-volume group (a busy channel, a
@@ -40,17 +66,29 @@ class HarnessMemoryCapture:
         task = self.store.get_task(task_id)
         if not task:
             raise KeyError(task_id)
+        envelope = task["envelope"]
+        tool_calls = self.store.list_harness_records(
+            "harness_tool_calls", task["organization_id"], where={"task_id": task_id}
+        )
+        completed_writes = [
+            c
+            for c in tool_calls
+            if (c.get("status") or (c.get("payload") or {}).get("status")) == "completed"
+            and (c.get("risk") or (c.get("payload") or {}).get("risk", "read")) != "read"
+        ]
+        # Keep the existing rule: an automation firing with no tool calls
+        # writes nothing.
+        if task.get("trigger_kind") == "automation" and not tool_calls:
+            return {"task_id": task_id, "captured": False, "reason": "empty_automation"}
         # Task transcripts are scoped to the owning Session and carry the
         # Task identity on each message.
         messages = self.store.list_session_messages(task["session_id"], limit=200)
         own_messages = [m for m in messages if m.get("task_id") == task_id]
-        transcript = "\n".join(
-            f"{message['role'].upper()}: {message.get('content') or ''}"
-            for message in own_messages
-        )
-        if not transcript.strip():
+        user_messages = [
+            m for m in own_messages if m.get("role") == "user" and str(m.get("content") or "").strip()
+        ]
+        if not user_messages and not completed_writes and not str(task.get("final_answer") or "").strip():
             return {"task_id": task_id, "captured": False, "reason": "empty_transcript"}
-        envelope = task["envelope"]
         use_model = bool(self.model_extractor and self.model_extractor.live)
         # H-12: capture writes to the scope of the conversation this Task
         # actually happened in, not an arbitrary pick from the authorization
@@ -62,44 +100,112 @@ class HarnessMemoryCapture:
             principal_id=envelope["principal_id"],
             destination=envelope["destination"],
         ).write_scope_id
-        result = self.ingestion.ingest(
-            organization_id=task["organization_id"],
-            source_system="toda_agent",
-            source_type="agent_task",
-            external_id=task_id,
-            content=(
-                f"Goal: {task['goal']}\nStatus: {task['state']}\n"
-                f"Final answer: {task.get('final_answer') or ''}\n\n{transcript}"
-            ),
-            scope_id=write_scope_id,
-            author_entity_id=envelope["principal_id"],
-            channel_id=envelope["destination"].get("id"),
-            is_private_channel=bool(envelope["destination"].get("is_private")),
-            entity_ids=list(task.get("metadata", {}).get("entity_ids") or []),
-            metadata={
-                "task_id": task_id,
-                "trigger_kind": task["trigger_kind"],
-                "conversation_id": envelope["conversation_id"],
-            },
-            learn=not use_model,
-            processing_mode="reference" if use_model else "memory",
-        )
-        memories = result["memories"]
-        if use_model:
+        memories: list[dict[str, Any]] = []
+        source_ids: list[str] = []
+        # 1. What people said, attributed to the speaker, through extraction.
+        for msg in user_messages:
+            meta = msg.get("metadata") or {}
+            author = (
+                meta.get("author_entity_id")
+                or meta.get("principal_id")
+                or envelope["principal_id"]
+            )
+            result = self.ingestion.ingest(
+                organization_id=task["organization_id"],
+                source_system="toda_task_user",
+                source_type="task_user_message",
+                external_id=f"{task_id}:{msg.get('id')}",
+                content=str(msg.get("content") or ""),
+                scope_id=write_scope_id,
+                author_entity_id=author,
+                channel_id=envelope["destination"].get("id"),
+                is_private_channel=bool(envelope["destination"].get("is_private")),
+                entity_ids=list((msg.get("metadata") or {}).get("entity_ids") or []),
+                metadata={"task_id": task_id, "trigger_kind": task["trigger_kind"]},
+                learn=not use_model,
+                processing_mode="reference" if use_model else "memory",
+            )
+            source_ids.append(result["source"]["id"])
+            extracted = result["memories"]
+            if use_model:
+                try:
+                    extracted = self.model_extractor.extract_source(result["source"])
+                except Exception:
+                    extracted = self.ingestion.memory.learn_from_source(result["source"])
+                if self.ingestion.reality:
+                    self.ingestion.reality.ingest_source(result["source"], extracted)
+            memories.extend(extracted)
+        # 2. What Toda did: one deterministic outcome memory per completed
+        # write tool call. No model call, never materialized into facts.
+        now = utcnow().isoformat()
+        outcomes: list[dict[str, Any]] = []
+        for call in completed_writes:
+            payload = call.get("payload") if isinstance(call.get("payload"), dict) else None
+            tool_name = call.get("tool_name") or (payload or {}).get("tool_name") or "tool"
+            arguments = call.get("arguments") or (payload or {}).get("arguments") or {}
+            outcomes.append(
+                {
+                    "id": new_id("mem"),
+                    "organization_id": task["organization_id"],
+                    "memory_type": "outcome",
+                    "content": _outcome_text(str(tool_name), dict(arguments)),
+                    "status": "active",
+                    "is_latest": True,
+                    "confidence": 0.9,
+                    "authority": 0.5,
+                    "scope_id": write_scope_id,
+                    "source_ids": [],
+                    "entity_ids": [],
+                    "observed_at": now,
+                    "valid_from": now,
+                    "author_entity_id": None,
+                }
+            )
+        for mem in outcomes:
+            self.store.upsert_memory(mem)
+        if outcomes and self.ingestion.indexing is not None:
             try:
-                memories = self.model_extractor.extract_source(result["source"])
+                self.ingestion.indexing.index_memories(outcomes)
             except Exception:
-                memories = self.ingestion.memory.learn_from_source(result["source"])
-            if self.ingestion.reality:
-                self.ingestion.reality.ingest_source(
-                    result["source"], memories
-                )
+                pass
+        memories.extend(outcomes)
+        # 3. Toda's answer as low-authority derived memory, never a fact.
+        final_answer = str(task.get("final_answer") or "").strip()
+        if final_answer:
+            cited = [
+                cid
+                for cid in _CITED_ID_PATTERN.findall(final_answer)
+                if cid.startswith("src_") and self.store.get_source(cid) is not None
+            ]
+            derived = {
+                "id": new_id("mem"),
+                "organization_id": task["organization_id"],
+                "memory_type": "derived",
+                "content": final_answer[:4000],
+                "status": "active",
+                "is_latest": True,
+                "confidence": 0.5,
+                "authority": 0.3,
+                "scope_id": write_scope_id,
+                "source_ids": cited,
+                "entity_ids": [],
+                "observed_at": now,
+                "valid_from": now,
+                "author_entity_id": None,
+            }
+            self.store.upsert_memory(derived)
+            if self.ingestion.indexing is not None:
+                try:
+                    self.ingestion.indexing.index_memories([derived])
+                except Exception:
+                    pass
+            memories.append(derived)
         self.audit.record(
             task["organization_id"],
             "memory.capture",
             {
                 "task_id": task_id,
-                "source_id": result["source"]["id"],
+                "source_id": source_ids[0] if source_ids else None,
                 "memory_count": len(memories),
             },
             principal_id=envelope["principal_id"],
@@ -107,7 +213,7 @@ class HarnessMemoryCapture:
         return {
             "task_id": task_id,
             "captured": True,
-            "source_id": result["source"]["id"],
+            "source_id": source_ids[0] if source_ids else None,
             "memory_ids": [memory["id"] for memory in memories],
         }
 

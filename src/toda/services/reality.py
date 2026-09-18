@@ -1014,6 +1014,8 @@ class RealityEngine:
     def materialize_memory(
         self, memory: dict[str, Any], *, source: dict[str, Any] | None = None
     ) -> dict[str, Any] | None:
+        if (memory.get("memory_type") or "") in {"derived", "outcome"}:
+            return None
         claim = memory.get("canonical_claim") or {}
         if not all(claim.get(key) for key in ("subject", "predicate", "object")):
             return None
