@@ -10,7 +10,9 @@ from toda.harness.prompting.catalog import load
 from toda.domain.models import (
     EXTRACTABLE_EDGE_TYPES,
     CanonicalClaim,
+    ClaimDecision,
     Memory,
+    MemoryClaim,
     MemoryRelation,
     MemoryType,
     utcnow,
@@ -92,6 +94,7 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                             "commitment",
                             "issue",
                             "relationship",
+                            "preference",
                             "episode_summary",
                             "outcome",
                             "derived",
@@ -116,28 +119,34 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                         "type": "array",
                         "items": {"type": "string"},
                     },
-                    "relation": {
+                    "claim": {
                         "type": ["object", "null"],
                         "description": (
-                            "A typed entity-to-entity edge this claim asserts, or null. "
-                            "Direction matters and is not symmetric -- emit exactly: "
-                            "MEMBER_OF person->team; WORKS_ON person->project; "
-                            "OWNS owner->thing; DEPENDS_ON dependent->dependency; "
-                            "ACCOUNT_OWNED_BY customer->person; "
-                            "ON_CALL_FOR person->service_or_team; "
-                            "AFFECTS cause->affected; COMMITTED_TO person->commitment; "
-                            "PARTICIPATED_IN person->thing; RELATED_TO either. "
-                            "Use ids from known entities or the new: refs you proposed."
+                            "The update decision for this claim against the "
+                            "current facts supplied: ADD a new fact, UPDATE the "
+                            "target fact, CONTRADICTS the target fact, or NOOP "
+                            "when already recorded. The object is either an "
+                            "entity_ref (a known id or new: ref) or a plain "
+                            "value, never both."
                         ),
                         "properties": {
-                            "edge_type": {
-                                "type": "string",
-                                "enum": list(EXTRACTABLE_EDGE_TYPES),
+                            "subject": {"type": "string"},
+                            "predicate": {"type": "string"},
+                            "object": {
+                                "type": "object",
+                                "properties": {
+                                    "entity_ref": {"type": "string"},
+                                    "value": {"type": "string"},
+                                },
+                                "additionalProperties": False,
                             },
-                            "from": {"type": "string"},
-                            "to": {"type": "string"},
+                            "decision": {
+                                "type": "string",
+                                "enum": ["ADD", "UPDATE", "CONTRADICTS", "NOOP"],
+                            },
+                            "target_fact_id": {"type": ["string", "null"]},
                         },
-                        "required": ["edge_type", "from", "to"],
+                        "required": ["subject", "predicate", "object", "decision"],
                         "additionalProperties": False,
                     },
                     "valid_until": {
@@ -153,16 +162,6 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                             "not short-lived."
                         ),
                     },
-                    "canonical_claim": {
-                        "type": ["object", "null"],
-                        "properties": {
-                            "subject": {"type": "string"},
-                            "predicate": {"type": "string"},
-                            "object": {"type": "string"},
-                        },
-                        "required": ["subject", "predicate", "object"],
-                        "additionalProperties": False,
-                    },
                 },
                 "required": [
                     "memory_type",
@@ -171,8 +170,7 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                     "authority",
                     "entity_ids",
                     "participant_ids",
-                    "canonical_claim",
-                    "relation",
+                    "claim",
                     "valid_until",
                 ],
                 "additionalProperties": False,
@@ -281,6 +279,42 @@ class ModelMemoryExtractor:
             }
             for entity in known_entities[:_KNOWN_ENTITY_CATALOG_LIMIT]
         ]
+        current_facts: list[dict[str, Any]] = []
+        predicate_catalog: list[dict[str, Any]] = []
+        if self.reality is not None:
+            try:
+                source_entity_ids = list(source.get("entity_ids") or [])[:20]
+                for entity_id in source_entity_ids:
+                    for fact in self.reality.current_facts(
+                        source["organization_id"], subject_id=entity_id
+                    )[:10]:
+                        current_facts.append(
+                            {
+                                "fact_id": fact["id"],
+                                "subject": fact.get("subject_id"),
+                                "predicate": fact.get("predicate"),
+                                "object": fact.get("object_value"),
+                            }
+                        )
+                used_predicates = sorted(
+                    {fact["predicate"] for fact in current_facts if fact.get("predicate")}
+                )
+                seen = set(used_predicates)
+                for predicate in self.store.predicates_by_usage(
+                    source["organization_id"], limit=50
+                ):
+                    predicate_catalog.append(
+                        {"name": predicate["name"], "cardinality": predicate["cardinality"]}
+                    )
+                    seen.add(predicate["name"])
+                for predicate in self.store.predicates_for_names(
+                    source["organization_id"], [p for p in used_predicates if p not in seen]
+                ):
+                    predicate_catalog.append(
+                        {"name": predicate["name"], "cardinality": predicate["cardinality"]}
+                    )
+            except Exception:
+                current_facts, predicate_catalog = [], []
         response = self.model.generate(
             messages=[
                 {"role": "system", "content": load("memory_extraction")},
@@ -291,6 +325,8 @@ class ModelMemoryExtractor:
                             "source_id": source["id"],
                             "content": source.get("content") or "",
                             "known_entities": entity_catalog,
+                            "current_facts": current_facts,
+                            "predicates": predicate_catalog,
                         },
                         sort_keys=True,
                     ),
@@ -352,8 +388,34 @@ class ModelMemoryExtractor:
                 continue
             entity_ids = _resolve_ids(item.get("entity_ids") or [])
             participant_ids = _resolve_ids(item.get("participant_ids") or [])
-            claim_data = item.get("canonical_claim")
-            claim = CanonicalClaim(**claim_data) if claim_data else None
+            claim_data = item.get("claim")
+            claim = None
+            if isinstance(claim_data, dict):
+                try:
+                    raw_object = claim_data.get("object") or {}
+                    decision = str(claim_data.get("decision") or "").upper()
+                    if decision not in {"ADD", "UPDATE", "CONTRADICTS", "NOOP"}:
+                        continue
+                    claim = MemoryClaim(
+                        subject=str(claim_data.get("subject") or ""),
+                        predicate=str(claim_data.get("predicate") or ""),
+                        object_entity_ref=(
+                            str(raw_object.get("entity_ref") or "") or None
+                            if isinstance(raw_object, dict)
+                            else None
+                        ),
+                        object_value=(
+                            str(raw_object.get("value") or "") or None
+                            if isinstance(raw_object, dict)
+                            else None
+                        ),
+                        decision=ClaimDecision(decision),
+                        target_fact_id=claim_data.get("target_fact_id"),
+                    )
+                except Exception:
+                    continue
+            legacy_claim_data = item.get("canonical_claim")
+            claim_legacy = CanonicalClaim(**legacy_claim_data) if legacy_claim_data else None
             # Only keep the edge when BOTH ends resolve to entities that exist
             # (or were proposed in this same pass). A half-resolved edge would
             # point at a name string and be unqueryable.
@@ -367,12 +429,18 @@ class ModelMemoryExtractor:
                         from_id=ends[0],
                         to_id=ends[1],
                     )
+            # A claim object entity_ref must resolve like any other id.
+            object_entity_id: str | None = None
+            if claim is not None and claim.object_entity_ref:
+                resolved = _resolve_ids([claim.object_entity_ref])
+                object_entity_id = resolved[0] if resolved else None
             memory = Memory(
                 organization_id=source["organization_id"],
                 memory_type=MemoryType(item["memory_type"]),
                 content=content,
-                canonical_claim=claim,
+                canonical_claim=claim_legacy,
                 relation=relation,
+                claim=claim,
                 confidence=float(item.get("confidence", 0.75)),
                 authority=float(item.get("authority", 0.7)),
                 scope_id=source["scope_id"],
@@ -407,6 +475,8 @@ class ModelMemoryExtractor:
                 observed_at=source.get("ingested_at") or utcnow(),
             )
             data = self.memory._consolidate(memory)
+            if object_entity_id:
+                data["object_entity_id"] = object_entity_id
             committed.append(data)
         if self.memory.indexing and committed:
             self.memory.indexing.index_memories(committed)

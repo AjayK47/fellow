@@ -237,6 +237,24 @@ class CanonicalClaim(BaseModel):
     object: str
 
 
+class ClaimDecision(str, Enum):
+    ADD = "ADD"
+    UPDATE = "UPDATE"
+    CONTRADICTS = "CONTRADICTS"
+    NOOP = "NOOP"
+
+
+class MemoryClaim(BaseModel):
+    """One update decision against the current facts, from the extractor."""
+
+    subject: str
+    predicate: str
+    object_entity_ref: str | None = None
+    object_value: str | None = None
+    decision: ClaimDecision
+    target_fact_id: str | None = None
+
+
 # Edge types extraction is allowed to assert from free text. Deliberately a
 # subset of OrgEdgeType: permission edges (CAN_VIEW, VISIBLE_TO, ACTS_AS,
 # AUTHORIZED_FOR, INHERITS_ACL_FROM) must never be writable by anything a
@@ -297,6 +315,9 @@ class Memory(BaseModel):
     # what turns "Ana owns the Acme account" into a queryable OWNS edge rather
     # than only prose that has to be found by similarity search.
     relation: MemoryRelation | None = None
+    # The extractor's update decision against the current facts (M4). When
+    # present, reality.apply_claim owns the fact lifecycle for this memory.
+    claim: MemoryClaim | None = None
 
 
 class Scope(BaseModel):

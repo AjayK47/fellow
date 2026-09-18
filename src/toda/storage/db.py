@@ -991,6 +991,20 @@ class BrainStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS predicates (
+                    id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    examples TEXT NOT NULL DEFAULT '[]',
+                    usage_count INTEGER NOT NULL DEFAULT 0,
+                    cardinality TEXT NOT NULL DEFAULT 'unknown',
+                    embedding TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (organization_id, name)
+                );
+
                 CREATE TABLE IF NOT EXISTS cases (
                     id TEXT PRIMARY KEY,
                     organization_id TEXT NOT NULL,
@@ -2176,6 +2190,147 @@ class BrainStore:
                 entity_ids,
             )
             return {row["id"]: _de(row["payload"]) for row in cur.fetchall()}
+
+    def upsert_predicate(self, predicate: dict[str, Any]) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """INSERT INTO predicates
+                (id, organization_id, name, description, examples, usage_count,
+                 cardinality, embedding, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(organization_id, name) DO UPDATE SET
+                  description = excluded.description,
+                  examples = excluded.examples,
+                  usage_count = excluded.usage_count,
+                  cardinality = excluded.cardinality,
+                  embedding = excluded.embedding,
+                  updated_at = excluded.updated_at""",
+                (
+                    predicate["id"],
+                    predicate["organization_id"],
+                    predicate["name"],
+                    predicate.get("description") or "",
+                    _ser(predicate.get("examples") or []),
+                    int(predicate.get("usage_count") or 0),
+                    predicate.get("cardinality") or "unknown",
+                    _ser(predicate["embedding"]) if predicate.get("embedding") else None,
+                    predicate["created_at"],
+                    predicate["updated_at"],
+                ),
+            )
+
+    def get_predicate(self, organization_id: str, name: str) -> dict[str, Any] | None:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT id, organization_id, name, description, examples, usage_count,"
+                " cardinality, embedding, created_at, updated_at FROM predicates"
+                " WHERE organization_id = ? AND name = ?",
+                (organization_id, name),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row["id"],
+                "organization_id": row["organization_id"],
+                "name": row["name"],
+                "description": row["description"],
+                "examples": _de(row["examples"] or "[]"),
+                "usage_count": row["usage_count"],
+                "cardinality": row["cardinality"],
+                "embedding": _de(row["embedding"]) if row["embedding"] else None,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+
+    def predicates_by_usage(
+        self, organization_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT id, organization_id, name, description, examples, usage_count,"
+                " cardinality, embedding, created_at, updated_at FROM predicates"
+                " WHERE organization_id = ? ORDER BY usage_count DESC, name ASC LIMIT ?",
+                (organization_id, int(limit)),
+            )
+            return [
+                {
+                    "id": row["id"],
+                    "organization_id": row["organization_id"],
+                    "name": row["name"],
+                    "description": row["description"],
+                    "examples": _de(row["examples"] or "[]"),
+                    "usage_count": row["usage_count"],
+                    "cardinality": row["cardinality"],
+                    "embedding": _de(row["embedding"]) if row["embedding"] else None,
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in cur.fetchall()
+            ]
+
+    def predicates_for_names(
+        self, organization_id: str, names: list[str]
+    ) -> list[dict[str, Any]]:
+        if not names:
+            return []
+        placeholders = ", ".join("?" for _ in names)
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT id, organization_id, name, description, examples, usage_count,"
+                " cardinality, embedding, created_at, updated_at FROM predicates"
+                f" WHERE organization_id = ? AND name IN ({placeholders})",
+                [organization_id, *names],
+            )
+            return [
+                {
+                    "id": row["id"],
+                    "organization_id": row["organization_id"],
+                    "name": row["name"],
+                    "description": row["description"],
+                    "examples": _de(row["examples"] or "[]"),
+                    "usage_count": row["usage_count"],
+                    "cardinality": row["cardinality"],
+                    "embedding": _de(row["embedding"]) if row["embedding"] else None,
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in cur.fetchall()
+            ]
+
+    def seed_predicates_from_facts(self, organization_id: str) -> int:
+        """Lazily seed the predicate catalog from existing facts (once per org)."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM predicates WHERE organization_id = ?",
+                (organization_id,),
+            )
+            if (cur.fetchone()["n"] or 0) > 0:
+                return 0
+            cur.execute(
+                "SELECT DISTINCT predicate FROM reality_facts WHERE organization_id = ?",
+                (organization_id,),
+            )
+            names = [row["predicate"] for row in cur.fetchall()]
+        from toda.domain.models import new_id as _new_id, utcnow as _utcnow
+
+        now = _utcnow().isoformat()
+        for name in names:
+            self.upsert_predicate(
+                {
+                    "id": _new_id("predicate"),
+                    "organization_id": organization_id,
+                    "name": name,
+                    "description": "",
+                    "examples": [],
+                    "usage_count": 0,
+                    "cardinality": "unknown",
+                    "embedding": None,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+        return len(names)
 
     # ---- scopes / memberships ----
 

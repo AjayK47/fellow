@@ -30,6 +30,17 @@ def _normalize(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().split())
 
 
+def _cosine(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
 # Entity-resolution safety gate, ported from Graphiti's dedup_helpers entropy
 # check (github.com/getzep/graphiti): a name that is both short and low in
 # character variety ("Al", "Jo", "the app") is exactly where a fuzzy-ratio
@@ -1016,24 +1027,259 @@ class RealityEngine:
     ) -> dict[str, Any] | None:
         if (memory.get("memory_type") or "") in {"derived", "outcome"}:
             return None
+        claim = memory.get("claim")
+        if isinstance(claim, dict) and claim.get("decision"):
+            return self.apply_claim(
+                memory["organization_id"], claim, memory, source=source
+            )
         claim = memory.get("canonical_claim") or {}
         if not all(claim.get(key) for key in ("subject", "predicate", "object")):
             return None
         subject_id = self._resolve_claim_subject(memory, claim["subject"])
-        return self.assert_fact(
-            organization_id=memory["organization_id"],
-            subject_id=subject_id,
-            predicate=claim["predicate"],
-            object_value=claim["object"],
-            scope_id=memory["scope_id"],
-            valid_from=memory.get("valid_from")
+        return self.apply_claim(
+            memory["organization_id"],
+            {
+                "subject_id": subject_id,
+                "predicate": claim["predicate"],
+                "object_value": claim["object"],
+                "decision": "ADD",
+            },
+            memory,
+            source=source,
+        )
+
+    # ------------------------------------------------------------------
+    # Predicate catalog and update decisions
+    # ------------------------------------------------------------------
+
+    def normalize_predicate(self, organization_id: str, raw: str) -> str:
+        """Snake_case, reuse a catalog predicate on cosine >= 0.88, else create."""
+        from toda.domain.models import new_id as _new_id, utcnow as _utcnow
+
+        key = self._predicate_key(raw)
+        self.store.seed_predicates_from_facts(organization_id)
+        existing = self.store.get_predicate(organization_id, key)
+        now = _utcnow().isoformat()
+        if existing is not None:
+            existing["usage_count"] = int(existing.get("usage_count") or 0) + 1
+            existing["updated_at"] = now
+            self.store.upsert_predicate(existing)
+            return existing["name"]
+        embedding = self._embed_text(raw)
+        if embedding:
+            best: dict[str, Any] | None = None
+            best_score = 0.0
+            for candidate in self.store.predicates_by_usage(organization_id, limit=200):
+                candidate_embedding = candidate.get("embedding")
+                if not candidate_embedding:
+                    continue
+                score = _cosine(embedding, candidate_embedding)
+                if score > best_score:
+                    best_score, best = score, candidate
+            if best is not None and best_score >= 0.88:
+                best["usage_count"] = int(best.get("usage_count") or 0) + 1
+                best["updated_at"] = now
+                self.store.upsert_predicate(best)
+                return best["name"]
+        self.store.upsert_predicate(
+            {
+                "id": _new_id("predicate"),
+                "organization_id": organization_id,
+                "name": key,
+                "description": "",
+                "examples": [raw] if raw != key else [],
+                "usage_count": 1,
+                "cardinality": "unknown",
+                "embedding": embedding,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        return key
+
+    def _embed_text(self, text: str) -> list[float] | None:
+        if self.embeddings is None:
+            return None
+        try:
+            vectors = self.embeddings.embed([text])
+        except Exception:
+            return None
+        if not vectors or not vectors[0]:
+            return None
+        return [float(v) for v in vectors[0]]
+
+    def _set_cardinality(self, organization_id: str, predicate: str, cardinality: str) -> None:
+        from toda.domain.models import utcnow as _utcnow
+
+        record = self.store.get_predicate(organization_id, predicate)
+        if record is None or record.get("cardinality") != "unknown":
+            return
+        record["cardinality"] = cardinality
+        record["updated_at"] = _utcnow().isoformat()
+        self.store.upsert_predicate(record)
+
+    def apply_claim(
+        self,
+        organization_id: str,
+        claim: dict[str, Any],
+        memory: dict[str, Any],
+        *,
+        source: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Apply an extractor update decision. Returns the fact, if any."""
+        from toda.domain.models import utcnow as _utcnow
+
+        decision = str(claim.get("decision") or "ADD").upper()
+        if decision not in {"ADD", "UPDATE", "CONTRADICTS", "NOOP"}:
+            return None
+        predicate = self.normalize_predicate(organization_id, str(claim.get("predicate") or ""))
+        if not predicate:
+            return None
+        subject_id = str(
+            claim.get("subject_id")
+            or self._resolve_claim_subject(memory, str(claim.get("subject") or ""))
+        )
+        object_entity_id = claim.get("object_entity_id") or memory.get("object_entity_id")
+        object_value = claim.get("object_value")
+        if object_value is None and object_entity_id:
+            entity = self.store.get_entity(str(object_entity_id))
+            object_value = (entity or {}).get("name") or str(object_entity_id)
+        if object_value is None:
+            return None
+        now = _utcnow().isoformat()
+        valid_from = (
+            memory.get("valid_from")
             or (source or {}).get("occurred_at")
-            or _now(),
+            or now
+        )
+        source_ids = list(memory.get("source_ids") or [])
+        confidence = float(memory.get("confidence") or 0.5)
+        authority = float(memory.get("authority") or 0.5)
+        target_fact_id = claim.get("target_fact_id")
+        target = self._get_payload("reality_facts", str(target_fact_id)) if target_fact_id else None
+
+        if decision == "NOOP":
+            if target is not None:
+                merged = sorted(set(target.get("source_ids") or []) | set(source_ids))
+                target["source_ids"] = merged
+                self._save_fact(target)
+            return None
+
+        if decision == "UPDATE":
+            if target is None:
+                candidates = self.current_facts(
+                    organization_id, subject_id=subject_id, predicate=predicate
+                )
+                target = candidates[0] if candidates else None
+            if target is None:
+                decision = "ADD"
+            else:
+                target["valid_to"] = valid_from
+                target["status"] = "superseded"
+                target["system_to"] = now
+                new_fact = {
+                    "id": new_id("fact"),
+                    "organization_id": organization_id,
+                    "subject_id": subject_id,
+                    "predicate": predicate,
+                    "object_value": object_value,
+                    "status": "active",
+                    "valid_from": valid_from,
+                    "valid_to": memory.get("valid_until"),
+                    "system_from": now,
+                    "system_to": None,
+                    "scope_id": memory["scope_id"],
+                    "source_ids": source_ids,
+                    "memory_id": memory["id"],
+                    "confidence": confidence,
+                    "authority": authority,
+                    "supersedes": target["id"],
+                }
+                if object_entity_id:
+                    new_fact["object_entity_id"] = object_entity_id
+                target["superseded_by"] = new_fact["id"]
+                self._save_fact(target)
+                self._set_cardinality(organization_id, predicate, "single")
+                with self.store.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO reality_facts
+                        (id, organization_id, subject_id, predicate, object_value, status,
+                         valid_from, valid_to, system_from, system_to, scope_id, payload)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            new_fact["id"], organization_id, subject_id, predicate,
+                            object_value, "active", valid_from,
+                            memory.get("valid_until"), now, None,
+                            memory["scope_id"], _dump(new_fact),
+                        ),
+                    )
+                return new_fact
+
+        if decision == "CONTRADICTS":
+            competing = self.current_facts(
+                organization_id, subject_id=subject_id, predicate=predicate
+            )
+            if target is not None and all(f["id"] != target["id"] for f in competing):
+                competing = [target, *competing]
+            fact = {
+                "id": new_id("fact"),
+                "organization_id": organization_id,
+                "subject_id": subject_id,
+                "predicate": predicate,
+                "object_value": object_value,
+                "status": "contested",
+                "valid_from": valid_from,
+                "valid_to": memory.get("valid_until"),
+                "system_from": now,
+                "system_to": None,
+                "scope_id": memory["scope_id"],
+                "source_ids": source_ids,
+                "memory_id": memory["id"],
+                "confidence": confidence,
+                "authority": authority,
+            }
+            if object_entity_id:
+                fact["object_entity_id"] = object_entity_id
+            with self.store.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO reality_facts
+                    (id, organization_id, subject_id, predicate, object_value, status,
+                     valid_from, valid_to, system_from, system_to, scope_id, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        fact["id"], organization_id, subject_id, predicate,
+                        object_value, "contested", valid_from,
+                        memory.get("valid_until"), now, None,
+                        memory["scope_id"], _dump(fact),
+                    ),
+                )
+            conflict = self._record_conflict(fact, competing, single_valued=False)
+            fact["conflict_id"] = conflict["id"]
+            return fact
+
+        # ADD: learn multi when another live value exists; conflicts only for
+        # single-cardinality predicates (catalog, else the legacy list).
+        live = [
+            fact
+            for fact in self.current_facts(
+                organization_id, subject_id=subject_id, predicate=predicate
+            )
+            if _normalize(fact.get("object_value")) != _normalize(object_value)
+        ]
+        if live:
+            self._set_cardinality(organization_id, predicate, "multi")
+        return self.assert_fact(
+            organization_id=organization_id,
+            subject_id=subject_id,
+            predicate=predicate,
+            object_value=object_value,
+            scope_id=memory["scope_id"],
+            valid_from=valid_from,
             valid_to=memory.get("valid_until"),
-            source_ids=memory.get("source_ids") or [],
+            source_ids=source_ids,
             memory_id=memory["id"],
-            confidence=float(memory.get("confidence") or 0.5),
-            authority=float(memory.get("authority") or 0.5),
+            confidence=confidence,
+            authority=authority,
         )
 
     def assert_fact(
@@ -1095,11 +1341,8 @@ class RealityEngine:
                 valid_to,
             )
         ]
-        single = (
-            predicate_key in self.SINGLE_VALUED_PREDICATES
-            or predicate_key.endswith(("_owner", "_status", "_assignee"))
-        )
-        if competing:
+        single = self._is_single_valued(organization_id, predicate_key)
+        if competing and single:
             conflict = self._record_conflict(fact, competing, single_valued=single)
             fact["conflict_id"] = conflict["id"]
             if single:
@@ -1842,6 +2085,19 @@ class RealityEngine:
         high_a = end_a or "9999-12-31T23:59:59+00:00"
         high_b = end_b or "9999-12-31T23:59:59+00:00"
         return low_a < high_b and low_b < high_a
+
+    def _is_single_valued(self, organization_id: str, predicate_key: str) -> bool:
+        """Catalog cardinality first; the legacy list covers uncatalogued names."""
+        try:
+            record = self.store.get_predicate(organization_id, predicate_key)
+        except Exception:
+            record = None
+        if record is not None:
+            return record.get("cardinality") == "single"
+        return (
+            predicate_key in self.SINGLE_VALUED_PREDICATES
+            or predicate_key.endswith(("_owner", "_status", "_assignee"))
+        )
 
     @classmethod
     def _predicate_key(cls, predicate: str) -> str:
