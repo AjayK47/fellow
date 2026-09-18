@@ -12,7 +12,7 @@ from toda.harness.models import NormalizedEvent
 
 log = logging.getLogger("toda.router")
 
-_ACK_REACTION = "hourglass_flowing_sand"
+_ACK_REACTION = "eyes"
 
 # Slack has no public "bot is typing" indicator for the Web API (that's an
 # RTM-only affordance), so the closest equivalent to "we're alive and

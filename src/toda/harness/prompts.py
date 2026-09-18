@@ -20,6 +20,19 @@ STEER_GUIDANCE = load("steer_guidance")
 AUTOMATION_TRIGGER_GUIDANCE = load("automation_trigger_guidance")
 
 
+def render_voice(persona_name: str = "Toda") -> str:
+    """Shared voice block, prepended to user-facing prompts only."""
+    return render("voice", persona_name=persona_name)
+
+
+def is_user_facing_run(run: dict[str, Any]) -> bool:
+    """Roots speak to people; child specialists report to their parent."""
+    if run.get("parent_task_id"):
+        return False
+    worker_type = run.get("worker_type") or (run.get("metadata") or {}).get("worker_type")
+    return worker_type not in {"general", "pi"}
+
+
 def _speaker_label(item: dict[str, Any]) -> str:
     """Display name for a user turn, or "" when the author is unknown.
 
@@ -41,6 +54,7 @@ def build_agent_messages(
     slack_conversation: list[dict[str, Any]] | None = None,
     active_skills: list[dict[str, Any]] | None = None,
     available_skills: list[dict[str, Any]] | None = None,
+    persona_name: str = "Toda",
 ) -> list[dict[str, Any]]:
     envelope = run["envelope"]
     invocation = {
@@ -119,15 +133,18 @@ def build_agent_messages(
                 "worker_has_write_tools", False
             ),
         }
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": CORE_SYSTEM_PROMPT},
+    messages: list[dict[str, Any]] = []
+    if is_user_facing_run(run):
+        messages.append({"role": "system", "content": render_voice(persona_name)})
+    messages.append({"role": "system", "content": CORE_SYSTEM_PROMPT})
+    messages.append(
         {
             "role": "system",
             "content": "<trusted_invocation>\n"
             + json.dumps(invocation, sort_keys=True)
             + "\n</trusted_invocation>",
         },
-    ]
+    )
     attachments = list((run.get("metadata") or {}).get("attachments") or [])
     if worker and attachments:
         messages.append(

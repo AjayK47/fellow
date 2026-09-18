@@ -226,6 +226,7 @@ class MediaConfig(_Section):
 
 
 class AgentConfig(_Section):
+    persona_name: str = "Toda"
     # Development/tests may run with deterministic offline clients. A
     # supervised pilot must opt in to this gate so a new Slack/API/dashboard
     # Task cannot start until behavioral readiness is real-world ready.

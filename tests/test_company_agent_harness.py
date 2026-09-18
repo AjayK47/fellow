@@ -12,7 +12,6 @@ from toda.harness.models import (
     InvocationEnvelope,
     ModelResponse,
     ModelToolCall,
-    ToolDefinition,
 )
 
 
@@ -480,7 +479,8 @@ def test_a_non_retryable_run_failure_notifies_slack_instead_of_going_silent(brai
     failures = [d for d in deliveries if d.get("kind") == "task_failure"]
     assert len(failures) == 1
     assert "couldn't finish" in failures[0]["text"].lower()
-    assert "unterminated string" in failures[0]["text"].lower()
+    assert "```" not in failures[0]["text"]
+    assert "unterminated string" not in failures[0]["text"].lower()
 
 
 def test_a_retryable_run_failure_does_not_notify_slack_before_retrying(brain):
@@ -1166,89 +1166,20 @@ def test_deliver_question_renders_buttons_or_select_by_choice_count(brain):
     assert plain["delivery"]["provider_result"]["blocks"] == []
 
 
-def test_status_checkpoint_tracking_and_live_update_message(brain):
-    """Phase F: the live Slack status message only starts once a run
-    crosses a *second*, distinct toolkit -- a single-toolkit run gets no
-    status message at all -- and every checkpoint after that edits the
-    same message in place instead of posting a new one."""
-    run = brain.company_agent.create_invocation(
-        envelope=_envelope(brain, conversation="status-checkpoints"),
+def test_no_progress_messages_for_multi_toolkit_tasks(brain):
+    """U1: long Tasks send one ack, then nothing until the answer. No
+    delivery.status_update jobs are enqueued regardless of toolkit use."""
+    brain.company_agent.create_invocation(
+        envelope=_envelope(brain, conversation="no-progress"),
         goal="Cross-toolkit task",
         trigger_kind="reactive",
         initial_message="Cross-toolkit task",
     )
-    linear_call = ModelToolCall(
-        id="c1",
-        name="integration_execute",
-        arguments={"tool_slug": "LINEAR_CREATE_ISSUE", "arguments": {}},
-    )
-    linear_definition = ToolDefinition(
-        name="integration_execute",
-        description="d",
-        input_schema={"type": "object"},
-    )
-    github_call = ModelToolCall(
-        id="c2",
-        name="integration_execute",
-        arguments={"tool_slug": "GITHUB_CREATE_ISSUE", "arguments": {}},
-    )
-    github_definition = ToolDefinition(
-        name="integration_execute",
-        description="d",
-        input_schema={"type": "object"},
-    )
-
-    brain.company_agent._track_checkpoint(run, linear_call, linear_definition)
     jobs = brain.harness_jobs.lease(
         worker_id="test-f-1", limit=10, kinds=["delivery.status_update"]
     )
-    assert jobs == []  # a single toolkit alone never triggers a status message
-
-    brain.company_agent._track_checkpoint(run, github_call, github_definition)
-    jobs = brain.harness_jobs.lease(
-        worker_id="test-f-2", limit=10, kinds=["delivery.status_update"]
-    )
-    assert len(jobs) == 1
-    assert jobs[0]["payload"]["task_id"] == run["id"]
-
-    refreshed = brain.store.get_task(run["id"])
-    assert refreshed["metadata"]["status_checkpoints"] == ["linear", "github"]
-
-    sent: list[dict] = []
-    brain.delivery.slack.send = lambda **kwargs: (
-        sent.append(kwargs),
-        {"ok": True, "channel": "C_STATUS", "ts": "100.1"},
-    )[1]
-    result = brain.delivery.deliver_status_update(run["id"])
-    assert result["delivered"] is True
-    assert len(sent) == 1
-    assert "linear" in sent[0]["blocks"][0]["text"]["text"]
-    assert "github" in sent[0]["blocks"][0]["text"]["text"]
-
-    # A third checkpoint must EDIT that same message, not post a new one.
-    slack_call = ModelToolCall(
-        id="c3",
-        name="integration_execute",
-        arguments={"tool_slug": "SLACK_SEND_MESSAGE"},
-    )
-    slack_definition = ToolDefinition(
-        name="integration_execute", description="d", input_schema={"type": "object"}
-    )
-    brain.company_agent._track_checkpoint(
-        brain.store.get_task(run["id"]), slack_call, slack_definition
-    )
-
-    updated: list[dict] = []
-    brain.delivery.slack.update_message = lambda **kwargs: (
-        updated.append(kwargs),
-        {"ok": True, "channel": "C_STATUS", "ts": "100.1"},
-    )[1]
-    brain.delivery.deliver_status_update(run["id"])
-    assert len(sent) == 1  # still just the one original post
-    assert len(updated) == 1
-    assert updated[0]["channel_id"] == "C_STATUS"
-    assert updated[0]["timestamp"] == "100.1"
-    assert "slack" in updated[0]["text"]
+    assert jobs == []
+    assert "delivery.status_update" not in brain.harness_worker.handlers
 
 
 def test_signed_slack_mention_routes_through_full_harness(brain):

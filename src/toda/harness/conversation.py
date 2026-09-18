@@ -23,6 +23,7 @@ from toda.harness.models import (
     TriggerKind,
 )
 from toda.harness.prompting.catalog import load
+from toda.harness.prompts import render_voice
 from toda.services.readiness import enforce_real_world_readiness
 
 log = logging.getLogger("toda.conversation")
@@ -139,6 +140,7 @@ class ConversationAgent:
         max_iterations: int = 5,
         max_tokens: int = 8_000,
         readiness_target: Any | None = None,
+        persona_name: str = "Toda",
     ) -> None:
         self.store = store
         self.model = model
@@ -149,6 +151,7 @@ class ConversationAgent:
         self.max_iterations = max_iterations
         self.max_tokens = max_tokens
         self.readiness_target = readiness_target
+        self.persona_name = persona_name
 
     def _ensure_task_start_allowed(self, envelope: InvocationEnvelope, trigger_kind: TriggerKind) -> None:
         if self.readiness_target is not None:
@@ -258,6 +261,7 @@ class ConversationAgent:
         conversation_tools = {item.name for item in definitions}
         schemas = [_START_TASK.openai_schema(), *[item.openai_schema() for item in definitions]]
         messages: list[dict[str, Any]] = [
+            {"role": "system", "content": render_voice(self.persona_name)},
             {"role": "system", "content": load("core")},
             {"role": "system", "content": load("conversation_manager")},
             {

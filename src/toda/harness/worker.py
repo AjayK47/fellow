@@ -172,9 +172,6 @@ class HarnessWorker:
                 payload["question"],
                 choices=payload.get("choices"),
             ),
-            "delivery.status_update": lambda payload: self.delivery.deliver_status_update(
-                payload["task_id"]
-            ),
             "delivery.acknowledge": lambda payload: self.delivery.deliver_acknowledgement(
                 payload["task_id"]
             ),

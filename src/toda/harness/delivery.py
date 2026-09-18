@@ -11,6 +11,8 @@ from datetime import timedelta
 from typing import Any
 
 from toda.domain.models import new_id, utcnow
+from toda.harness.prompts import render_voice
+from toda.harness.retry import failure_category
 from toda.harness.router import _ACK_REACTION
 from toda.harness.slack_markdown import to_slack_mrkdwn
 from toda.services.scope_resolution import resolve_scope
@@ -62,10 +64,7 @@ def _approval_preview_text(prefix: str, arguments: dict[str, Any]) -> str:
 # the fact, so the real cost stays bounded by what the model actually thinks.
 _ACK_MAX_TOKENS = 1_500
 
-_ACK_SYSTEM_PROMPT = """You are Toda, a colleague at this company, replying \
-in Slack the instant a request arrives — before you have started work.
-
-Write ONE short sentence acknowledging what was asked, in your own voice.
+_ACK_TASK_INSTRUCTION = """Write ONE short sentence acknowledging what was asked, in your own voice.
 
 - Name the specific thing, so it is clear you actually read it.
 - Say what you are about to do, not what you have found. You have done
@@ -79,14 +78,13 @@ Examples of the register:
 "I'll check the deploy history and see what changed last week."
 """
 
+_ACK_SYSTEM_PROMPT = _ACK_TASK_INSTRUCTION
+
 
 
 _APPROVAL_MAX_TOKENS = 1_500
 
-_APPROVAL_SYSTEM_PROMPT = """You are Toda, asking a colleague in Slack to \
-approve one action before you take it.
-
-Write ONE short sentence saying plainly what you are about to do and to
+_APPROVAL_TASK_INSTRUCTION = """Write ONE short sentence saying plainly what you are about to do and to
 what, so they can decide without knowing anything about how you work.
 
 - Name the real subject: the file, the document, the channel, the record.
@@ -97,6 +95,26 @@ what, so they can decide without knowing anything about how you work.
 - If you genuinely cannot tell what the action does, say so in plain
   words rather than guessing.
 """
+
+_APPROVAL_SYSTEM_PROMPT = _APPROVAL_TASK_INSTRUCTION
+
+
+def _ack_system_prompt(persona_name: str = "Toda") -> str:
+    return render_voice(persona_name) + "\n\n" + _ACK_TASK_INSTRUCTION
+
+
+def _approval_system_prompt(persona_name: str = "Toda") -> str:
+    return render_voice(persona_name) + "\n\n" + _APPROVAL_TASK_INSTRUCTION
+
+
+_FAILURE_TEXTS = {
+    "budget": "This one grew bigger than I'm allowed to spend on a single request. Want me to split it into smaller pieces?",
+    "too_long": "This one grew too long to hold in a single pass. Want me to split it into smaller pieces?",
+    "provider": "My model provider isn't responding right now. I'll pick this up again if you ask me in a few minutes.",
+    "permission": "I ran into a permission problem and had to stop. If you can grant access, I'll pick it up from there.",
+    "invalid_request": "I couldn't send that request as written, so I stopped before doing anything. Want to rephrase it?",
+    "unknown": "Something went wrong and I couldn't finish this one. Want to try again?",
+}
 
 
 @dataclass(frozen=True)
@@ -146,6 +164,7 @@ class DeliveryService:
         slack_sender: Any,
         audit: Any,
         model: Any | None = None,
+        persona_name: str = "Toda",
     ) -> None:
         self.store = store
         self.authz = authz
@@ -156,6 +175,7 @@ class DeliveryService:
         # the real model spins up; paying main-model latency to produce it
         # would defeat its whole purpose.
         self.model = model
+        self.persona_name = persona_name
 
     def deliver_conversation(self, session_id: str, message_id: str) -> dict[str, Any]:
         session = self.store.get_session(session_id)
@@ -287,8 +307,8 @@ class DeliveryService:
             # The model already sent its own message directly via
             # slack_send_message (typed_tools.py sets this flag right when
             # that happens, specifically to prevent this). Every OTHER
-            # delivery path already honors it (_maybe_notify_failure,
-            # deliver_status_update) -- this one didn't, which is exactly
+            # delivery path already honors it (_maybe_notify_failure)
+            # -- this one didn't, which is exactly
             # how a real production run ended up delivering both the
             # model's direct send AND a redundant auto-delivered final
             # answer as two separate Slack messages for one automation
@@ -422,13 +442,8 @@ class DeliveryService:
         slack = (task.get("metadata") or {}).get("slack") or {}
         destination = envelope["destination"]
         channel_id = slack.get("channel_id") or destination["id"]
-        error = str(task.get("error") or "unknown error")[:500]
-        text = (
-            "Something went wrong and I couldn't finish this one — "
-            "no partial action was left running.\n"
-            f"```{error}```\n"
-            "Feel free to try again or rephrase the request."
-        )
+        category = failure_category(str(task.get("error") or ""))
+        text = _FAILURE_TEXTS.get(category, _FAILURE_TEXTS["unknown"])
         log.info(
             "Delivering task failure: task_id=%s channel=%s",
             task_id,
@@ -532,7 +547,7 @@ class DeliveryService:
         try:
             response = self.model.generate(
                 messages=[
-                    {"role": "system", "content": _ACK_SYSTEM_PROMPT},
+                    {"role": "system", "content": _ack_system_prompt(self.persona_name)},
                     {"role": "user", "content": goal},
                 ],
                 temperature=0.4,
@@ -555,72 +570,6 @@ class DeliveryService:
         # sentence in quotes leaves the padding behind otherwise.
         line = " ".join(str(response.content or "").split()).strip('"').strip()
         return line[:300]
-
-    def deliver_status_update(self, task_id: str) -> dict[str, Any]:
-        """Edit a single live status message in place as a Task crosses
-        toolkit-transition checkpoints (see CompanyAgent._track_checkpoint).
-        The first checkpoint that clears the multi-checkpoint bar posts a
-        new message; every later checkpoint edits that same message rather
-        than posting a new one, so a long multi-toolkit task reads as one
-        progress indicator instead of a flood of separate Slack messages.
-        """
-        task = self.store.get_task(task_id)
-        if not task:
-            raise KeyError(task_id)
-        if (task.get("metadata") or {}).get("suppress_delivery"):
-            return {"task_id": task_id, "delivered": False, "reason": "suppressed"}
-        self._recheck(task)
-        envelope = task["envelope"]
-        slack = (task.get("metadata") or {}).get("slack") or {}
-        channel_id = slack.get("channel_id") or envelope["destination"]["id"]
-        checkpoints = (task.get("metadata") or {}).get("status_checkpoints") or []
-        lines = "\n".join(
-            f"{'done' if index < len(checkpoints) - 1 else 'working'} — {toolkit}"
-            for index, toolkit in enumerate(checkpoints)
-        )
-        text = f"Working on it...\n{lines}" if lines else "Working on it..."
-        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-        candidates = self.store.list_harness_records(
-            "deliveries", task["organization_id"], where={"task_id": task_id}
-        )
-        existing = next(
-            (item for item in candidates if item.get("kind") == "status_update"), None
-        )
-        provider_result = (existing or {}).get("provider_result") or {}
-        if existing and provider_result.get("channel") and provider_result.get("ts"):
-            result = self.slack.update_message(
-                channel_id=provider_result["channel"],
-                timestamp=provider_result["ts"],
-                text=text,
-                blocks=blocks,
-                workspace_id=slack.get("workspace_id"),
-            )
-            delivery = dict(existing)
-            delivery.update(
-                {
-                    "status": "completed" if result.get("ok") else "dry_run",
-                    "provider_result": result,
-                    "text": text,
-                    "updated_at": utcnow().isoformat(),
-                }
-            )
-            self.store.upsert_delivery(delivery)
-        else:
-            result = self.slack.send(
-                channel_id=channel_id,
-                text=text,
-                blocks=blocks,
-                workspace_id=slack.get("workspace_id"),
-                organization_id=task["organization_id"],
-            )
-            delivery = self._record(
-                owner=DeliveryOwner.for_task(task),
-                kind="status_update",
-                status="completed" if result.get("ok") else "dry_run",
-                payload={"provider_result": result, "text": text},
-                idempotency_key=f"slack.status:{task_id}",
-            )
-        return {"task_id": task_id, "delivered": True, "delivery": delivery}
 
     def _approval_sentence(self, task: dict[str, Any], preview: dict[str, Any]) -> str:
         """Plain language for the approval card, or "" to fall back.
@@ -648,7 +597,7 @@ class DeliveryService:
         try:
             response = self.model.generate(
                 messages=[
-                    {"role": "system", "content": _APPROVAL_SYSTEM_PROMPT},
+                    {"role": "system", "content": _approval_system_prompt(self.persona_name)},
                     {"role": "user", "content": request},
                 ],
                 temperature=0.2,

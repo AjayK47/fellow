@@ -82,7 +82,9 @@ def test_active_skill_versions_are_pinned_to_the_task(brain):
     assert pinned_again["version"] == pinned_procedure["version"]
 
 
-def test_slack_skill_is_injected_and_validates_the_final_response(brain):
+def test_slack_skill_is_injected_and_skips_validator_rewrite(brain):
+    """U1: slack-communication no longer opts into response_validation, so a
+    Task answer with the skill active makes no validator model call."""
     main_model = ScriptedModelClient(
         [
             ModelResponse(
@@ -130,8 +132,8 @@ def test_slack_skill_is_injected_and_validates_the_final_response(brain):
     outcome = brain.company_agent.execute_task(task["id"])
 
     assert outcome.answer == (
-        "Spain won the *2026 FIFA World Cup*. "
-        "Source: <https://www.fifa.com/final|FIFA>"
+        "Spain won the **2026 FIFA World Cup**. "
+        "Source: [FIFA](https://www.fifa.com/final)"
     )
     active_block = next(
         message["content"]
@@ -140,19 +142,9 @@ def test_slack_skill_is_injected_and_validates_the_final_response(brain):
     )
     assert "Write for Slack" in active_block
     assert '"activation_mode": "mandatory"' in active_block
-    validation_input = json.loads(
-        validation_model.requests[0]["messages"][-1]["content"]
-    )
-    assert validation_input["destination"]["type"] == "slack_channel"
-    assert validation_input["active_skill_contracts"][0]["name"] == (
-        "Write for Slack"
-    )
+    assert validation_model.requests == []
     completed = brain.store.get_task(task["id"])
-    assert completed["metadata"]["last_skill_validation"]["valid"] is False
-    audit = brain.store.list_audit(
-        "org_acme", event_type="agent.response.skill_validated"
-    )
-    assert audit[-1]["payload"]["corrected"] is True
+    assert (completed.get("metadata") or {}).get("last_skill_validation", {}).get("checked") is False
 
 
 def test_platform_skills_are_visible_without_memory_public_scope(brain):

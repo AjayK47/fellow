@@ -43,7 +43,7 @@ def test_queue_carrier_is_transport_metadata_and_preserves_trace(brain):
     queue = brain.harness_jobs
     with brain.store.telemetry.span("root", organization_id="org_acme") as root:
         job = queue.enqueue(
-            organization_id="org_acme", kind="delivery.status_update",
+            organization_id="org_acme", kind="delivery.acknowledge",
             payload={"task_id": "task_none"}, idempotency_key="trace-carry-test",
         )
         trace_id = f"{root.span.get_span_context().trace_id:032x}"

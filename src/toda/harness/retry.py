@@ -55,3 +55,32 @@ def is_permanent_task_error(error: str) -> bool:
         # limit; retryable always wins.
         return False
     return any(marker in lower for marker in _PERMANENT_ERROR_MARKERS)
+
+
+_BUDGET_MARKERS = (
+    "iteration_limit",
+    "tool_call_limit",
+    "model_call_limit",
+    "model_token_budget",
+    "monetary_cost_limit",
+    "worker_deadline_exceeded",
+)
+
+
+def failure_category(error: str) -> str:
+    """Coarse user-facing failure bucket for voice-consistent notices."""
+    lower = (error or "").lower()
+    if any(marker in lower for marker in _BUDGET_MARKERS):
+        return "budget"
+    if "context_window_exceeded" in lower:
+        return "too_long"
+    if is_retryable_task_error(error):
+        return "provider"
+    if any(
+        marker in lower
+        for marker in ("permission", "not authorized", "forbidden", "403", "not_in_channel")
+    ):
+        return "permission"
+    if is_permanent_task_error(error):
+        return "invalid_request"
+    return "unknown"

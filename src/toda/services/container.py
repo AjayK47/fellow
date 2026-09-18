@@ -348,6 +348,7 @@ class TodaApp:
                 embeddings=self.embeddings,
                 run_inspection=self.run_inspection,
                 readiness_target=self,
+                persona_name=runtime_settings.agent.persona_name,
             )
 
         self.company_agent = _task_agent_factory(
@@ -370,6 +371,7 @@ class TodaApp:
             task_agent_factory=_task_agent_factory,
             delivery_enqueue=self.harness_jobs.enqueue,
             readiness_target=self,
+            persona_name=runtime_settings.agent.persona_name,
         )
         self.session_manager = SessionManagerScheduler(
             store=self.store,
@@ -513,6 +515,7 @@ class TodaApp:
             # it has to land while the main model is still on its first
             # turn, so it cannot be the main model itself.
             model=self.extraction_model,
+            persona_name=runtime_settings.agent.persona_name,
         )
         self.harness_worker = HarnessWorker(
             queue=self.harness_jobs,

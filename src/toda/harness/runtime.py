@@ -146,6 +146,7 @@ class CompanyAgent:
         embeddings: Any | None = None,
         run_inspection: Any | None = None,
         readiness_target: Any | None = None,
+        persona_name: str = "Toda",
     ) -> None:
         self.runs = runs
         self.context_service = context_service
@@ -174,6 +175,7 @@ class CompanyAgent:
         self.embeddings = embeddings
         self.run_inspection = run_inspection
         self.readiness_target = readiness_target
+        self.persona_name = persona_name
 
     def create_invocation(
         self,
@@ -824,6 +826,7 @@ class CompanyAgent:
                     slack_conversation=self._slack_conversation(run),
                     active_skills=active_skills,
                     available_skills=(run.get("metadata") or {}).get("skill_index") or [],
+                    persona_name=self.persona_name,
                 )
                 final_budget = request_budget(
                     context_window=context_length,
@@ -867,6 +870,7 @@ class CompanyAgent:
                     slack_conversation=self._slack_conversation(run),
                     active_skills=active_skills,
                     available_skills=(run.get("metadata") or {}).get("skill_index") or [],
+                    persona_name=self.persona_name,
                 )
                 final_budget = request_budget(
                     context_window=context_length,
@@ -1342,7 +1346,6 @@ class CompanyAgent:
                 # so the transcript stays deterministic regardless of timing.
                 for call in read_calls:
                     self._append_tool_result(run, results_by_call_id[call.id])
-                    self._track_checkpoint(run, call, allowed_by_name.get(call.name))
 
             for call in other_calls:
                 run["tool_call_count"] = int(run.get("tool_call_count", 0)) + 1
@@ -1468,7 +1471,6 @@ class CompanyAgent:
                         correlation_id=run.get("correlation_id"),
                     )
                 self._append_tool_result(run, result)
-                self._track_checkpoint(run, call, definition)
             run = self.runs.get(run["id"]) or run
         raise RuntimeError("iteration_limit")
 
@@ -1680,51 +1682,6 @@ class CompanyAgent:
             tool_call_id=result.call_id,
             name=result.tool_name,
             metadata={"status": result.status, "approval_id": result.approval_id},
-        )
-
-    def _toolkit_label(self, definition: Any, call: ModelToolCall) -> str | None:
-        if definition and definition.toolkits:
-            return definition.toolkits[0]
-        if call.name == "integration_execute":
-            # integration_execute covers every toolkit dynamically via
-            # tool_slug, which Composio conventionally
-            # names "{TOOLKIT}_{ACTION}" -- good enough for a friendly
-            # progress label without an extra composio.describe() round trip.
-            slug = str(call.arguments.get("tool_slug") or "")
-            if "_" in slug:
-                return slug.split("_", 1)[0].lower()
-        return None
-
-    def _track_checkpoint(
-        self, run: dict[str, Any], call: ModelToolCall, definition: Any
-    ) -> None:
-        """Phase F: the live Slack status message only updates on a toolkit
-        *transition* (e.g. Linear -> GitHub), not on every tool call --
-        editing it per call would blow through Slack's rate limits for
-        nothing anyone reads. It also only starts firing from the second
-        transition onward: a run that never leaves its first toolkit gets
-        no status message at all, same as a single-turn no-tool-call reply.
-        """
-        if (run.get("metadata") or {}).get("suppress_delivery"):
-            return
-        toolkit = self._toolkit_label(definition, call)
-        if not toolkit:
-            return
-        metadata = dict(run.get("metadata") or {})
-        checkpoints = list(metadata.get("status_checkpoints") or [])
-        if checkpoints and checkpoints[-1] == toolkit:
-            return
-        checkpoints.append(toolkit)
-        metadata["status_checkpoints"] = checkpoints
-        run["metadata"] = metadata
-        self.runs.update(run)
-        if len(checkpoints) < 2:
-            return
-        self.enqueue_job(
-            organization_id=run["organization_id"],
-            kind="delivery.status_update",
-            payload={"task_id": run["id"]},
-            idempotency_key=f"delivery.status_update:{run['id']}:{len(checkpoints)}",
         )
 
     def _enqueue_post_run_jobs(self, run: dict[str, Any]) -> None:

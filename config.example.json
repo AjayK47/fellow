@@ -112,6 +112,7 @@
     "max_bytes": 26214400
   },
   "agent": {
+    "persona_name": "Toda",
     "require_real_world_readiness": true,
     "max_duration_seconds": 3600,
     "max_model_calls": 100,
