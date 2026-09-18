@@ -329,7 +329,6 @@ def gateway() -> None:
     owner = DatabaseOwner(settings.storage.db_path)
     owner.acquire()
     brain = reset_app(settings.storage.db_path)
-    brain.indexing.backfill()
     _register_composio_webhook(brain)
     if not is_initialized(brain.store, organization_id=settings.organization.id):
         owner.release()
@@ -365,7 +364,10 @@ def gateway() -> None:
 
         slack_stopper = _stop_socket_mode
     else:
-        print("Toda gateway: configure Slack at http://127.0.0.1:8080/setup")
+        print(
+            "Toda gateway: Slack not configured; set slack.app_token and "
+            f"slack.bot_token in {config_path()} to enable Socket Mode"
+        )
 
     gateway_app = create_app(
         prebuilt_brain=brain,

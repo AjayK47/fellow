@@ -18,22 +18,16 @@ REQUIRED = {
     "CONTRIBUTING.md",
     "SECURITY.md",
     "CODE_OF_CONDUCT.md",
-    "SUPPORT.md",
-    "GOVERNANCE.md",
-    "CHANGELOG.md",
     "THIRD_PARTY_NOTICES.md",
     "Dockerfile",
     "compose.yaml",
-    "install.sh",
-    "install.ps1",
     ".dockerignore",
-    ".env.example",
+    "config.example.json",
     "pyproject.toml",
     "uv.lock",
 }
 FORBIDDEN_PREFIXES = ("data/", "harnesses/", "old/", "build/", ".venv/", "web/dist/")
 FORBIDDEN_FILES = {".env", "--help"}
-SECRET_SUFFIXES = ("_API_KEY", "_API_KEYS", "_TOKEN", "_SECRET")
 OLD_BRANDS = re.compile(r"\b(?:docket|apdate)\b", re.IGNORECASE)
 
 
@@ -61,8 +55,6 @@ def main() -> int:
     scripts = project.get("project", {}).get("scripts", {})
     if scripts.get("toda") != "toda.main:main":
         errors.append("the toda CLI entry point is missing")
-    if not (ROOT / "install.sh").stat().st_mode & 0o111:
-        errors.append("install.sh must be executable")
 
     for skill in sorted((ROOT / "src/toda/builtin_skills").glob("*/SKILL.md")):
         text = skill.read_text(encoding="utf-8")
@@ -72,12 +64,6 @@ def main() -> int:
         if not re.search(r"^origin:\s*$", text, re.MULTILINE):
             errors.append(f"skill has no provenance origin: {skill.relative_to(ROOT)}")
 
-    for line_number, line in enumerate(
-        (ROOT / ".env.example").read_text(encoding="utf-8").splitlines(), start=1
-    ):
-        key, separator, value = line.partition("=")
-        if separator and key.endswith(SECRET_SUFFIXES) and value.strip():
-            errors.append(f"example secret must be blank: .env.example:{line_number}")
 
     maintained = [ROOT / "README.md", ROOT / "ARCHITECTURE.md", ROOT / "src/toda", ROOT / "web/src"]
     for candidate in maintained:

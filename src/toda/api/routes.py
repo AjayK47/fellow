@@ -4178,7 +4178,7 @@ def audit_authz(decision_id: str, request: Request) -> dict[str, Any]:
 
 # ---- Toda Console SPA (built with Vite from web/) ----------------------
 # Serves the React console at `/` and any non-API path. During development,
-# run `npm run dev` inside web/ (proxies /v1 to this server).
+# run `pnpm dev` inside web/ (proxies /v1 to this server).
 _PACKAGED_CONSOLE_DIST = Path(__file__).resolve().parents[1] / "static" / "console"
 _SOURCE_CONSOLE_DIST = Path(__file__).resolve().parents[3] / "web" / "dist"
 _CONSOLE_DIST = (
@@ -4212,7 +4212,7 @@ else:
     def console_not_built() -> dict[str, str]:
         return {
             "message": (
-                "Toda Console not built. Run: cd web && npm install && npm run build"
+                "Toda Console not built. Run: pnpm --dir web install && pnpm --dir web build"
             ),
             "api_docs": "/docs",
         }

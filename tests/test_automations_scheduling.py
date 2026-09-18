@@ -190,6 +190,40 @@ def test_misfire_skip_reschedules_without_firing_when_badly_overdue(brain):
     assert next_run > datetime.now(timezone.utc) - timedelta(minutes=1)
 
 
+def test_automation_whose_owner_left_the_conversation_is_disabled_once(brain):
+    automation = brain.automations.create(
+        organization_id="org_acme",
+        name="Digest",
+        goal="Summarize export issues",
+        principal_id="person_ajay",
+        conversation_id="automation:owner-left",
+        destination=_destination(),
+        interval_seconds=3600,
+    )
+    brain.sessions.resolve(
+        organization_id="org_acme",
+        conversation_key="automation:owner-left",
+        destination=_destination(),
+        participants=["person_someone_else"],
+    )
+    automation["next_run_at"] = "2000-01-01T00:00:00+00:00"
+    brain.automations._upsert(automation)
+
+    first = brain.automations.tick("org_acme")
+    assert first["fired"] == 0
+    assert {"automation_id": automation["id"], "reason": "conversation_not_permitted"} in first[
+        "skipped"
+    ]
+    refreshed = brain.store.get_harness_record("automations", automation["id"])
+    assert refreshed["status"] == "disabled"
+    assert refreshed["next_run_at"] is None
+
+    # Disabled means the scheduler stops looking at it, rather than
+    # refusing and auditing it again on every tick.
+    second = brain.automations.tick("org_acme")
+    assert all(item["automation_id"] != automation["id"] for item in second["skipped"])
+
+
 def test_misfire_fire_once_still_fires_when_badly_overdue(brain):
     automation = brain.automations.create(
         organization_id="org_acme",

@@ -286,7 +286,8 @@ class AutomationService:
             # a schedule. Checked at creation too; re-checked here because
             # the Session may not have existed then.
             if not self._owner_participates(automation):
-                automation["enabled"] = False
+                automation["status"] = "disabled"
+                automation["next_run_at"] = None
                 automation["updated_at"] = now.isoformat()
                 self._upsert(automation)
                 skipped.append(
