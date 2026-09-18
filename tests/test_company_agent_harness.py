@@ -76,13 +76,16 @@ def test_reactive_run_is_durable_and_captures_memory(brain):
     )
     assert checkpoints
     assert any(item["state"] == "running" for item in checkpoints)
-    captured = [
-        source
-        for source in brain.store.list_sources("org_acme")
-        if source.get("external_id") == run["id"]
-        and source.get("source_type") == "agent_task"
+    # M2: capture writes what people said / what Toda did / a low-authority
+    # derived answer — never the old toda_agent transcript source.
+    derived = [
+        memory
+        for memory in brain.store.list_memories("org_acme")
+        if memory.get("memory_type") == "derived"
+        and "permitted company context" in (memory.get("content") or "")
     ]
-    assert captured, "completed Task must be captured asynchronously"
+    assert derived, "completed Task answer must be captured as derived memory"
+    assert all(memory.get("authority") == 0.3 for memory in derived)
 
 
 def test_request_batch_approval_pauses_once_then_pre_approves_declared_actions(brain):
@@ -1659,6 +1662,7 @@ def test_wake_preserves_slack_conversation_address_for_main_context(brain):
         "workspace_id": "TACME",
         "channel_id": "CSUPPORT2",
         "context_key": context_key,
+        "thread_ts": None,
         "actor_profile": {
             "principal_id": "person_ravi",
             "source_user_id": "URAVI2",

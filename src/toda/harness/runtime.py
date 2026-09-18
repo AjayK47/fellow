@@ -689,23 +689,32 @@ class CompanyAgent:
             threshold_tokens = int(
                 provisional_budget.effective_input_window * threshold_percent
             )
-            if len(full_history) > 30 and _estimate_tokens(full_history) > threshold_tokens:
+            if _estimate_tokens(full_history) > threshold_tokens:
                 compacted = True
-                session = self.runs.store.get_session(run["session_id"])
                 split = _tool_safe_head(full_history, 30)
                 older = full_history[:split]
                 history = full_history[split:]
-                previous_summary = (session or {}).get("summary") or ""
-                already_through = (session or {}).get("summary_through_message_id")
+                if is_child:
+                    previous_summary = (run.get("metadata") or {}).get("summary") or ""
+                    already_through = (run.get("metadata") or {}).get("summary_through_message_id")
+                else:
+                    session = self.runs.store.get_session(run["session_id"])
+                    previous_summary = (session or {}).get("summary") or ""
+                    already_through = (session or {}).get("summary_through_message_id")
                 # H-05: only fold in messages that haven't already been
                 # summarized — the running summary is merged incrementally,
                 # never re-derived from the whole `older` slice each time.
+                # If the watermark sits inside the recent window, everything
+                # in `older` predates it and is already summarized.
                 new_messages = older
                 if already_through:
                     for index, message in enumerate(older):
                         if message["id"] == already_through:
                             new_messages = older[index + 1 :]
                             break
+                    else:
+                        if already_through in {m.get("id") for m in history}:
+                            new_messages = []
                 if new_messages:
                     if self.history_compactor is not None:
                         summary = self.history_compactor.compact(
@@ -718,15 +727,29 @@ class CompanyAgent:
                     summary = previous_summary
                 # `older` can be empty when the trim boundary backed all the
                 # way to the start to keep a tool group intact; there is then
-                # nothing aged out to summarize or watermark.
-                if session and older:
-                    session["summary"] = summary
-                    session["summary_through_message_id"] = older[-1]["id"]
-                    session["updated_at"] = utcnow().isoformat()
-                    self.runs.store.update_session(session)
+                # nothing aged out to summarize or watermark. The watermark
+                # only advances when new messages were actually folded — never
+                # backward over already-summarized ground.
+                if older and new_messages:
+                    if is_child:
+                        metadata = dict(run.get("metadata") or {})
+                        metadata["summary"] = summary
+                        metadata["summary_through_message_id"] = older[-1]["id"]
+                        run["metadata"] = metadata
+                        self.runs.update(run)
+                    else:
+                        session = self.runs.store.get_session(run["session_id"])
+                        if session:
+                            session["summary"] = summary
+                            session["summary_through_message_id"] = older[-1]["id"]
+                            session["updated_at"] = utcnow().isoformat()
+                            self.runs.store.update_session(session)
             else:
-                session = self.runs.store.get_session(run["session_id"])
-                summary = (session or {}).get("summary") or ""
+                if is_child:
+                    summary = (run.get("metadata") or {}).get("summary") or ""
+                else:
+                    session = self.runs.store.get_session(run["session_id"])
+                    summary = (session or {}).get("summary") or ""
 
             # Build once without company context to determine how much room is
             # left for permission-filtered retrieval. Tool schemas are part of
@@ -740,6 +763,7 @@ class CompanyAgent:
                 slack_conversation=self._slack_conversation(run),
                 active_skills=active_skills,
                 available_skills=(run.get("metadata") or {}).get("skill_index") or [],
+                persona_name=self.persona_name,
             )
             preliminary_budget = request_budget(
                 context_window=context_length,
@@ -859,9 +883,47 @@ class CompanyAgent:
                 except Exception:
                     pass
             if not final_budget.fits:
-                # Keep the newest conversation evidence and the active prompt;
-                # the incremental summary carries the aged-out middle.
-                history = history[_tool_safe_head(history, 8):]
+                # Last resort after compaction: fold what is being dropped
+                # into the summary first, never drop without summarizing.
+                # Only messages past the current watermark are folded; the
+                # rest is already in the summary.
+                cut = _tool_safe_head(history, 8)
+                dropped = history[:cut]
+                history = history[cut:]
+                if is_child:
+                    watermark = (self.runs.get(run["id"]) or {}).get("metadata", {}).get("summary_through_message_id")
+                else:
+                    watermark = ((self.runs.store.get_session(run["session_id"]) or {}).get("summary_through_message_id"))
+                if watermark:
+                    for index, message in enumerate(dropped):
+                        if message.get("id") == watermark:
+                            dropped = dropped[index + 1 :]
+                            break
+                    else:
+                        if watermark in {m.get("id") for m in history}:
+                            dropped = []
+                if dropped:
+                    if self.history_compactor is not None:
+                        try:
+                            summary = self.history_compactor.compact(
+                                previous_summary=summary,
+                                new_messages=dropped,
+                            )
+                        except Exception:
+                            summary = summary
+                    if is_child:
+                        metadata = dict(run.get("metadata") or {})
+                        metadata["summary"] = summary
+                        metadata["summary_through_message_id"] = dropped[-1].get("id", "")
+                        run["metadata"] = metadata
+                        self.runs.update(run)
+                    else:
+                        session = self.runs.store.get_session(run["session_id"])
+                        if session:
+                            session["summary"] = summary
+                            session["summary_through_message_id"] = dropped[-1].get("id", "")
+                            session["updated_at"] = utcnow().isoformat()
+                            self.runs.store.update_session(session)
                 messages = build_agent_messages(
                     run=run,
                     context=context,

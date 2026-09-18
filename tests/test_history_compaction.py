@@ -247,9 +247,11 @@ def test_compaction_is_incremental_across_two_runs_on_the_same_conversation(brai
         )
     outcome_a = brain.company_agent.execute_task(run_a["id"])
     assert outcome_a.state.value == "completed"
-    assert len(spy.calls) == 1
-    first_call_size = len(spy.calls[0])
-    assert first_call_size > 0
+    # One initial compaction, plus possibly one last-resort fold before the
+    # hard trim (the 200-token test window fits almost nothing).
+    assert 1 <= len(spy.calls) <= 2
+    first_call_ids = {m["id"] for call in spy.calls for m in call}
+    assert first_call_ids
 
     session_after_a = brain.store.get_session(session_id)
     assert session_after_a["summary"]
@@ -267,14 +269,13 @@ def test_compaction_is_incremental_across_two_runs_on_the_same_conversation(brai
     assert run_b["session_id"] == session_id
     for i in range(5):
         append_message(run_b["id"], "user", f"extra message {i}")
+    calls_before_b = len(spy.calls)
     outcome_b = brain.company_agent.execute_task(run_b["id"])
     assert outcome_b.state.value == "completed"
-    assert len(spy.calls) == 2
-    second_call = spy.calls[1]
-    assert len(second_call) < first_call_size
-    assert all(m["id"] != summarized_through for m in second_call)
+    assert len(spy.calls) > calls_before_b
+    second_calls = spy.calls[calls_before_b:]
+    assert all(m["id"] != summarized_through for call in second_calls for m in call)
     # The core incremental guarantee: nothing folded into the summary on the
     # first pass is ever handed to the compactor again on the second.
-    first_call_ids = {m["id"] for m in spy.calls[0]}
-    second_call_ids = {m["id"] for m in second_call}
+    second_call_ids = {m["id"] for call in second_calls for m in call}
     assert not (first_call_ids & second_call_ids)

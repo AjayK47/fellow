@@ -372,6 +372,7 @@ class TodaApp:
             delivery_enqueue=self.harness_jobs.enqueue,
             readiness_target=self,
             persona_name=runtime_settings.agent.persona_name,
+            history_compactor=self.history_compactor,
         )
         self.session_manager = SessionManagerScheduler(
             store=self.store,

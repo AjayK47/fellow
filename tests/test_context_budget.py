@@ -197,4 +197,7 @@ def test_runtime_state_still_carries_the_clock_and_counters():
     assert state["used_tool_calls"] == 11
     assert state["current_time"]["utc"]
     # The limits stay in the stable block, since they never change.
-    assert '"max_iterations": 50' in messages[1]["content"]
+    invocation = next(
+        m["content"] for m in messages if m["content"].startswith("<trusted_invocation>")
+    )
+    assert '"max_iterations": 50' in invocation

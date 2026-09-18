@@ -13,7 +13,7 @@ import json
 import logging
 from typing import Any, Callable
 
-from toda.domain.models import new_id
+from toda.domain.models import new_id, utcnow
 from toda.harness.model_client import instrument_model
 from toda.harness.models import (
     AgentOutcome,
@@ -143,6 +143,7 @@ class ConversationAgent:
         max_tokens: int = 8_000,
         readiness_target: Any | None = None,
         persona_name: str = "Toda",
+        history_compactor: Any | None = None,
     ) -> None:
         self.store = store
         self.model = model
@@ -154,6 +155,7 @@ class ConversationAgent:
         self.max_tokens = max_tokens
         self.readiness_target = readiness_target
         self.persona_name = persona_name
+        self.history_compactor = history_compactor
 
     def _ensure_task_start_allowed(self, envelope: InvocationEnvelope, trigger_kind: TriggerKind) -> None:
         if self.readiness_target is not None:
@@ -199,7 +201,37 @@ class ConversationAgent:
         model: Any | None = None,
     ) -> AgentOutcome:
         turn_id = new_id("turn")
-        history = self.store.list_session_messages(session["id"], limit=30)
+        full_history = self.store.list_session_messages(session["id"], limit=200)
+        history = full_history[-30:]
+        session_summary = str((session or {}).get("summary") or "")
+        if len(full_history) > 30:
+            older = full_history[:-30]
+            already_through = (session or {}).get("summary_through_message_id")
+            new_messages = older
+            if already_through:
+                for index, message in enumerate(older):
+                    if message.get("id") == already_through:
+                        new_messages = older[index + 1 :]
+                        break
+                else:
+                    if already_through in {m.get("id") for m in history}:
+                        new_messages = []
+            if new_messages:
+                if self.history_compactor is not None:
+                    session_summary = self.history_compactor.compact(
+                        previous_summary=session_summary,
+                        new_messages=new_messages,
+                    )
+                else:
+                    session_summary = (session_summary + "\n" + "\n".join(
+                        f"{m.get('role', '').upper()}: {m.get('content') or ''}" for m in new_messages
+                    ).strip()).strip()[-8000:]
+                updated = dict(session)
+                updated["summary"] = session_summary
+                updated["summary_through_message_id"] = older[-1]["id"]
+                updated["updated_at"] = utcnow().isoformat()
+                self.store.update_session(updated)
+                session = updated
         latest_user = next(
             (item for item in reversed(history) if item.get("role") in {"user", "event"}),
             None,
@@ -266,6 +298,14 @@ class ConversationAgent:
             {"role": "system", "content": render_voice(self.persona_name)},
             {"role": "system", "content": load("core")},
             {"role": "system", "content": load("conversation_manager")},
+            *(
+                [{
+                    "role": "system",
+                    "content": "<conversation_summary>\n" + load("conversation_summary_prefix") + "\n\n" + session_summary + "\n</conversation_summary>",
+                }]
+                if session_summary.strip()
+                else []
+            ),
             {
                 "role": "system",
                 "content": "<organization_memory>\n" + memory_md + "\n</organization_memory>",
