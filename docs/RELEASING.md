@@ -8,7 +8,7 @@
 6. Install the wheel and start the container in fresh environments.
 7. Test the deterministic quickstart, local login, Slack ingress, approval,
    delivery, backup, and restore paths.
-8. Update `CHANGELOG.md`, tag `vX.Y.Z`, and let the release workflow publish
+8. Tag `vX.Y.Z` with release notes and let the release workflow publish
    attestable artifacts.
 
 The PyPI distribution is `toda-ai`; the Python import and executable are
