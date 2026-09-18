@@ -386,6 +386,7 @@ _APPROVAL_TOOL_NAMES = frozenset(
         "run_code",
         "delete_file",
         "workspace_publish",
+        "post_draft",
         # Grants Toda an OAuth connection to an external account.
         "request_app_connection",
         # This IS the approval mechanism; waiving it would be circular.
@@ -930,8 +931,7 @@ def build_tool_registry(
 
         registry.register(
             ToolDefinition(
-                name="slack_react",
-                description="Add a reaction to a message in the current Slack conversation.",
+                name="slack_react",                description="Add a reaction to a message in the current Slack conversation.",
                 input_schema=_object_schema({"timestamp": {"type": "string"}, "name": {"type": "string"}}, ["timestamp", "name"]),
                 risk="write",
                 allowed_destination_types=["slack_channel", "private_channel", "dm", "internal_agent_session"],
@@ -939,6 +939,118 @@ def build_tool_registry(
                 capability_id="slack.react",
             ),
             _slack_react,
+        )
+
+        def _reply_card(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+            title = str(args.get("title") or "")[:150]
+            rows = args.get("rows") or []
+            if not title or not (1 <= len(rows) <= 10):
+                raise ValueError("reply_card needs a title and 1-10 rows")
+            for row in rows:
+                if str(row.get("tone") or "") not in {"good", "warn", "risk", "neutral"}:
+                    raise ValueError(f"bad row tone: {row.get('tone')!r}")
+            card = {
+                "title": title,
+                "subtitle": str(args.get("subtitle") or ""),
+                "rows": [
+                    {"tag": str(r.get("tag") or ""), "tone": str(r.get("tone") or "neutral"), "text": str(r.get("text") or "")}
+                    for r in rows
+                ],
+                "footer": str(args.get("footer") or ""),
+            }
+            task = store.get_task(runtime["task_id"])
+            if task is not None:
+                metadata = dict(task.get("metadata") or {})
+                cards = list(metadata.get("reply_cards") or [])
+                cards.append(card)
+                metadata["reply_cards"] = cards
+                task["metadata"] = metadata
+                task["updated_at"] = utcnow().isoformat()
+                store.update_task(task)
+            return {"attached": True, "card": card}
+
+        registry.register(
+            ToolDefinition(
+                name="reply_card",
+                description="Attach a small structured card to your reply (title, 1-10 tagged rows, footer). The message itself stays one or two lines; the card carries anything worth scanning. Never write Block Kit JSON.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "subtitle": {"type": "string"},
+                        "rows": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 10,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tag": {"type": "string"},
+                                    "tone": {"type": "string", "enum": ["good", "warn", "risk", "neutral"]},
+                                    "text": {"type": "string"},
+                                },
+                                "required": ["tag", "tone", "text"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "footer": {"type": "string"},
+                    },
+                    "required": ["title", "rows"],
+                    "additionalProperties": False,
+                },
+                risk="read",
+                allowed_destination_types=["slack_channel", "private_channel", "dm", "internal_agent_session"],
+                capability_id="slack.card",
+            ),
+            _reply_card,
+        )
+
+        def _post_draft(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+            from toda.harness.delivery import render_card_blocks
+            from toda.harness.slack_markdown import to_slack_mrkdwn as _to_mrkdwn
+
+            text = str(args.get("text") or "")
+            if not text.strip():
+                raise ValueError("post_draft needs text")
+            card = args.get("card") if isinstance(args.get("card"), dict) else None
+            thread_ts = (runtime.get("task_metadata") or {}).get("slack", {}).get("thread_ts")
+            mrkdwn = _to_mrkdwn(text)
+            result = slack_sender.send(
+                channel_id=str(runtime["destination"]["id"]),
+                text=mrkdwn,
+                blocks=render_card_blocks(mrkdwn, card) or None,
+                workspace_id=(runtime.get("task_metadata") or {}).get("slack", {}).get("workspace_id"),
+                organization_id=runtime["organization_id"],
+                thread_ts=thread_ts,
+            )
+            task = store.get_task(runtime["task_id"])
+            if task is not None:
+                metadata = dict(task.get("metadata") or {})
+                metadata["suppress_delivery"] = True
+                task["metadata"] = metadata
+                task["updated_at"] = utcnow().isoformat()
+                store.update_task(task)
+            return {"posted": True, "provider_result": result}
+
+        registry.register(
+            ToolDefinition(
+                name="post_draft",
+                description="Post a team-behalf message (announcement, digest, routine post) to the current conversation. Use ONLY for posts made on behalf of the team, never for answering the asker. Always needs approval first.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "card": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["text"],
+                    "additionalProperties": False,
+                },
+                risk="write",
+                allowed_destination_types=["slack_channel", "private_channel", "dm", "internal_agent_session"],
+                idempotency_required=True,
+                capability_id="slack.draft",
+            ),
+            _post_draft,
         )
 
     # Internet content is deliberately isolated from company retrieval. It is

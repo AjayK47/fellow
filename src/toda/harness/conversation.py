@@ -121,6 +121,8 @@ _CONVERSATION_READ_TOOLS = {
     "web_fetch",
     # Arithmetic, so a number in a reply is computed rather than guessed.
     "calculate",
+    # Structured card attached to the reply; read-only, rendered by delivery.
+    "reply_card",
 }
 
 
@@ -281,6 +283,7 @@ class ConversationAgent:
                     {"role": item["role"], "content": str(item.get("content") or "")}
                 )
 
+        pending_card: dict[str, Any] | None = None
         for _ in range(self.max_iterations):
             active_model = model or self.model
             if active_model is None:
@@ -305,7 +308,7 @@ class ConversationAgent:
                     task_id=None,
                     role="assistant",
                     content=answer,
-                    metadata={"conversation_turn_id": turn_id},
+                    metadata={"conversation_turn_id": turn_id, **({"reply_card": pending_card} if pending_card else {})},
                 )
                 self.delivery_enqueue(
                     organization_id=session["organization_id"],
@@ -392,6 +395,8 @@ class ConversationAgent:
                     output = result.output if result.status == "completed" else {
                         "error": result.error or result.status
                     }
+                    if call.name == "reply_card" and isinstance(output, dict) and output.get("attached"):
+                        pending_card = output.get("card") or pending_card
                 messages.append(
                     {
                         "role": "tool",

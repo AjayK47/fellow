@@ -26,7 +26,7 @@ steps:
     description: Use Slack mrkdwn and labeled angle-bracket links, not Markdown syntax.
   - order: 3
     name: Make it scannable
-    description: Keep paragraphs short, use bullets or Block Kit fields instead of tables, and know when to switch to a document artifact.
+    description: Keep paragraphs short, use a reply_card instead of tables, and know when to switch to a document artifact.
 ---
 This is the practical companion to Slack is the only delivery channel Toda
 has, and to the system's own standing rule to keep Slack responses concise,
@@ -65,3 +65,12 @@ collecting all sources into an unlabeled list at the end of a short message
 -- in a short reply, the reader can't tell which source backs which
 sentence otherwise. For a longer artifact, a source list at the end is
 fine.
+
+## Cards and drafts
+
+Structure worth scanning (a status list, a digest, a comparison): call
+`reply_card` with a title and short tagged rows, and keep the message itself
+to one or two lines. Never write Block Kit JSON yourself. Posts made on
+behalf of the team (announcements, digests, routine posts) go through
+`post_draft`, which always asks for approval first; answers to the person
+who asked are never drafted.

@@ -29,6 +29,7 @@ CONVERSATION = frozenset(
         "web_search",
         "web_fetch",
         "calculate",
+        "reply_card",
     }
 )
 

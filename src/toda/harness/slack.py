@@ -527,6 +527,11 @@ class SlackGateway:
         return self._resolve_interaction(payload)
 
     def _resolve_interaction(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("type") == "view_submission":
+            view = payload.get("view") or {}
+            if view.get("callback_id") == "toda_edit_draft":
+                return self._resolve_edit_submission(payload, view)
+            raise ValueError("Unsupported interaction")
         actions = payload.get("actions") or []
         if not actions:
             raise ValueError("Interaction has no action")
@@ -534,9 +539,105 @@ class SlackGateway:
         action_id = action.get("action_id")
         if action_id in {"toda_approve", "toda_deny"}:
             return self._resolve_approval_interaction(payload, action)
+        if action_id == "toda_edit":
+            return self._resolve_edit_action(payload, action)
         if action_id in {"toda_choice", "toda_choice_select"}:
             return self._resolve_choice_interaction(payload, action)
         raise ValueError("Unsupported interaction")
+
+    def open_view(self, trigger_id: str, view: dict[str, Any], workspace_id: str | None = None) -> dict[str, Any]:
+        """Open a Slack modal. Called synchronously (trigger_id expires in 3s)."""
+        token = self._token_for(workspace_id)
+        if not token:
+            return {"ok": False, "dry_run": True}
+        response = httpx.post(
+            "https://slack.com/api/views.open",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+            json={"trigger_id": trigger_id, "view": view},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _resolve_edit_action(self, payload: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        approval_id = action.get("value")
+        approval = self.store.get_harness_record("approvals", approval_id)
+        if not approval:
+            raise KeyError("approval not found")
+        user_id = str((payload.get("user") or {}).get("id") or "unknown")
+        mapping = slack_identity_mapping(
+            self.store, approval["organization_id"],
+            str((payload.get("team") or {}).get("id") or ""), user_id,
+        )
+        decided_by = mapping["principal_id"] if mapping else f"slack:{user_id}"
+        if decided_by not in set(approval.get("allowed_approver_ids") or [approval.get("requested_by")]):
+            raise UnauthorizedApprover("Slack user cannot decide this approval")
+        draft_text = str((approval.get("arguments") or {}).get("text") or "")[:3000]
+        trigger_id = str(payload.get("trigger_id") or "")
+        if not trigger_id:
+            raise ValueError("Missing trigger_id for modal")
+        self.open_view(
+            trigger_id,
+            {
+                "type": "modal",
+                "callback_id": "toda_edit_draft",
+                "private_metadata": approval_id,
+                "title": {"type": "plain_text", "text": "Edit draft"},
+                "submit": {"type": "plain_text", "text": "Post"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "draft",
+                        "label": {"type": "plain_text", "text": "Draft"},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "text",
+                            "multiline": True,
+                            "initial_value": draft_text,
+                            "max_length": 3000,
+                        },
+                    }
+                ],
+            },
+            (approval.get("preview") or {}).get("destination", {}).get("workspace_id")
+            if isinstance(approval.get("preview"), dict)
+            else None,
+        )
+        return {"accepted": True, "opened_modal": True}
+
+    def _resolve_edit_submission(self, payload: dict[str, Any], view: dict[str, Any]) -> dict[str, Any]:
+        approval_id = str(view.get("private_metadata") or "")
+        approval = self.store.get_harness_record("approvals", approval_id)
+        if not approval:
+            raise KeyError("approval not found")
+        user_id = str((payload.get("user") or {}).get("id") or "unknown")
+        mapping = slack_identity_mapping(
+            self.store, approval["organization_id"],
+            str((payload.get("team") or {}).get("id") or ""), user_id,
+        )
+        decided_by = mapping["principal_id"] if mapping else f"slack:{user_id}"
+        if decided_by not in set(approval.get("allowed_approver_ids") or [approval.get("requested_by")]):
+            raise UnauthorizedApprover("Slack user cannot decide this approval")
+        try:
+            new_text = str(
+                view["state"]["values"]["draft"]["text"]["value"] or ""
+            )
+        except (KeyError, TypeError):
+            raise ValueError("Malformed edit submission")
+        self.queue.enqueue(
+            organization_id=approval["organization_id"],
+            kind="approval.resolve",
+            payload={
+                "approval_id": approval_id,
+                "approved": True,
+                "decided_by": decided_by,
+                "edited_arguments": {**(approval.get("arguments") or {}), "text": new_text},
+            },
+            idempotency_key=f"approval.slack:{approval_id}:toda_edit",
+            link_carrier=approval.get("telemetry_carrier"),
+        )
+        return {}
 
     def _resolve_approval_interaction(
         self, payload: dict[str, Any], action: dict[str, Any]

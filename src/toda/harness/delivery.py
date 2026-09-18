@@ -57,6 +57,44 @@ def _approval_preview_text(prefix: str, arguments: dict[str, Any]) -> str:
     )
 
 
+_TONE_EMOJI = {
+    "good": ":large_green_circle:",
+    "warn": ":large_yellow_circle:",
+    "risk": ":red_circle:",
+    "neutral": ":white_circle:",
+}
+
+
+def render_card_blocks(text: str, card: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """One card renderer used by every delivery path. Model never writes blocks."""
+    blocks: list[dict[str, Any]] = []
+    if text:
+        blocks.append(
+            {"type": "section", "text": {"type": "mrkdwn", "text": text[:3000]}}
+        )
+    if not card:
+        return blocks[:50]
+    title = str(card.get("title") or "")[:150]
+    if title:
+        blocks.append({"type": "header", "text": {"type": "plain_text", "text": title}})
+    subtitle = str(card.get("subtitle") or "")
+    if subtitle:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": subtitle[:3000]}]})
+    for row in list(card.get("rows") or [])[:10]:
+        tag = str(row.get("tag") or "")
+        tone = str(row.get("tone") or "neutral")
+        emoji = _TONE_EMOJI.get(tone, _TONE_EMOJI["neutral"])
+        body = str(row.get("text") or "")
+        line = f"{emoji} *{tag}*  {body}"[:3000]
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": line}})
+    footer = str(card.get("footer") or "")
+    if card.get("rows"):
+        blocks.append({"type": "divider"})
+    if footer:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": footer[:3000]}]})
+    return blocks[:50]
+
+
 # One line of output, but the budget has to cover the model's own thinking
 # too: reasoning cannot be switched off on every provider (ai-studio rejects
 # effort "none"), so a tight cap gets spent deliberating and the sentence
@@ -246,9 +284,12 @@ class DeliveryService:
                 "delivery": reservation,
             }
         try:
+            card = (message.get("metadata") or {}).get("reply_card")
+            text = to_slack_mrkdwn(str(message.get("content") or ""))
             result = self.slack.send(
                 channel_id=slack.get("channel_id") or destination.get("id") or "",
-                text=to_slack_mrkdwn(str(message.get("content") or "")),
+                text=text,
+                blocks=render_card_blocks(text, card) or None,
                 workspace_id=slack.get("workspace_id"),
                 organization_id=session["organization_id"],
                 idempotency_key=idempotency_key,
@@ -381,12 +422,16 @@ class DeliveryService:
             channel_id,
         )
         try:
+            cards = (task.get("metadata") or {}).get("reply_cards") or []
+            card = cards[-1] if cards else None
+            text = to_slack_mrkdwn(task["final_answer"])
             result = self.slack.send(
                 channel_id=channel_id,
                 # The model writes Markdown; Slack speaks mrkdwn. Blocks here
                 # have always declared "mrkdwn" while carrying raw Markdown,
                 # so "### Heading" and "**bold**" rendered literally.
-                text=to_slack_mrkdwn(task["final_answer"]),
+                text=text,
+                blocks=render_card_blocks(text, card) or None,
                 workspace_id=slack.get("workspace_id"),
                 organization_id=task["organization_id"],
                 idempotency_key=idempotency_key,
@@ -653,37 +698,76 @@ class DeliveryService:
         slack = (task.get("metadata") or {}).get("slack") or {}
         preview = approval["preview"]
         sentence = self._approval_sentence(task, preview)
-        text = (
-            f"*{sentence}*"
-            if sentence
-            else f"Approval required: {preview['description']}\n"
-                 f"Action: `{preview['action']}`"
-        )
-        blocks = [
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": text},
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "style": "primary",
-                        "text": {"type": "plain_text", "text": "Approve"},
-                        "action_id": "toda_approve",
-                        "value": approval_id,
-                    },
-                    {
-                        "type": "button",
-                        "style": "danger",
-                        "text": {"type": "plain_text", "text": "Deny"},
-                        "action_id": "toda_deny",
-                        "value": approval_id,
-                    },
-                ],
-            },
-        ]
+        is_draft = (preview.get("action") or approval.get("tool_name")) == "post_draft"
+        if is_draft:
+            draft_args = approval.get("arguments") or {}
+            draft_text = to_slack_mrkdwn(str(draft_args.get("text") or ""))
+            blocks = render_card_blocks(draft_text, draft_args.get("card")) or [
+                {"type": "section", "text": {"type": "mrkdwn", "text": draft_text}}
+            ]
+            blocks.append(
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": "Draft · awaiting your OK"}]}
+            )
+            text = draft_text
+            blocks.append(
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "style": "primary",
+                            "text": {"type": "plain_text", "text": "Approve & post"},
+                            "action_id": "toda_approve",
+                            "value": approval_id,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Edit"},
+                            "action_id": "toda_edit",
+                            "value": approval_id,
+                        },
+                        {
+                            "type": "button",
+                            "style": "danger",
+                            "text": {"type": "plain_text", "text": "Discard"},
+                            "action_id": "toda_deny",
+                            "value": approval_id,
+                        },
+                    ],
+                },
+            )
+        else:
+            text = (
+                f"*{sentence}*"
+                if sentence
+                else f"Approval required: {preview['description']}\n"
+                      f"Action: `{preview['action']}`"
+            )
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": text},
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "style": "primary",
+                            "text": {"type": "plain_text", "text": "Approve"},
+                            "action_id": "toda_approve",
+                            "value": approval_id,
+                        },
+                        {
+                            "type": "button",
+                            "style": "danger",
+                            "text": {"type": "plain_text", "text": "Deny"},
+                            "action_id": "toda_deny",
+                            "value": approval_id,
+                        },
+                    ],
+                },
+            ]
         result = self.slack.send(
             channel_id=slack.get("channel_id") or envelope["destination"]["id"],
             text=text,
@@ -746,11 +830,20 @@ class DeliveryService:
             workspace_id = ((task or {}).get("metadata") or {}).get("slack", {}).get(
                 "workspace_id"
             )
-            label = "Approved" if approved else "Denied"
+            from datetime import datetime as _dt
+
+            now_label = _dt.now().strftime("%-I:%M %p") if hasattr(_dt.now(), "strftime") else ""
+            is_draft = (approval.get("tool_name") or "") == "post_draft"
+            if is_draft and approved:
+                label, sub = "Posted", f"Posted by {decided_by}" + (f" · {now_label}" if now_label else "")
+            elif is_draft:
+                label, sub = "Discarded", f"Discarded by {decided_by}"
+            else:
+                label, sub = ("Approved", f"Approved by {decided_by}") if approved else ("Denied", f"Denied by {decided_by}")
             self.slack.update_message(
                 channel_id=channel_id,
                 timestamp=ts,
-                text=f"{label} by {decided_by}",
+                text=sub,
                 blocks=[
                     {
                         "type": "section",
