@@ -1133,6 +1133,40 @@ def build_tool_registry(
         ),
     )
 
+    def _about_me(args: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+        principal_id = runtime["principal_id"]
+        scope_id = f"scope_person_{principal_id}"
+        facts = (
+            reality.current_facts(
+                runtime["organization_id"], scope_ids=[scope_id]
+            )
+            if reality is not None and store.get_scope(scope_id) is not None
+            else []
+        )
+        return {
+            "preferences": [
+                {
+                    "fact_id": fact["id"],
+                    "content": f"{fact.get('subject_id')} {fact.get('predicate')} {fact.get('object_value')}",
+                    "predicate": fact.get("predicate"),
+                    "object_value": fact.get("object_value"),
+                    "observed_at": fact.get("system_from"),
+                }
+                for fact in facts
+            ]
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="about_me",
+            description="What Toda remembers about the person asking (their stated and inferred preferences, with dates). Use when someone asks what you know about them.",
+            input_schema=_object_schema({}, []),
+            risk="read",
+            capability_id="memory.read",
+        ),
+        _about_me,
+    )
+
     def _read_source(
         args: dict[str, Any], runtime: dict[str, Any]
     ) -> dict[str, Any]:
@@ -3073,7 +3107,9 @@ class ToolExecutor:
                 status="disabled",
                 error="Tool is outside this run's resolved capability envelope.",
             )
-        policy = self.effective_policy(run["organization_id"], definition)
+        policy = self.effective_policy(
+            run["organization_id"], definition, principal_id=run["envelope"]["principal_id"]
+        )
         if policy["access"] != "enabled":
             return ToolResult(
                 call_id=call.id,
@@ -3512,7 +3548,7 @@ class ToolExecutor:
         return mode if mode in _TOOL_POLICY_MODES else "autonomous"
 
     def effective_policy(
-        self, organization_id: str, definition: ToolDefinition
+        self, organization_id: str, definition: ToolDefinition, principal_id: str | None = None
     ) -> dict[str, Any]:
         mode = self.organization_policy_mode(organization_id)
         records = self.store.list_harness_records(
@@ -3522,7 +3558,8 @@ class ToolExecutor:
             order_by="updated_at",
             limit=1,
         )
-        override = str((records[0] if records else {}).get("execution") or "inherit")
+        record = records[0] if records else {}
+        override = str(record.get("execution") or "inherit")
         if override not in _TOOL_EXECUTIONS:
             override = "inherit"
         native_allow = runs_without_approval(definition)
@@ -3531,6 +3568,26 @@ class ToolExecutor:
             if override == "inherit"
             else override
         )
+        source = "tool_override" if override != "inherit" else mode
+        # Per-person relaxations: a principal override wins, but may only
+        # relax ask/ai_review -> direct for write-risk tools — never for
+        # destructive tools, and never for always-approval tools (except
+        # post_draft, whose approval is the product).
+        if principal_id:
+            principal_override = str(
+                ((record.get("principal_overrides") or {}).get(principal_id) or "")
+            )
+            if (
+                principal_override == "direct"
+                and definition.risk == "write"
+                and execution in {"ask", "ai_review"}
+                and (
+                    definition.name == "post_draft"
+                    or definition.name not in _APPROVAL_TOOL_NAMES
+                )
+            ):
+                execution = "direct"
+                source = "principal_override"
         # Tool authors may mark a capability as intrinsically governed. A
         # direct organization default can relax ordinary writes, but not this
         # explicit safety floor; it becomes AI review rather than a mandatory
@@ -3545,7 +3602,7 @@ class ToolExecutor:
             "override": override,
             "access": "forbidden" if execution == "deny" else "enabled",
             "execution": execution,
-            "source": "tool_override" if override != "inherit" else mode,
+            "source": source,
         }
 
     def _policy(self, organization_id: str, tool_name: str) -> dict[str, Any]:

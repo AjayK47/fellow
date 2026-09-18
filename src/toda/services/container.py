@@ -18,6 +18,7 @@ from toda.services.ingestion import IngestionService
 from toda.services.indexing import IndexingService
 from toda.services.memory import MemoryService
 from toda.services.mcp_client import MCPClientService
+from toda.services.preferences import PreferenceLearner
 from toda.services.proactive import ProactiveService
 from toda.services.profiles import ProfilesService
 from toda.services.retrieval import RetrievalService
@@ -655,6 +656,15 @@ class TodaApp:
         )
         self.harness_worker.register(
             "connector.unsubscribe_triggers", self._unsubscribe_connector_triggers
+        )
+        self.preference_learner = PreferenceLearner(
+            store=self.store, reality=self.reality, slack_sender=self.slack_sender
+        )
+        self.harness_worker.register(
+            "preferences.learn",
+            lambda payload: self.preference_learner.learn(
+                payload["organization_id"], payload["principal_id"]
+            ),
         )
         self.harness_evaluation = HarnessEvaluationService(
             store=self.store, audit=self.audit, reality=self.reality

@@ -29,6 +29,33 @@ class ContextService:
         self.graph = graph
         self.audit = audit
 
+    def load_preferences(
+        self, organization_id: str, principal_id: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """The acting person's preference facts, loaded directly (not
+        searched): person-stated before inferred, then most recent."""
+        scope_id = f"scope_person_{principal_id}"
+        if self.store.get_scope(scope_id) is None:
+            return []
+        facts = (self.retrieval.reality.current_facts(
+            organization_id, scope_ids=[scope_id]
+        ) if self.retrieval.reality else [])
+        preferences = list(facts)
+        stated = [f for f in preferences if float(f.get("authority") or 0) >= 0.5]
+        inferred = [f for f in preferences if float(f.get("authority") or 0) < 0.5]
+        stated.sort(key=lambda f: f.get("system_from") or "", reverse=True)
+        inferred.sort(key=lambda f: f.get("system_from") or "", reverse=True)
+        return (stated + inferred)[:limit]
+
+    def render_about_you(self, preferences: list[dict[str, Any]]) -> str:
+        lines = []
+        for fact in preferences:
+            subject = fact.get("subject_id") or "you"
+            lines.append(
+                f"- {subject} {fact.get('predicate')} {fact.get('object_value')}"
+            )
+        return "<about_you>\n" + "\n".join(lines) + "\n</about_you>" if lines else ""
+
     def _decision_from_id(self, decision_id: str) -> AuthorizationDecision:
         """Rehydrate an already-resolved decision from its id — cheap (one
         row read, no new resolve()/audit write) versus re-running

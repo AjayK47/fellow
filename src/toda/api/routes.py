@@ -3210,9 +3210,39 @@ def assert_reality_fact(
     return brain.reality.assert_fact(**body.model_dump())
 
 
+@router.get("/v1/me/preferences")
+def get_my_preferences(request: Request, organization_id: str) -> dict[str, Any]:
+    """The caller's own preference facts (member-writable, own facts only)."""
+    brain = _app(request)
+    principal_id = _acting_principal(request)
+    facts = brain.context.load_preferences(organization_id, principal_id)
+    return {"facts": facts, "count": len(facts)}
+
+
+@router.delete("/v1/me/preferences/{fact_id}")
+def delete_my_preference(request: Request, organization_id: str, fact_id: str) -> dict[str, Any]:
+    """Delete one of the caller's own preference facts. Deleting an inferred
+    preference records a tombstone so the learner does not re-infer it."""
+    from toda.domain.models import utcnow as _utcnow
+
+    brain = _app(request)
+    principal_id = _acting_principal(request)
+    scope_id = f"scope_person_{principal_id}"
+    fact = brain.reality._get_payload("reality_facts", fact_id)
+    if not fact or fact.get("organization_id") != organization_id:
+        raise HTTPException(404, "preference not found")
+    if fact.get("scope_id") != scope_id or fact.get("subject_id") != principal_id:
+        raise HTTPException(403, "not your preference")
+    now = _utcnow().isoformat()
+    fact["status"] = "deleted"
+    fact["system_to"] = now
+    brain.reality._save_fact(fact)
+    brain.reality._close_projected_edge(organization_id, fact_id, valid_until=now)
+    return {"deleted": fact_id}
+
+
 @router.get("/v1/facts")
-def list_reality_facts(
-    request: Request,
+def list_reality_facts(    request: Request,
     organization_id: str,
     subject_id: str | None = None,
     predicate: str | None = None,

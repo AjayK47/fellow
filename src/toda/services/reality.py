@@ -1124,6 +1124,21 @@ class RealityEngine:
             return None
         if self._refuse_reserved(predicate):
             return None
+        memory_type = str(memory.get("memory_type") or "")
+        scope_id = str(memory.get("scope_id") or "")
+        if memory_type == "preference":
+            # Preferences live in the speaker's personal scope even when
+            # stated in a channel. The claim subject is the speaker.
+            speaker = str(
+                memory.get("author_entity_id")
+                or claim.get("subject_id")
+                or ""
+            )
+            personal_scope = f"scope_person_{speaker}" if speaker else ""
+            if not personal_scope or self.store.get_scope(personal_scope) is None:
+                log.info("Skipping preference fact: no personal scope for %s", speaker)
+                return None
+            scope_id = personal_scope
         subject_id = str(
             claim.get("subject_id")
             or self._resolve_claim_subject(memory, str(claim.get("subject") or ""))
@@ -1177,7 +1192,7 @@ class RealityEngine:
                     "valid_to": memory.get("valid_until"),
                     "system_from": now,
                     "system_to": None,
-                    "scope_id": memory["scope_id"],
+                    "scope_id": scope_id,
                     "source_ids": source_ids,
                     "memory_id": memory["id"],
                     "confidence": confidence,
@@ -1200,7 +1215,7 @@ class RealityEngine:
                             new_fact["id"], organization_id, subject_id, predicate,
                             object_value, object_entity_id, "active", valid_from,
                             memory.get("valid_until"), now, None,
-                            memory["scope_id"], _dump(new_fact),
+                            scope_id, _dump(new_fact),
                         ),
                     )
                 self._project_edge(new_fact)
@@ -1223,7 +1238,7 @@ class RealityEngine:
                 "valid_to": memory.get("valid_until"),
                 "system_from": now,
                 "system_to": None,
-                "scope_id": memory["scope_id"],
+                "scope_id": scope_id,
                 "source_ids": source_ids,
                 "memory_id": memory["id"],
                 "confidence": confidence,
@@ -1241,7 +1256,7 @@ class RealityEngine:
                         fact["id"], organization_id, subject_id, predicate,
                         object_value, object_entity_id, "contested", valid_from,
                         memory.get("valid_until"), now, None,
-                        memory["scope_id"], _dump(fact),
+                        scope_id, _dump(fact),
                     ),
                 )
             conflict = self._record_conflict(fact, competing, single_valued=False)
@@ -1264,7 +1279,7 @@ class RealityEngine:
             subject_id=subject_id,
             predicate=predicate,
             object_value=object_value,
-            scope_id=memory["scope_id"],
+            scope_id=scope_id,
             valid_from=valid_from,
             valid_to=memory.get("valid_until"),
             source_ids=source_ids,

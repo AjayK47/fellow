@@ -177,6 +177,21 @@ class CompanyAgent:
         self.readiness_target = readiness_target
         self.persona_name = persona_name
 
+    def _about_you(self, run: dict[str, Any]) -> str:
+        """The acting person's preference facts, for user-facing runs only."""
+        if _is_child_worker(run):
+            return ""
+        try:
+            preferences = self.context_service.load_preferences(
+                run["organization_id"], run["envelope"]["principal_id"]
+            )
+        except Exception:
+            return ""
+        try:
+            return self.context_service.render_about_you(preferences)
+        except Exception:
+            return ""
+
     def create_invocation(
         self,
         *,
@@ -764,6 +779,7 @@ class CompanyAgent:
                 active_skills=active_skills,
                 available_skills=(run.get("metadata") or {}).get("skill_index") or [],
                 persona_name=self.persona_name,
+                about_you=self._about_you(run),
             )
             preliminary_budget = request_budget(
                 context_window=context_length,
@@ -816,6 +832,8 @@ class CompanyAgent:
                 slack_conversation=self._slack_conversation(run),
                 active_skills=active_skills,
                 available_skills=(run.get("metadata") or {}).get("skill_index") or [],
+                persona_name=self.persona_name,
+                about_you=self._about_you(run),
             )
             final_budget = request_budget(
                 context_window=context_length,
@@ -851,6 +869,7 @@ class CompanyAgent:
                     active_skills=active_skills,
                     available_skills=(run.get("metadata") or {}).get("skill_index") or [],
                     persona_name=self.persona_name,
+                    about_you=self._about_you(run),
                 )
                 final_budget = request_budget(
                     context_window=context_length,
@@ -933,6 +952,7 @@ class CompanyAgent:
                     active_skills=active_skills,
                     available_skills=(run.get("metadata") or {}).get("skill_index") or [],
                     persona_name=self.persona_name,
+                    about_you=self._about_you(run),
                 )
                 final_budget = request_budget(
                     context_window=context_length,

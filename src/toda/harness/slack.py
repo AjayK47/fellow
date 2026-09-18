@@ -541,6 +541,8 @@ class SlackGateway:
             return self._resolve_approval_interaction(payload, action)
         if action_id == "toda_edit":
             return self._resolve_edit_action(payload, action)
+        if action_id in {"toda_preference_yes", "toda_preference_no"}:
+            return self._resolve_preference_interaction(payload, action)
         if action_id in {"toda_choice", "toda_choice_select"}:
             return self._resolve_choice_interaction(payload, action)
         raise ValueError("Unsupported interaction")
@@ -638,6 +640,53 @@ class SlackGateway:
             link_carrier=approval.get("telemetry_carrier"),
         )
         return {}
+
+    def _resolve_preference_interaction(self, payload: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        """Yes/No on an ask-less auto-approve suggestion. Writes the fact
+        (and the principal tool override on Yes) directly — no Task needed."""
+        from toda.domain.models import utcnow as _utcnow
+
+        parts = str(action.get("value") or "").split("::")
+        if len(parts) != 3:
+            raise ValueError("Malformed preference interaction")
+        principal_id, tool_name, channel = parts
+        user_id = str((payload.get("user") or {}).get("id") or "unknown")
+        team_id = str((payload.get("team") or {}).get("id") or "")
+        organization_id = self._organization_for_workspace(team_id)
+        mapping = slack_identity_mapping(self.store, organization_id, team_id, user_id)
+        decided_by = mapping["principal_id"] if mapping else f"slack:{user_id}"
+        if decided_by != principal_id:
+            raise UnauthorizedApprover("Slack user cannot decide this preference")
+        now = _utcnow().isoformat()
+        scope_id = f"scope_person_{principal_id}"
+        if action.get("action_id") == "toda_preference_yes":
+            self.store.upsert_simple_harness_record(
+                "tool_policies",
+                {
+                    "id": f"tool_policy:{organization_id}:{tool_name}",
+                    "organization_id": organization_id,
+                    "tool_name": tool_name,
+                    "execution": "inherit",
+                    "principal_overrides": {principal_id: "direct"},
+                    "updated_at": now,
+                },
+            )
+            predicate, object_value = "auto_approve", f"{tool_name}@{channel}"
+        else:
+            predicate, object_value = "declined_auto_approve", f"{tool_name}@{channel}"
+        if self.store.get_scope(scope_id) is not None and hasattr(self, "reality"):
+            self.reality.assert_fact(
+                organization_id=organization_id,
+                subject_id=principal_id,
+                predicate=predicate,
+                object_value=object_value,
+                scope_id=scope_id,
+                valid_from=now,
+                source_ids=[],
+                confidence=0.9,
+                authority=0.9,
+            )
+        return {"accepted": True}
 
     def _resolve_approval_interaction(
         self, payload: dict[str, Any], action: dict[str, Any]
@@ -1469,6 +1518,26 @@ class SlackSender:
         if not payload.get("ok"):
             raise RuntimeError(f"Slack message update failed: {payload.get('error')}")
         return payload
+
+    def open_dm(self, workspace_id: str | None, user_id: str) -> dict[str, Any]:
+        """Open (or reuse) a DM channel with a user. Returns its channel_id."""
+        token = self._token_for(workspace_id)
+        if not token:
+            return {"ok": False, "dry_run": True, "channel_id": None}
+        response = httpx.post(
+            "https://slack.com/api/conversations.open",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json={"users": user_id},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError(f"Slack DM open failed: {payload.get('error')}")
+        return {"ok": True, "channel_id": (payload.get("channel") or {}).get("id")}
 
     def react(
         self,

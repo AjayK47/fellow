@@ -123,6 +123,8 @@ _CONVERSATION_READ_TOOLS = {
     "calculate",
     # Structured card attached to the reply; read-only, rendered by delivery.
     "reply_card",
+    # The asker's own remembered preferences.
+    "about_me",
 }
 
 
@@ -267,6 +269,14 @@ class ConversationAgent:
             conversation={"session_id": session["id"]},
         ).model_dump(mode="json")
         memory_md = self._organization_memory(session["organization_id"])
+        try:
+            about_you = self.context_service.render_about_you(
+                self.context_service.load_preferences(
+                    session["organization_id"], envelope.principal_id
+                )
+            )
+        except Exception:
+            about_you = ""
         pseudo_run = {
             "id": turn_id,
             "organization_id": session["organization_id"],
@@ -310,6 +320,7 @@ class ConversationAgent:
                 "role": "system",
                 "content": "<organization_memory>\n" + memory_md + "\n</organization_memory>",
             },
+            *([{"role": "system", "content": about_you}] if about_you else []),
             {
                 "role": "system",
                 "content": "<company_context>\n"

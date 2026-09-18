@@ -4,7 +4,8 @@ import { PageHeader, Section, Card, Empty, Pill } from "../components";
 import { useState } from "react";
 
 export default function Reality() {
-  const [tab, setTab] = useState<"facts" | "conflicts" | "cases" | "judgments">("facts");
+  const [tab, setTab] = useState<"facts" | "conflicts" | "cases" | "judgments" | "preferences">("facts");
+  const [prefVersion, setPrefVersion] = useState(0);
   const facts = useAsync<{ facts: Json[] }>(
     () => api.get("/v1/facts", { organization_id: ORG, acting_principal_id: PRINCIPAL }), [tab]
   );
@@ -17,7 +18,10 @@ export default function Reality() {
   const judgments = useAsync<{ judgments: Json[]; count: number }>(
     () => api.get("/v1/judgments", { organization_id: ORG, acting_principal_id: PRINCIPAL }), [tab]
   );
-  const active = tab === "facts" ? facts : tab === "conflicts" ? conflicts : tab === "cases" ? cases : judgments;
+  const preferences = useAsync<{ facts: Json[]; count: number }>(
+    () => api.get("/v1/me/preferences", { organization_id: ORG }), [tab, prefVersion]
+  );
+  const active = tab === "facts" ? facts : tab === "conflicts" ? conflicts : tab === "cases" ? cases : tab === "judgments" ? judgments : preferences;
   return (
     <>
       <PageHeader
@@ -27,7 +31,7 @@ export default function Reality() {
       <Section>
         <Card className="p-0">
           <div className="flex gap-1 border-b border-line px-2 pt-2">
-            {(["facts", "conflicts", "cases", "judgments"] as const).map((t) => (
+            {(["facts", "conflicts", "cases", "judgments", "preferences"] as const).map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
@@ -143,6 +147,41 @@ export default function Reality() {
                       <td>{String(jo.feedback_type || jo.judgment_type)}</td>
                       <td>{String(jo.principal_id)}</td>
                       <td>{fmt(jo.summary || jo.payload, 140)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+          {tab === "preferences" && preferences.data && (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th className="whitespace-nowrap">predicate</th>
+                  <th className="w-full">object</th>
+                  <th className="whitespace-nowrap">since</th>
+                  <th className="whitespace-nowrap"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {(preferences.data.facts || []).map((f) => {
+                  const fo = f as Record<string, unknown>;
+                  return (
+                    <tr key={String(fo.id)}>
+                      <td>{String(fo.predicate)}</td>
+                      <td>{fmt(fo.object_value, 120)}</td>
+                      <td>{fmt(fo.system_from, 16)}</td>
+                      <td>
+                        <button
+                          className="text-red-600 hover:underline"
+                          onClick={async () => {
+                            await api.del(`/v1/me/preferences/${String(fo.id)}?organization_id=${ORG}`);
+                            setPrefVersion((v) => v + 1);
+                          }}
+                        >
+                          delete
+                        </button>
+                      </td>
                     </tr>
                   );
                 })}

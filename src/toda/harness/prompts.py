@@ -55,6 +55,7 @@ def build_agent_messages(
     active_skills: list[dict[str, Any]] | None = None,
     available_skills: list[dict[str, Any]] | None = None,
     persona_name: str = "Toda",
+    about_you: str = "",
 ) -> list[dict[str, Any]]:
     envelope = run["envelope"]
     invocation = {
@@ -227,6 +228,8 @@ def build_agent_messages(
                 + "\n</organization_memory>",
             }
         )
+    if about_you and is_user_facing_run(run):
+        messages.append({"role": "system", "content": about_you})
     messages.append(
         {
             "role": "system",

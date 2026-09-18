@@ -598,6 +598,26 @@ class HarnessWorker:
             )
         if data["state"] == "failed":
             self._maybe_notify_failure(data["task_id"])
+        if payload.get("decided_by"):
+            from toda.domain.models import utcnow as _utcnow
+
+            hour = _utcnow().isoformat()[:13]
+            decided_approval = self.store.get_harness_record(
+                "approvals", payload["approval_id"]
+            )
+            organization_id = (
+                (decided_approval or {}).get("organization_id")
+                or (self.store.get_task(data["task_id"]) or {}).get("organization_id")
+            )
+            self.queue.enqueue(
+                organization_id=organization_id,
+                kind="preferences.learn",
+                payload={
+                    "organization_id": organization_id,
+                    "principal_id": payload["decided_by"],
+                },
+                idempotency_key=f"preferences.learn:{payload['decided_by']}:{hour}",
+            )
         return data
 
     def _maybe_notify_failure(self, task_id: str) -> None:

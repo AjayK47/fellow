@@ -429,11 +429,20 @@ class ModelMemoryExtractor:
                         from_id=ends[0],
                         to_id=ends[1],
                     )
-            # A claim object entity_ref must resolve like any other id.
-            object_entity_id: str | None = None
+            # A preference claim's subject is always the speaker.
+            if (
+                claim is not None
+                and str(item.get("memory_type") or "") == "preference"
+                and source.get("author_entity_id")
+            ):
+                claim = claim.model_copy(
+                    update={"subject": str(source["author_entity_id"])}
+                )
             if claim is not None and claim.object_entity_ref:
                 resolved = _resolve_ids([claim.object_entity_ref])
-                object_entity_id = resolved[0] if resolved else None
+                object_entity_id: str | None = resolved[0] if resolved else None
+            else:
+                object_entity_id = None
             memory = Memory(
                 organization_id=source["organization_id"],
                 memory_type=MemoryType(item["memory_type"]),
