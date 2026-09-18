@@ -214,18 +214,50 @@ class RetrievalService:
         )
         decision = self.authorize(organization_id, acting_principal_id, destination, purpose)
 
-        if include_superseded:
-            candidates = self.store.list_memories(organization_id, latest_only=False)
-        else:
-            candidates = self.store.list_memories(organization_id, latest_only=True)
-            candidates = [
-                m
-                for m in candidates
-                if m.get("status") in {"active", "confirmed"}
-            ]
+        latest_only = not include_superseded
+        statuses: tuple[str, ...] = () if include_superseded else ("active", "confirmed")
 
-        # Permission filter FIRST — before ranking exposes content
-        allowed = self.authz.filter_memories(decision, candidates)
+        if not query.strip():
+            candidates = self.store.recent_memories(
+                organization_id, decision.allowed_scope_ids, limit=50
+            )
+            allowed = [
+                m for m in candidates if self.authz.can_read_memory(decision, m)
+            ]
+        else:
+            query_embedding = self._query_vector(
+                query, query_embedding, needed=True
+            )
+            semantic_hits = self._semantic_hits(
+                self.store.vec_search_memories, organization_id, query_embedding, k=100
+            )
+            fts_hits = self.store.memory_fts_search(
+                query, organization_id, decision.allowed_scope_ids, limit=100
+            )
+            entity_matches = self.store.find_entity_candidates(
+                organization_id, query, limit=50
+            )
+            entity_ids_matched = [e.get("id") for e in entity_matches if e.get("id")]
+            entity_mem_ids = self.store.memories_for_entities(
+                organization_id,
+                entity_ids_matched,
+                decision.allowed_scope_ids,
+                limit=200,
+            )
+            candidate_ids = list(set(semantic_hits) | set(fts_hits) | set(entity_mem_ids))
+            if not candidate_ids:
+                allowed = []
+            else:
+                loaded = self.store.get_memories(
+                    candidate_ids,
+                    scope_ids=decision.allowed_scope_ids,
+                    statuses=statuses,
+                    latest_only=latest_only,
+                )
+                allowed = [
+                    m for m in loaded if self.authz.can_read_memory(decision, m)
+                ]
+            fts_ranks = fts_hits
 
         if as_of:
             allowed = [
@@ -241,20 +273,19 @@ class RetrievalService:
             wanted = set(entity_ids)
             allowed = [m for m in allowed if wanted.intersection(m.get("entity_ids") or [])]
 
-        query_embedding = self._query_vector(
-            query, query_embedding, needed=bool(query.strip() and allowed)
-        )
-        # Semantic candidates come from the vec0 ANN index (ordered by cosine
-        # distance) rather than a per-row Python cosine loop. A memory that
-        # isn't among the nearest `k` simply scores 0 on the semantic term —
-        # correct, since it isn't a strong semantic match either way.
-        semantic_hits = self._semantic_hits(
-            self.store.vec_search_memories, organization_id, query_embedding, k=max(200, limit * 10)
-        )
-        fts_ranks = self.store.memory_fts_ranks(query, [m["id"] for m in allowed])
+        # Reuse candidate-stage semantic/FTS signals for scoring; empty-query
+        # browse mode has neither.
+        if not query.strip():
+            semantic_hits = {}
+            fts_ranks = {}
 
         scored: list[SearchResult] = []
         q_tokens = self._tokens(query)
+        entity_cache: dict[str, dict[str, Any]] = {}
+        if query.strip():
+            wanted_eids = {eid for m in allowed for eid in (m.get("entity_ids") or [])}
+            if wanted_eids:
+                entity_cache = self.store.get_entities(sorted(wanted_eids))
         for m in allowed:
             semantic_score = semantic_hits.get(m["id"], 0.0)
             score = self._score(m, q_tokens, query, semantic_score, fts_ranks.get(m["id"], 0.0))
@@ -265,7 +296,7 @@ class RetrievalService:
                     # still allow entity-name hits via entity list
                     entity_hit = False
                     for eid in m.get("entity_ids") or []:
-                        ent = self.store.get_entity(eid)
+                        ent = entity_cache.get(eid)
                         if ent and any(t in (ent.get("name") or "").lower() for t in q_tokens):
                             entity_hit = True
                             break

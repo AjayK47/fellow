@@ -2072,6 +2072,111 @@ class BrainStore:
             # FTS5 BM25 returns smaller (normally negative) values for better matches.
             return {row["memory_id"]: -float(row["rank"]) for row in cur.fetchall()}
 
+    def memory_fts_search(
+        self, query: str, organization_id: str, scope_ids: list[str], limit: int = 100
+    ) -> dict[str, float]:
+        """FTS5 candidate shortlist scoped in SQL, before authz ranking."""
+        tokens = [t for t in re.findall(r"[a-z0-9_]+", query.lower()) if len(t) > 2]
+        if not tokens or not scope_ids:
+            return {}
+        match = " OR ".join(tokens)
+        placeholders = ", ".join("?" for _ in scope_ids)
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT memory_id, bm25(memories_fts) AS rank FROM memories_fts
+                WHERE memories_fts MATCH ? AND organization_id = ?
+                AND scope_id IN ({placeholders})
+                ORDER BY rank LIMIT ?""",
+                [match, organization_id, *scope_ids, int(limit)],
+            )
+            return {row["memory_id"]: -float(row["rank"]) for row in cur.fetchall()}
+
+    def get_memories(
+        self,
+        ids: list[str],
+        scope_ids: list[str] | None = None,
+        statuses: tuple[str, ...] = ("active", "confirmed"),
+        latest_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Load one candidate set in a single query with scope/status filters."""
+        if not ids:
+            return []
+        id_placeholders = ", ".join("?" for _ in ids)
+        clauses = [f"id IN ({id_placeholders})"]
+        params: list[Any] = list(ids)
+        if scope_ids is not None:
+            if not scope_ids:
+                return []
+            placeholders = ", ".join("?" for _ in scope_ids)
+            clauses.append(f"scope_id IN ({placeholders})")
+            params.extend(scope_ids)
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        if latest_only:
+            clauses.append("is_latest = 1")
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT payload FROM memories WHERE {' AND '.join(clauses)}", params
+            )
+            return [_de(r["payload"]) for r in cur.fetchall()]
+
+    def memories_for_entities(
+        self,
+        organization_id: str,
+        entity_ids: list[str],
+        scope_ids: list[str] | None,
+        limit: int = 200,
+    ) -> list[str]:
+        """Memory ids touching entities whose name/alias matches query tokens."""
+        if not entity_ids:
+            return []
+        if scope_ids is not None and not scope_ids:
+            return []
+        ent_placeholders = ", ".join("?" for _ in entity_ids)
+        clauses = ["organization_id = ?", "is_latest = 1"]
+        params: list[Any] = [organization_id]
+        if scope_ids is not None:
+            placeholders = ", ".join("?" for _ in scope_ids)
+            clauses.append(f"scope_id IN ({placeholders})")
+            params.extend(scope_ids)
+        # entity_ids stored in payload JSON; join via json_each for one query.
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT memories.id AS id FROM memories, json_each(memories.payload, '$.entity_ids')
+                WHERE {' AND '.join(clauses)} AND value IN ({ent_placeholders})
+                LIMIT ?""",
+                [*params, *entity_ids, int(limit)],
+            )
+            return [row["id"] for row in cur.fetchall()]
+
+    def recent_memories(
+        self, organization_id: str, scope_ids: list[str], limit: int = 50
+    ) -> list[dict[str, Any]]:
+        if not scope_ids:
+            return []
+        placeholders = ", ".join("?" for _ in scope_ids)
+        with self.cursor() as cur:
+            cur.execute(
+                f"""SELECT payload FROM memories WHERE organization_id = ?
+                AND scope_id IN ({placeholders}) AND status IN ('active', 'confirmed')
+                AND is_latest = 1 ORDER BY observed_at DESC LIMIT ?""",
+                [organization_id, *scope_ids, int(limit)],
+            )
+            return [_de(r["payload"]) for r in cur.fetchall()]
+
+    def get_entities(self, entity_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if not entity_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in entity_ids)
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT id, payload FROM entities WHERE id IN ({placeholders})",
+                entity_ids,
+            )
+            return {row["id"]: _de(row["payload"]) for row in cur.fetchall()}
+
     # ---- scopes / memberships ----
 
     def upsert_scope(self, scope: dict[str, Any]) -> None:
