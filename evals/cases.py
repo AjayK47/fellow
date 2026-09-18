@@ -108,6 +108,72 @@ RETRIEVAL_CASES: tuple[RetrievalCase, ...] = (
             "destination bounds disclosure, not just membership."
         ),
     ),
+    # --- Update / contradiction beats (M4): supersession, reversal, and
+    # history queries over the same storylines. No new beats needed. ---
+    RetrievalCase(
+        id="renewal.owner_previous",
+        query="who owned the export API security review before Wren took over?",
+        asker="p_kit",
+        destination=_DM,
+        relevant=("acme.renewal.owner_kit", "acme.renewal.owner_changed"),
+        note="A history question: the superseded owner IS the answer here.",
+    ),
+    RetrievalCase(
+        id="renewal.blocker_resolved",
+        query="is the Calderon Freight renewal still blocked?",
+        asker="p_sam",
+        destination=_DM,
+        relevant=("acme.renewal.unblocked",),
+        note="The UPDATE (unblocked) must outrank the April blocker.",
+    ),
+    RetrievalCase(
+        id="renewal.blocker_history",
+        query="what blocked the Calderon Freight renewal back in April?",
+        asker="p_dana",
+        destination=_DM,
+        relevant=("acme.renewal.security_review",),
+        note="History query: the superseded blocker is the right answer.",
+    ),
+    RetrievalCase(
+        id="export.queue_reversed",
+        query="are we putting exports behind a durable queue?",
+        asker="p_kit",
+        destination=_DM,
+        relevant=("export.decision.reversed",),
+        note="The reversal UPDATEs the queue decision; the answer is no.",
+    ),
+    RetrievalCase(
+        id="export.queue_original",
+        query="what did the team originally decide about export backpressure?",
+        asker="p_wren",
+        destination=_DM,
+        relevant=("export.decision.queue", "export.decision.reversed"),
+        note="Both the original decision and its reversal are relevant.",
+    ),
+    RetrievalCase(
+        id="export.cause_and_decision",
+        query="what caused the export outage and what did we decide to do?",
+        asker="p_kit",
+        destination=_DM,
+        relevant=("export.incident.cause", "export.decision.reversed"),
+        note="Multi-part: cause plus the CURRENT decision, not the dropped one.",
+    ),
+    RetrievalCase(
+        id="support.hours_current",
+        query="how late is support coverage on weekdays now?",
+        asker="p_sam",
+        destination=_DM,
+        relevant=("support.hours",),
+        note="The hours beat is itself an update ('now runs until 8pm').",
+    ),
+    RetrievalCase(
+        id="renewal.opened_context",
+        query="which customer has a renewal due at the end of the quarter?",
+        asker="p_dana",
+        destination=_DM,
+        relevant=("acme.renewal.opened",),
+        note="Untouched by any update; must still retrieve cleanly.",
+    ),
 )
 
 
