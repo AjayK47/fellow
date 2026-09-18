@@ -971,6 +971,7 @@ class BrainStore:
                     subject_id TEXT NOT NULL,
                     predicate TEXT NOT NULL,
                     object_value TEXT NOT NULL,
+                    object_entity_id TEXT,
                     status TEXT NOT NULL,
                     valid_from TEXT,
                     valid_to TEXT,
@@ -1182,6 +1183,14 @@ class BrainStore:
                     dimensions INTEGER NOT NULL
                 )"""
             )
+            # Non-destructive additive migration for databases created before
+            # object_entity_id existed (M5): keep every row, add the column.
+            columns = {
+                row["name"]
+                for row in cur.execute("PRAGMA table_info(reality_facts)").fetchall()
+            }
+            if "object_entity_id" not in columns:
+                cur.execute("ALTER TABLE reality_facts ADD COLUMN object_entity_id TEXT")
 
     # ---- vector index lifecycle ----
 

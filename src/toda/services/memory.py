@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from toda.domain.models import (
-    EXTRACTABLE_EDGE_TYPES,
     Memory,
     MemoryEdgeType,
     MemoryStatus,
@@ -89,151 +88,10 @@ class MemoryService:
         )
         return committed
 
-    # Below this the extraction is a guess, and a guess written as a typed edge
-    # becomes indistinguishable from a fact anyone confirmed.
-    RELATION_CONFIDENCE_FLOOR = 0.8
-
-    def _record_relation(self, memory: Memory, data: dict[str, Any]) -> None:
-        """Promote an extracted claim into a queryable entity-to-entity edge.
-
-        The model already resolves "Ana owns the Acme account" into a triple
-        with both entities identified, but that only ever fed supersession
-        matching -- so resolve_owners(), on_call_for() and the WORKS_ON lookups
-        in context building queried a graph nothing populated, and ownership
-        questions fell back to similarity search over prose.
-        """
-        relation = memory.relation
-        if relation is None or memory.confidence < self.RELATION_CONFIDENCE_FLOOR:
-            return
-        if relation.edge_type not in EXTRACTABLE_EDGE_TYPES:
-            return
-        self.graph.add_edge(
-            memory.organization_id,
-            relation.edge_type,
-            relation.from_id,
-            relation.to_id,
-            source_ids=data.get("source_ids") or memory.source_ids,
-        )
-
     def _consolidate(self, memory: Memory) -> dict[str, Any]:
-        """If a current memory shares the same canonical claim subject+predicate, supersede it."""
-        org = memory.organization_id
-        existing = self.graph.current_memories(org)
-
-        match = self._find_supersede_target(memory, existing)
-        if match:
-            # new memory updates old
-            superseded = self.graph.supersede_memory(
-                match["id"], memory, MemoryEdgeType.UPDATES
-            )
-            self._record_relation(memory, superseded)
-            return superseded
-
-        # check extends (same subject, different predicate detail)
-        extend_target = self._find_extend_target(memory, existing)
-        data = self.graph.commit_memory(memory)
-        if extend_target:
-            self.graph.add_edge(
-                org,
-                MemoryEdgeType.EXTENDS,
-                data["id"],
-                extend_target["id"],
-                source_ids=data.get("source_ids"),
-            )
-        self._record_relation(memory, data)
-        return data
-
-    # Predicates that represent a single current value (supersede on object change).
-    # Generic "is" is NOT identity — "X is using PG" and "X is owned by Y" coexist.
-    _IDENTITY_PREDICATES = frozenset(
-        {
-            "launch_date",
-            "uses_primary_store",
-            "owner_of",
-            "primary_owner",
-            "status",
-            "on_call",
-            "version",
-        }
-    )
-
-    def _find_supersede_target(
-        self, memory: Memory, existing: list[dict[str, Any]]
-    ) -> dict[str, Any] | None:
-        claim = memory.canonical_claim
-        if claim and self._is_identity_predicate(claim.predicate):
-            for m in existing:
-                cc = m.get("canonical_claim") or {}
-                if (
-                    cc.get("subject") == claim.subject
-                    and cc.get("predicate") == claim.predicate
-                    and cc.get("object") != claim.object
-                    and m.get("scope_id") == memory.scope_id
-                ):
-                    return m
-
-        # Content-level identity only for known single-value claim phrases
-        identity_key = self._identity_content_key(memory.content)
-        if not identity_key:
-            return None
-        for m in existing:
-            if m.get("memory_type") != (
-                memory.memory_type.value if hasattr(memory.memory_type, "value") else memory.memory_type
-            ):
-                continue
-            if m.get("scope_id") != memory.scope_id:
-                continue
-            if not set(m.get("entity_ids") or []).intersection(set(memory.entity_ids or [])):
-                continue
-            other_key = self._identity_content_key(m.get("content") or "")
-            if other_key == identity_key and m.get("content") != memory.content:
-                return m
-        return None
-
-    def _find_extend_target(
-        self, memory: Memory, existing: list[dict[str, Any]]
-    ) -> dict[str, Any] | None:
-        claim = memory.canonical_claim
-        if not claim:
-            return None
-        # Only EXTENDS for non-identity predicates that share a subject
-        if self._is_identity_predicate(claim.predicate):
-            return None
-        for m in existing:
-            cc = m.get("canonical_claim") or {}
-            if cc.get("subject") == claim.subject and cc.get("predicate") != claim.predicate:
-                if set(m.get("entity_ids") or []).intersection(set(memory.entity_ids or [])):
-                    return m
-        return None
-
-    @classmethod
-    def _is_identity_predicate(cls, predicate: str | None) -> bool:
-        if not predicate:
-            return False
-        p = predicate.strip().lower()
-        if p in cls._IDENTITY_PREDICATES:
-            return True
-        # Never treat bare copula "is"/"are" as identity
-        if p in {"is", "are", "was", "were", "has", "have"}:
-            return False
-        return False
-
-    @staticmethod
-    def _identity_content_key(content: str) -> str | None:
-        """Return a stable key only for single-valued atomic claims; else None."""
-        lower = content.lower()
-        markers = (
-            ("launch date", "launch_date"),
-            ("release date", "launch_date"),
-            ("ship date", "launch_date"),
-            ("primary store", "uses_primary_store"),
-            ("selected postgresql", "uses_primary_store"),
-            ("selected postgres", "uses_primary_store"),
-        )
-        for phrase, key in markers:
-            if phrase in lower:
-                return key
-        return None
+        """Commit a memory as an observation. Memories are never overwritten
+        by other memories; facts carry the current truth instead."""
+        return self.graph.commit_memory(memory)
 
     def get_memory(self, memory_id: str) -> dict[str, Any] | None:
         return self.store.get_memory(memory_id)

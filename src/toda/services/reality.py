@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 from collections import Counter
@@ -12,6 +13,8 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from toda.domain.models import new_id, utcnow
+
+log = logging.getLogger("toda.reality")
 
 
 def _dump(value: Any) -> str:
@@ -73,36 +76,20 @@ def _is_resolvable_label(label: str) -> bool:
 class RealityEngine:
     """Evidence-first materialization of the current and historical company state."""
 
-    SINGLE_VALUED_PREDICATES = {
-        "owner",
-        "owned_by",
-        "account_owner",
-        "assignee",
-        "status",
-        "state",
-        "priority",
-        "launch_date",
-        "release_date",
-        "primary_store",
-        "uses_primary_store",
-        "on_call",
-        "on_call_for",
-    }
-    PREDICATE_ALIASES = {
-        "is_owned_by": "owner",
-        "owned_by": "owner",
-        "owner_is": "owner",
-        "account_owned_by": "account_owner",
-        "assigned_to": "assignee",
-        "is_assigned_to": "assignee",
-        "current_status": "status",
-        "has_status": "status",
-        "primary_database": "primary_store",
-        "database": "primary_store",
-        "uses_database": "primary_store",
-        "release_date": "launch_date",
-        "ship_date": "launch_date",
-    }
+    # Authorization edges stay a fixed system vocabulary, written only by
+    # admin APIs — never by extraction. A claim or projection using one of
+    # these names is refused and logged.
+    RESERVED_EDGE_TYPES = frozenset(
+        {
+            "MEMBER_OF",
+            "CAN_VIEW",
+            "CAN_EDIT",
+            "VISIBLE_TO",
+            "ACTS_AS",
+            "AUTHORIZED_FOR",
+            "INHERITS_ACL_FROM",
+        }
+    )
     CASE_MEMORY_TYPES = {"issue", "commitment", "decision", "outcome"}
 
     def __init__(
@@ -1135,6 +1122,8 @@ class RealityEngine:
         predicate = self.normalize_predicate(organization_id, str(claim.get("predicate") or ""))
         if not predicate:
             return None
+        if self._refuse_reserved(predicate):
+            return None
         subject_id = str(
             claim.get("subject_id")
             or self._resolve_claim_subject(memory, str(claim.get("subject") or ""))
@@ -1199,20 +1188,22 @@ class RealityEngine:
                     new_fact["object_entity_id"] = object_entity_id
                 target["superseded_by"] = new_fact["id"]
                 self._save_fact(target)
+                self._close_projected_edge(organization_id, target["id"], valid_until=valid_from)
                 self._set_cardinality(organization_id, predicate, "single")
                 with self.store.cursor() as cur:
                     cur.execute(
                         """INSERT INTO reality_facts
-                        (id, organization_id, subject_id, predicate, object_value, status,
+                        (id, organization_id, subject_id, predicate, object_value, object_entity_id, status,
                          valid_from, valid_to, system_from, system_to, scope_id, payload)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             new_fact["id"], organization_id, subject_id, predicate,
-                            object_value, "active", valid_from,
+                            object_value, object_entity_id, "active", valid_from,
                             memory.get("valid_until"), now, None,
                             memory["scope_id"], _dump(new_fact),
                         ),
                     )
+                self._project_edge(new_fact)
                 return new_fact
 
         if decision == "CONTRADICTS":
@@ -1243,12 +1234,12 @@ class RealityEngine:
             with self.store.cursor() as cur:
                 cur.execute(
                     """INSERT INTO reality_facts
-                    (id, organization_id, subject_id, predicate, object_value, status,
+                    (id, organization_id, subject_id, predicate, object_value, object_entity_id, status,
                      valid_from, valid_to, system_from, system_to, scope_id, payload)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         fact["id"], organization_id, subject_id, predicate,
-                        object_value, "contested", valid_from,
+                        object_value, object_entity_id, "contested", valid_from,
                         memory.get("valid_until"), now, None,
                         memory["scope_id"], _dump(fact),
                     ),
@@ -1280,6 +1271,7 @@ class RealityEngine:
             memory_id=memory["id"],
             confidence=confidence,
             authority=authority,
+            object_entity_id=object_entity_id,
         )
 
     def assert_fact(
@@ -1296,8 +1288,11 @@ class RealityEngine:
         memory_id: str | None = None,
         confidence: float = 0.8,
         authority: float = 0.8,
+        object_entity_id: str | None = None,
     ) -> dict[str, Any]:
         predicate_key = self._predicate_key(predicate)
+        if self._refuse_reserved(predicate_key):
+            raise ValueError(f"refused reserved predicate: {predicate_key}")
         object_key = _normalize(object_value)
         current = self.current_facts(
             organization_id, subject_id=subject_id, predicate=predicate_key
@@ -1320,6 +1315,7 @@ class RealityEngine:
             "subject_id": subject_id,
             "predicate": predicate_key,
             "object_value": object_value,
+            "object_entity_id": object_entity_id,
             "status": "active",
             "valid_from": valid_from,
             "valid_to": valid_to,
@@ -1363,6 +1359,7 @@ class RealityEngine:
                         old["valid_to"] = valid_from
                         old["superseded_by"] = fact["id"]
                         self._save_fact(old)
+                        self._close_projected_edge(organization_id, old["id"], valid_until=valid_from)
                     conflict["status"] = "resolved"
                     conflict["resolution"] = {
                         "winner_fact_id": fact["id"],
@@ -1374,15 +1371,16 @@ class RealityEngine:
         with self.store.cursor() as cur:
             cur.execute(
                 """INSERT INTO reality_facts
-                (id, organization_id, subject_id, predicate, object_value, status,
+                (id, organization_id, subject_id, predicate, object_value, object_entity_id, status,
                  valid_from, valid_to, system_from, system_to, scope_id, payload)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     fact["id"],
                     organization_id,
                     subject_id,
                     predicate_key,
                     object_value,
+                    object_entity_id,
                     fact["status"],
                     valid_from,
                     valid_to,
@@ -1392,6 +1390,7 @@ class RealityEngine:
                     _dump(fact),
                 ),
             )
+        self._project_edge(fact)
         return fact
 
     def current_facts(
@@ -2087,22 +2086,50 @@ class RealityEngine:
         return low_a < high_b and low_b < high_a
 
     def _is_single_valued(self, organization_id: str, predicate_key: str) -> bool:
-        """Catalog cardinality first; the legacy list covers uncatalogued names."""
+        """Cardinality comes from the learned catalog. Unknown predicates
+        default to single-valued (conservative: competing claims surface as
+        conflicts for a person until the catalog learns otherwise)."""
         try:
             record = self.store.get_predicate(organization_id, predicate_key)
         except Exception:
             record = None
         if record is not None:
-            return record.get("cardinality") == "single"
-        return (
-            predicate_key in self.SINGLE_VALUED_PREDICATES
-            or predicate_key.endswith(("_owner", "_status", "_assignee"))
+            return record.get("cardinality") != "multi"
+        return True
+
+    def _refuse_reserved(self, predicate: str) -> bool:
+        """True when a predicate collides with the authorization vocabulary."""
+        if str(predicate or "").upper() in self.RESERVED_EDGE_TYPES:
+            log.warning("Refusing knowledge predicate in authorization vocabulary: %s", predicate)
+            return True
+        return False
+
+    def _project_edge(self, fact: dict[str, Any]) -> dict[str, Any] | None:
+        """An edge is a fact whose object is an entity. The graph view is
+        derived from facts; traversal keeps reading `edges` unchanged."""
+        object_entity_id = fact.get("object_entity_id")
+        if not object_entity_id:
+            return None
+        if self._refuse_reserved(fact.get("predicate") or ""):
+            return None
+        return self.graph.add_edge(
+            fact["organization_id"],
+            str(fact["predicate"]),
+            str(fact["subject_id"]),
+            str(object_entity_id),
+            properties={"fact_id": fact["id"]},
+            source_ids=list(fact.get("source_ids") or []),
         )
+
+    def _close_projected_edge(self, organization_id: str, fact_id: str, *, valid_until: str | None = None) -> None:
+        for edge in self.store.list_edges(organization_id, active_only=False):
+            if (edge.get("properties") or {}).get("fact_id") == fact_id and not edge.get("valid_until"):
+                self.graph.supersede_edge(edge["id"], valid_until=valid_until)
+                return
 
     @classmethod
     def _predicate_key(cls, predicate: str) -> str:
-        key = re.sub(r"[^a-z0-9]+", "_", _normalize(predicate)).strip("_")
-        return cls.PREDICATE_ALIASES.get(key, key)
+        return re.sub(r"[^a-z0-9]+", "_", _normalize(predicate)).strip("_")
 
     def _get_payload(self, table: str, record_id: str) -> dict[str, Any] | None:
         if table not in {"reality_facts", "fact_conflicts"}:
