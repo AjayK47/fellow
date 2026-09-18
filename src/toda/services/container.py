@@ -500,6 +500,7 @@ class TodaApp:
             model_extractor=self.model_memory_extractor,
             embeddings=self.embeddings,
             skills=self.skills,
+            history_compactor=self.history_compactor,
         )
         self.skill_curator = SkillCurator(
             store=self.store,

@@ -54,6 +54,7 @@ class HarnessMemoryCapture:
         model_extractor: Any | None = None,
         embeddings: Any | None = None,
         skills: Any | None = None,
+        history_compactor: Any | None = None,
     ) -> None:
         self.store = store
         self.ingestion = ingestion
@@ -61,6 +62,7 @@ class HarnessMemoryCapture:
         self.model_extractor = model_extractor
         self.embeddings = embeddings
         self.skills = skills
+        self.history_compactor = history_compactor
 
     def capture_task(self, task_id: str) -> dict[str, Any]:
         task = self.store.get_task(task_id)
@@ -350,12 +352,28 @@ class HarnessMemoryCapture:
             self.store.upsert_episode(episode)
             raise
 
-        # A rolling window, not a fresh model summarization pass every
-        # tick -- consolidation must stay O(new events); a dedicated
-        # summarizer call can replace this later without changing the
-        # episode contract (id, summary, summary_embedding stay the same).
-        combined = f"{prior_summary}\n{transcript}".strip() if prior_summary else transcript
-        episode["summary"] = combined[-_EPISODE_MAX_SUMMARY_CHARS:]
+        # Rolling summary via the shared compactor when live; today's
+        # truncation stays as the offline fallback. Extraction above keeps
+        # running on the new transcript, not the summary.
+        if self.history_compactor is not None:
+            try:
+                episode["summary"] = self.history_compactor.compact(
+                    previous_summary=prior_summary,
+                    new_messages=[
+                        {
+                            "role": "user",
+                            "content": f"{source.get('author_entity_id') or 'unknown'}: {source.get('content') or ''}",
+                            "id": source["id"],
+                        }
+                        for source in new_sources
+                    ],
+                )
+            except Exception:
+                combined = f"{prior_summary}\n{transcript}".strip() if prior_summary else transcript
+                episode["summary"] = combined[-_EPISODE_MAX_SUMMARY_CHARS:]
+        else:
+            combined = f"{prior_summary}\n{transcript}".strip() if prior_summary else transcript
+            episode["summary"] = combined[-_EPISODE_MAX_SUMMARY_CHARS:]
         episode["summary_embedding"] = (
             self.embeddings.embed([episode["summary"]])[0] if self.embeddings and episode["summary"].strip() else None
         )
