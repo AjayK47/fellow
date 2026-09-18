@@ -874,6 +874,7 @@ def build_tool_registry(
             if destination.get("type") not in {"slack_channel", "private_channel", "dm"}:
                 raise ValueError("outbound Slack action requires the current Slack destination")
             workspace_id = (runtime.get("task_metadata") or {}).get("slack", {}).get("workspace_id")
+            thread_ts = (runtime.get("task_metadata") or {}).get("slack", {}).get("thread_ts")
             result = slack_sender.send(
                 channel_id=str(destination["id"]),
                 # Same Markdown -> mrkdwn translation the automatic delivery
@@ -887,6 +888,7 @@ def build_tool_registry(
                 # any later turn -- the exact blind spot that log exists to
                 # close.
                 organization_id=runtime["organization_id"],
+                thread_ts=thread_ts,
             )
             # The model chose to send its own (possibly richly-formatted)
             # message directly — don't also let the automatic plain-text

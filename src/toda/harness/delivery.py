@@ -177,6 +177,30 @@ class DeliveryService:
         self.model = model
         self.persona_name = persona_name
 
+    @staticmethod
+    def _task_thread(task: dict[str, Any]) -> str | None:
+        return ((task.get("metadata") or {}).get("slack") or {}).get("thread_ts")
+
+    def _conversation_thread(self, session_id: str, message_id: str) -> str | None:
+        messages = self.store.list_session_messages(session_id, limit=200)
+        target = next((m for m in messages if m.get("id") == message_id), None)
+        if target is None:
+            return None
+        created = str(target.get("created_at") or "")
+        thread = None
+        for item in messages:
+            if item.get("id") == message_id:
+                break
+            if item.get("role") in {"user", "event"}:
+                ts = (item.get("metadata") or {}).get("thread_ts")
+                if ts:
+                    thread = ts
+                elif created and str(item.get("created_at") or "") > created:
+                    break
+        if thread is None and target is not None:
+            thread = ((target.get("metadata") or {}).get("thread_ts"))
+        return thread
+
     def deliver_conversation(self, session_id: str, message_id: str) -> dict[str, Any]:
         session = self.store.get_session(session_id)
         if not session:
@@ -228,6 +252,7 @@ class DeliveryService:
                 workspace_id=slack.get("workspace_id"),
                 organization_id=session["organization_id"],
                 idempotency_key=idempotency_key,
+                thread_ts=self._conversation_thread(session_id, message_id),
             )
         except Exception:
             # Hand the claim back so the job's own retry can re-send rather
@@ -365,6 +390,7 @@ class DeliveryService:
                 workspace_id=slack.get("workspace_id"),
                 organization_id=task["organization_id"],
                 idempotency_key=idempotency_key,
+                thread_ts=self._task_thread(task),
             )
         except Exception:
             # Hand the reservation back before propagating, so the job's
@@ -456,6 +482,7 @@ class DeliveryService:
                 workspace_id=slack.get("workspace_id"),
                 organization_id=task["organization_id"],
                 idempotency_key=idempotency_key,
+                thread_ts=self._task_thread(task),
             )
         except Exception:
             self._release_reservation(
@@ -520,6 +547,7 @@ class DeliveryService:
             blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
             workspace_id=slack.get("workspace_id"),
             organization_id=task["organization_id"],
+            thread_ts=self._task_thread(task),
         )
         # Toda has now spoken, so the "heard you, not spoken yet" hourglass
         # has done its job.
@@ -662,6 +690,7 @@ class DeliveryService:
             blocks=blocks,
             workspace_id=slack.get("workspace_id"),
             organization_id=task["organization_id"],
+            thread_ts=self._task_thread(task),
         )
         delivery = self._record(
             owner=DeliveryOwner.for_task(task),
@@ -755,6 +784,7 @@ class DeliveryService:
             blocks=blocks,
             workspace_id=slack.get("workspace_id"),
             organization_id=task["organization_id"],
+            thread_ts=self._task_thread(task),
         )
         delivery = self._record(
             owner=DeliveryOwner.for_task(task),

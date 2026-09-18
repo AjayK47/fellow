@@ -1240,6 +1240,7 @@ class SlackSender:
         workspace_id: str | None = None,
         idempotency_key: str | None = None,
         organization_id: str | None = None,
+        thread_ts: str | None = None,
     ) -> dict[str, Any]:
         text = _scrub_blocked_emoji(text)
         blocks = _scrub_blocks(blocks)
@@ -1258,8 +1259,11 @@ class SlackSender:
                 "channel": channel_id,
                 "text": text,
                 "blocks": blocks or [],
+                "thread_ts": thread_ts,
             }
         body: dict[str, Any] = {"channel": channel_id, "text": text}
+        if thread_ts:
+            body["thread_ts"] = thread_ts
         if idempotency_key:
             # NOTE: despite what this once said, Slack's chat.postMessage
             # does NOT deduplicate by client_msg_id for bot-token calls --

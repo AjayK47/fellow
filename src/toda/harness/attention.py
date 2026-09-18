@@ -421,6 +421,7 @@ class AttentionPipeline:
                 "workspace_id": event.scope.workspace_id,
                 "channel_id": event.scope.channel_id,
                 "context_key": event.payload.get("context_key"),
+                "thread_ts": event.payload.get("thread_ts") or event.payload.get("message_ts"),
                 "actor_profile": event.payload.get("actor_profile") or {
                     "principal_id": event.actor.id,
                     "source_user_id": event.actor.source_id,
