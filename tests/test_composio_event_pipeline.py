@@ -568,7 +568,7 @@ def test_credential_connect_rejects_an_unknown_organization(api_client, monkeypa
             "credentials": {"generic_api_key": "sk_test_dummy"},
         },
     )
-    assert response.status_code == 404
+    assert response.status_code == 404, response.text
 
 
 def _client():

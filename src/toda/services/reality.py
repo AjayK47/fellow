@@ -91,6 +91,12 @@ class RealityEngine:
         }
     )
     CASE_MEMORY_TYPES = {"issue", "commitment", "decision", "outcome"}
+    # Cardinality for claims no model judged (the offline extractor): these
+    # hold one value at a time, everything else the catalog hasn't learned
+    # as single may hold many.
+    UNJUDGED_SINGLE_VALUED = frozenset(
+        {"owner", "assignee", "status", "state", "priority", "launch_date", "release_date", "on_call"}
+    )
 
     def __init__(
         self, store: Any, graph: Any, audit: Any, embeddings: Any | None = None
@@ -1029,7 +1035,6 @@ class RealityEngine:
                 "subject_id": subject_id,
                 "predicate": claim["predicate"],
                 "object_value": claim["object"],
-                "decision": "ADD",
             },
             memory,
             source=source,
@@ -1289,17 +1294,20 @@ class RealityEngine:
             fact["conflict_id"] = conflict["id"]
             return fact
 
-        # ADD: learn multi when another live value exists; conflicts only for
-        # single-cardinality predicates (catalog, else the legacy list).
-        live = [
-            fact
-            for fact in self.current_facts(
-                organization_id, subject_id=subject_id, predicate=predicate
-            )
-            if _normalize(fact.get("object_value")) != _normalize(object_value)
-        ]
-        if live:
-            self._set_cardinality(organization_id, predicate, "multi")
+        # ADD: a model that saw the live values and still chose ADD teaches
+        # the catalog the predicate holds many. A claim nobody judged (no
+        # decision) teaches nothing and supersedes only single predicates.
+        judged = bool(claim.get("decision"))
+        if judged:
+            live = [
+                fact
+                for fact in self.current_facts(
+                    organization_id, subject_id=subject_id, predicate=predicate
+                )
+                if _normalize(fact.get("object_value")) != _normalize(object_value)
+            ]
+            if live:
+                self._set_cardinality(organization_id, predicate, "multi")
         return self.assert_fact(
             organization_id=organization_id,
             subject_id=subject_id,
@@ -1313,6 +1321,7 @@ class RealityEngine:
             confidence=confidence,
             authority=authority,
             object_entity_id=object_entity_id,
+            judged=judged,
         )
 
     def assert_fact(
@@ -1330,6 +1339,7 @@ class RealityEngine:
         confidence: float = 0.8,
         authority: float = 0.8,
         object_entity_id: str | None = None,
+        judged: bool = True,
     ) -> dict[str, Any]:
         predicate_key = self._predicate_key(predicate)
         if self._refuse_reserved(predicate_key):
@@ -1378,7 +1388,7 @@ class RealityEngine:
                 valid_to,
             )
         ]
-        single = self._is_single_valued(organization_id, predicate_key)
+        single = self._is_single_valued(organization_id, predicate_key, judged=judged)
         if competing and single:
             conflict = self._record_conflict(fact, competing, single_valued=single)
             fact["conflict_id"] = conflict["id"]
@@ -2126,17 +2136,21 @@ class RealityEngine:
         high_b = end_b or "9999-12-31T23:59:59+00:00"
         return low_a < high_b and low_b < high_a
 
-    def _is_single_valued(self, organization_id: str, predicate_key: str) -> bool:
-        """Cardinality comes from the learned catalog. Unknown predicates
-        default to single-valued (conservative: competing claims surface as
-        conflicts for a person until the catalog learns otherwise)."""
+    def _is_single_valued(
+        self, organization_id: str, predicate_key: str, *, judged: bool = True
+    ) -> bool:
+        """Cardinality comes from the learned catalog. For judged claims an
+        unknown predicate defaults to single-valued (conservative: competing
+        claims surface as conflicts until the catalog learns otherwise).
+        Unjudged claims default to many unless single by nature."""
         try:
             record = self.store.get_predicate(organization_id, predicate_key)
         except Exception:
             record = None
-        if record is not None:
-            return record.get("cardinality") != "multi"
-        return True
+        cardinality = (record or {}).get("cardinality") or "unknown"
+        if cardinality != "unknown":
+            return cardinality == "single"
+        return judged or predicate_key in self.UNJUDGED_SINGLE_VALUED
 
     def _refuse_reserved(self, predicate: str) -> bool:
         """True when a predicate collides with the authorization vocabulary."""

@@ -5,6 +5,16 @@ from __future__ import annotations
 from toda.domain.models import MemoryType
 
 
+def _launch_facts(brain, org):
+    with brain.store.cursor() as cur:
+        cur.execute(
+            "SELECT object_value, status FROM reality_facts"
+            " WHERE organization_id = ? AND predicate = 'launch_date'",
+            (org,),
+        )
+        return {row["object_value"]: row["status"] for row in cur.fetchall()}
+
+
 def test_newer_fact_supersedes_older_without_deleting_history(empty_brain):
     brain = empty_brain
     org = "org_test"
@@ -51,24 +61,15 @@ def test_newer_fact_supersedes_older_without_deleting_history(empty_brain):
     assert r1["memories"], "first ingest must produce memories"
     assert r2["memories"], "second ingest must produce memories"
 
-    # Current memories should reflect later date
-    current = brain.memory.list_current(org, entity_ids=["project_x"])
-    launch_current = [
-        m
-        for m in current
-        if "launch date" in (m.get("content") or "").lower() and m.get("is_latest")
-    ]
-    assert launch_current, "expected current launch-date memory"
-    assert any("15 September" in m["content"] for m in launch_current)
-    assert not any(
-        "1 September" in m["content"] and m.get("is_latest") for m in launch_current
-    )
+    # Facts carry the current truth; the older value stays as history.
+    current = brain.reality.current_facts(org, subject_id="project_x", predicate="launch_date")
+    assert [f["object_value"] for f in current] == ["15 September for Project X"]
+    assert _launch_facts(brain, org)["1 September for Project X"] == "superseded"
 
-    # History preserved: older memory still in store, superseded
-    all_mems = brain.store.list_memories(org, latest_only=False)
-    superseded = [m for m in all_mems if m.get("status") == "superseded"]
-    assert superseded, "older memory must remain with superseded status"
-    assert any("1 September" in (m.get("content") or "") for m in superseded)
+    # Memories are observations: both stay readable.
+    contents = [m.get("content") or "" for m in brain.store.list_memories(org, latest_only=False)]
+    assert any("1 September" in c for c in contents)
+    assert any("15 September" in c for c in contents)
 
     # Provenance on memories
     for m in r1["memories"] + r2["memories"]:
@@ -169,19 +170,13 @@ def test_unrelated_is_facts_do_not_supersede_each_other(empty_brain):
         entity_ids=["project_x"],
         learn=True,
     )
-    current2 = brain.memory.list_current(org, entity_ids=["project_x"])
-    launch_latest = [
-        m
-        for m in current2
-        if "launch date" in (m.get("content") or "").lower() and m.get("is_latest")
-    ]
-    assert any("15 September" in m["content"] for m in launch_latest)
-    superseded = [
-        m
-        for m in brain.store.list_memories(org, latest_only=False)
-        if m.get("status") == "superseded" and "1 September" in (m.get("content") or "")
-    ]
-    assert superseded, "contradictory launch_date must supersede older value"
+    launch = _launch_facts(brain, org)
+    assert launch["15 September"] == "active"
+    assert launch["1 September"] == "superseded", "contradictory launch_date must supersede"
+    is_facts = brain.reality.current_facts(org, subject_id="project_x", predicate="is")
+    assert {"using PostgreSQL for storage", "owned by platform team"} <= {
+        f["object_value"] for f in is_facts
+    }, "generic 'is' facts must not supersede each other"
 
 
 def test_reingest_bumps_version_and_keeps_prior_source(empty_brain):

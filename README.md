@@ -42,9 +42,11 @@ Open <http://127.0.0.1:8080> and sign in as the owner. API docs are at
 `/docs`, liveness at `/health`, runtime readiness at `/v1/harness/status`.
 
 **Running without an API key:** remove the entries under
-`models.assignments` and Toda uses its built-in deterministic model and
-embedding providers. Nothing is billed and the whole runtime still runs. For
-demo data, run `uv run toda-seed`.
+`models.assignments` and set `agent.require_real_world_readiness` to `false`
+(otherwise new Tasks are refused until real providers pass their checks).
+Toda then uses its built-in deterministic model and embedding providers.
+Nothing is billed and the whole runtime still runs. For demo data, run
+`uv run toda-seed`.
 
 ## Configuration
 

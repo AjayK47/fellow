@@ -328,34 +328,29 @@ class GraphService:
     def resolve_owners(
         self, organization_id: str, entity_ids: list[str]
     ) -> list[dict[str, Any]]:
+        """Owners of each entity, from any ownership edge.
+
+        Learned facts project edges named by their predicate key ("owns",
+        "owns_account_for", "account_owned_by"), seeded data uses OWNS and
+        ACCOUNT_OWNED_BY; both read the same way.
+        """
         results = []
         for eid in entity_ids:
-            owners = self.store.list_edges(organization_id, edge_type=OrgEdgeType.OWNS.value, to_id=eid)
-            for e in owners:
-                owner = self.store.get_entity(e["from_id"])
-                results.append(
-                    {
-                        "entity_id": eid,
-                        "owner_id": e["from_id"],
-                        "owner": owner,
-                        "edge": e,
-                    }
-                )
-            # ACCOUNT_OWNED_BY (customer -> person)
-            accounts = self.store.list_edges(
-                organization_id, edge_type=OrgEdgeType.ACCOUNT_OWNED_BY.value, from_id=eid
-            )
-            for e in accounts:
-                owner = self.store.get_entity(e["to_id"])
-                results.append(
-                    {
-                        "entity_id": eid,
-                        "owner_id": e["to_id"],
-                        "owner": owner,
-                        "edge": e,
-                    }
-                )
+            for edge in self.store.list_edges(organization_id, to_id=eid):
+                if _ownership_direction(edge["edge_type"]) == "owns":
+                    results.append(self._owner_row(eid, edge["from_id"], edge))
+            for edge in self.store.list_edges(organization_id, from_id=eid):
+                if _ownership_direction(edge["edge_type"]) == "owned_by":
+                    results.append(self._owner_row(eid, edge["to_id"], edge))
         return results
+
+    def _owner_row(self, entity_id: str, owner_id: str, edge: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "entity_id": entity_id,
+            "owner_id": owner_id,
+            "owner": self.store.get_entity(owner_id),
+            "edge": edge,
+        }
 
     def on_call_for(self, organization_id: str, service_or_team_id: str) -> list[dict[str, Any]]:
         edges = self.store.list_edges(
@@ -468,3 +463,13 @@ def _placeholder_node(node_id: str, organization_id: str) -> dict[str, Any]:
         "name": f"{label} {shown}",
         "placeholder": True,
     }
+
+
+def _ownership_direction(edge_type: str) -> str | None:
+    """"owns" when from_id owns to_id, "owned_by" when to_id owns from_id."""
+    key = str(edge_type or "").lower()
+    if "owned_by" in key:
+        return "owned_by"
+    if key.startswith("owns") or key in {"owner_of", "is_owner_of"}:
+        return "owns"
+    return None

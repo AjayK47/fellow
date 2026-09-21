@@ -66,6 +66,9 @@ def sign_in(
         json.dumps({"dashboard_session_id": session["token"]}).encode()
     )
     signed = itsdangerous.TimestampSigner(DASHBOARD_SESSION_SECRET).sign(payload).decode()
+    # Replace, not add: the server re-sets its own toda_session cookie on
+    # every response, and a second same-name cookie would lose to it.
+    client.cookies.delete("toda_session")
     client.cookies.set("toda_session", signed)
 
 

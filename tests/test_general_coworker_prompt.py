@@ -1,18 +1,17 @@
-from toda.harness.prompts import CORE_SYSTEM_PROMPT
+from toda.harness.prompts import CORE_SYSTEM_PROMPT, render_voice
 
 
-def test_toda_is_a_general_coworker_with_additional_company_context():
+def test_toda_is_a_colleague_with_a_configurable_name():
+    voice = render_voice("Mio")
+    assert "You are Mio, a colleague on this team" in voice
     prompt = CORE_SYSTEM_PROMPT.lower()
-    assert "organizational ai coworker" in prompt
-    assert "permissioned harness" in prompt
     assert "requested outcome" in prompt
     assert "never invent" in prompt
 
 
 def test_company_claims_still_require_authorized_company_evidence():
     prompt = CORE_SYSTEM_PROMPT.lower()
-    assert "permissioned harness" in prompt
-    assert "organizational" in prompt
+    assert "organization, destination, and scope" in prompt
     assert "untrusted reference material" in prompt
 
 

@@ -86,6 +86,18 @@ def test_standup_update_supersedes_old_time(brain):
     assert [f["id"] for f in current] == [fact2["id"]]
 
 
+def _conflicts_about(brain, subject_id):
+    """The seeded org has its own (resolved) launch-date conflict."""
+    return [
+        conflict
+        for conflict in brain.reality.list_conflicts("org_acme")
+        if any(
+            brain.reality._get_payload("reality_facts", fact_id)["subject_id"] == subject_id
+            for fact_id in conflict["fact_ids"]
+        )
+    ]
+
+
 def test_multi_valued_add_keeps_both_with_no_conflict(brain):
     source1 = _source(brain, "Priya likes ice cream.", "m4-likes-1")
     extractor = _extractor(brain, json.dumps(_memory_payload(
@@ -99,7 +111,7 @@ def test_multi_valued_add_keeps_both_with_no_conflict(brain):
     fact2 = _apply(brain, extractor2, source2)
     current = brain.reality.current_facts("org_acme", subject_id=fact2["subject_id"])
     assert {f["object_value"] for f in current} == {"ice cream", "coffee"}
-    assert brain.reality.list_conflicts("org_acme") == []
+    assert _conflicts_about(brain, fact2["subject_id"]) == []
     record = brain.store.get_predicate("org_acme", "likes")
     assert record is not None and record["cardinality"] == "multi"
 
@@ -117,7 +129,7 @@ def test_contradicts_creates_contested_fact_and_conflict(brain):
         obj="Ben", target=fact1["id"])))
     fact2 = _apply(brain, extractor2, source2)
     assert fact2 is not None and fact2["status"] == "contested"
-    assert len(brain.reality.list_conflicts("org_acme")) == 1
+    assert len(_conflicts_about(brain, fact2["subject_id"])) == 1
 
 
 def test_noop_attaches_source_without_new_fact(brain):

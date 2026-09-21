@@ -39,6 +39,7 @@ REQUIRED = {
     "skill_response_validation",
     "image_analysis",
     "image_analysis_default_question",
+    "voice",
 }
 
 

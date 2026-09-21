@@ -12,6 +12,8 @@ grow from ordinary conversation.
 
 from __future__ import annotations
 
+import pytest
+
 import json
 
 from toda.harness import extraction as extraction_module
@@ -312,62 +314,51 @@ def test_known_entity_catalog_keeps_the_most_recent_entities_when_capped(
     ]
 
 
-def _relation_memory(org, from_id, to_id, *, edge_type="ACCOUNT_OWNED_BY", confidence=0.9):
-    from toda.domain.models import CanonicalClaim, Memory, MemoryRelation, MemoryType
-
-    return Memory(
-        organization_id=org,
-        memory_type=MemoryType.RELATIONSHIP,
-        content="Ana owns the Acme account.",
-        canonical_claim=CanonicalClaim(subject=from_id, predicate="owns account for", object=to_id),
-        confidence=confidence,
-        scope_id="scope_org_public",
-        source_ids=["src_test"],
-        entity_ids=[from_id, to_id],
-        relation=MemoryRelation(edge_type=edge_type, from_id=from_id, to_id=to_id),
-    )
-
-
-def test_extracted_relation_becomes_a_queryable_owner_edge(empty_brain):
-    """brain_resolve_owner queries OWNS / ACCOUNT_OWNED_BY edges.
-
-    The extractor already resolved claims to (subject, predicate, object) with
-    both entities identified, but that only fed supersession matching -- so the
-    owner lookup queried a graph nothing populated and ownership questions fell
-    back to similarity search over prose.
-    """
-    org = "org_rel"
-    brain = empty_brain
-    brain.store.put_organization({"id": org, "name": "Rel"})
-    for eid, etype, name in (
-        ("person_ana", "person", "Ana"),
-        ("customer_acme", "customer", "Acme"),
-    ):
-        brain.graph.upsert_entity(
-            {"id": eid, "organization_id": org, "entity_type": etype, "name": name}
-        )
-
-    assert brain.graph.resolve_owners(org, ["customer_acme"]) == []
-
-    brain.memory._consolidate(_relation_memory(org, "customer_acme", "person_ana"))
-
-    owners = brain.graph.resolve_owners(org, ["customer_acme"])
-    assert [o["owner_id"] for o in owners] == ["person_ana"], "owner lookup should resolve by edge"
-
-
-def test_low_confidence_extraction_does_not_become_a_graph_fact(empty_brain):
-    org = "org_rel_low"
-    brain = empty_brain
-    brain.store.put_organization({"id": org, "name": "RelLow"})
+def _owner_brain(brain, org):
+    brain.store.put_organization({"id": org, "name": org})
     for eid, etype in (("person_ana", "person"), ("customer_acme", "customer")):
         brain.graph.upsert_entity(
             {"id": eid, "organization_id": org, "entity_type": etype, "name": eid}
         )
+    assert brain.graph.resolve_owners(org, ["customer_acme"]) == []
+    return brain
 
-    brain.memory._consolidate(
-        _relation_memory(org, "customer_acme", "person_ana", confidence=0.5)
+
+def _assert_owner_fact(brain, org, subject, predicate, obj):
+    brain.reality.assert_fact(
+        organization_id=org,
+        subject_id=subject,
+        predicate=predicate,
+        object_value=obj,
+        object_entity_id=obj,
+        scope_id="scope_org_public",
+        valid_from="2026-09-01T00:00:00+00:00",
     )
 
+
+@pytest.mark.parametrize(
+    ("subject", "predicate", "obj"),
+    [
+        ("person_ana", "owns", "customer_acme"),
+        ("person_ana", "Owns account for", "customer_acme"),
+        ("customer_acme", "account owned by", "person_ana"),
+    ],
+)
+def test_a_learned_ownership_fact_answers_the_owner_lookup(empty_brain, subject, predicate, obj):
+    """Facts project edges named by their normalized predicate ("owns"), while
+    brain_resolve_owner only read the seeded OWNS / ACCOUNT_OWNED_BY types --
+    so an ownership learned from Slack never reached the owner lookup."""
+    org = "org_rel"
+    brain = _owner_brain(empty_brain, org)
+    _assert_owner_fact(brain, org, subject, predicate, obj)
+    owners = brain.graph.resolve_owners(org, ["customer_acme"])
+    assert [o["owner_id"] for o in owners] == ["person_ana"]
+
+
+def test_an_unrelated_edge_is_not_an_owner(empty_brain):
+    org = "org_rel_other"
+    brain = _owner_brain(empty_brain, org)
+    _assert_owner_fact(brain, org, "person_ana", "met with", "customer_acme")
     assert brain.graph.resolve_owners(org, ["customer_acme"]) == []
 
 
