@@ -13,7 +13,7 @@ RUN pnpm run build
 
 FROM ghcr.io/astral-sh/uv:0.6.17 AS uv
 
-FROM python:3.12-slim AS runtime
+FROM python:3.15-slim AS runtime
 # TODA_CONFIG is the only environment variable Toda reads -- a config file
 # cannot tell you where it lives. Everything else (data dir, host, port)
 # comes from that file. The TODA_DATA_DIR / TODA_HOST / TODA_PORT variables
